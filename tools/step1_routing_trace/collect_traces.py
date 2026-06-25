@@ -38,6 +38,7 @@ hook 点（mlx_lm のソースを実読して確定）:
 
 import argparse
 import json
+import os
 import sys
 
 import mlx.core as mx
@@ -126,6 +127,25 @@ def load_prompts(path):
     return prompts
 
 
+def resolve_text(prompt_obj, base_dir):
+    """プロンプト本文を組み立てる。
+
+    - "text": インライン本文（coding/agentic 用）。
+    - "text_file": 大きな実素材（長コード/エージェントログ）へのパス。
+      base_dir（prompts JSONL のあるディレクトリ）相対で解決。長文脈10%枠で使う。
+    - "instruction" + "text_file": 指示文を素材の先頭に付ける（要約/検索タスク形）。
+    """
+    if "text_file" in prompt_obj:
+        path = prompt_obj["text_file"]
+        if not os.path.isabs(path):
+            path = os.path.join(base_dir, path)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        instruction = prompt_obj.get("instruction", "").strip()
+        return f"{instruction}\n\n{content}" if instruction else content
+    return prompt_obj["text"]
+
+
 def encode_prompt(tokenizer, text):
     """chat template があれば適用（coding/agentic は chat 形式が実用途に近い）。"""
     try:
@@ -140,8 +160,8 @@ def encode_prompt(tokenizer, text):
     return tokenizer.encode(text)
 
 
-def run_prompt(model, tokenizer, prompt_obj, max_new_tokens, out_f):
-    text = prompt_obj["text"]
+def run_prompt(model, tokenizer, prompt_obj, max_new_tokens, out_f, base_dir):
+    text = resolve_text(prompt_obj, base_dir)
     pid = prompt_obj["prompt_id"]
     cat = prompt_obj.get("category", "unknown")
 
@@ -212,10 +232,19 @@ def main():
         raise SystemExit("--prompts と --out が必要（または --smoke）")
 
     prompts = load_prompts(args.prompts)
+    base_dir = os.path.dirname(os.path.abspath(args.prompts))
     print(f"[qwisp] {len(prompts)} prompts", file=sys.stderr)
+    skipped = 0
     with open(args.out, "w", encoding="utf-8") as out_f:
         for p in prompts:
-            run_prompt(model, tokenizer, p, args.max_new_tokens, out_f)
+            try:
+                run_prompt(model, tokenizer, p, args.max_new_tokens, out_f, base_dir)
+            except FileNotFoundError as e:
+                RECORDER.enabled = False
+                skipped += 1
+                print(f"[qwisp] SKIP {p.get('prompt_id')}: 素材なし ({e})", file=sys.stderr)
+    if skipped:
+        print(f"[qwisp] {skipped} prompt(s) skipped（corpora 未配置）", file=sys.stderr)
     print(f"[qwisp] traces -> {args.out}", file=sys.stderr)
 
 

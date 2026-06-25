@@ -2,7 +2,10 @@
 __pycache__/
 *.pyc
 
-# Trace outputs (Step 1 / Step 2 artifacts — can be large)
-*.jsonl
-!tools/**/prompts.sample.jsonl
+# Step 1/2 trace outputs (can be large) — prompts*.jsonl は追跡する
 traces*.jsonl
+*.traces.jsonl
+
+# 長文脈の実素材（各自のコード/ログ）— README だけ追跡
+tools/step1_routing_trace/corpora/*
+!tools/step1_routing_trace/corpora/README.md
