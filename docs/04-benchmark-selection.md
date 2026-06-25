@@ -11,14 +11,14 @@
 
 ## 選定（ユーザー確定）
 
-| 枠 | ベンチ | HF dataset | 状態 |
-| --- | --- | --- | --- |
-| coding 45% | **SWE-bench Verified** | `princeton-nlp/SWE-bench_Verified` | ✅スキーマ確認済 |
-| coding 45% | **LiveCodeBench** | `livecodebench/code_generation_lite` | ⚠ config/split 要確認 |
-| agentic 45% | **BFCL v4** | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | ⚠ 非標準（複数 JSON ファイル） |
-| agentic 45% | **Terminal-Bench 2.0** | `zai-org/terminal-bench-2-verified`（候補: `harborframework/...`, `penfever/...`） | ⚠ config/split 要確認 |
-| long_context 10% | **RULER** | 正準静的 dataset 無し（生成器）。prebuilt or 自前生成 | ⚠ 取得方法 未確定 |
-| long_context 10% | **RepoQA** | `repoqa` パッケージ（evalplus）配布。HF id 要確認 | ⚠ 要確認 |
+| 枠 | ベンチ | 取得元（確定） | フィールド | 状態 |
+| --- | --- | --- | --- | --- |
+| coding 45% | **SWE-bench Verified** | `princeton-nlp/SWE-bench_Verified`（datasets-server /rows） | `problem_statement` | ✅実フェッチ済 |
+| coding 45% | **LiveCodeBench** | `livecodebench/code_generation_lite` 生 `test.jsonl`（Range 先頭のみ） | `question_content`(+`starter_code`) | ✅実フェッチ済 |
+| agentic 45% | **BFCL v4** | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` 生 `BFCL_v3_*.json` | `question`+`function` を tool-use 整形 | ✅実フェッチ済 |
+| agentic 45% | **Terminal-Bench 2.0** | `zai-org/terminal-bench-2-verified` tree→各 `<task>/instruction.md` | `instruction.md` | ✅実フェッチ済 |
+| long_context 10% | **RULER** | `rbiswasfc/ruler`（/rows、config `*_8k`、split `validation`） | `input` | ✅実フェッチ済 |
+| long_context 10% | **RepoQA** | evalplus GitHub release gz（`2024-06-23`） | `content` 連結＋`needles` 説明 | ✅実フェッチ済 |
 
 ## 実スキーマ調査（HF datasets-server `/first-rows` 等）
 
@@ -59,12 +59,23 @@
 - `*.lock.json`（追跡）: 解決済み index/instance_id（完全再現）。
 - 出力 `prompts.jsonl`（既存スキーマ: `text` or `instruction`+`text_file`）。
 
-## 残 TODO（実装前）
+## 実装結果（解決済み）
 
-1. LiveCodeBench の config/split/フィールドを実ロードで確定（version タグ）。
-2. Terminal-Bench 2.0 の正リポと instruction フィールド（行 or 同梱ファイル）。
-3. BFCL のファイル取得＋tool-use 整形アダプタ。
-4. RULER の取得方法（prebuilt vs 自前生成、長さ 8K/16K）。
-5. RepoQA の HF id とフィールド。
+保留5件は実フェッチで全解決。`datasets` ライブラリは使わず（loading-script の非決定性回避）、
+**HF 生ファイル `/resolve/main/` ＋ datasets-server `/rows` を stdlib で直取り**する方針で
+`tools/prompt_builder/build_prompts.py` を実装。全6アダプタが実データで取得・正規化を確認。
 
-> 関連: 比率 [[prompt-mix-decision]]、収集器 `tools/step1_routing_trace/`、決定状況 [[qwisp-open-decisions]]。
+- datasets-server は LiveCodeBench/Terminal-Bench/BFCL を rows 提供できず（501/500＝loading-script・
+  非標準）→ 生ファイル直取りに切替で解決。
+- BFCL は `multi_turn_*` が `function` キーを持たない別スキーマ → 単一ターン系
+  （simple/multiple/parallel/live_*）に限定＋欠落 skip で解決。
+- RULER は合成生成器だが prebuilt `rbiswasfc/ruler` の `*_8k` を採用。`input` がそのまま長文脈。
+- RepoQA は evalplus GitHub release の gz（version `2024-06-23`）。
+
+**性能**（並行化済み）: ベンチ間＋ベンチ内フェッチを ThreadPool 並行、LiveCodeBench は
+Range で先頭のみ、巨大DL はオンディスクキャッシュ。コールド ~104s（I/O 律速）/ ウォーム ~2.5s。
+seed 固定＋順序保存で**決定論**（再実行で lock 一致を確認）。
+
+生成物: `tools/step1_routing_trace/prompts.bench.jsonl`（gitignore、再現は manifest+lock）。
+
+> 関連: builder `tools/prompt_builder/`、比率 [[prompt-mix-decision]]、収集器 `tools/step1_routing_trace/`、決定状況 [[qwisp-open-decisions]]。
