@@ -52,12 +52,36 @@
 - PoC 4.0 の cold 計測（8GB/s）は直前 `mx.load` の mmap でページが温まり過大評価。**gate の帯域は bench_flash の clean 4 GB/s を維持**。
 - PoC は**1層・少 token・no-sort** で実証。実 engine では sort 経路・全40層・実 tok/s（実機 streaming のオーバーヘッド）が残課題。
 
+## Stage A：MTP × streaming は両立するか（trace-sim、`sim_mtp.py`）
+
+**問い**：MTP 投機デコード（depth D）は expert streaming と同時に使えて実際に速くなるか。
+
+**モデル**：verify は窓 K=D+1 トークンを1パス → 各層で expert 和集合に触れる。OUR 実測 AR 54tok/s を基準に MTPLX の depth 倍率（D1 1.465×/D2 1.436×/D3 1.140×）＋受理率を graft し T_compute(D)。streaming ペナルティ T_flash(D,B)=verify 窓の union-miss×expert_bytes÷flash_bw（prefill で温め後 decode を窓処理、OUR 4.18GB/s）。prefetch 2ブラケット: serial=T_compute+T_flash / overlap=max(T_compute,T_flash)。
+
+**結果**（net_tps の best depth）:
+
+| B/層 | DRAM | serial(prefetch off) | overlap(prefetch on) |
+|---:|---:|---|---|
+| 32 | 2.3G | D1 14.0 | **D0 18.1**（MTP 負け）|
+| 64 | 4.5G | D1 21.1 | **D0 30.6** |
+| 96 | 6.8G | D1 30.2 | **D0 51.7** |
+| 128 | 9.1G | D1 40.5 | **D1 79.1**（逆転）|
+| 256 | 18.1G | D1 69.0 | D1 79.1 |
+
+**核心**：`miss/verify` は ~(D+1)倍にスケールするが accepted は sub-linear（1.0/1.89/2.43/2.40）→ **miss/accepted-token が D とともに増える**（B=64: 77→82→94→129）。
+
+**結論：両立するが効くのは regime 次第。**
+- compute-bound（B≥128, ~16GB）: MTP 効く。D1 で 1.4-1.5×。
+- flash-bound（B≤64, ~12GB＝max reach 域）: MTP 効かない/損。**prefetch でも救えない**（帯域が硬い上限＝HOBBIT 留保の定量確認）。
+- **D1 が常に最適、D2/D3 は streaming 下で悪化。**
+
+**設計含意（reach↔速度の2動作点）**: Max reach=12GB/素 AR streaming/17-21tok/s vs Speed=16GB/MTP D1/40-79tok/s。**MTP は 12GB reach の目玉には乗らず、RAM 余裕時の速度ティア。**
+
+留保: draft 窓を AR 連続トークンで近似、倍率/受理は MTPLX マシン graft、union は独立ルーティング仮定（実測 miss が ~線形＝窓内相関低）。
+
 ## 次（実 engine へ）
 
-1. **switch_mlp を streaming 版に差し替え**（LRU キャッシュ＋ExpertLoader）→ 全40層で実モデル生成し、出力一致＆**実 tok/s・実 peak memory** を測る（シミュ gate の実機検証）。
-2. 非expert 分離常駐。
-3. キャッシュ方策（予測器寄り、Step2 の oracle gap を取りに行く）。
-4. 混合精度 expert（hot高bit/cold低bit）。
-5. MTP prefetch 統合。
+1. **switch_mlp を streaming 版に差し替え**（LRU＋ExpertLoader）→ 全40層で実生成、出力一致＆**実 tok/s・実 peak**（シミュ gate の実機検証）。MTP は Speed 動作点（B≥128）でのみ統合価値。
+2. 非expert 分離常駐。3. キャッシュ方策（予測器寄り）。4. 混合精度 expert。
 
 > 関連: go/no-go [[go-no-go-first-read]]、実装 `tools/step4_streaming/`、決定状況 [[qwisp-open-decisions]]。
