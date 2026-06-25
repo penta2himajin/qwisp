@@ -79,9 +79,29 @@
 
 留保: draft 窓を AR 連続トークンで近似、倍率/受理は MTPLX マシン graft、union は独立ルーティング仮定（実測 miss が ~線形＝窓内相関低）。
 
-## 次（実 engine へ）
+## アーキ決定実験（`probe_lazy_load.py`）→ (A) 明示キャッシュ必須
 
-1. **switch_mlp を streaming 版に差し替え**（LRU＋ExpertLoader）→ 全40層で実生成、出力一致＆**実 tok/s・実 peak**（シミュ gate の実機検証）。MTP は Speed 動作点（B≥128）でのみ統合価値。
-2. 非expert 分離常駐。3. キャッシュ方策（予測器寄り）。4. 混合精度 expert。
+`mlx_lm.load` が expert を遅延 mmap に保つか（→OS 委任の (B) が使えるか）を RSS で実測：
+**load 前 0.10GB → load 後 20.14GB → 生成後 20.14GB（mx_peak 19.6GB）**。
+＝**全 20GB を eager 実体化**。(B) 遅延 mmap 委任は**不可**（12GB 機では load 破綻）。
+
+→ **(A)：expert を materialize しないカスタムロード経路＋自前キャッシュ**で確定。
+ポリシー制御が効く＝Step2 の Belady gap（予測器）を取りに行ける＝Qwisp の差別化点。
+
+## 前例（戦略上の注意）
+
+mlx-swift で同空間の実装が既に存在：
+- **SwiftLM**（github SharpAI/SwiftLM）: ネイティブ MLX-Swift、100B+ MoE の SSD streaming、~10GB resident で 122B、OpenAI 互換、macOS/iOS アプリ。
+- **TurboQuant-MLX**: Qwen 122B を 16GB Mac mini で MoE expert streaming。
+
+→ full-Swift は viable（将来の製品化の道）。docs `01` E-2 の「未踏ニッチ」前提は弱まり、差別化を**測定駆動のキャッシュ方策／Qwen3.6 特化／2 動作点設計**に絞る必要。**ゼロから作る前に SwiftLM/TurboQuant を再利用/土台候補として精査**する価値が高い。
+
+## 次（実 engine v0.1）
+
+検証は Python/MLX（モデル＋MTP が既存、差別化は*方策*）。将来製品化は Swift。
+1. **カスタムロード**：非expert（~3.6GB）常駐、switch_mlp.* は未ロード。
+2. **StreamingSwitchGLU**（PoC 4.1 製品化）＋ ExpertCache（LRU→予測器）＋ ExpertLoader。
+3. 全40層で実生成 → `verify.py` で full と一致＋**実 tok/s・実 peak**（Max reach 動作点で裏取り）。
+4. 以降: async prefetch / 予測器キャッシュ / 混合精度 / MTP（Speed 動作点）。
 
 > 関連: go/no-go [[go-no-go-first-read]]、実装 `tools/step4_streaming/`、決定状況 [[qwisp-open-decisions]]。
