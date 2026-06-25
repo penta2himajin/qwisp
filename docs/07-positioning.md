@@ -258,6 +258,22 @@ mlx_lm ネイティブ KV 量子化（`kv_bits=4`）を 64K で実測：
 | mixed-precision（A） | proxy 発散・大工事・quick de-risk 不可 | 高リスク低 ROI |
 | KV 量子化 | 64K -1GB のみ（hybrid が KV を解決済） | 見送り |
 
-**v0.2 = shippable 到達点**：35B-A3B が exact・8GB17/12GB26 tok/s・64K/16GB・full と bit 一致。「極限まで高められた実用性能」を実機達成。さらなる伸びは churn/IO の物理天井に阻まれ、どのレバーも ROI 低と**measure-first で全数確認**。
+**v0.2 = shippable 到達点**：35B-A3B が exact・8GB17/12GB26 tok/s・64K/16GB・full と bit 一致。「極限まで高められた実用性能」を実機達成。
+
+### mixed-precision のミニマル品質検証 → GREEN（先の悲観を覆す）
+
+同一モデル・同一方式で expert を低bit roundtrip（精度だけ落とし格納は4bit、既存 gather で動かす）し品質測定（`qwisp/mixed_probe.py`）：
+
+| 条件 | token 一致 |
+|---|---|
+| 全 experts 2bit（最悪） | 8/40（token4 で発散）|
+| **mixed hot128@4 / cold128@2bit** | **40/40 完全一致** |
+| **mixed hot128@4 / cold128@3bit** | **40/40 完全一致** |
+
+- **hot を 4bit 維持・cold のみ低bit化で出力は full と完全一致**＝HOBBIT 仮説が我々のモデルで成立。cold は選択頻度が低く低精度でも argmax を変えない。
+- 先の悲観（mixed は不確実）は **conflated proxy（unsloth 3bit-all 別方式）＋最悪ケース（全2bit）由来の誤り**。ミニマル検証で**主リスク（品質）retire**。
+- 留保：40tok/1prompt の一次証拠。本番は多/長/多様 prompt で再確認。
+
+→ **評価が変わる：mixed-precision が唯一の生きたレバー**。予測器（う）死亡・KV量子化低価値の中、mixed は**品質 GREEN・reach・差別化**。価値=cold 半分を 2bit→miss-IO 半減/格納半減（reach）/品質保持（top-k drop と違う差別化）。コスト=混合bit two-gather 実装（中〜大）＋MLX 2bit dequant 速度（要検証）。
 
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
