@@ -28,16 +28,35 @@
 
 おそらく **(a) を主**にしつつ（予測器キャッシュで Belady gap を取りに行く価値が Step2 で定量化済）、(b) を初期の足場に使うのが筋。
 
+## PoC 4.1：streaming MoE forward の出力一致（✅PASS、compute 層）
+
+**問い**：全256 experts 常駐でなく「必要 experts のサブセットだけ」読んで計算した routed 出力が full と一致するか。
+
+**方法**（`tools/step4_streaming/poc_moe_forward.py`）：実 hidden state を捕捉し、top-k で選ばれた experts のサブセット（unique）だけを ExpertLoader で読み、`gather_qmm`（mlx_lm の QuantizedSwitchLinear/SwitchGLU に忠実）で計算 → full の `switch_mlp(x, inds)` と比較。token<8 で sort 回避し厳密一致を取る。
+
+**結果**：4 token / top_k=8 → unique **29/256 experts**。**max|diff| = mean|diff| = 0.00e+00（bit 完全一致）**。VERDICT PASS。
+
+→ **必要な 29 experts だけ常駐で routed 出力を full と完全同一に計算できる**。streaming MoE 層の compute が正しい。
+
+## engine コアの両層が GREEN
+
+| PoC | 層 | 結果 |
+|---|---|---|
+| 4.0 | IO/メモリ | expert on-demand load が bit 一致、1.77MB/expert |
+| 4.1 | compute | subset-only forward が full と bit 一致（diff=0） |
+
+「正しく動く streaming MoE 層」が実モデルで端から端まで成立。AFM3-CA の中核機構が Qwen3.6-35B-A3B で動くことが実証された。
+
 ## 留保
 
-- PoC の cold 計測（8GB/s）は直前 `mx.load` の mmap でページが温まり過大評価。**gate の帯域は bench_flash の clean 4 GB/s を維持**（それでも GREEN）。
-- 検証したのは**weight の bit 一致＝IO 層**。「streaming MoE forward の出力が full と一致」は次の PoC（compute は標準だが配線確認）。
+- PoC 4.0 の cold 計測（8GB/s）は直前 `mx.load` の mmap でページが温まり過大評価。**gate の帯域は bench_flash の clean 4 GB/s を維持**。
+- PoC は**1層・少 token・no-sort** で実証。実 engine では sort 経路・全40層・実 tok/s（実機 streaming のオーバーヘッド）が残課題。
 
-## 次
+## 次（実 engine へ）
 
-1. 1層 streaming MoE forward → full と出力一致（compute 配線確認）。
-2. 全層拡張＋非expert 分離常駐。
-3. キャッシュ方策実装（(a) 予測器寄り）。
+1. **switch_mlp を streaming 版に差し替え**（LRU キャッシュ＋ExpertLoader）→ 全40層で実モデル生成し、出力一致＆**実 tok/s・実 peak memory** を測る（シミュ gate の実機検証）。
+2. 非expert 分離常駐。
+3. キャッシュ方策（予測器寄り、Step2 の oracle gap を取りに行く）。
 4. 混合精度 expert（hot高bit/cold低bit）。
 5. MTP prefetch 統合。
 
