@@ -39,10 +39,11 @@ class StreamingSwitchGLU(nn.Module):
             mode="affine", sorted_indices=False)
 
     def __call__(self, x, inds):
-        inds_np = np.array(inds.tolist())
-        U = sorted(set(int(v) for v in inds_np.flatten()))
-        pos = {e: i for i, e in enumerate(U)}
-        remap = mx.array(np.vectorize(pos.get)(inds_np).astype(np.int32))
+        # unique(sorted)＋remap を np.unique 一発で（旧 set/sorted/dict/np.vectorize を置換）。
+        inds_np = np.asarray(inds.tolist())
+        U_arr, inv = np.unique(inds_np, return_inverse=True)
+        U = U_arr.tolist()
+        remap = mx.array(inv.reshape(inds_np.shape).astype(np.int32))
 
         sub = self._experts(U)
         xe = mx.expand_dims(x, (-2, -3))
