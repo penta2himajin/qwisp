@@ -56,10 +56,45 @@
 - oracle は上界。実 ML キャッシュは gap の大半を取るが全部ではない。
 - 5,120 decode トークン（40×128）の一次読み。decode 長・プロンプト数を増やす余地。
 
-## 次（Step 3）
+## 実測較正（Step 3 結果、2026-06）
 
-1. **実効 flash 帯域の実測**（1.6MB ランダム読み、cache bypass）→ ゲート再較正（最大の仮定を実数化）。
-2. **素の MLX ベースライン**（フロア機での fit / peak mem / prefill・decode tok/s × context 長）＝「超えるべき基準値」。
-3. 上記でゲートを引き直し → 4つ組（[[qwisp-open-decisions]]）を確定へ。
+`tools/step3_baseline/` で実測。仮定を実数に置換した。
+
+**実効 flash 帯域**（`bench_flash.py`、F_NOCACHE、purge 後の cold）: 1.6MB ランダム読み = **約 4.0 GB/s**（保守仮定 1GB/s の **4.18×**）。チャンク大で更に速い（2MB で 5.6GB/s＝bundling 効果）。※測定前に `sudo purge` 必須（さもないと RAM キャッシュ served で 15GB/s と過大評価される）。
+
+**素の AR ベースライン**（`bench_mlx.py`、4bit）: decode **50-54 tok/s**、peak **19.8-21.9GB**（@8K）。→ 全載りフロア ~22GB＝24GB 機。target 15 tok/s は保守的。
+
+**gate の物理修正**: 旧 gate は追加レイテンシを全予算と比較し compute 時間を二重計上していた。`--baseline-tok-s` を追加し `net_tps = 1/(1/baseline + miss_lat)` を直接出すよう修正（simulate.py）。
+
+**再較正後 go/no-go**（flash 4.18GB/s 実測、baseline 54、target 15）:
+
+| policy | GO 閾値 | expert DRAM | 旧（1GB/s, 二重計上）|
+|---|---|---:|---|
+| LRU | **B=48** | 3.1GB | B=128 / 8.2GB |
+| Belady | **≤B=32** | ≤2.0GB | B=64 / 4.1GB |
+
+net_tps（実 tok/s）例: LRU B=48→17.6, B=64→20.8, B=128→34.7 / Belady B=48→25.8, B=64→30.4。
+
+**実測 reach マップ**（非expert＋KV@8K ≒ 5.5GB を加算）:
+
+| 構成 | 予算 | 常駐 | 機 |
+|---|---|---:|---|
+| 全載り | 256 | 21.9GB | 24GB |
+| LRU 15tps | B=48 | 8.6GB | **12GB** |
+| Belady 15tps | ≤B=32 | ≤7.5GB | 12GB 余裕 |
+| LRU 30tps | B≈110 | ~12.5GB | 16GB |
+| Belady 30tps | B=64 | 9.6GB | 12GB タイト |
+
+→ **実測帯域で素の LRU streaming が 35B-A3B を 15 tok/s で 12GB 機に収める。** 当初 24GB から大幅拡大。
+
+**量子化の知見（重要）**: unsloth UD-MLX-3bit はメモリ -3GB だが decode -35%（54→35 tok/s。3bit dequant 重・4bit 側が MTPLX 速度最適化済）。**一律低bit は「軽く速く」にならず速度予算を食う**。真のサイズ落としレバーは**混合精度 expert（hot 高bit／cold 低bit）**＝streaming エンジン内で実装（docs `01` C節 HOBBIT/EdgeMoE）。
+
+## 次（Step 4 へ）
+
+routing/キャッシュ側＋実帯域で GREEN 確度が上がった。残る最難関は **MLX mmap-from-NAND streaming の工学**（docs `01` E-2、未検証＝「作ってよい」段階）。
+1. expert/非expert 分離ロード（非expert 常駐）。
+2. MLX + mmap-from-NAND のキャッシュ方策実装（Step 2 で勝った方策＝予測器寄りを翻訳）。
+3. 混合精度 expert で「サイズ落とし」を速度を殺さず実現。
+4. 4つ組（[[qwisp-open-decisions]]）を実測値で確定：例 `{35B-A3B 4bit, ≥15 tok/s, 8K ctx, 12GB(M?)}`。
 
 > 再現: `tools/step1_routing_trace/collect_traces.py`（trace）→ `tools/step2_cache_sim/simulate.py`（sim）。trace/生成プロンプトは gitignore、再現は manifest+lock。

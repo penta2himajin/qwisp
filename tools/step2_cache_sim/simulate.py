@@ -167,8 +167,11 @@ def main():
     ap.add_argument("--policies", default="lru,lfu,belady")
     ap.add_argument("--expert-bytes", type=float, default=1.6e6,
                     help="1 expert のバイト数（既定 ~1.6MB: 4bit, inter=512, hidden=2048）")
-    ap.add_argument("--flash-bw", type=float, default=1.0e9, help="flash 帯域 B/s（既定 1GB/s）")
+    ap.add_argument("--flash-bw", type=float, default=1.0e9, help="flash 帯域 B/s（既定 1GB/s。Step3 実測値を入れる）")
     ap.add_argument("--target-tok-s", type=float, default=15.0, help="go/no-go の目標 decode tok/s")
+    ap.add_argument("--baseline-tok-s", type=float, default=None,
+                    help="素の AR decode tok/s（Step3 実測）。指定すると net_tps=1/(1/baseline+miss_lat) "
+                         "を計算しゲートを物理的に正す（compute 時間を二重計上しない）")
     ap.add_argument("--out", help="結果 JSON 出力先")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -183,33 +186,34 @@ def main():
     active_per_token = top_k * n_layers
     budgets = [int(b) for b in args.budgets.split(",")]
     policies = [p.strip() for p in args.policies.split(",")]
-    time_budget_s = 1.0 / args.target_tok_s
+    base_s = (1.0 / args.baseline_tok_s) if args.baseline_tok_s else 0.0
 
     print(f"[qwisp] layers={n_layers} top_k={top_k} active/token={active_per_token} "
           f"prompts={len(by_prompt)}", file=sys.stderr)
-    print(f"[qwisp] expert={args.expert_bytes/1e6:.2f}MB flash={args.flash_bw/1e9:.1f}GB/s "
-          f"target={args.target_tok_s}tok/s → budget {time_budget_s*1000:.1f}ms/token", file=sys.stderr)
+    print(f"[qwisp] expert={args.expert_bytes/1e6:.2f}MB flash={args.flash_bw/1e9:.2f}GB/s "
+          f"target={args.target_tok_s}tok/s baseline={args.baseline_tok_s or 'n/a'}tok/s "
+          f"(compute {base_s*1000:.1f}ms/token)", file=sys.stderr)
 
     results = []
-    header = f"{'policy':8} {'B/層':>5} {'totDRAM':>8} {'hit(all)':>9} {'hit(dec)':>9} {'miss(dec)':>9} {'+lat/tok':>9} {'flashTPS':>9} {'gate':>5}"
+    header = f"{'policy':8} {'B/層':>5} {'totDRAM':>8} {'hit(dec)':>9} {'miss(dec)':>9} {'+lat/tok':>9} {'net_tps':>8} {'gate':>5}"
     print(header)
     print("-" * len(header))
     for policy in policies:
         for B in budgets:
             tally = run_policy(by_prompt, B, policy)
-            h_all = hit_rate(tally)
             h_dec = hit_rate(tally, "decode")
             miss_dec = 1.0 - h_dec
-            lat = miss_dec * active_per_token * args.expert_bytes / args.flash_bw  # s/token
-            flash_tps = (1.0 / lat) if lat > 0 else INF
-            gate = "GO" if lat <= time_budget_s else "no"
+            lat = miss_dec * active_per_token * args.expert_bytes / args.flash_bw  # s/token（追加）
+            # net decode tps = 1/(compute時間 + miss待ち)。baseline 未指定なら flash-only。
+            net_tps = (1.0 / (base_s + lat)) if (base_s + lat) > 0 else INF
+            gate = "GO" if net_tps >= args.target_tok_s else "no"
             tot_dram_gb = B * n_layers * args.expert_bytes / 1e9
-            print(f"{policy:8} {B:>5} {tot_dram_gb:>7.1f}G {h_all:>9.3f} {h_dec:>9.3f} "
-                  f"{miss_dec:>9.3f} {lat*1000:>7.1f}ms {flash_tps:>8.1f} {gate:>5}")
+            print(f"{policy:8} {B:>5} {tot_dram_gb:>7.1f}G {h_dec:>9.3f} "
+                  f"{miss_dec:>9.3f} {lat*1000:>7.1f}ms {net_tps:>7.1f} {gate:>5}")
             results.append({
                 "policy": policy, "budget_per_layer": B, "total_dram_gb": tot_dram_gb,
-                "hit_all": h_all, "hit_decode": h_dec, "miss_decode": miss_dec,
-                "added_latency_s": lat, "flash_only_tok_s": flash_tps, "gate_pass": gate == "GO",
+                "hit_decode": h_dec, "miss_decode": miss_dec,
+                "added_latency_s": lat, "net_tok_s": net_tps, "gate_pass": gate == "GO",
             })
 
     # 局所性の素の指標: B=256（全載り）の decode hit = 1 - compulsory miss。
