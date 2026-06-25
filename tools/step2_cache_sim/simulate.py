@@ -27,7 +27,7 @@ import argparse
 import json
 import sys
 from bisect import bisect_right
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 INF = float("inf")
 
@@ -56,7 +56,23 @@ def simulate_layer(seq, capacity, policy, tally):
     seq: [(token_idx, phase, experts_tuple), ...]（token 昇順）。
     policy: 'lru' | 'lfu' | 'belady'。
     """
-    resident = {}  # expert -> bookkeeping（LRU: last_use, LFU: [freq, last_use]）
+    # 高速パス: LRU は OrderedDict で O(1)。oldest は popitem(last=False)。
+    # 現トークンの expert は直前に末尾へ移動済み → B>=top_k なら victim にならない。
+    if policy == "lru":
+        cache = OrderedDict()
+        for tok, phase, experts in seq:
+            for e in experts:
+                if e in cache:
+                    tally[(phase, "hit")] += 1
+                    cache.move_to_end(e)
+                else:
+                    tally[(phase, "miss")] += 1
+                    if len(cache) >= capacity:
+                        cache.popitem(last=False)
+                    cache[e] = None  # 追加で末尾（=最新）
+        return
+
+    resident = {}  # expert -> bookkeeping（LFU: [freq, last_use]）
 
     # Belady 用: expert -> その層内で出現する token 位置の昇順リスト
     if policy == "belady":
