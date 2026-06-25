@@ -1,0 +1,6 @@
+# Step 1 routing trace collector (MLX)
+# 実行は mlx_lm を持つ mtplx runtime-venv の python を使う:
+#   $HOME/Library/Application Support/MTPLX/runtime-venv/bin/python
+# 単体環境を作る場合の最低限（Apple Silicon のみ）:
+mlx>=0.31,<0.32
+mlx-lm>=0.31,<0.32

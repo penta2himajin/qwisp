@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# Trace outputs (Step 1 / Step 2 artifacts — can be large)
+*.jsonl
+!tools/**/prompts.sample.jsonl
+traces*.jsonl

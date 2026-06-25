@@ -10,10 +10,12 @@
 
 **重要な気づき**：routing は「モデル × プロンプトの性質」であって**ハードに依存しない**。よって制約デバイスは一切不要。24GB+ のマシンでもクラウドでも普通に流して取れる。**フロア機が手元になくても今日から始められる。**
 
-代表プロンプト群（君の実用途）：
-- コーディング（既存リポジトリ編集・生成）
-- エージェント（tool-calling ループ）
-- 長文脈（要約・NIAH 的検索）
+代表プロンプト群（確定比率 — 主用途を重く）：
+- **コーディング 45%**（既存リポジトリ編集・生成）
+- **エージェント tool-call 45%**（tool-calling ループ）
+- **長文脈 10%**（要約・NIAH 的検索）
+
+比率の根拠：コーディング／agentic が主用途で、長文脈はその上に乗る応用（前者2つが立って初めて要る）。同ドメイン（長いコード・長い tool 履歴）なので活性化 expert の*集合*は重複が大きい。ただし長文脈枠をゼロにしないのは、Step 2 が測るのは expert の種類でなく **DRAM 予算に対するワーキングセット／churn** であり、長い prefill は同じ expert 集合でも瞬間作業集合を膨らませて **no-go を出しうる唯一のケース**だから。10% は「用途」でなく「キャッシュを膨らませるストレス検査」枠。なお agentic ループは履歴が自然に伸びるため、長文脈カバレッジの一部は agentic 枠内で無料で入る。
 
 出力フォーマット（案）：`{prompt_id, token_idx, layer_idx, [expert_ids]}` の JSONL。
 
@@ -71,7 +73,7 @@ per-token 追加レイテンシ ≈ miss率 × アクティブexpert数 × exper
 
 ## 当面の意思決定ポイント
 
-- [ ] Step 1 のフックは `mlx_lm` か `transformers` か
-- [ ] 代表プロンプト群の確定（コード / エージェント / 長文脈の比率）
+- [x] Step 1 のフック → **MLX で計装・実装済み＆実モデルで検証済み**（transformers 案は撤回）。理由：transformers を選んだ唯一の動機は `output_router_logits` の hook 容易性だけで、routing 自体はフレームワーク非依存。だが手元の実用モデルが MLX 形式（`~/.mtplx/.../Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`, 4bit, 256 experts/top-8, 40層）で **24GB に載って今すぐ動く唯一の道が MLX**。かつ量子化 routing = 出荷忠実で go/no-go に最も効く。実装は `tools/step1_routing_trace/collect_traces.py`：`qwen3_next.Qwen3NextSparseMoeBlock.__call__` を monkeypatch し `argpartition(softmax(gate(x)))[..., -8:]` を捕捉、**AR モード（mlx_lm.load は mtp.* を落とす）**で JSONL 化。smoke 検証で layers=40/top_k=8/max_expert_id=255 が config 一致を確認。
+- [x] 代表プロンプト群の確定 → **コーディング45 / エージェント tool-call 45 / 長文脈10**（下記 Step 1 参照）
 - [ ] フロア機種の暫定値（手元 or 入手予定の最弱機）
 - [ ] 「十分高性能」の 4 つ組定義（Step 3 後に確定）
