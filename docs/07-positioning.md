@@ -274,6 +274,29 @@ mlx_lm ネイティブ KV 量子化（`kv_bits=4`）を 64K で実測：
 - 先の悲観（mixed は不確実）は **conflated proxy（unsloth 3bit-all 別方式）＋最悪ケース（全2bit）由来の誤り**。ミニマル検証で**主リスク（品質）retire**。
 - 留保：40tok/1prompt の一次証拠。本番は多/長/多様 prompt で再確認。
 
-→ **評価が変わる：mixed-precision が唯一の生きたレバー**。予測器（う）死亡・KV量子化低価値の中、mixed は**品質 GREEN・reach・差別化**。価値=cold 半分を 2bit→miss-IO 半減/格納半減（reach）/品質保持（top-k drop と違う差別化）。コスト=混合bit two-gather 実装（中〜大）＋MLX 2bit dequant 速度（要検証）。
+→ **mixed は品質 GREEN・reach・差別化**だが、速度は要検証。
+
+### MLX 2bit gather 速度（two-gather の関門）→ メモリ↔速度トレードオフ
+
+合成 gate_proj（out512/in2048, tokens=1）per-call µs：
+
+| gather | µs |
+|---|---:|
+| 8experts 4bit 1回（現行） | 275 |
+| 8experts 2bit 1回 | 288（2bit は速くない）|
+| mixed 4@4bit+4@2bit two-gather | 343（現行比 1.25×）|
+
+- **MLX は 2bit が 4bit より速くない**（dequant 計算ゆえ）。two-gather は +25%（カーネル2回＋分割）→ net 速度マイナス。
+
+### 事前処理は可能か → 2つの設計と本質トレードオフ
+
+per-token の「選択8個の hot/cold 分割」は routing 依存で**事前処理不可**。だが cold の量子化は事前可。
+
+- **設計A**: cold を**オフライン 2bit 格納**、miss 時 2bit ロード（IO半減）→4bit に requant→cache 一律4bit→**single gather（compute ペナルティ無）**。得=disk縮小＋miss-IO数%。**損=RAM 減らず（reach 無し）**。requant は miss 毎（安い）。
+- **設計B**: cold を cache に 2bit 保持→two-gather（+25%）。得=RAM 減（reach）。損=速度マイナス。
+
+**本質**: MLX では 2bit が速くない＆gather は単一bit ゆえ、**「RAM reach」と「two-gather 回避」は両立しない**。reach 欲しい→設計B（速度犠牲）。two-gather 回避→設計A（reach 無し, disk＋miss-IO のみ）。
+
+**mixed-precision 全数特性化**: 品質✅／速度（設計B ✗・設計A 微増）／RAM-reach（設計B のみ, 速度犠牲）／工数中〜大。speed+memory 両取りは MLX 上で不可。
 
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
