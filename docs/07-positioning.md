@@ -98,4 +98,20 @@ v0.2 以降：MTP-head prefetch（差別化）／混合精度 expert／KV 量子
 
 **同期を消すには**（=本命だが重い）：MTP-head 予測で forward 前に必要 expert を常駐させ、**GPU slot lookup（`slot_of[inds]`、`.tolist()` 不要）＋miss 時のみ再計算**する投機的キャッシュ。これは差別化（MTP-head prefetch）の本体でもある＝v0.3 の研究課題。
 
+### 64K 文脈の実機検証（哲学「文脈」軸、B=64）
+
+合成プロンプト（コード片反復で長さ確保）で系の性質（メモリ・速度＝長さ依存・内容非依存）を測定：
+
+| ctx | prefill_tps | decode_tps | mxpeak |
+|---:|---:|---:|---:|
+| 4,096 | 271 | 15.5 | 7.76GB |
+| 16,384 | 268 | 15.1 | 8.85GB |
+| 65,536 | 206 | **15.3** | **13.26GB** |
+
+- **decode が長さに依らずフラット（15.5→15.3）** ＝ Gated DeltaNet ハイブリッド（40層中ほぼ線形注意=O(1)状態）の payoff。長文脈でも decode が重くならない。
+- **64K が ~13.3GB に載る → 16GB 機**（KV量子化＋B縮小で 12GB 射程）。KV 増は 16× 長で +5.5GB のみ＝長文脈 KV が安いことを実測。
+- 留保: `hit` は反復プロンプトで楽観（routing 多様性は実素材=RULER/RepoQA で要再測）、64K prefill は ~5分（thrash 由来、要改善）。**メモリ・decode 速度の結論は有効。**
+
+→ 哲学3本柱のうち**「文脈」軸を実機で確認**（能力=35B-A3B/SWE73.4、速度=8GBで17・12GBで26tok/s、文脈=64K/16GB・decodeフラット）。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
