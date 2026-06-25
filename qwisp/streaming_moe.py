@@ -30,6 +30,7 @@ class StreamingSwitchGLU(nn.Module):
         # 出力は不正（前トークンの experts を使う）。同期除去の速度天井を測る用。
         self.probe_no_sync = False
         self._prev = None
+        self._prefetch = None  # A-2a: PrefetchCache。設定時は GPU slot_of で同期なし remap。
 
     def _experts(self, U):
         if self._cache is not None:
@@ -43,7 +44,10 @@ class StreamingSwitchGLU(nn.Module):
             mode="affine", sorted_indices=False)
 
     def __call__(self, x, inds):
-        if self.probe_no_sync and self._prev is not None and self._prev[1].shape == inds.shape:
+        if self._prefetch is not None:
+            # A-2a: GPU slot_of で remap（.tolist 同期なし）。miss は slot0 にクランプ（近似）。
+            sub, remap = self._prefetch.gather(self._layer, inds)
+        elif self.probe_no_sync and self._prev is not None and self._prev[1].shape == inds.shape:
             # 同期除去の天井測定: 前トークンの (sub, remap) を再利用（.tolist/cache をスキップ）
             sub, remap = self._prev
         else:

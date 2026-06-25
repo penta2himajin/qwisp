@@ -133,4 +133,22 @@ v0.2 以降：MTP-head prefetch（差別化）／混合精度 expert／KV 量子
 3. miss（`slot_of[inds] < 0`）を GPU フラグで検出 → そのトークンのみ同期して再計算（投機的）。
 4. slotted の in-place 更新が遅い問題は、prefetch をトークン間（per-layer critical path 外）に出すことで回避を狙う。
 
+### A-2a 実測（近似版、`qwisp/prefetch.py`）→ 構造的な壁
+
+prev-token prefetch＋GPU slot_of remap（miss は slot0 クランプ＝近似）で速度と一致率を測定（B=128）：
+
+| | decode tok/s | 一致 |
+|---|---:|---|
+| exact | 18.0 | 64/64 |
+| prefetch(近似) | **33.0 (1.84×)** | 37/64（38 で発散）|
+
+- **同期除去の現実効果 = 1.84×**（probe の 4.5× は同一 experts 再利用の理想値）。
+- **miss率 17.8%**＝320 access/token のうち ~57 miss ＝**ほぼ全トークンに miss**。
+- **∴ exactness と高速は直接相反**：厳密化（miss 検出→再計算）はほぼ毎トークン再計算になり 1.84× が消える。per-layer miss 検出＝同期＝1.84× の源と相反。
+- 根本原因は**トークン単位 routing churn**（連続トークンで experts が 17.8% 入替、Step1 の churn と整合）。prev-token prefetch は構造的に限界。
+
+**結論**：同期除去の高速化を exact に成立させるには miss を near-zero にする必要があり、それは churn ゆえ困難。MTP-head prefetch（実次トークン予測）は prev-token より miss を下げうるが near-zero 保証なし＝**不確実な v0.3 研究賭け、quick win ではない**。
+
+→ **当面の shippable エンジンは v0.2（np.unique, exact, 8GBで17/12GBで26 tok/s, 64K/16GB）。** 速度の次段（同期除去の exact 化）は MTP-head 予測精度に懸かる研究課題として分離。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
