@@ -232,4 +232,32 @@ mlx_lm ネイティブ KV 量子化（`kv_bits=4`）を 64K で実測：
 
 → **diminishing returns の境界**。mixed-precision は唯一の残レバーだが「大工事＋不確実品質＋quick de-risk 不可」。proxy は非好意的。**速度（churn/IO 天井）・reach（KV は小, expert cache が支配）・各レバー ROI をすべて実測で地図化済み。v0.2 を shippable な到達点として締めるのが合理。**
 
+### (う) cross-layer 予測器の de-risk（学習）→ 割に合わない
+
+`qwisp/predictor_eval.py`：prefill から `(層L-1 gate入力, 層L experts)` を ~4900例/層 集め、tiny MLP（2048→256→256）を MLX 学習し top-8 coverage を測定：
+
+| | coverage |
+|---|---|
+| trained MLP（平均） | **0.535** |
+| zero-shot（次層 gate を現 hidden に） | 0.771 |
+| 既存 LRU cache hit | 0.85 |
+| 文献（ProMoE/Fate） | 0.96 |
+
+- **trained 0.54 < zero-shot 0.77 < cache 0.85**＝予測器を入れても既存 cache に勝てない。zero-shot は本物の次層 gate ゆえ強く、小 MLP は限データで再学習しきれず下回る。
+- 文献 96% には大予測器＋多様大量データ＋Fate 等の正確手法が要り、hybrid model への transfer 不確実。届いても見返り ~13%（cache 85% ゆえ IO 分 bounded）。
+- → **(う) も「大工事＋不確実＋見返り限定」。measure-first が安価に却下。**
+
+## 最終結論：最適化空間を完全に地図化、v0.2 で締める
+
+| レバー | 実測 de-risk | 判定 |
+|---|---|---|
+| np.unique | +12% | **採用（v0.2）** |
+| slotted cache | -15% | 棄却 |
+| 同期除去（A-2a） | 1.84× だが churn 発散 | exact 不成立 |
+| cross-layer 予測器（う） | trained 0.54 < cache 0.85 | 割に合わず |
+| mixed-precision（A） | proxy 発散・大工事・quick de-risk 不可 | 高リスク低 ROI |
+| KV 量子化 | 64K -1GB のみ（hybrid が KV を解決済） | 見送り |
+
+**v0.2 = shippable 到達点**：35B-A3B が exact・8GB17/12GB26 tok/s・64K/16GB・full と bit 一致。「極限まで高められた実用性能」を実機達成。さらなる伸びは churn/IO の物理天井に阻まれ、どのレバーも ROI 低と**measure-first で全数確認**。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
