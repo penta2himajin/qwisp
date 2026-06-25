@@ -61,7 +61,7 @@
 - ただし**学習データ・計算コストが要る本格 ML ワーク**。off-the-shelf で済ませたいなら C 優先。別フェーズ扱い。
 - 関連：Probe Pruning、Prompt-prompted Adaptive Structured Pruning (Dong & Chen)、Federici et al. "Dynamic Input Pruning + Cache-Aware Masking"（限定メモリ向けで cache-aware、要チェック）。
 
-## E. quick-wichtel 固有の批判的留保
+## E. Qwisp 固有の批判的留保
 
 1. **フラッシュ 1GB/s の壁**：windowing/bundling は硬い壁を柔らかい壁に変えるだけ。勝負は「hot expert の作業集合を DRAM に高ヒット率で収める」一点。収まらなければ結局数 tok/s。
 2. **MLX / unified memory とのトポロジー不整合**：上記 offloading 研究はほぼ CUDA/PCIe 前提（GPU↔ホスト DRAM）。Apple は独立 VRAM が無く、"offload" 先はホスト DRAM でなく **NAND**。→ コード移植はできない。**方策（キャッシュ置換・prefetch・expert 分離・混合精度）を MLX + mmap-from-NAND 環境に翻訳する**ことになる。逆に言えばエッジ MoE 研究の大半が離散 GPU 前提なので、ここは**未踏で新規性を出せるニッチ**。ただし流用コードは減り自前システム実装比重が増える。

@@ -1,6 +1,6 @@
 # 03 — 設計に至る議論の記録
 
-quick-wichtel の方針が固まるまでの対話を時系列で要約。一次ソースは `01-research-notes.md` 参照。
+Qwisp の方針が固まるまでの対話を時系列で要約。一次ソースは `01-research-notes.md` 参照。
 
 ## 1. 発端：DS4 の Qwen 版を作れないか
 
@@ -42,6 +42,7 @@ quick-wichtel の方針が固まるまでの対話を時系列で要約。一次
 ## 5. 確定事項 / 未決事項
 
 **確定：**
+- プロジェクト名 **Qwisp**（Qwen + wisp。DC コミックスの妖精 Qwsp/Qwisp と同綴りだがソフト衝突なし。旧称 quick-wichtel から改名）
 - プラットフォーム Apple Silicon / MLX のみ
 - 主モデル Qwen3.6-35B-A3B（MoE）、27B は従
 - 中核：MoE expert streaming（AFM 戦略の自前 OSS 版）
