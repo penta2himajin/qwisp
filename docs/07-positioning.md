@@ -297,6 +297,15 @@ per-token の「選択8個の hot/cold 分割」は routing 依存で**事前処
 
 **本質**: MLX では 2bit が速くない＆gather は単一bit ゆえ、**「RAM reach」と「two-gather 回避」は両立しない**。reach 欲しい→設計B（速度犠牲）。two-gather 回避→設計A（reach 無し, disk＋miss-IO のみ）。
 
-**mixed-precision 全数特性化**: 品質✅／速度（設計B ✗・設計A 微増）／RAM-reach（設計B のみ, 速度犠牲）／工数中〜大。speed+memory 両取りは MLX 上で不可。
+**mixed-precision 全数特性化**: 品質✅／速度（設計B ~15-20%減・設計A 微増）／RAM-reach（設計B のみ）／工数中〜大。speed+memory 両取りは MLX 上で不可。
+
+### 関連研究調査 → Design B の改良（実装方針）
+
+mixed-precision dynamic expert quantization は 2026 の主戦場（DynaExq 2511.15015／MxMoE 2505.05799／AlphaQ 2606.04980／HOBBIT）。我々の方向は正しく、改良点：
+1. **動的精度（cache 統合）**: 静的 hot set でなく LRU resident=hot=4bit / cold=2bit、再hot化で4bit昇格（両精度 disk で安価）＝DynaExq/HOBBIT 流。「両精度保管」がこれを可能にする。
+2. **binary 維持**（2精度=2gather）。AlphaQ 流の段階割当は精度数だけ gather 増＝逆効果。
+3. **究極解＝fused mixed-precision Metal kernel**（two-gather を1カーネル、`mx.fast.metal_kernel`、大工事）。まず two-gather 版で実測→効けば fused。
+
+**実装計画(v0.3)**: ①cold の 2bit ファイルを disk 作成（両精度保管）②streaming engine: resident4bit/cold2bit の binary two-gather、LRU 動的 ③実測 tok/s・RAM・quality。HOBBIT 精度ペア=4bit→2bit。
 
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
