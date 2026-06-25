@@ -88,4 +88,14 @@ v0.2 以降：MTP-head prefetch（差別化）／混合精度 expert／KV 量子
 
 **v0.2 の作業対象（gap を埋める）**：(1) cache に stacked subset を保持し concat を省く、(2) async prefetch（pread は GIL 解放）で flash と compute を overlap、(3) MTP-head 予測で prefetch hit を上げる。
 
+### v0.2 最適化（実測）
+
+プロファイルで decode の self-time 最大は `StreamingSwitchGLU.__call__`（Python オーケストレーション）と判明。
+
+- **np.unique 化（採用、+12%）**：`set/sorted/dict/np.vectorize` → `np.unique(return_inverse=True)` 一発。verify 24/24 維持。decode B=64 15.2→17.0、B=128 23.1→25.9 tok/s。
+- **slotted cache（棄却・ネガティブ結果）**：永続 [B,...] スタック＋slot 単位インプレース更新（`a[slot]=row`、GPU slot lookup も可）を試作。だが **-8〜15% 悪化**。mlx の行インプレース更新はサブセット concat より速くない（関数的 scatter で安くない）。低 RSS は Metal バッファが ru_maxrss に出ない見かけ。**revert**。
+- **残るボトルネック（真因）**：per-layer の `inds.tolist()` **GPU-eval 同期**。on-demand では層ごとに「router 計算→CPU で expert id→ロード/gather」の往復が必要で、forward パイプラインが層ごとに直列化。B=128（hit 高・IO 少）でも overhead ~20ms/token がほぼこの同期。slotted では触れられない。
+
+**同期を消すには**（=本命だが重い）：MTP-head 予測で forward 前に必要 expert を常駐させ、**GPU slot lookup（`slot_of[inds]`、`.tolist()` 不要）＋miss 時のみ再計算**する投機的キャッシュ。これは差別化（MTP-head prefetch）の本体でもある＝v0.3 の研究課題。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
