@@ -57,6 +57,12 @@ class ExpertCache:
     def reset_stats(self):
         self.hits = self.misses = 0
 
+    def clear(self):
+        """常駐 expert を全破棄（W パス間で cold start を揃える用）。"""
+        self._store.clear()
+        self._lru.clear()
+        self.hits = self.misses = 0
+
     @property
     def hit_rate(self) -> float:
         t = self.hits + self.misses

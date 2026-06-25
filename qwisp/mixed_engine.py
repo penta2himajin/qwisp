@@ -40,6 +40,9 @@ class MixedSwitchGLU(nn.Module):
         self._c4 = c4              # 4bit ExpertCache
         self._c2 = c2              # 2bit ExpertCache
 
+    # verify 窓の上限。これ以下は mixed two-gather、超なら prefill(4bit 単一 gather)。
+    W_MAX = 8
+
     def _grp(self, x, U, remap, cache, bits):
         sub = cache.gather(self._layer, U)
         xe = mx.expand_dims(x, (-2, -3))
@@ -49,35 +52,38 @@ class MixedSwitchGLU(nn.Module):
                                  sub[f"{proj}.biases"], rhs_indices=remap, transpose=True,
                                  group_size=64, bits=bits, mode="affine", sorted_indices=False)
         h = swiglu(qmm(xe, "gate_proj"), qmm(xe, "up_proj"))
-        return qmm(h, "down_proj").squeeze(-2)  # [...,ngrp,dim]
+        return qmm(h, "down_proj").squeeze(-2)  # [B,W,K,dim]
+
+    def _side(self, x, inds_np, sel, cache, bits):
+        """sel=True の精度側を 1 gather で計算 → [B,W,K,dim]。非 sel は dummy(remap 0)で masked。
+        gather_qmm は位置ごとに matmul するので非 sel も計算されるが combine で捨てる。"""
+        sel_ids = inds_np[sel]
+        if sel_ids.size == 0:
+            return None
+        U = np.unique(sel_ids)                                  # sorted
+        # remap: 全位置を U の index に（非 sel は U に無い→clip で 0、後で masked）
+        remap_np = np.clip(np.searchsorted(U, inds_np), 0, len(U) - 1).astype(np.int32)
+        return self._grp(x, U.tolist(), mx.array(remap_np), cache, bits)
 
     def __call__(self, x, inds):
-        # prefill or many-token: 4bit 単一 gather（簡易）
-        if x.shape[1] != 1:
-            inds_np = np.asarray(inds.tolist())
+        W = x.shape[1]
+        inds_np = np.asarray(inds.tolist())                    # [B,W,K]
+        # 大きな prefill は per-position 2-gather が重い → 4bit 単一 gather にフォールバック
+        if W > self.W_MAX:
             U, inv = np.unique(inds_np, return_inverse=True)
             remap = mx.array(inv.reshape(inds_np.shape).astype(np.int32))
             return self._grp(x, U.tolist(), remap, self._c4, 4)
 
-        # decode: hot/cold split → two-gather
-        ids = np.asarray(inds.tolist()).reshape(-1)        # [8]
-        hot_pos = [i for i, e in enumerate(ids) if int(e) in self._hot]
-        cold_pos = [i for i in range(len(ids)) if i not in hot_pos]
-        dim = x.shape[-1]
-        out = mx.zeros((1, 1, len(ids), dim), dtype=x.dtype)
-
-        def fill(pos, cache, bits):
-            if not pos:
-                return
-            sub_ids = [int(ids[i]) for i in pos]
-            U, inv = np.unique(np.asarray(sub_ids), return_inverse=True)
-            remap = mx.array(inv.reshape(1, 1, len(pos)).astype(np.int32))
-            y = self._grp(x, U.tolist(), remap, cache, bits)   # [1,1,len(pos),dim]
-            for j, i in enumerate(pos):
-                out[0, 0, i] = y[0, 0, j]
-        fill(hot_pos, self._c4, 4)
-        fill(cold_pos, self._c2, 2)
-        return out
+        # decode/verify（W<=W_MAX）: hot=4bit / cold=2bit を masked-combine で two-gather
+        hot_mask_np = np.isin(inds_np, list(self._hot))        # [B,W,K] bool
+        y_hot = self._side(x, inds_np, hot_mask_np, self._c4, 4)
+        y_cold = self._side(x, inds_np, ~hot_mask_np, self._c2, 2)
+        if y_cold is None:
+            return y_hot
+        if y_hot is None:
+            return y_cold
+        m = mx.array(hot_mask_np)[..., None]                   # [B,W,K,1]
+        return mx.where(m, y_hot, y_cold)
 
 
 def build_mixed(model_dir, dir2, hot_b):

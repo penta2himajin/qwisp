@@ -91,3 +91,29 @@ prefetch off=serial / ideal overlap=max(Tcomp,Tflash)（HOBBIT 上限）。
 組むと制約 regime（4–8GB）でも MTP D1 が主役**になり、qwisp の目玉動作点に乗る。
 留保は Stage A と同じ（acceptance/mult は MTPLX 全載り graft、union 独立ルーティング仮定、
 overlap は理想 prefetch 上限）＋ two-gather penalty は verify バッチで実際は <1.41 の可能性。
+
+## 6. 実エンジン実測（Step4 Stage B-systems, `qwisp/mtp_systems_bench.py`）
+
+sim の不確実部（windowed verify の実 flash/compute）を**実エンジンで実測**。制約キャッシュ
+（hot=64 を c4 常駐 / cold を c2 制約＝実 disk miss）で W=1(AR) と W=2(D1 verify) の実
+per-forward レイテンシを測り、**このモデルの実測受理率 0.886**（mtplx_runtime.json）と合成:
+D0=1/T(W1), D1=1.886/T(W2)。同期 pread＝**serial(no-prefetch) ブラケット**。MTP ヘッドは
+未使用（受理率は graft、Stage A で実ドラフト化）。MTP 重みは `mtp.safetensors`（sidecar）に健在。
+
+| 総GB | cfg | T(W1) | T(W2) | **W2/W1** | D0 tps | **D1 tps** | D1/D0 |
+|----:|:----|:-----:|:-----:|:---------:|:------:|:----------:|:-----:|
+| 6 | all4 | 70.8m | 116.7m | 1.65 | 14.1 | 16.2 | 1.14 |
+| 6 | **mixed** | 73.5m | 85.1m | **1.16** | 13.6 | **22.2** | **1.63** |
+| 8 | all4 | 54.9m | 76.0m | 1.39 | 18.2 | 24.8 | 1.36 |
+| 8 | **mixed** | 54.6m | 67.0m | **1.23** | 18.3 | **28.2** | **1.54** |
+
+- **核心**: mixed の **W2/W1=1.16–1.23**（verify 窓が accepted あたりほぼタダ）。all4 は 1.39–1.65
+  （union-miss が重い）。cold を 2bit にすると verify の追加 miss IO が半減＋reach で miss 数↓。
+- **MTP D1 は mixed で 1.54–1.63x**（all4 は 1.14–1.36x のみ）。
+- **mixed+MTP(D1) vs all4-noMTP(D0) = 1.57x@6GB / 1.54x@8GB**（同 RAM）。
+- sim(serial,6GB,hot64) 予測 D1/D0: all4 1.12（実 1.14✓）/ mixed 1.29（実 **1.63**＝実機が更に良い。
+  per-forward 固定オーバヘッドが窓で償却＝sim 未モデル化分）。**sim の定性予測を実機が裏付け（GREEN）**。
+
+留保: serial ブラケット（prefetch 未実装。overlap はこれ以上）/ mixed の T(W1) は masked-combine
+の 2× MoE matmul overhead 込み（融合カーネルで更に改善余地、8GB では既に all4 と同等）/ 受理率は
+実測 graft（Stage A で実ヘッド化）。**Stage B GREEN → 次は Stage A: `mtp.safetensors` を実装し実ドラフトで end-to-end**。
