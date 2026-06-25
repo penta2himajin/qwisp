@@ -114,4 +114,23 @@ v0.2 以降：MTP-head prefetch（差別化）／混合精度 expert／KV 量子
 
 → 哲学3本柱のうち**「文脈」軸を実機で確認**（能力=35B-A3B/SWE73.4、速度=8GBで17・12GBで26tok/s、文脈=64K/16GB・decodeフラット）。
 
+### A-1: 同期除去の天井測定（probe）
+
+`.tolist()` 同期が真のボトルネックか確かめるため、decode 中に前トークンの (sub, remap) を再利用して per-layer の同期/CPU 作業をゼロにする probe（`StreamingSwitchGLU.probe_no_sync`、出力は不正、速度天井測定用）：
+
+| | decode tok/s |
+|---|---:|
+| probe OFF（正しい baseline） | 17.6 |
+| probe ON（同期除去の天井） | **79.9** |
+
+→ **per-layer 同期除去で 4.5×** ＝同期が圧倒的ボトルネックと確証、A（投機的 prefetch エンジン）を強く正当化。
+ただし 79.9 は前トークンの**同一 experts 再利用**で mlx が定数最適化する理想値（full-AR 54 すら超える非現実）。**正しい no-sync エンジンの現実的天井は ~40-54 tok/s 級（現状 26 の約2×）**と見る。
+
+### A-2 計画（正しい投機的キャッシュ）
+
+1. 各層 GPU `slot_of`[256] int32（slot or -1）。forward は `remap = slot_of[inds]`（GPU、`.tolist()` 不要）。
+2. トークン間に prev-token（or MTP-head 予測）の experts を prefetch → 常駐＋slot_of 更新。記録は1トークン1回の batch sync。
+3. miss（`slot_of[inds] < 0`）を GPU フラグで検出 → そのトークンのみ同期して再計算（投機的）。
+4. slotted の in-place 更新が遅い問題は、prefetch をトークン間（per-layer critical path 外）に出すことで回避を狙う。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。

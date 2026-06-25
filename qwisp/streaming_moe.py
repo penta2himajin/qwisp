@@ -26,6 +26,10 @@ class StreamingSwitchGLU(nn.Module):
         self._gs = group_size
         self._bits = bits
         self._cache = cache  # v0.2: ExpertCache。None なら on-demand。
+        # A-1 probe: 前トークンの (sub, remap) を再利用し per-layer 同期/CPU 作業を消す。
+        # 出力は不正（前トークンの experts を使う）。同期除去の速度天井を測る用。
+        self.probe_no_sync = False
+        self._prev = None
 
     def _experts(self, U):
         if self._cache is not None:
@@ -39,13 +43,19 @@ class StreamingSwitchGLU(nn.Module):
             mode="affine", sorted_indices=False)
 
     def __call__(self, x, inds):
-        # unique(sorted)＋remap を np.unique 一発で（旧 set/sorted/dict/np.vectorize を置換）。
-        inds_np = np.asarray(inds.tolist())
-        U_arr, inv = np.unique(inds_np, return_inverse=True)
-        U = U_arr.tolist()
-        remap = mx.array(inv.reshape(inds_np.shape).astype(np.int32))
+        if self.probe_no_sync and self._prev is not None and self._prev[1].shape == inds.shape:
+            # 同期除去の天井測定: 前トークンの (sub, remap) を再利用（.tolist/cache をスキップ）
+            sub, remap = self._prev
+        else:
+            # unique(sorted)＋remap を np.unique 一発で（旧 set/sorted/dict/np.vectorize を置換）。
+            inds_np = np.asarray(inds.tolist())
+            U_arr, inv = np.unique(inds_np, return_inverse=True)
+            U = U_arr.tolist()
+            remap = mx.array(inv.reshape(inds_np.shape).astype(np.int32))
+            sub = self._experts(U)
+            if self.probe_no_sync:
+                self._prev = (sub, remap)
 
-        sub = self._experts(U)
         xe = mx.expand_dims(x, (-2, -3))
         x_up = self._qmm(xe, sub, "up_proj", remap)
         x_gate = self._qmm(xe, sub, "gate_proj", remap)
