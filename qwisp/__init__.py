@@ -6,6 +6,7 @@
 
 from .expert_source import ExpertSource
 from .streaming_moe import StreamingSwitchGLU
+from .cache import ExpertCache
 from .loader import load_streaming
 
-__all__ = ["ExpertSource", "StreamingSwitchGLU", "load_streaming"]
+__all__ = ["ExpertSource", "StreamingSwitchGLU", "ExpertCache", "load_streaming"]

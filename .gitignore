@@ -5,6 +5,7 @@ __pycache__/
 # Step 1/2 trace outputs (can be large) — prompts*.jsonl は追跡する
 traces*.jsonl
 *.traces.jsonl
+results*.json
 
 # ベンチ由来の生成プロンプト（manifest+lock で再現可能・データ再配布回避）
 tools/step1_routing_trace/prompts.bench.jsonl

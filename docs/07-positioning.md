@@ -64,4 +64,28 @@ competitive 精査（2026-06）を経た Qwisp の確定ポジショニングと
 
 v0.2 以降：MTP-head prefetch（差別化）／混合精度 expert／KV 量子化（64K）／Speed 動作点（高B で MTP 投機）。
 
+## v0.1 実測結果（M1-M3 完了、2026-06）
+
+`qwisp/` パッケージで実装・実機計測（24GB Apple Silicon、ctx 232、gen 64）。
+
+**M1 ロード surgery**：`load_streaming`（mlx_lm.load(lazy=True)→switch_mlp 差し替え→非expert のみ eval）で **RSS 1.79GB**（full eager 20.14GB）。expert 非常駐ロード成立。非expert 常駐は ~1.8GB（推定より小）。
+
+**M2 正しさ（`verify.py`）**：streaming（LRU cache）の greedy 出力が full と **24/24 トークン完全一致**。PoC 4.1 の層単位 bit 一致に続く end-to-end 確認。
+
+**M3 実 tok/s（`bench.py`、AC 電源・確定値）**：
+
+| B/層 | decode tok/s | cache | peak RSS | 機 |
+|---:|---:|---:|---:|---|
+| 32 | 11.9 | 2.26G | 4.38G | 8GB 余裕 |
+| 64 | 15.2 | 4.53G | 6.75G | 8GB |
+| 128 | 23.1 | 9.05G | 11.3G | 12GB |
+
+→ **35B-A3B が 6.75GB で 15tok/s / 11.3GB で 23tok/s ＝制約機で実用速度を実機達成。**
+
+給電依存：バッテリー駆動だと ~2-12% 低下（低B ほど顕著＝IO/Python 負荷が CPU スロットルに敏感）。計測は AC で確定。
+
+**シミュ突き合わせ**：実測はシミュ net_tps 予測より ~27% 低い（B=64: 15.2 vs 20.8）。差は給電でなく **Python オーケストレーション＋毎回の subset concat**（シミュ未モデル）。overlap(prefetch) 予測は B=64 で 30tok/s ＝ **MTP-head prefetch＋Python オーバーヘッド削減で 15→25+ tok/s の余地**が定量化。
+
+**v0.2 の作業対象（gap を埋める）**：(1) cache に stacked subset を保持し concat を省く、(2) async prefetch（pread は GIL 解放）で flash と compute を overlap、(3) MTP-head 予測で prefetch hit を上げる。
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
