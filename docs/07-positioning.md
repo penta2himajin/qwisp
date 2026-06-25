@@ -224,4 +224,12 @@ mlx_lm ネイティブ KV 量子化（`kv_bits=4`）を 64K で実測：
 - **64K の支配項は KV でなく expert cache（B=64 で 4.5GB）＋prefill 活性**。
 - → **KV 量子化は本 model では見送り**。reach の本命レバーは **mixed-precision expert**（cold を低bit→expert cache 半減/2×B、品質保持＝HOBBIT 流の差別化）。
 
+### mixed-precision の de-risk（品質）→ 大工事・不確実
+
+低bit expert の品質コストを 4bit↔3bit(unsloth) のトークン一致で測定：**9/40、6 で発散**。
+- 一律低bit は品質を明確に落とす。ただし unsloth 3bit は別量子化方式で **conflated**（bit幅のみの効果でない）。
+- 本命の mixed（hot 4bit/cold 2bit）はこれより劣化小のはず（HOBBIT ~1%）だが、確認には**本実装が必要**：2bit源作成（4bit→dequant→requant）＋混合bit two-gather（`gather_qmm` 単一bitゆえ hot/cold 2回 gather 合成）＋verify ＝**数時間級・品質リスク・quick de-risk 不可**。
+
+→ **diminishing returns の境界**。mixed-precision は唯一の残レバーだが「大工事＋不確実品質＋quick de-risk 不可」。proxy は非好意的。**速度（churn/IO 天井）・reach（KV は小, expert cache が支配）・各レバー ROI をすべて実測で地図化済み。v0.2 を shippable な到達点として締めるのが合理。**
+
 > 関連: go/no-go [[go-no-go-first-read]]、Step4 PoC [[step4-poc]]、MTP×streaming [[mtp-streaming]]。
