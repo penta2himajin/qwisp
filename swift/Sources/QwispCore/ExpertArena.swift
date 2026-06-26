@@ -43,28 +43,83 @@ public final class ExpertArena {
         }
     }
 
+    /// expert e を指定 slot に in-place pread（cache の miss ロード用, 9 テンソル並列）。
+    public func loadOne(_ layer: Int, _ e: Int, slot: Int) {
+        DispatchQueue.concurrentPerform(iterations: ExpertSource.projs.count * ExpertSource.parts.count) { idx in
+            let proj = ExpertSource.projs[idx / ExpertSource.parts.count]
+            let part = ExpertSource.parts[idx % ExpertSource.parts.count]
+            let s = slots["\(proj).\(part)"]!
+            try? source.preadInto(s.ptr + slot * s.sliceBytes, layer, proj, part, e)
+        }
+    }
+
     public func arr(_ proj: String, _ part: String) -> MLXArray { slots["\(proj).\(part)"]!.arr }
 }
 
+/// 1 層ぶんの LRU expert キャッシュ。C slot の native arena を token を跨いで持続させ、
+/// hit は pread を省く（8GB 予算を expert cache に使う）。miss は LRU evict→slot へ pread。
+public final class LayerExpertCache {
+    let arena: ExpertArena         // C slots, この層専用
+    let layer: Int
+    let C: Int
+    var slotOf: [Int: Int] = [:]   // expert id -> slot
+    var expertAt: [Int]            // slot -> expert id (-1 = 空)
+    var tick: [Int]                // slot -> 最終使用 tick（LRU）
+    var clock = 0
+    public private(set) var hits = 0
+    public private(set) var misses = 0
+
+    public init(device: MTLDevice, source: ExpertSource, layer: Int, C: Int) throws {
+        self.arena = try ExpertArena(device: device, source: source, N: C, refLayer: layer)
+        self.layer = layer; self.C = C
+        expertAt = [Int](repeating: -1, count: C)
+        tick = [Int](repeating: 0, count: C)
+    }
+
+    /// experts(U) を cache に確保（miss は pread）し、各 U[i] の slot を返す。
+    public func ensure(_ experts: [Int]) -> [Int: Int] {
+        var result: [Int: Int] = [:]
+        for e in experts {
+            clock += 1
+            if let s = slotOf[e] { tick[s] = clock; hits += 1; result[e] = s; continue }
+            misses += 1
+            // 空 slot 優先、無ければ LRU evict
+            var slot = -1
+            for s in 0 ..< C where expertAt[s] == -1 { slot = s; break }
+            if slot == -1 {
+                var oldest = 0
+                for s in 1 ..< C where tick[s] < tick[oldest] { oldest = s }
+                slot = oldest
+                slotOf.removeValue(forKey: expertAt[slot])
+            }
+            arena.loadOne(layer, e, slot: slot)
+            expertAt[slot] = e; slotOf[e] = slot; tick[slot] = clock; result[e] = slot
+        }
+        return result
+    }
+}
+
 /// 持続 arena 経由で switch_mlp を回す streaming MoE（gate/shared は resident）。
+/// cache!=nil で per-layer LRU キャッシュ、nil なら毎回 arena に全ロード。
 public final class StreamingMoEBlock {
     let topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int
     let gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj
     let arena: ExpertArena
+    let cache: LayerExpertCache?
     let layer: Int
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
-                arena: ExpertArena) {
+                arena: ExpertArena, cache: LayerExpertCache? = nil) {
         self.topK = topK; self.numExperts = numExperts; self.normTopk = normTopk
         self.expertBits = expertBits; self.layer = layer
         self.gate = gate; self.shGate = shGate; self.shUp = shUp; self.shDown = shDown
-        self.sharedGate = sharedGate; self.arena = arena
+        self.sharedGate = sharedGate; self.arena = arena; self.cache = cache
     }
 
-    private func gatherQmm(_ x: MLXArray, _ proj: String, _ remap: MLXArray) -> MLXArray {
-        gatherQuantizedMatmul(x, arena.arr(proj, "weight"), scales: arena.arr(proj, "scales"),
-                              biases: arena.arr(proj, "biases"), rhsIndices: remap,
+    private func gatherQmm(_ x: MLXArray, _ store: ExpertArena, _ proj: String, _ remap: MLXArray) -> MLXArray {
+        gatherQuantizedMatmul(x, store.arr(proj, "weight"), scales: store.arr(proj, "scales"),
+                              biases: store.arr(proj, "biases"), rhsIndices: remap,
                               transpose: true, groupSize: 64, bits: expertBits, mode: .affine,
                               sortedIndices: false)
     }
@@ -76,23 +131,31 @@ public final class StreamingMoEBlock {
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopk { scores = scores / scores.sum(axis: -1, keepDims: true) }
 
-        // distinct experts U + slot remap（CPU 同期）
+        // distinct experts U（CPU 同期）
         let flat = inds.asType(.int32).asArray(Int32.self)
-        var slotOf: [Int32: Int] = [:]
-        var U: [Int] = []
+        var seen = Set<Int>(); var U: [Int] = []
+        for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
+
+        let store: ExpertArena
         var remapVals = [Int32](repeating: 0, count: flat.count)
-        for (j, e) in flat.enumerated() {
-            if let s = slotOf[e] { remapVals[j] = Int32(s) }
-            else { let s = U.count; slotOf[e] = s; U.append(Int(e)); remapVals[j] = Int32(s) }
+        if let c = cache {
+            let slotOf = c.ensure(U)                                   // hit は pread 省略
+            for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slotOf[Int(e32)]!) }
+            store = c.arena
+        } else {
+            var slot: [Int: Int] = [:]
+            for (i, e) in U.enumerated() { slot[e] = i }
+            try arena.load(layer, U)                                   // in-place pread（concat 無し）
+            for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slot[Int(e32)]!) }
+            store = arena
         }
-        try arena.load(layer, U)                                       // in-place pread（concat 無し）
         let remap = MLXArray(remapVals, inds.shape).asType(.uint32)
 
         let xe = x.expandedDimensions(axes: [-2, -3])
-        let g = gatherQmm(xe, "gate_proj", remap)
-        let u = gatherQmm(xe, "up_proj", remap)
+        let g = gatherQmm(xe, store, "gate_proj", remap)
+        let u = gatherQmm(xe, store, "up_proj", remap)
         let h = (g * MLX.sigmoid(g)) * u
-        let d = gatherQmm(h, "down_proj", remap).squeezed(axis: -2)    // [T,K,H]
+        let d = gatherQmm(h, store, "down_proj", remap).squeezed(axis: -2)    // [T,K,H]
         let y = (d * scores.expandedDimensions(axis: -1)).sum(axis: -2)
 
         let sg = shGate.apply(x), su = shUp.apply(x)

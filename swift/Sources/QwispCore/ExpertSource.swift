@@ -72,6 +72,18 @@ public final class ExpertSource {
         return f
     }
 
+    /// 全 layer の header/fd を逐次で先読み（並列 pread 前に dict 競合を避ける）。
+    public func warm(numLayers: Int = 40) throws {
+        for layer in 0 ..< numLayers {
+            for proj in ExpertSource.projs {
+                for part in ExpertSource.parts {
+                    let name = key(layer, proj, part)
+                    if let shard = wm[name] { _ = try header(shard); _ = fd(shard) }
+                }
+            }
+        }
+    }
+
     /// (layer,proj,part) の 1-expert スライスのバイト数（= 全 layer 共通の slot サイズ）。
     public func sliceBytes(_ layer: Int, _ proj: String, _ part: String) throws -> Int {
         let name = key(layer, proj, part)

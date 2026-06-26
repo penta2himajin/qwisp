@@ -39,8 +39,11 @@ public final class StreamingQwispModel {
     let eps: Float
     var layers: [StreamingDecoderLayer] = []
 
+    public var expertCaches: [LayerExpertCache] = []
+
     public init(store: WeightStore, arena: ExpertArena, numLayers: Int = 40,
-                fullAttnInterval: Int = 4, eps: Float = 1e-6) {
+                fullAttnInterval: Int = 4, eps: Float = 1e-6,
+                device: MTLDevice? = nil, source: ExpertSource? = nil, cacheC: Int? = nil) throws {
         self.store = store; self.arena = arena; self.numLayers = numLayers; self.eps = eps
         let base = QwispModel(store: store, numLayers: numLayers, fullAttnInterval: fullAttnInterval,
                               eps: eps)
@@ -52,12 +55,18 @@ public final class StreamingQwispModel {
             func q4(_ n: String) -> Proj {
                 .quantized(store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases"), 4)
             }
+            // MoE 層のみ cache を作る（cacheC 指定時）
+            var layerCache: LayerExpertCache? = nil
+            let bl = base.layers[i]
+            if let C = cacheC, let dev = device, let src = source, bl.gdn != nil || bl.attn != nil {
+                layerCache = try LayerExpertCache(device: dev, source: src, layer: i, C: C)
+                expertCaches.append(layerCache!)
+            }
             let mlp = StreamingMoEBlock(
                 topK: 8, numExperts: 256, normTopk: true, expertBits: 4, layer: i,
                 gate: q8("\(p).mlp.gate"), shGate: q4("\(p).mlp.shared_expert.gate_proj"),
                 shUp: q4("\(p).mlp.shared_expert.up_proj"), shDown: q4("\(p).mlp.shared_expert.down_proj"),
-                sharedGate: q8("\(p).mlp.shared_expert_gate"), arena: arena)
-            let bl = base.layers[i]
+                sharedGate: q8("\(p).mlp.shared_expert_gate"), arena: arena, cache: layerCache)
             layers.append(StreamingDecoderLayer(
                 isLinear: bl.isLinear, eps: eps,
                 inputLayernorm: store.req("\(p).input_layernorm.weight"),
@@ -97,11 +106,15 @@ public enum StreamingDecode {
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let ids = r["ids"] else { return "ERROR: ref に ids 無し" }
 
+        // cache slot 数 C を env QWISP_CACHE_C で指定（0/未指定=cache無）。
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()       // expert は eval しない（mmap のまま、streaming で pread）
         let source = try ExpertSource(modelDir: modelDir)
+        try source.warm()                // 並列 pread 前に header/fd を先読み（dict 競合回避）
         let arena = try ExpertArena(device: device, source: source, N: 64)
-        let model = StreamingQwispModel(store: store, arena: arena)
+        let model = try StreamingQwispModel(store: store, arena: arena,
+                                            device: device, source: source, cacheC: C > 0 ? C : nil)
         let rssLoad = rssGB()
 
         let T = ids.dim(-1)
@@ -121,11 +134,16 @@ public enum StreamingDecode {
         }
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let rssPeak = rssGB()
+        let hits = model.expertCaches.reduce(0) { $0 + $1.hits }
+        let misses = model.expertCaches.reduce(0) { $0 + $1.misses }
+        let hitRate = hits + misses > 0 ? Double(hits) / Double(hits + misses) * 100 : 0
 
         return String(format: """
-            [S3] streaming decode(8GB狙い, arena N=64, experts 非常駐):
-               %.1f tok/s (%.1f ms/tok)  RSS: load=%.1fGB peak=%.1fGB  生成=%@
+            [S3] streaming decode(8GB狙い, LRU cache C=%d/層, experts 非常駐):
+               %.1f tok/s (%.1f ms/tok)  RSS: load=%.1fGB peak=%.1fGB
+               cache hit=%.0f%% (hit=%d miss=%d)  生成=%@
             """,
-            Double(N) / secs, secs / Double(N) * 1000, rssLoad, rssPeak, "\(toks.prefix(6))")
+            C, Double(N) / secs, secs / Double(N) * 1000, rssLoad, rssPeak,
+            hitRate, hits, misses, "\(toks.prefix(6))")
     }
 }
