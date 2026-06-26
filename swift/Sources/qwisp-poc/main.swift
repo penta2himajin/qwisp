@@ -43,6 +43,15 @@ if FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
     print("[M2b-0] skip: config.json not found at \(modelDir)")
 }
 
+// M2b-1: GatedDeltaNet recurrent 核の検証
+let gdnRef = "/tmp/qwisp_gdn_ref.safetensors"
+if FileManager.default.fileExists(atPath: gdnRef) {
+    do { print(try GatedDeltaValidation.run(refPath: gdnRef)) }
+    catch { print("[M2b-1] error: \(error)") }
+} else {
+    print("[M2b-1] skip: gdn ref not found (run: PY -m qwisp.gdn_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
