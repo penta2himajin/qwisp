@@ -162,6 +162,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var probeNoSync = false      // 天井計測: GPU remap, 毎層 sync 無し
     nonisolated(unsafe) public static var predictOnly = false      // 軽量予測 pass: routed gather 省略、inds だけ捕捉
     nonisolated(unsafe) public static var captureGateInput = false // Tell M2: 各層の gate 入力を capture
+    nonisolated(unsafe) public static var captureInds = false      // calib: 全 mode で routing inds を記録
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -191,6 +192,7 @@ public final class StreamingMoEBlock {
         let gates = MLX.softmax(gate.apply(x), axis: -1, precise: true)
         let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
         let inds = order[0..., (numExperts - topK)...]                 // [T,K]
+        if StreamingMoEBlock.captureInds { cache?.lastInds = inds.asType(.int32) }  // calib/計測: 全 mode で routing 記録
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopk { scores = scores / scores.sum(axis: -1, keepDims: true) }
 

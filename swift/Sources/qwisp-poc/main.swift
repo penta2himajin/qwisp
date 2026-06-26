@@ -32,6 +32,22 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[Tell M2] error: \(error)") }
         do { print(try Tell.runM5(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M5] error: \(error)") }
+        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_CALIB"] == "1" {
+            do { print(try Tell.runHotColdCalib(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotCold] error: \(error)") }
+        }
+        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_FAST"] == "1" {
+            do { print(try Tell.runHotColdFast(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdFast] error: \(error)") }
+        }
+        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_DIAG"] == "1" {
+            do { print(try Tell.runHotColdDiag(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdDiag] error: \(error)") }
+        }
+        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_ONLINE"] == "1" {
+            do { print(try Tell.runHotColdOnline(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdOnline] error: \(error)") }
+        }
         do { print(try Tell.runM4(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M4] error: \(error)") }
         do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }

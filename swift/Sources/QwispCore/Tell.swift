@@ -7,6 +7,278 @@ import Metal
 /// background prefetch で先読み → prefetch I/O を GPU 計算に隠す。cross-layer 予測 prefetch の
 /// efficient 化（Fate one-pass 相当）を mlx 上で実現する独自スケジューラ。
 public enum Tell {
+    /// hot/cold 設計の Stage-1 計測: 実 decode の per-layer expert 使用頻度を集計し、
+    /// 「top-B hot expert が routing の何 % をカバーするか」を出す（hot/cold の有望度判定）。
+    public static func runHotColdCalib(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotCold] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256
+        let caches = model.makeCaches()
+        let nMoE = model.expertCaches.count
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)  // [moeLayer][expert]
+        var total = 0
+
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< N {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays }
+                     + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                guard let li = ec.lastInds else { continue }
+                for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1; if mi == 0 { } }
+            }
+            total += 1
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = false
+
+        // 各層 top-B coverage = top-B expert の使用回数 / 全使用回数。層平均を出す。
+        func coverage(_ B: Int) -> Double {
+            var sum = 0.0
+            for mi in 0 ..< nMoE {
+                let sorted = counts[mi].sorted(by: >)
+                let tot = sorted.reduce(0, +)
+                let top = sorted.prefix(B).reduce(0, +)
+                sum += tot > 0 ? Double(top) / Double(tot) : 0
+            }
+            return sum / Double(nMoE) * 100
+        }
+        // distinct expert 数の層平均（活性集合サイズ）
+        var distinctAvg = 0.0
+        for mi in 0 ..< nMoE { distinctAvg += Double(counts[mi].filter { $0 > 0 }.count) }
+        distinctAvg /= Double(nMoE)
+
+        return String(format: """
+            [HotCold-CALIB] %d tok, %d MoE層, top-k=8/256。per-layer 活性 expert 平均=%.0f/256
+              top-B hot coverage(routing の何%%): B16=%.0f%% B32=%.0f%% B48=%.0f%% B64=%.0f%% B96=%.0f%% B128=%.0f%%
+            """,
+            total, nMoE, distinctAvg,
+            coverage(16), coverage(32), coverage(48), coverage(64), coverage(96), coverage(128))
+    }
+
+    /// hot/cold Step-2: オンライン適応 hot set + no-sync。毎 token 走行頻度の top-C を ensure し
+    /// （安定なら大半 hit で IO 小）、no-sync forward。静的 calib の distribution shift を吸収できるか。
+    public static func runHotColdOnline(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdOnline] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "16") ?? 16
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+
+        func topC(_ c: [Int]) -> [Int] {
+            Array(c.enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset })
+        }
+
+        // warm-start calib（exact, 短く）
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+
+        // 本番: fresh prefill から token 0 を decode（calib の counts を warm start として継続更新）。
+        let caches2 = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: caches2)
+        cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            for (mi, ec) in model.expertCaches.enumerated() { _ = ec.ensure(topC(counts[mi])) }
+            out.append(cur.item(Int.self))
+            StreamingMoEBlock.probeNoSync = true
+            (_, lg) = try model.forwardHidden(cur, caches: caches2)
+            MLX.eval([lg] + caches2.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            StreamingMoEBlock.probeNoSync = false
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdOnline] online-adaptive hot top-%d + no-sync: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
+    /// hot/cold Stage-1 診断: exact decode の実 routing に対し、(a)静的calib hot set と
+    /// (b)オンライン適応 hot set の coverage を比較。code 失敗が distribution shift か予測不能かを切分け。
+    public static func runHotColdDiag(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdDiag] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+
+        func topSet(_ c: [Int], _ k: Int) -> Set<Int> {
+            Set(c.enumerated().sorted { $0.element > $1.element }.prefix(k).map { $0.offset })
+        }
+
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        // running counts（calib + online 共用）。calib 期間で warm start。
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        // 静的 calib hot set を固定
+        let staticHot = (0 ..< nMoE).map { topSet(counts[$0], C) }
+
+        // eval 期間: 実 routing vs 静的 / オンライン coverage
+        var hitStatic = 0, hitOnline = 0, totalRoute = 0
+        // per-token の最悪層 coverage（drift 起点の指標）
+        var worstTokMin = 100.0
+        for _ in 0 ..< N {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            var tokWorst = 100.0
+            for (mi, ec) in model.expertCaches.enumerated() {
+                guard let li = ec.lastInds else { continue }
+                let es = li.asArray(Int32.self).map { Int($0) }
+                let onlineHot = topSet(counts[mi], C)   // token 前までの running top-C
+                var hS = 0, hO = 0
+                for e in es {
+                    if staticHot[mi].contains(e) { hS += 1 }
+                    if onlineHot.contains(e) { hO += 1 }
+                }
+                hitStatic += hS; hitOnline += hO; totalRoute += es.count
+                tokWorst = Swift.min(tokWorst, Double(hO) / Double(es.count) * 100)
+                for e in es { counts[mi][e] += 1 }   // online 更新（causal: 計測後）
+            }
+            worstTokMin = Swift.min(worstTokMin, tokWorst)
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false
+        return String(format: """
+            [HotColdDiag] C=%d calib=%d eval=%d。実 routing に対する hot-set coverage:
+              静的 calib hot = %.1f%%   オンライン適応 hot = %.1f%%   (per-token 最悪層 online=%.0f%%)
+            """, C, calibN, N,
+            Double(hitStatic) / Double(totalRoute) * 100,
+            Double(hitOnline) / Double(totalRoute) * 100, worstTokMin)
+    }
+
+    /// hot/cold 試行: 頻度上位 hot expert を C slot に pin(常駐)→ pure no-sync decode。
+    /// hot resident で miss が減り no-sync drift が抑えられるか（速度はほぼ no-sync 天井）を検証。
+    public static func runHotColdFast(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdFast] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+
+        // --- phase 1: calibration（exact decode で頻度集計）---
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.captureInds = false
+
+        // --- phase 2: top-C hot を各層 pin（ensure で常駐ロード）---
+        for (mi, ec) in model.expertCaches.enumerated() {
+            let hot = Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset })
+            _ = ec.ensure(hot)
+        }
+
+        // --- phase 3: 実プロンプトから pure no-sync decode（ensure 無し＝hot 固定）---
+        let caches2 = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: caches2)
+        cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        StreamingMoEBlock.probeNoSync = true   // 以降 no-sync（hot 固定 slotTable で gather）
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            out.append(cur.item(Int.self))
+            (_, lg) = try model.forwardHidden(cur, caches: caches2)
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdFast] hot-pin top-%d + pure no-sync (calib=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """, C, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
     /// 各層の gate 入力の「最後の位置」だけ取る（chunk-0 予測の thrash 回避）。
     static func lastGate(_ model: StreamingQwispModel) -> [MLXArray] {
         // gate 入力は 2D [S, H]（MoE は [B*S, H] を受ける）。seq 軸=axis0 の最終行のみ取る。
