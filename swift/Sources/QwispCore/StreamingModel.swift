@@ -289,6 +289,69 @@ public enum StreamingDecode {
             syncTokens, N, Double(syncTokens) / Double(N) * 100)
     }
 
+    /// async overlap 実現可能性テスト: fast forward を asyncEval→GPU 実行中に CPU で expert pread→eval。
+    /// overlap すれば total ≈ max(GPU, pread)、しなければ GPU+pread。one-pass prefetch の土台確認。
+    public static func runAsyncProbe(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[async] skip" }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: 64)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let caches = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        _ = try model.prefillChunked(ids, caches: caches)
+        var tok = MLX.argMax(MLX.zeros([1, 248320]), axis: -1).reshaped([1, 1])  // dummy
+        tok = ids[0..., 0 ..< 1]
+        MLX.eval([tok] + caches.flatMap { $0.stateArrays })
+
+        // scratch buffer に ~120 expert(9テンソル) を pread する作業（per-token prefetch 相当）
+        let sb = try source.sliceBytes(0, "gate_proj", "weight")
+        let scratch = UnsafeMutableRawPointer.allocate(byteCount: sb * 16, alignment: 16)
+        defer { scratch.deallocate() }
+        func preadWork() {
+            for e in 0 ..< 120 {
+                try? source.preadInto(scratch.advanced(by: (e % 16) * sb), 0, "gate_proj", "weight", e % 256)
+            }
+        }
+        func fwd() -> MLXArray {
+            StreamingMoEBlock.probeNoSync = true
+            let c = model.makeCaches()
+            let (_, lg) = try! model.forwardHidden(tok, caches: c)
+            return MLX.argMax(lg[0, 0], axis: -1)
+        }
+        func t(_ f: () -> Void) -> Double {
+            for _ in 0 ..< 3 { f() }
+            let s = DispatchTime.now(); for _ in 0 ..< 20 { f() }
+            return Double(DispatchTime.now().uptimeNanoseconds - s.uptimeNanoseconds) / 1e6 / 20
+        }
+        let tGpu = t { let o = fwd(); o.eval() }
+        let tPread = t { preadWork() }
+        let tSeq = t { let o = fwd(); o.eval(); preadWork() }      // 逐次
+        let tAsync = t { let o = fwd(); MLX.asyncEval([o]); preadWork(); o.eval() }  // 同一スレッド
+        // 別スレッドで pread を forward と並行（真の async prefetch パターン）
+        let tBg = t {
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async { preadWork(); sem.signal() }
+            let o = fwd(); o.eval()
+            sem.wait()
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let best = Swift.min(tAsync, tBg)
+        return String(format: """
+            [async] overlap 可能性: GPU forward=%.1fms  pread(120exp)=%.1fms  逐次=%.1fms
+               同一スレ async=%.1fms  別スレ bg=%.1fms  理論下限 max=%.1fms
+               → overlap %@ (best %.1fms / 逐次 %.1fms = %.0f%% 隠蔽, 完全なら %.0f%%)
+            """,
+            tGpu, tPread, tSeq, tAsync, tBg, Swift.max(tGpu, tPread),
+            best < tSeq * 0.9 ? "成立✅" : "弱い⚠️", best, tSeq,
+            (tSeq - best) / tPread * 100, (tSeq - Swift.max(tGpu, tPread)) / tPread * 100)
+    }
+
     /// 2-pass cross-layer 予測 fast(Fate 流): pass-1 で各層 routing を予測→prefetch→pass-2 GPU-remap。
     /// 予測カバー率が高ければ誤差小で安定するはず（fast mode の 31%誤り→~3%へ）。品質+速度を測る。
     public static func runCrossLayerFast(modelDir: String, refPath: String) throws -> String {

@@ -17,6 +17,8 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[M2c×stream] error: \(error)") }
         do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[fast] error: \(error)") }
+        do { print(try StreamingDecode.runAsyncProbe(modelDir: md, refPath: mtpRef)) }
+        catch { print("[async] error: \(error)") }
         do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[xlayer] error: \(error)") }
     }
