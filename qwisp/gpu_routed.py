@@ -10,12 +10,17 @@ tolist 無し）。これで mixed 全常駐(12GB)が A(94tok/s) にどこまで
 fast_hot が回帰したのは cold 側が cache+tolist のままだったため。ここは両側 GPU-route・mx.contiguous。
 """
 from __future__ import annotations
+import re
+
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
+from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
 
-from .expert_source import PROJS, PARTS
+from .expert_source import ExpertSource, PROJS, PARTS
+
+_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 
 
 class GPURoutedMixedSwitchGLU(nn.Module):
@@ -67,3 +72,24 @@ class GPURoutedMixedSwitchGLU(nn.Module):
         y_hot = self._qmm(x, self._hotbuf, remap_hot, 4)
         y_cold = self._qmm(x, self._coldbuf, remap_cold, 2)
         return mx.where(self._is_hot[inds][..., None], y_hot, y_cold)
+
+
+def load_gpu_routed(model_dir, dir2, hot_b=64):
+    """lean ローダ: full 18GB を経由せず lazy→streaming で calibrate→GPU バッファ構築.
+
+    peak RSS ≈ 非expert 1.8GB + mixed 全常駐 12GB（4bit 全常駐 18GB を materialize しない）。
+    16GB Mac に収めるための経路。返り値 (model, tok)。
+    """
+    from .loader import load_streaming
+    from .mixed_engine import _calibrate
+    model, tok, src4 = load_streaming(model_dir)          # lazy, streaming, 低 RSS
+    src2 = ExpertSource(dir2)
+    counts = _calibrate(model, tok)                       # streaming 上で hot 集計（低 RSS）
+    for name, blk in model.language_model.named_modules() if hasattr(model, "language_model") \
+            else model.named_modules():
+        if isinstance(blk, Qwen3NextSparseMoeBlock):
+            layer = int(_LAYER_RE.search(name).group(1))
+            c = counts.get(id(blk), np.zeros(256, np.int64))
+            hot = set(np.argsort(c)[-hot_b:].tolist())
+            blk.switch_mlp = GPURoutedMixedSwitchGLU(layer, hot, src4, src2)
+    return model, tok

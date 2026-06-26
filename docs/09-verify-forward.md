@@ -133,4 +133,19 @@ per-layer 同期が構造的に残る**（experts がディスク）。
 | **GPU-routed mixed + MTP D1** | **~70** |
 
 → デプロイは「**載るなら GPU-routed resident + (MTP)**、載らないなら streaming」の二段。
-残課題: (2 保留) two-gather 融合カーネルで 78→~90 / forward 天井引き上げ、(3) 16GB に 12GB を収める KV/OS 切り詰め。
+
+### 4.10 16GB Mac 適合（task 3, `qwisp/gpu_routed.load_gpu_routed` + `mem_probe.py`）
+mixed 全常駐は **13.47GB**（lean ローダ: 全4bit 18GB を materialize せず lazy→streaming で calibrate
+→GPU バッファ構築）。実バッファ実測 hot 4.53 + cold 7.55 = 12.08GB（cold は確かに 2bit）。peak を
+抑える 2 点で **16GB に収まる**:
+
+| 文脈 | KV | mx_peak | AR tok/s | 16GB |
+|:----:|:--:|:------:|:--------:|:----:|
+| 8K | f16 | **14.49GB** | 57.6 | ✅ |
+| 16K | 8bit | **14.64GB** | 44.5 | ✅ |
+
+要点: ① **chunked prefill**（`prefill_step_size=512`）で長プロンプトの transient activation を抑制
+（un-chunked 8K は 15.9→14.5GB）② **KV 量子化**（`kv_bits=8/4`）で長文脈の KV を圧縮。decode tps は
+文脈長で低下（full-attn の KV 増, 8K 58→16K 44）。**16GB Mac で GPU-routed mixed が AR 45–58 / +MTP ~60–75**。
+
+残課題: (2 保留) two-gather 融合カーネルで forward 78→~90。
