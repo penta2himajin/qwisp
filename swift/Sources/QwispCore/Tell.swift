@@ -156,6 +156,102 @@ public enum Tell {
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
+    /// SS-MoE DK: no-sync hot-pin draft を K トークン先まで → 1 回の batched exact verify(lossless)。
+    /// 高 accept(0.94+)を multi-token で償却し no-sync 天井に安全到達。reject 時のみ accepted prefix を
+    /// exact 再走（GDN partial-commit 回避）。QWISP_DRAFT_K で K。
+    public static func runHotColdSpecK(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpecK] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
+        let K = Int(ProcessInfo.processInfo.environment["QWISP_DRAFT_K"] ?? "4") ?? 4
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset }))
+        }
+
+        let mc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: mc)
+        var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
+        MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+        var out: [Int] = []; var steps = 0, accTok = 0
+        let t0 = DispatchTime.now()
+        while out.count < N {
+            steps += 1
+            // draft K（no-sync, state は捨てる）
+            let snaps0 = mc.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true
+            var drafts: [Int] = []; var dcur = uArr
+            for _ in 0 ..< K {
+                let (_, dl) = try model.forwardHidden(dcur, caches: mc)
+                dcur = MLX.argMax(dl[0..., (dl.dim(1) - 1)...], axis: -1)
+                drafts.append(dcur.item(Int.self))
+            }
+            for (i, c) in mc.enumerated() { c.restore(snaps0[i], isLinear: isLin[i], trim: K) }
+            // verify batched [u, d1..dK]（exact, seqMultiToken lossless）
+            StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = true
+            let snaps1 = mc.map { $0.snapshot() }
+            let draftArr = MLXArray(drafts.map { Int32($0) }, [1, K])
+            let seq = MLX.concatenated([uArr, draftArr], axis: 1)            // [1, K+1]
+            let (_, vlg) = try model.forwardHidden(seq, caches: mc)
+            let evals = MLX.argMax(vlg[0, 0 ..< (K + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            // accept: drafts[i]==evals[i] が続く長さ p
+            var p = 0
+            while p < K && drafts[p] == evals[p] { p += 1 }
+            out.append(uArr.item(Int.self))
+            for i in 0 ..< p { out.append(drafts[i]) }                       // 受理 draft
+            accTok += p
+            if p == K {
+                uArr = MLXArray([Int32(evals[K])], [1, 1])                   // 全受理→次=最終位置 exact
+                AttentionLayer.seqMultiToken = false
+                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })             // 全 K+1 commit 済
+            } else {
+                // reject: pre-verify に戻し accepted prefix [u, d1..dp] を exact 再走で commit
+                for (i, c) in mc.enumerated() { c.restore(snaps1[i], isLinear: isLin[i], trim: K + 1) }
+                let acceptedTok = [uArr.item(Int.self)] + Array(drafts.prefix(p))
+                let accSeq = MLXArray(acceptedTok.map { Int32($0) }, [1, acceptedTok.count])
+                _ = try model.forwardHidden(accSeq, caches: mc)
+                AttentionLayer.seqMultiToken = false
+                uArr = MLXArray([Int32(evals[p])], [1, 1])                   // 訂正トークン
+                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+            }
+        }
+        StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdSpecK] no-sync draft K=%d + batched exact verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
+            """, K, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
+    }
+
     /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。
     /// probe(exact を真値に、no-sync を snapshot/restore で side 比較)が全一致なら no-sync(47, 速)、
     /// 不一致(drift 兆候)なら exact M2 経路(lossless)へ。プロンプト難度に自動適応。
