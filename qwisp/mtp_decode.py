@@ -154,9 +154,9 @@ def greedy(lm, prompt, max_tokens):
 
 
 def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False,
-                 io_workers=8, prefetch=False):
-    src4 = ExpertSource(model_dir)
-    src2 = ExpertSource(dir2)
+                 io_workers=8, prefetch=False, memmap=False):
+    src4 = ExpertSource(model_dir, memmap=memmap)
+    src2 = ExpertSource(dir2, memmap=memmap)
     c4 = ExpertCache(src4, budget_per_layer=hot_b, io_workers=io_workers)
     c2 = ExpertCache(src2, budget_per_layer=cold_b, io_workers=io_workers)
     counts = _calibrate(model, tok)
@@ -203,6 +203,7 @@ def main():
     ap.add_argument("--prefetch", action="store_true", help="async cold prefetch を有効化")
     ap.add_argument("--adaptive-T", type=float, default=None,
                     help="GPU-routed の層別 hot サイズ（頻度累積マス閾, 例 0.8）")
+    ap.add_argument("--memmap", action="store_true", help="mixed の miss ロードを np.memmap 経由に")
     args = ap.parse_args()
 
     print("[dec] loading ...", file=sys.stderr)
@@ -233,7 +234,7 @@ def main():
               f"{f' adaptive_T={args.adaptive_T}' if args.adaptive_T else ''})", file=sys.stderr)
     elif args.mixed:
         caches, pf = attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
-                                  fast_hot=args.fast_hot, prefetch=args.prefetch)
+                                  fast_hot=args.fast_hot, prefetch=args.prefetch, memmap=args.memmap)
         print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B}"
               f"{' +prefetch' if args.prefetch else ''})", file=sys.stderr)
 

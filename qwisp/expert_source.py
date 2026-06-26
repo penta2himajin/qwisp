@@ -21,12 +21,38 @@ _PREFIX = "language_model.model.layers"
 
 
 class ExpertSource:
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, memmap: bool = False):
         self.dir = model_dir
         with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
             self.wm = json.load(f)["weight_map"]
         self._hdr: dict[str, tuple[dict, int]] = {}
         self._fd: dict[str, int] = {}
+        self.use_memmap = memmap          # True で miss ロードを np.memmap fancy-index に
+        self._mmap: dict[tuple, "np.memmap"] = {}
+
+    def _memmap(self, layer: int, proj: str, part: str):
+        """(layer,proj,part) の [256,...] を np.memmap で遅延 map（選択ページのみ読む）。"""
+        k = (layer, proj, part)
+        if k not in self._mmap:
+            key = self._key(layer, proj, part)
+            shard = self.wm[key]
+            hdr, ds = self._header(shard)
+            t = hdr[key]; b, _ = t["data_offsets"]
+            self._mmap[k] = np.memmap(os.path.join(self.dir, shard), dtype=_DT[t["dtype"]],
+                                      mode="r", offset=ds + b, shape=tuple(t["shape"]))
+        return self._mmap[k]
+
+    def load_expert_slices_mmap(self, layer: int, experts) -> dict:
+        """memmap fancy-index で miss expert を選択読み。tensor 毎に 1 mx.array（per-slice 比 1/k 本）。"""
+        idx = np.asarray(experts)
+        out = {e: {} for e in experts}
+        for proj in PROJS:
+            for part in PARTS:
+                sub = np.ascontiguousarray(self._memmap(layer, proj, part)[idx])  # [k,...] 選択
+                m = mx.array(sub)
+                for i, e in enumerate(experts):
+                    out[e][f"{proj}.{part}"] = m[i:i + 1]
+        return out
 
     def _key(self, layer: int, proj: str, part: str) -> str:
         return f"{_PREFIX}.{layer}.mlp.switch_mlp.{proj}.{part}"
@@ -72,6 +98,8 @@ class ExpertSource:
         os.pread は GIL を解放するので ThreadPoolExecutor で latency を重ねられる（682 syscall/fwd 対策）。
         pool=None なら逐次。
         """
+        if self.use_memmap:
+            return self.load_expert_slices_mmap(layer, experts)
         out = {e: {} for e in experts}
         jobs = [(e, p, q) for e in experts for p in PROJS for q in PARTS]
         if pool is None:
