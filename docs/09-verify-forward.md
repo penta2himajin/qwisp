@@ -44,3 +44,37 @@ concat）が 5-6× ギャップ**。lm_head/attention/MTP-head は無関係。
 
 **推奨**: まず (1) 持続 hot バッファ（低リスク、concat 削減）→ (2) async cold prefetch（overlap で IO 隠蔽）。
 (3) は mlx の制約調査が要る根治策。lm_head/MTP-head は触らない（無関係）。
+
+## 4. 実施結果（overhead 削減）
+
+### 4.1 MTP ループ overhead（light rollback）
+hybrid の非trimmable KV を **KVCache=trim / ArraysCache=shallow snapshot** で巻き戻し（docs/08 §7）。
+ループ overhead 42%→3%（verify 支配に）。
+
+### 4.2 持続 hot バッファ（fast_hot）= 回帰（負の結果）
+hot64 を持続 [64,...] バッファ化し GPU remap で gather。**7.7→4.6 tok/s に回帰**（96/96 は維持）。
+mlx は大バッファ gather が小 subset の都度 gather より遅い（prior SlottedExpertCache -15% と同根）。
+→ default off。**「concat が遅い」前提が誤りだった**（下記）。
+
+### 4.3 真因は pure-python でなく IO syscall 数（精密プロファイル）
+gather 91ms の内訳: **pread(IO)=89ms（682 slice=76miss×9 tensor の syscall）／ pure-python（ensure
+ループ+concat 構築）=わずか 2.4ms**。`inds.tolist()`→`np.array` 変換も全40層で 50µs（無視可）。
+帯域は 76MB/4GB/s≈19ms ＝ **残り 70ms は 682-syscall の latency**。→ **python 高速化でなく IO 並列化**が解。
+
+### 4.4 並列 pread（採用、大きな実勝ち）
+`os.pread` は GIL 解放 → `ExpertCache` が miss を **ThreadPoolExecutor で一括並列ロード**
+（`ExpertSource.load_expert_slices`）。worker は **8 が最適**（多いと GIL 競合で悪化: 8→149ms,
+32→170ms）。
+
+| 指標 | 前 | 後（並列 pread, 8w） |
+|:-----|---:|---:|
+| gather | 114.8ms | **59.8ms** |
+| verify forward | 213ms | **~149ms（1.4×）** |
+| AR greedy(6GB/ctx512) | 4.2 tok/s | **6.4 tok/s（1.52×）** |
+| MTP spec light | 6.3 tok/s | **7.9 tok/s** |
+| 正しさ | — | 96/96 維持 |
+
+### 4.5 残る天井
+並列 pread 後の内訳: **per-layer tolist 同期 86ms/56%**（GPU-drain churn, docs/07）／gather 60ms/38%。
+次の根治は §3 の (3) Blink 流 GPU-side routing（固定 shape グラフで host 同期除去）＝mlx 制約調査が要る
+高難度策。async cold prefetch(2) で gather の IO を GPU compute と overlap する余地も残る。

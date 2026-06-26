@@ -19,7 +19,7 @@ from .expert_source import PARTS, PROJS
 
 
 class ExpertCache:
-    def __init__(self, source, budget_per_layer: int, io_workers: int = 16):
+    def __init__(self, source, budget_per_layer: int, io_workers: int = 8):
         self.src = source
         self.B = budget_per_layer
         self._store: dict[tuple[int, int], dict[str, mx.array]] = {}

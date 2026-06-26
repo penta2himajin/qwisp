@@ -139,11 +139,11 @@ def greedy(lm, prompt, max_tokens):
     return out[:max_tokens]
 
 
-def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False):
+def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False, io_workers=8):
     src4 = ExpertSource(model_dir)
     src2 = ExpertSource(dir2)
-    c4 = ExpertCache(src4, budget_per_layer=hot_b)
-    c2 = ExpertCache(src2, budget_per_layer=cold_b)
+    c4 = ExpertCache(src4, budget_per_layer=hot_b, io_workers=io_workers)
+    c2 = ExpertCache(src2, budget_per_layer=cold_b, io_workers=io_workers)
     counts = _calibrate(model, tok)
     for name, blk in lm.named_modules():
         if isinstance(blk, Qwen3NextSparseMoeBlock):
