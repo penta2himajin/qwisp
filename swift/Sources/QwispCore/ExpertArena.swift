@@ -53,6 +53,19 @@ public final class ExpertArena {
         }
     }
 
+    /// 複数 (expert, slot) の全 9 テンソルを一括並列 pread（層内 miss をまとめる）。
+    public func loadMany(_ layer: Int, _ jobs: [(e: Int, slot: Int)]) {
+        let np = ExpertSource.projs.count * ExpertSource.parts.count   // 9
+        DispatchQueue.concurrentPerform(iterations: jobs.count * np) { k in
+            let (e, slot) = jobs[k / np]
+            let idx = k % np
+            let proj = ExpertSource.projs[idx / ExpertSource.parts.count]
+            let part = ExpertSource.parts[idx % ExpertSource.parts.count]
+            let s = slots["\(proj).\(part)"]!
+            try? source.preadInto(s.ptr + slot * s.sliceBytes, layer, proj, part, e)
+        }
+    }
+
     public func arr(_ proj: String, _ part: String) -> MLXArray { slots["\(proj).\(part)"]!.arr }
 }
 
@@ -91,15 +104,16 @@ public final class LayerExpertCache {
     }
 
     /// experts(U) を cache に確保（miss は pread）し、各 U[i] の slot を返す。
+    /// miss の slot 割当を先に済ませ、全 miss×9 テンソルの pread を一括並列化。
     public func ensure(_ experts: [Int]) -> [Int: Int] {
         let t0 = DispatchTime.now().uptimeNanoseconds
         defer { LayerExpertCache.ensureNanos += DispatchTime.now().uptimeNanoseconds - t0 }
         var result: [Int: Int] = [:]
+        var missList: [(e: Int, slot: Int)] = []
         for e in experts {
             clock += 1
             if let s = slotOf[e] { tick[s] = clock; hits += 1; result[e] = s; continue }
             misses += 1
-            // 空 slot 優先、無ければ LRU evict
             var slot = -1
             for s in 0 ..< C where expertAt[s] == -1 { slot = s; break }
             if slot == -1 {
@@ -108,10 +122,11 @@ public final class LayerExpertCache {
                 slot = oldest
                 slotOf.removeValue(forKey: expertAt[slot])
             }
-            arena.loadOne(layer, e, slot: slot)
-            expertAt[slot] = e; slotOf[e] = slot; tick[slot] = clock; result[e] = slot
-            slotTableDirty = true
+            expertAt[slot] = e; slotOf[e] = slot; tick[slot] = clock
+            result[e] = slot; missList.append((e, slot)); slotTableDirty = true
         }
+        // 全 miss × 9 テンソルを一括並列 pread（層内 miss をまとめてレイテンシ重畳）
+        if !missList.isEmpty { arena.loadMany(layer, missList) }
         return result
     }
 }
