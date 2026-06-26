@@ -99,6 +99,15 @@ for (ref, lbl) in [("/tmp/qwisp_dec0_ref.safetensors", "DecoderLayer-0"),
     }
 }
 
+// M2b-3: embed_tokens + final norm + lm_head を REAL 量子化重みで検証
+let headRef = "/tmp/qwisp_head_ref.safetensors"
+if FileManager.default.fileExists(atPath: headRef) {
+    do { print(try ModelHeadValidation.run(refPath: headRef)) }
+    catch { print("[M2b-3 head] error: \(error)") }
+} else {
+    print("[M2b-3 head] skip: head ref not found (run: PY -m qwisp.real_head_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
