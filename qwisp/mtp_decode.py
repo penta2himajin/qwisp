@@ -56,8 +56,24 @@ def _fwd(lm, toks, kv):
     return h, lm.lm_head(h)
 
 
-def speculative(lm, head, prompt, max_tokens):
-    """MTP D1 投機デコード。返り値: (tokens, n_steps, n_accept_draft)。"""
+def _snap_light(kv):
+    """非trimmable cache(線形注意 ArraysCache, 固定小サイズ)だけ shallow snapshot。
+    KVCache(full-attn) は trim で巻き戻すので snapshot 不要。array コピー無し（参照のみ）。"""
+    return [(i, list(c.state)) for i, c in enumerate(kv) if not c.is_trimmable()]
+
+
+def _rollback_light(kv, snap, n):
+    """reject 時の巻き戻し: trimmable は trim(n)、非trimmable は restore（→ pre-[u,d]）。"""
+    for c in kv:
+        if c.is_trimmable():
+            c.trim(n)
+    for i, s in snap:
+        kv[i].state = s
+
+
+def speculative(lm, head, prompt, max_tokens, light=True):
+    """MTP D1 投機デコード。返り値: (tokens, n_steps, n_accept_draft)。
+    light=True: hybrid 用の軽量巻き戻し（KVCache=trim / ArraysCache=shallow snapshot）。"""
     main_kv = lm.make_cache()
     mtp_kv = KVCache()
     p = mx.array(prompt)[None]
@@ -76,8 +92,8 @@ def speculative(lm, head, prompt, max_tokens):
         # draft d from (last_h, u)
         dl = head(last_h, mx.array([[u]]), cache=mtp_kv)
         d = int(mx.argmax(dl[0, -1]).item())
-        # verify: main on [u,d]（snapshot で reject 巻き戻し可能に）
-        snap = _snap(main_kv)
+        # verify: main on [u,d]（reject 巻き戻し用に snapshot）
+        snap = _snap_light(main_kv) if light else _snap(main_kv)
         H2, lg2 = _fwd(lm, mx.array([[u, d]]), main_kv)
         v = int(mx.argmax(lg2[0, 0]).item())
         out.append(u)
@@ -87,8 +103,11 @@ def speculative(lm, head, prompt, max_tokens):
             w = int(mx.argmax(lg2[0, 1]).item())
             head(H2[:, 0:1], mx.array([[d]]), cache=mtp_kv)   # catch-up mtp 位置
             u, last_h = w, H2[:, 1:2]
-        else:                                          # reject: main を u のみ commit に巻き戻し
-            _restore(main_kv, snap)
+        else:                                          # reject: pre-[u,d] に戻し u のみ再処理
+            if light:
+                _rollback_light(main_kv, snap, 2)
+            else:
+                _restore(main_kv, snap)
             H1, _ = _fwd(lm, mx.array([[u]]), main_kv)
             u, last_h = v, H1[:, 0:1]
         mx.eval([c.state for c in main_kv] + [mtp_kv.state])
@@ -145,29 +164,32 @@ def main():
         ids = ids + tok.encode(base)
     prompt = ids[:args.ctx]
 
-    # 正しさ: full-residency で greedy と投機が一致するか
+    # 正しさ: light/heavy 両方が greedy と一致するか
     g = greedy(lm, prompt, args.gen)
-    sp, steps, accd = speculative(lm, head, prompt, args.gen)
-    match = sum(1 for a, b in zip(g, sp) if a == b)
-    print(f"[dec] correctness: spec vs greedy {match}/{len(g)} "
-          f"(steps={steps}, draft_accept={accd}/{steps}={accd/steps:.3f})")
+    for lab, lt in (("light", True), ("heavy", False)):
+        sp, steps, accd = speculative(lm, head, prompt, args.gen, light=lt)
+        match = sum(1 for a, b in zip(g, sp) if a == b)
+        print(f"[dec] correctness({lab}): {match}/{len(g)} "
+              f"(steps={steps}, draft_accept={accd/steps:.3f})")
 
-    # 速度: greedy(AR) vs spec、必要なら mixed streaming で
-    caches = None
+    # 速度: greedy(AR) vs spec(heavy/light)、必要なら mixed streaming で
     if args.mixed:
-        caches = attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B)
+        attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B)
         print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B})",
               file=sys.stderr)
 
-    t0 = time.perf_counter(); g = greedy(lm, prompt, args.gen); t_ar = time.perf_counter() - t0
-    t0 = time.perf_counter(); sp, steps, accd = speculative(lm, head, prompt, args.gen)
-    t_sp = time.perf_counter() - t0
-    match = sum(1 for a, b in zip(g, sp) if a == b)
+    def timed(fn):
+        t0 = time.perf_counter(); r = fn(); return r, time.perf_counter() - t0
+
+    (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
+    (sp_h, steps_h, _), t_h = timed(lambda: speculative(lm, head, prompt, args.gen, light=False))
+    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True))
     eng = "mixed-stream" if args.mixed else "full-resident"
-    print(f"\n[dec] engine={eng}  gen={args.gen}")
-    print(f"  AR  greedy : {args.gen/t_ar:6.1f} tok/s")
-    print(f"  MTP D1 spec: {args.gen/t_sp:6.1f} tok/s  ({t_ar/t_sp:.2f}x)  "
-          f"draft_accept={accd/steps:.3f} steps={steps} match={match}/{len(g)}")
+    print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
+    print(f"  AR greedy        : {args.gen/t_ar:6.1f} tok/s")
+    print(f"  MTP D1 spec heavy: {args.gen/t_h:6.1f} tok/s  ({t_ar/t_h:.2f}x)")
+    print(f"  MTP D1 spec light: {args.gen/t_l:6.1f} tok/s  ({t_ar/t_l:.2f}x)  "
+          f"draft_accept={accd/steps_l:.3f}")
 
 
 if __name__ == "__main__":
