@@ -85,6 +85,7 @@ public final class LayerExpertCache {
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
+    public var lastGateInput: MLXArray?   // Tell M2: この層の MoE 入力(=真の gate 入力)を capture
     /// lastInds のうち cache 未収容（fast で wrong-slot になった）expert 数。
     public func missCount() -> Int {
         guard let li = lastInds else { return 0 }
@@ -160,6 +161,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var syncNanos: UInt64 = 0   // inds.asArray(GPU→CPU drain) 累積
     nonisolated(unsafe) public static var probeNoSync = false      // 天井計測: GPU remap, 毎層 sync 無し
     nonisolated(unsafe) public static var predictOnly = false      // 軽量予測 pass: routed gather 省略、inds だけ捕捉
+    nonisolated(unsafe) public static var captureGateInput = false // Tell M2: 各層の gate 入力を capture
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -185,6 +187,7 @@ public final class StreamingMoEBlock {
     }
 
     public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
+        if StreamingMoEBlock.captureGateInput { cache?.lastGateInput = x }   // M2: 真の gate 入力を保存
         let gates = MLX.softmax(gate.apply(x), axis: -1, precise: true)
         let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
         let inds = order[0..., (numExperts - topK)...]                 // [T,K]

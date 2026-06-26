@@ -143,4 +143,80 @@ public enum Tell {
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
+
+    /// M2: Fate 流 one-pass。各層の真の gate 入力(=MoE 入力 x)を capture し、chunk N の最終 gate
+    /// 入力で chunk N+1 を予測(隣接層 cosine>83% で高精度)→prefetch→GPU-remap。pass-1 不要=高速。
+    public static func runM2(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "4") ?? 4
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        func distinct(_ a: MLXArray) -> [Int] {
+            var seen = Set<Int>(); var u: [Int] = []
+            for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
+            return u
+        }
+        // 前 token の各層 gate 入力（chunk-0 の bootstrap 用, temporal）
+        var prevGate: [MLXArray]? = nil
+
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for ti in 0 ..< N {
+            let prev = cur
+            StreamingMoEBlock.captureGateInput = true
+            if ti == 0 {
+                // bootstrap: 最初の token は full sync(demand-load) で正確な gate 入力を得る
+                StreamingMoEBlock.probeNoSync = false
+                let (_, lgt) = try model.forwardHidden(prev, caches: caches)
+                let next = MLX.argMax(lgt[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+                prevGate = model.expertCaches.map { $0.lastGateInput! }
+                out.append(prev.item(Int.self)); cur = next
+                continue
+            }
+            StreamingMoEBlock.probeNoSync = true
+            var h = model.embedPub(prev)
+            var pos = 0
+            while pos < L {
+                let end = Swift.min(pos + CH, L)
+                // 予測元: chunk 0 は前 token 同層 gate 入力(temporal)、以降は前 chunk 最終 gate 入力
+                let src = pos > 0 ? model.expertCaches[pos - 1].lastGateInput! : prevGate![pos]
+                let preds = (pos ..< end).map { i in model.predictLayerInds(i, pos > 0 ? src : prevGate![i]) }
+                MLX.eval(preds)
+                for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(distinct(preds[k])) }
+                h = try model.runChunk(h, pos, end, caches: caches)
+                pos = end
+            }
+            let logits = model.finalLogits(h)
+            let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+            prevGate = model.expertCaches.map { $0.lastGateInput! }
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
 }
