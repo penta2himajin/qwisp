@@ -70,6 +70,15 @@ if FileManager.default.fileExists(atPath: attnRef) {
     print("[M2b-2] skip: attn ref not found (run: PY -m qwisp.attn_ref)")
 }
 
+// M2b-3: 実モデル layer-0 を REAL 4bit 量子化重みで検証
+let realLayerRef = "/tmp/qwisp_real_layer_ref.safetensors"
+if FileManager.default.fileExists(atPath: realLayerRef) {
+    do { print(try RealLayer0Validation.run(refPath: realLayerRef)) }
+    catch { print("[M2b-3] error: \(error)") }
+} else {
+    print("[M2b-3] skip: real-layer ref not found (run: PY -m qwisp.real_layer_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
