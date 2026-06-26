@@ -12,7 +12,7 @@ import argparse
 import numpy as np
 import mlx.core as mx
 from mlx_lm.models.qwen3_next import Qwen3NextAttention
-from qwisp.gdn_layer_ref import build_args
+from qwisp.gdn_layer_ref import build_text_args
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
     B, L, H = 1, args.L, 2048
     rng = np.random.default_rng(13)
 
-    attn = Qwen3NextAttention(build_args())
+    attn = Qwen3NextAttention(build_text_args())
 
     def rnd(shape, scale=0.02):
         return mx.array((rng.standard_normal(shape) * scale).astype(np.float32))
