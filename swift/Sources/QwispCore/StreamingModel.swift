@@ -117,6 +117,16 @@ public final class StreamingQwispModel {
         return (hidden, headProj().apply(hidden))
     }
 
+    /// layer-skip draft 用: skip に含まれる層は identity(計算ごと省略)。draft を計算ごと安くする。
+    /// 注意: skip 層は cache を更新しないので draft state は近似（throwaway 前提）。
+    public func forwardHiddenSkip(_ ids: MLXArray, caches: [LayerCache], skip: Set<Int>)
+        throws -> (hidden: MLXArray, logits: MLXArray) {
+        var h = embed(ids)
+        for (i, layer) in layers.enumerated() where !skip.contains(i) { h = try layer(h, cache: caches[i]) }
+        let hidden = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return (hidden, headProj().apply(hidden))
+    }
+
     /// チャンク分割 prefill。1 forward の |U| が cache slot C を超えると in-place arena が
     /// 破綻するため、chunk≤C/topK で分割（chunk 毎に eval して arena 上書き前に materialize）。
     public func prefillChunked(_ ids: MLXArray, caches: [LayerCache], chunk: Int = 4)

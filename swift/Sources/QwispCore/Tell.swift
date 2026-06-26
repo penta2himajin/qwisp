@@ -166,6 +166,7 @@ public enum Tell {
         let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
         let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
         let K = Int(ProcessInfo.processInfo.environment["QWISP_DRAFT_K"] ?? "4") ?? 4
+        let skipStride = Int(ProcessInfo.processInfo.environment["QWISP_SKIP_STRIDE"] ?? "0") ?? 0
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -202,20 +203,28 @@ public enum Tell {
         (_, lg) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+        // layer-skip draft 集合（skipStride≥2: i%stride==stride-1 を間引く。層0/末尾は残す）
+        let L = model.layerCount
+        var skip = Set<Int>()
+        if skipStride >= 2 { for i in 1 ..< (L - 1) where i % skipStride == (skipStride - 1) { skip.insert(i) } }
+
         var out: [Int] = []; var steps = 0, accTok = 0
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
-            // draft K（no-sync, state は捨てる）
+            // draft K（no-sync + layer-skip, state は捨てる）
             let snaps0 = mc.map { $0.snapshot() }
             StreamingMoEBlock.probeNoSync = true
             var drafts: [Int] = []; var dcur = uArr
             for _ in 0 ..< K {
-                let (_, dl) = try model.forwardHidden(dcur, caches: mc)
+                let (_, dl) = skip.isEmpty
+                    ? try model.forwardHidden(dcur, caches: mc)
+                    : try model.forwardHiddenSkip(dcur, caches: mc, skip: skip)
                 dcur = MLX.argMax(dl[0..., (dl.dim(1) - 1)...], axis: -1)
                 drafts.append(dcur.item(Int.self))
             }
-            for (i, c) in mc.enumerated() { c.restore(snaps0[i], isLinear: isLin[i], trim: K) }
+            // skip した層は未実行＝未前進なので trim しない（非skip層のみ巻き戻し）
+            for (i, c) in mc.enumerated() where !skip.contains(i) { c.restore(snaps0[i], isLinear: isLin[i], trim: K) }
             // verify batched [u, d1..dK]（exact, seqMultiToken lossless）
             StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = true
             let snaps1 = mc.map { $0.snapshot() }
@@ -248,8 +257,8 @@ public enum Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         return String(format: """
-            [HotColdSpecK] no-sync draft K=%d + batched exact verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
-            """, K, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
+            [HotColdSpecK] no-sync draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
+            """, K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
     /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。
