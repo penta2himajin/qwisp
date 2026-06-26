@@ -90,10 +90,11 @@ public final class StreamingQwispModel {
         return x
     }
     public func embedPub(_ ids: MLXArray) -> MLXArray { embed(ids) }
-    public func finalLogits(_ h: MLXArray) -> MLXArray {
-        let n = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
-        return headProj().apply(n)
+    public func finalNorm(_ h: MLXArray) -> MLXArray {
+        MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
     }
+    public func logitsFromNorm(_ n: MLXArray) -> MLXArray { headProj().apply(n) }
+    public func finalLogits(_ h: MLXArray) -> MLXArray { logitsFromNorm(finalNorm(h)) }
     public var layerCount: Int { numLayers }
     /// Tell M1: 層 i の expert を任意 hidden h から予測（cross-layer）。
     public func predictLayerInds(_ i: Int, _ h: MLXArray) -> MLXArray { layers[i].mlp.predictInds(h) }
@@ -457,7 +458,7 @@ public enum StreamingDecode {
             MLX.eval([gnext] + sgCaches.flatMap { $0.stateArrays })
         }
         let sgMatch = zip(sg, gR).filter { $0 == $1 }.count
-        let (sp, steps, acc, secs) = try specLoop(model, head, ids, N)
+        let (sp, steps, acc, secs) = try specLoop(model, head, ids, N, diagGreedy: gR)
         let spR = spRef.asArray(Int32.self).map { Int($0) }
         let vsPython = zip(sp, spR).filter { $0 == $1 }.count
         let vsGreedy = zip(sp, gR).filter { $0 == $1 }.count
@@ -474,12 +475,16 @@ public enum StreamingDecode {
     /// streaming model 用の D1 投機ループ（Speculative.speculative の streaming 版）。
     /// refreshEvery>0 で verify を hybrid no-sync fast（refreshEvery 毎に sync で cache 更新）。
     static func specLoop(_ model: StreamingQwispModel, _ head: MTPHead, _ promptIds: MLXArray,
-                         _ maxTokens: Int, refreshEvery: Int = 0)
+                         _ maxTokens: Int, refreshEvery: Int = 0, diagGreedy: [Int]? = nil)
         throws -> (toks: [Int], steps: Int, acc: Int, secs: Double) {
         let mainCaches = model.makeCaches()
         let mtpKV = KVCache()
         let isLin = model.isLinearFlags
         let P = promptIds.dim(-1)
+        let diag = ProcessInfo.processInfo.environment["QWISP_SPEC_DIAG"] == "1" && diagGreedy != nil
+        var diagDone = false
+        let forceReject = ProcessInfo.processInfo.environment["QWISP_FORCE_REJECT"] == "1"
+        let acceptResync = ProcessInfo.processInfo.environment["QWISP_ACCEPT_RESYNC"] == "1"
         StreamingMoEBlock.probeNoSync = false
         let (H, lg) = try model.prefillChunked(promptIds, caches: mainCaches)
         var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
@@ -500,12 +505,40 @@ public enum StreamingDecode {
             let (H2, lg2) = try model.forwardHidden(ud, caches: mainCaches)
             let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)
             let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
-            let d = Int(vals[0]), v = Int(vals[1])
+            var d = Int(vals[0]); let v = Int(vals[1])
+            if forceReject { d = -1 }                          // 常に reject → commit 状態は [u] 再forward 由来のみ
+            // 診断: 検証の位置-u argmax(=greedy 次トークンであるべき)を greedy ref と照合し、
+            // 初回乖離点で top-2 margin を出す（near-tie=GDN batched 数値, clean gap=logic bug）。
+            if diag && !diagDone, let gr = diagGreedy, out.count + 1 < gr.count {
+                let vwu = Int(vals[1])                          // = vw[0] = verify argmax @ position u
+                let expected = gr[out.count + 1]                // greedy token AFTER u (u itself = gr[out.count])
+                if vwu != expected {
+                    let row = lg2[0, 0]                          // [V] logits @ position u
+                    let top1 = row.max().item(Float.self)
+                    let i1 = MLX.argMax(row, axis: -1).item(Int.self)
+                    let masked = MLX.where(MLX.arange(row.dim(0)) .== Int32(i1), MLXArray(-1e30 as Float), row)
+                    let top2 = masked.max().item(Float.self)
+                    let grLogit = row[expected].item(Float.self)
+                    print(String(format: "[SPEC-DIAG] first diverge @out=%d step=%d accept=%@  vw_u=%d expected=%d  "
+                        + "top1(id=%d)=%.4f top2=%.4f margin=%.4f  greedy_tok_logit=%.4f gap=%.4f",
+                        out.count, steps, (v == d) ? "Y" : "N", vwu, expected, i1, top1, top2, top1 - top2,
+                        grLogit, top1 - grLogit))
+                    diagDone = true
+                }
+            }
             out.append(uArr.item(Int.self))
             if v == d {
                 acc += 1; out.append(d)
                 _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)
-                uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
+                if acceptResync {
+                    // 検証: commit 状態を batched[u,v] でなく逐次(u→v 各単一 token)で作り直す。
+                    for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
+                    _ = try model.forwardHidden(uArr, caches: mainCaches)              // u 単独
+                    let (Hv, lgv) = try model.forwardHidden(dArr, caches: mainCaches)  // v 単独
+                    uArr = MLX.argMax(lgv[0, 0], axis: -1).reshaped([1, 1]); lastH = Hv[0..., 0 ..< 1]
+                } else {
+                    uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
+                }
             } else {                                       // reject → [u] のみ再投入(look-ahead 重複回避)
                 for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
                 let (H1, _) = try model.forwardHidden(uArr, caches: mainCaches)

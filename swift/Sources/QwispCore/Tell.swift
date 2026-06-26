@@ -7,6 +7,57 @@ import Metal
 /// background prefetch で先読み → prefetch I/O を GPU 計算に隠す。cross-layer 予測 prefetch の
 /// efficient 化（Fate one-pass 相当）を mlx 上で実現する独自スケジューラ。
 public enum Tell {
+    /// 各層の gate 入力の「最後の位置」だけ取る（chunk-0 予測の thrash 回避）。
+    static func lastGate(_ model: StreamingQwispModel) -> [MLXArray] {
+        // gate 入力は 2D [S, H]（MoE は [B*S, H] を受ける）。seq 軸=axis0 の最終行のみ取る。
+        model.expertCaches.map { let g = $0.lastGateInput!; return g[(g.dim(0) - 1)...] }
+    }
+
+    static func distinctInts(_ a: MLXArray) -> [Int] {
+        var seen = Set<Int>(); var u: [Int] = []
+        for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
+        return u
+    }
+
+    /// Tell の chunked cross-layer prefetch forward（M2 の中核を再利用可能化）。
+    /// prevGate(前 forward の各層 gate 入力)で chunk-0 を bootstrap、以降は前 chunk 最終 gate 入力で予測。
+    /// 返り値: (post-norm hidden, logits)。captureGateInput により各層 gate 入力が cache に残る。
+    /// exact=true で全 chunk を sync gather（spec 検証を lossless 化）。
+    /// exact=false は cross-layer 予測（高速だが複数 token 検証では look-ahead 位置 v の
+    /// GDN 再帰状態が drift し spec から乖離 → lossless でない。単一 token のみ安全）。
+    static func tellForward(_ model: StreamingQwispModel, _ ids: MLXArray, _ caches: [LayerCache],
+                            _ prevGate: [MLXArray]?, _ CH: Int, exact: Bool = false) throws -> (MLXArray, MLXArray) {
+        StreamingMoEBlock.captureGateInput = true
+        let L = model.layerCount
+        var h = model.embedPub(ids)
+        var pos = 0
+        while pos < L {
+            let end = Swift.min(pos + CH, L)
+            if exact {
+                StreamingMoEBlock.probeNoSync = false
+                h = try model.runChunk(h, pos, end, caches: caches)
+                pos = end
+                continue
+            }
+            StreamingMoEBlock.probeNoSync = true
+            let preds: [MLXArray]
+            if pos > 0 {
+                let src = model.expertCaches[pos - 1].lastGateInput!
+                preds = (pos ..< end).map { model.predictLayerInds($0, src) }
+            } else if let pg = prevGate {
+                preds = (pos ..< end).map { model.predictLayerInds($0, pg[$0]) }
+            } else {
+                preds = (pos ..< end).map { model.predictLayerInds($0, h) }
+            }
+            MLX.eval(preds)
+            for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(distinctInts(preds[k])) }
+            h = try model.runChunk(h, pos, end, caches: caches)
+            pos = end
+        }
+        let normed = model.finalNorm(h)            // post-norm hidden（MTP の h_prev 用）
+        return (normed, model.logitsFromNorm(normed))
+    }
+
     /// M0: 2-pass(pass-1 予測 → pass-2 chunked + overlapped prefetch)。near-lossless で速度を稼ぐ。
     public static func runM0(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
@@ -188,7 +239,7 @@ public enum Tell {
                 let (_, lgt) = try model.forwardHidden(prev, caches: caches)
                 let next = MLX.argMax(lgt[0, 0], axis: -1).reshaped([1, 1])
                 MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
-                prevGate = model.expertCaches.map { $0.lastGateInput! }
+                prevGate = lastGate(model)
                 out.append(prev.item(Int.self)); cur = next
                 continue
             }
@@ -215,7 +266,7 @@ public enum Tell {
             let logits = model.finalLogits(h)
             let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
-            prevGate = model.expertCaches.map { $0.lastGateInput! }
+            prevGate = lastGate(model)
             out.append(prev.item(Int.self)); cur = next
         }
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
@@ -225,5 +276,81 @@ public enum Tell {
             [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
+    /// M4 = MTP D1 投機 × Tell M2 verify。verify(2トークン)に cross-layer prefetch を適用し、
+    /// chunk stall を ~1.85トークンに償却。near-lossless 維持で M2(28) を超える狙い。
+    public static func runM4(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M4] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "2") ?? 2
+        // 既定は exact verify（spec を lossless に再現）。QWISP_M4_PRED=1 で予測 verify（高速だが lossy）。
+        let exactVerify = ProcessInfo.processInfo.environment["QWISP_M4_PRED"] != "1"
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let head = try MTPHead(modelDir: modelDir, store: store)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let mainCaches = model.makeCaches()
+        let mtpKV = KVCache()
+        let P = ids.dim(-1)
+
+        // prefill（sync, gate 入力 capture）→ prevGate
+        // 注意: prompt 全体を 1 forward すると |U|>C で arena 破綻するため chunk 分割必須（specLoop と同じ）。
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = true
+        let (Hf, lgf) = try model.prefillChunked(ids, caches: mainCaches)
+        var uArr = MLX.argMax(lgf[0..., (lgf.dim(1) - 1)...], axis: -1)
+        var lastH = Hf[0..., (P - 1)...]
+        _ = head(Hf[0..., 0 ..< (P - 1)], ids[0..., 1...], cache: mtpKV)
+        var prevGate: [MLXArray]? = lastGate(model)
+        func evalAll() {
+            MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 }
+                     + mainCaches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+        }
+        evalAll()
+        prevGate = lastGate(model)
+
+        var out: [Int] = []; var steps = 0, acc = 0
+        let t0 = DispatchTime.now()
+        while out.count < N {
+            steps += 1
+            let dl = head(lastH, uArr, cache: mtpKV)
+            let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
+            let ud = MLX.concatenated([uArr, dArr], axis: 1)
+            let snaps = mainCaches.map { $0.snapshot() }
+            let (H2, lg2) = try tellForward(model, ud, mainCaches, prevGate, CH, exact: exactVerify)   // ★Tell verify
+            let pg2 = lastGate(model)
+            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)
+            let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
+            let d = Int(vals[0]), v = Int(vals[1])
+            out.append(uArr.item(Int.self))
+            if v == d {
+                acc += 1; out.append(d)
+                _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)
+                uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
+                prevGate = pg2
+            } else {
+                for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
+                let (H1, _) = try tellForward(model, uArr, mainCaches, prevGate, CH, exact: exactVerify)   // [u] 再投入
+                uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
+                prevGate = lastGate(model)
+            }
+            evalAll()
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M4] MTP × Tell verify(%@, C=%d, chunk=%d): %.1f tok/s  accept=%.3f  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            exactVerify ? "exact" : "pred", C, CH, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 }
