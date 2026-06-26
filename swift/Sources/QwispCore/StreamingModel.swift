@@ -83,15 +83,42 @@ public final class StreamingQwispModel {
 
     public func makeCaches() -> [LayerCache] { (0 ..< numLayers).map { _ in LayerCache() } }
 
+    func headProj() -> Proj {
+        .quantized(store.req("language_model.lm_head.weight"),
+                   store.req("language_model.lm_head.scales"),
+                   store.req("language_model.lm_head.biases"), 4)
+    }
+
     public func callAsFunction(_ ids: MLXArray, caches: [LayerCache]) throws -> MLXArray {
+        try forwardHidden(ids, caches: caches).logits
+    }
+
+    /// cached forward で (post-norm hidden, logits)（MTP 投機用）。
+    public func forwardHidden(_ ids: MLXArray, caches: [LayerCache]) throws -> (hidden: MLXArray, logits: MLXArray) {
         var h = embed(ids)
         for (i, layer) in layers.enumerated() { h = try layer(h, cache: caches[i]) }
-        h = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
-        let head = Proj.quantized(store.req("language_model.lm_head.weight"),
-                                  store.req("language_model.lm_head.scales"),
-                                  store.req("language_model.lm_head.biases"), 4)
-        return head.apply(h)
+        let hidden = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return (hidden, headProj().apply(hidden))
     }
+
+    /// チャンク分割 prefill。1 forward の |U| が cache slot C を超えると in-place arena が
+    /// 破綻するため、chunk≤C/topK で分割（chunk 毎に eval して arena 上書き前に materialize）。
+    public func prefillChunked(_ ids: MLXArray, caches: [LayerCache], chunk: Int = 4)
+        throws -> (hidden: MLXArray, logits: MLXArray) {
+        let P = ids.dim(1)
+        var hiddens: [MLXArray] = []
+        var lastLogits = MLXArray.zeros([1, 1, 1])
+        var pos = 0
+        while pos < P {
+            let end = Swift.min(pos + chunk, P)
+            let (h, lg) = try forwardHidden(ids[0..., pos ..< end], caches: caches)
+            MLX.eval([h, lg] + caches.flatMap { $0.stateArrays })  // arena 上書き前に確定
+            hiddens.append(h); lastLogits = lg
+            pos = end
+        }
+        return (MLX.concatenated(hiddens, axis: 1), lastLogits)
+    }
+    public var isLinearFlags: [Bool] { layers.map { $0.isLinear } }
 }
 
 public enum StreamingDecode {
@@ -99,6 +126,97 @@ public enum StreamingDecode {
         var u = rusage()
         getrusage(RUSAGE_SELF, &u)
         return Double(u.ru_maxrss) / 1e9   // macOS: bytes
+    }
+
+    /// MTP D1 投機 on streaming（verify が ~1.85 トークン/forward を生成→per-layer sync を償却）。
+    public static func runSpeculative(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"], let spRef = r["spec_spec"] else {
+            return "[M2c×stream] skip: spec_prompt 無し"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir)
+        try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let head = try MTPHead(modelDir: modelDir, store: store)   // MTP head は resident(~400MB)
+        let rssLoad = rssGB()
+
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let N = 48
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        // 先に streaming greedy が Python greedy と一致するか（forward の正しさを切り分け）
+        let sgCaches = model.makeCaches()
+        var (_, glg) = try model.prefillChunked(ids, caches: sgCaches)
+        var gnext = MLX.argMax(glg[0, glg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([gnext] + sgCaches.flatMap { $0.stateArrays })
+        var sg: [Int] = []
+        for _ in 0 ..< N {
+            sg.append(gnext.item(Int.self))
+            (_, glg) = try model.forwardHidden(gnext, caches: sgCaches)
+            gnext = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([gnext] + sgCaches.flatMap { $0.stateArrays })
+        }
+        let sgMatch = zip(sg, gR).filter { $0 == $1 }.count
+        let (sp, steps, acc, secs) = try specLoop(model, head, ids, N)
+        let spR = spRef.asArray(Int32.self).map { Int($0) }
+        let vsPython = zip(sp, spR).filter { $0 == $1 }.count
+        let vsGreedy = zip(sp, gR).filter { $0 == $1 }.count
+        let rssPeak = rssGB()
+        let ok = vsPython == N
+        return String(format: """
+            [M2c×stream] MTP 投機 on 8GB streaming(C=%d): streaming greedy=Python %d/%d  spec vs Python %d/%d vs greedy %d/%d %@
+               accept=%.3f  %.1f tok/s  RSS load=%.1fGB peak=%.1fGB
+            """,
+            C, sgMatch, N, vsPython, N, vsGreedy, N, ok ? "OK ✅" : "❌",
+            Double(acc) / Double(steps), Double(N) / secs, rssLoad, rssPeak)
+    }
+
+    /// streaming model 用の D1 投機ループ（Speculative.speculative の streaming 版）。
+    static func specLoop(_ model: StreamingQwispModel, _ head: MTPHead, _ promptIds: MLXArray, _ maxTokens: Int)
+        throws -> (toks: [Int], steps: Int, acc: Int, secs: Double) {
+        let mainCaches = model.makeCaches()
+        let mtpKV = KVCache()
+        let isLin = model.isLinearFlags
+        let P = promptIds.dim(-1)
+        let (H, lg) = try model.prefillChunked(promptIds, caches: mainCaches)
+        var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
+        var lastH = H[0..., (P - 1)...]
+        _ = head(H[0..., 0 ..< (P - 1)], promptIds[0..., 1...], cache: mtpKV)
+        MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })
+
+        var out: [Int] = []; var steps = 0, acc = 0
+        let t0 = DispatchTime.now()
+        while out.count < maxTokens {
+            steps += 1
+            let dl = head(lastH, uArr, cache: mtpKV)
+            let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
+            let ud = MLX.concatenated([uArr, dArr], axis: 1)
+            let snaps = mainCaches.map { $0.snapshot() }
+            let (H2, lg2) = try model.forwardHidden(ud, caches: mainCaches)
+            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)
+            let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
+            let d = Int(vals[0]), v = Int(vals[1])
+            out.append(uArr.item(Int.self))
+            if v == d {
+                acc += 1; out.append(d)
+                _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)
+                uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
+            } else {
+                for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
+                let uv = MLX.concatenated([uArr, vw[0 ..< 1].reshaped([1, 1])], axis: 1)
+                let (H1, _) = try model.forwardHidden(uv, caches: mainCaches)
+                uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
+            }
+            MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })
+        }
+        uArr.eval()
+        return (Array(out.prefix(maxTokens)), steps, acc,
+                Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9)
     }
 
     public static func run(modelDir: String, refPath: String) throws -> String {
@@ -117,10 +235,9 @@ public enum StreamingDecode {
                                             device: device, source: source, cacheC: C > 0 ? C : nil)
         let rssLoad = rssGB()
 
-        let T = ids.dim(-1)
         let caches = model.makeCaches()
-        var logits = try model(ids, caches: caches)
-        var next = MLX.argMax(logits[0, T - 1], axis: -1).reshaped([1, 1])
+        var (_, logits) = try model.prefillChunked(ids, caches: caches)   // |U|>C 破綻回避
+        var next = MLX.argMax(logits[0, logits.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([next] + caches.flatMap { $0.stateArrays })
 
         let N = 32
