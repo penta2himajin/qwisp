@@ -120,6 +120,19 @@ def main():
     run(f"E mixed@{args.cold_B}", lambda: attach_mixed_eng(lm, src4, src2, args.hot, args.cold_B, counts))
     SSG.__call__ = oss; MSG.__call__ = oms
 
+    # F: GPU-routed mixed（全常駐, tolist 無し）— 同期税を消した時の上限
+    from .gpu_routed import GPURoutedMixedSwitchGLU
+    def attach_gpu_routed():
+        for name, blk in lm.named_modules():
+            if isinstance(blk, Qwen3NextSparseMoeBlock):
+                L = int(_LAYER_RE.search(name).group(1))
+                cc = counts.get(id(blk), np.zeros(256, np.int64))
+                hot = set(np.argsort(cc)[-args.hot:].tolist())
+                blk.switch_mlp = GPURoutedMixedSwitchGLU(L, hot, src4, src2)
+    attach_gpu_routed()
+    m, h = time_fwd(lm, prompt, args.steps)
+    rows.append(("F gpu-routed", m, h, 0.0))
+
     print(f"\n[full] 2-token verify forward, ctx={args.ctx}, steps={args.steps}, hot={args.hot}")
     print(f"{'config':14} {'model ms':>9} {'lm_head ms':>11} {'tolist ms':>10} {'total ms':>9} {'tok/s(2/fwd)':>12}")
     print("-" * 70)
@@ -137,6 +150,8 @@ def main():
     print(f"  D-B = mixed two-gather税  : {get('D')-get('B'):+.1f}")
     print(f"  E-D = mixed IO税          : {get('E')-get('D'):+.1f}")
     print(f"  E total(現行) vs A床      : {get('E'):.1f} vs {get('A'):.1f}  (streaming税 {get('E')-get('A'):+.1f})")
+    print(f"  F gpu-routed mixed(全常駐, tolist 無し): {get('F'):.1f}  "
+          f"(D mixed@256={get('D'):.1f} から同期税 {get('D')-get('F'):+.1f} を回収)")
 
 
 if __name__ == "__main__":
