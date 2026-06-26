@@ -193,6 +193,13 @@ public enum Tell {
                 continue
             }
             StreamingMoEBlock.probeNoSync = true
+            // M3 multi-source: token 開始時に全層 temporal 予測(prevGate[i] 同層)を一括 prefetch（stall 無し）
+            let multiSrc = ProcessInfo.processInfo.environment["QWISP_MULTI"] == "1"
+            if multiSrc, let pg = prevGate {
+                let tpreds = (0 ..< L).map { model.predictLayerInds($0, pg[$0]) }
+                MLX.eval(tpreds)
+                for i in 0 ..< L { _ = model.expertCaches[i].ensure(distinct(tpreds[i])) }
+            }
             var h = model.embedPub(prev)
             var pos = 0
             while pos < L {
