@@ -133,6 +133,12 @@ def main():
     m, h = time_fwd(lm, prompt, args.steps)
     rows.append(("F gpu-routed", m, h, 0.0))
 
+    # G: F + ダミー tolist（concat 無し・同期だけ）→ 純粋な同期 drain コストを分離
+    GPURoutedMixedSwitchGLU._probe_sync = True
+    m, h = time_fwd(lm, prompt, args.steps)
+    GPURoutedMixedSwitchGLU._probe_sync = False
+    rows.append(("G gpu-routed+sync", m, h, None))
+
     print(f"\n[full] 2-token verify forward, ctx={args.ctx}, steps={args.steps}, hot={args.hot}")
     print(f"{'config':14} {'model ms':>9} {'lm_head ms':>11} {'tolist ms':>10} {'total ms':>9} {'tok/s(2/fwd)':>12}")
     print("-" * 70)
@@ -152,6 +158,8 @@ def main():
     print(f"  E total(現行) vs A床      : {get('E'):.1f} vs {get('A'):.1f}  (streaming税 {get('E')-get('A'):+.1f})")
     print(f"  F gpu-routed mixed(全常駐, tolist 無し): {get('F'):.1f}  "
           f"(D mixed@256={get('D'):.1f} から同期税 {get('D')-get('F'):+.1f} を回収)")
+    print(f"  G F+ダミーtolist(concat無・同期のみ): {get('G'):.1f}  "
+          f"(G-F={get('G')-get('F'):+.1f}=純 sync drain / D-G={get('D')-get('G'):+.1f}=concat+cache)")
 
 
 if __name__ == "__main__":

@@ -65,7 +65,11 @@ class GPURoutedMixedSwitchGLU(nn.Module):
         h = swiglu(q(xe, "gate_proj"), q(xe, "up_proj"))
         return q(h, "down_proj").squeeze(-2)
 
+    _probe_sync = False    # 診断: True で per-layer tolist 同期だけ足す（drain コスト分離）
+
     def __call__(self, x, inds):
+        if self._probe_sync:
+            _ = inds.tolist()         # GPU drain を強制（streaming の tolist を模擬）
         # tolist 無し: 全部 GPU 演算。remap も is_hot も GPU LUT 引き。
         remap_hot = self._lut_hot[inds]
         remap_cold = self._lut_cold[inds]
