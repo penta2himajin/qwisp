@@ -153,18 +153,34 @@ class MTPHead(nn.Module):
         sh = mx.sigmoid(self.shared_expert_gate(x)) * sh
         return y + sh
 
-    def __call__(self, h_prev, next_tok, concat_order="emb_hid"):
-        """h_prev:[B,L,H] main hidden, next_tok:[B,L] 条件トークン → 次々トークンの logits。"""
+    def __call__(self, h_prev, next_tok, concat_order="emb_hid", mask_mode="causal",
+                 cache=None):
+        """h_prev:[B,L,H] main hidden, next_tok:[B,L] 条件トークン → 次々トークンの logits。
+        cache=KVCache を渡すと self_attn が KV 蓄積（投機ループ用、offset で RoPE）。"""
         emb = self._embed(next_tok)
         e = self.pre_fc_norm_embedding(emb)
         hh = self.pre_fc_norm_hidden(h_prev)
         cat = mx.concatenate([e, hh] if concat_order == "emb_hid" else [hh, e], axis=-1)
         x = self.fc(cat)
-        mask = create_attention_mask(x, None)
-        r = self.self_attn(self.input_layernorm(x), mask, None)
+        if cache is not None:
+            mask = create_attention_mask(x, cache) if x.shape[1] > 1 else None
+        elif mask_mode == "diag":
+            Lq = x.shape[1]
+            mask = mx.where(mx.eye(Lq, dtype=mx.bool_), 0.0, -1e9).astype(x.dtype)
+        else:
+            mask = create_attention_mask(x, None)
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         x = x + r
         x = x + self._moe(self.post_attention_layernorm(x))
         return self._lm_head(self.norm(x))
+
+
+def build_head(model_dir, lm):
+    """loaded language_model から MTPHead を構築（正準構成）。"""
+    g = load_mtp_weights(model_dir, shift_extra=False)
+    head = MTPHead(lm.args, g, lm.model.embed_tokens, lm.lm_head)
+    mx.eval(head.parameters())
+    return head
 
 
 def _main_forward(lm, inputs):
@@ -229,10 +245,11 @@ def main():
         head = MTPHead(margs, g, lm.model.embed_tokens, lm.lm_head)
         mx.eval(head.parameters())
         hsrc = pre if hid_mode == "pre" else post
-        draft = mx.argmax(head(hsrc[:, :-1], next_tok, "emb_hid"), axis=-1)[0]
-        acc = float(mx.mean((draft[lo:hi] == tgt).astype(mx.float32)).item())
-        print(f"  [canonical] shift_extra={int(shift_extra)} hidden={hid_mode:4} "
-              f"concat=emb_hid acceptance={acc:.3f}  (n={hi-lo}, doc=0.886)")
+        for mm in ("causal", "diag"):
+            draft = mx.argmax(head(hsrc[:, :-1], next_tok, "emb_hid", mm), axis=-1)[0]
+            acc = float(mx.mean((draft[lo:hi] == tgt).astype(mx.float32)).item())
+            print(f"  [canonical] shift_extra={int(shift_extra)} hidden={hid_mode:4} "
+                  f"mask={mm:6} acceptance={acc:.3f}  (n={hi-lo}, doc=0.886)")
 
 
 if __name__ == "__main__":
