@@ -113,12 +113,14 @@ def speculative(lm, head, prompt, max_tokens, light=True, profile=False, pf=None
             out.append(d)
             head(H2[:, 0:1], d_arr, cache=mtp_kv)      # catch-up mtp
             u, u_arr, last_h = w, vw[1:2].reshape(1, 1), H2[:, 1:2]
-        else:                                          # reject: pre-[u,d] に戻し u のみ再処理
-            if light:
-                _rollback_light(main_kv, snap, 2)
+        else:                                          # reject: pre-[u,d] に戻し [u,v] を再投入。
+            if light:                                  # u は確定トークン → cache に戻さないと
+                _rollback_light(main_kv, snap, 2)      # 以降の文脈から u が欠落し lossless 違反になる。
             else:
                 _restore(main_kv, snap)
-            H1, _ = _fwd(lm, vw[0:1].reshape(1, 1), main_kv)
+            uv = mx.concatenate([u_arr, vw[0:1].reshape(1, 1)], axis=1)   # [1,2] = [u, v]
+            H1, _ = _fwd(lm, uv, main_kv)
+            # 次の draft は head(hidden_u, v): u の hidden(=position0) が次トークンの文脈。
             u, u_arr, last_h = v, vw[0:1].reshape(1, 1), H1[:, 0:1]
         prof["rest"] += time.perf_counter() - t0
     mx.eval(last_h)                                    # 末尾の lazy 残を flush して decode 計時を正す
