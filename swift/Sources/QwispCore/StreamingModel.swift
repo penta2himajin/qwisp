@@ -128,6 +128,52 @@ public enum StreamingDecode {
         return Double(u.ru_maxrss) / 1e9   // macOS: bytes
     }
 
+    /// hybrid fast decode: ほとんどの token を GPU-remap no-sync(高速・近似)で回し、
+    /// 毎 refreshEvery token だけ sync mode(正確・cache 更新)。quality-GREEN 前提の速度モード。
+    /// tok/s と greedy 一致率(品質)の両方を計測。
+    public static func runHybridFast(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else {
+            return "[fast] skip: spec_prompt 無し"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let RE = Int(ProcessInfo.processInfo.environment["QWISP_REFRESH"] ?? "4") ?? 4
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let N = 48
+        let caches = model.makeCaches()
+
+        // prefill(sync, chunked) + cache warmup
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var next = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([next] + caches.flatMap { $0.stateArrays })
+
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for i in 0 ..< N {
+            out.append(next.item(Int.self))
+            StreamingMoEBlock.probeNoSync = (i % RE != 0)   // refreshEvery 毎に sync(正確+cache更新)
+            (_, lg) = try model.forwardHidden(next, caches: caches)
+            next = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [fast] hybrid no-sync decode(C=%d, sync 1/%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            C, RE, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
     /// MTP D1 投機 on streaming（verify が ~1.85 トークン/forward を生成→per-layer sync を償却）。
     public static func runSpeculative(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }

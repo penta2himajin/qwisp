@@ -14,6 +14,8 @@ if CommandLine.arguments.contains("stream") {
        FileManager.default.fileExists(atPath: "\(md)/mtp.safetensors") {
         do { print(try StreamingDecode.runSpeculative(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
         catch { print("[M2c×stream] error: \(error)") }
+        do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+        catch { print("[fast] error: \(error)") }
     }
     exit(0)
 }
