@@ -125,6 +125,18 @@ if FileManager.default.fileExists(atPath: fullRef),
     catch { print("[M2b-3 decode] error: \(error)") }
 }
 
+// S1: ExpertSource pread スライスが resident と bit 一致するか
+if FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
+    do { print(try ExpertSourceValidation.run(modelDir: modelDir)) }
+    catch { print("[S1] error: \(error)") }
+}
+
+// S2: 持続 arena streaming MoE が resident と一致するか（concat 無し in-place）
+if FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
+    do { print(try StreamingMoEValidation.run(modelDir: modelDir)) }
+    catch { print("[S2] error: \(error)") }
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
