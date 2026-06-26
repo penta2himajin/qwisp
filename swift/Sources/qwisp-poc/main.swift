@@ -16,6 +16,8 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[M2c×stream] error: \(error)") }
         do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
         catch { print("[fast] error: \(error)") }
+        do { print(try StreamingDecode.runSpeculativeFast(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+        catch { print("[M2c×fast] error: \(error)") }
     }
     exit(0)
 }

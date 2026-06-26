@@ -223,12 +223,15 @@ public enum StreamingDecode {
     }
 
     /// streaming model 用の D1 投機ループ（Speculative.speculative の streaming 版）。
-    static func specLoop(_ model: StreamingQwispModel, _ head: MTPHead, _ promptIds: MLXArray, _ maxTokens: Int)
+    /// refreshEvery>0 で verify を hybrid no-sync fast（refreshEvery 毎に sync で cache 更新）。
+    static func specLoop(_ model: StreamingQwispModel, _ head: MTPHead, _ promptIds: MLXArray,
+                         _ maxTokens: Int, refreshEvery: Int = 0)
         throws -> (toks: [Int], steps: Int, acc: Int, secs: Double) {
         let mainCaches = model.makeCaches()
         let mtpKV = KVCache()
         let isLin = model.isLinearFlags
         let P = promptIds.dim(-1)
+        StreamingMoEBlock.probeNoSync = false
         let (H, lg) = try model.prefillChunked(promptIds, caches: mainCaches)
         var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
         var lastH = H[0..., (P - 1)...]
@@ -238,6 +241,8 @@ public enum StreamingDecode {
         var out: [Int] = []; var steps = 0, acc = 0
         let t0 = DispatchTime.now()
         while out.count < maxTokens {
+            // fast モード: refreshEvery 毎に sync(cache 更新)、それ以外は GPU-remap no-sync
+            StreamingMoEBlock.probeNoSync = refreshEvery > 0 && (steps % refreshEvery != 0)
             steps += 1
             let dl = head(lastH, uArr, cache: mtpKV)
             let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
@@ -261,8 +266,37 @@ public enum StreamingDecode {
             MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })
         }
         uArr.eval()
+        StreamingMoEBlock.probeNoSync = false
         return (Array(out.prefix(maxTokens)), steps, acc,
                 Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9)
+    }
+
+    /// MTP × hybrid fast: 投機(verify ~1.85トークン) × no-sync fast。最速モード。
+    public static func runSpeculativeFast(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else {
+            return "[M2c×fast] skip"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let RE = Int(ProcessInfo.processInfo.environment["QWISP_REFRESH"] ?? "8") ?? 8
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let head = try MTPHead(modelDir: modelDir, store: store)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = 48
+        let (sp, steps, acc, secs) = try specLoop(model, head, ids, N, refreshEvery: RE)
+        let match = zip(sp, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [M2c×fast] MTP投機 × hybrid no-sync(C=%d, sync 1/%d): %.1f tok/s  accept=%.3f  品質(greedy一致) %d/%d=%.0f%%  RSS=%.1fGB
+            """,
+            C, RE, Double(N) / secs, Double(acc) / Double(steps), match, N,
+            Double(match) / Double(N) * 100, rssGB())
     }
 
     public static func run(modelDir: String, refPath: String) throws -> String {
