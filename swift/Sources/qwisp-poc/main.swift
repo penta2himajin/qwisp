@@ -12,7 +12,12 @@ if FileManager.default.fileExists(atPath: refPath) {
     } catch {
         print("[M1] error: \(error)")
     }
+    do {
+        print(try PersistentArenaTest.run(refPath: refPath))
+    } catch {
+        print("[M3] error: \(error)")
+    }
 } else {
-    print("[M1] skip: ref not found at \(refPath) (run: PY -m qwisp.swift_ref)")
+    print("[M1/M3] skip: ref not found at \(refPath) (run: PY -m qwisp.swift_ref)")
 }
 print("[qwisp-poc] done.")
