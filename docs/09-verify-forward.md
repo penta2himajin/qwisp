@@ -84,9 +84,31 @@ pf を先に計測すると逆転（pf 6.1 / no-pf 7.7）＝順序効果。**正
 - streaming の miss は本質的に churn で、予測には >0.85 coverage の cross-layer 予測器が要る（未達）。
 - コードは opt-in（`--prefetch`, default off）で負の結果として保持。
 
-### 4.6 残る天井
-並列 pread 後の内訳: **per-layer tolist 同期 86ms/56%**（GPU-drain churn, docs/07）／gather 60ms/38%。
-低リスク策（持続 hot バッファ=回帰 / async prefetch=無効）は出尽くした。**残るは §3(3) Blink 流
-GPU-side routing**（固定 shape グラフで host 同期除去）一択で、mlx 制約の正面突破（`mx.compile`+
-固定バッファ gather の feasibility 実験、最悪 Metal カーネル自作）が要る高難度策。または許容 RAM を
-上げて resident 比率を増やす（streaming 税そのものを減らす）かの設計判断。
+### 4.6 段階分解で真因確定（`qwisp/full_profile.py`）
+同じ 2-token verify を engine 構成で段階測定（ctx512）:
+
+| 構成 | model ms | tok/s | |
+|:-----|------:|:----:|:--|
+| A resident（純正4bit, GPU gather, **tolist無し**） | 19.4 | **94** | 床（MTPLX 94.5 と一致）|
+| B stream@256（全常駐・**tolistあり**） | 115.9 | 16.8 | IO ゼロでも 6× 遅い |
+| C all4@37（miss） | 224.8 | 8.8 | |
+| D mixed@256 | 126.8 | 15.5 | |
+| E mixed@37（現行 streaming） | 148.3 | 13.3 | |
+| **F GPU-routed mixed（全常駐, tolist排除）** | **24.1** | **77.9** | |
+
+**税の分解**: B−A=**+96ms 同期税**（streaming税130の74%）／ E−D=**+8ms mixed IO税（ほぼ解決）**／
+D−B=+26ms two-gather税。**IO ゼロの B でも A の 6× 遅い＝ボトルネックは IO でなく per-layer 同期**
+（tolist のデータ50µs でなく、毎層 GPU パイプライン drain による損失）。
+
+### 4.7 GPU-routing = 実証成功（`qwisp/gpu_routed.py`）
+`GPURoutedMixedSwitchGLU`: hot(4bit)/cold(2bit) 全 expert を**持続 GPU バッファ**に置き、**GPU の
+inds LUT で直接 gather_qmm**（CPU 往復・tolist ゼロ）。結果 **F=24.1ms/77.9tok/s**＝D(15.5) から
+同期税 102.7ms を回収（**5×**）、ネイティブ A(94) との差 ~5ms は two-gather のみ。**正しさ 64/64**
+（resident-4bit 参照と一致, mixed GREEN）。fast_hot 回帰の原因（cold 側が cache+tolist のまま）を
+両側 GPU-route で解消。
+
+**適用条件と射程**: GPU-routing は per-layer の miss 同期が不可能＝**全 expert 常駐前提**。
+mixed 全常駐 = 12GB → **18–24GB Mac で ~78 tok/s**（現 streaming ~13 の 5–6×）。全4bit常駐(18GB)なら
+24–32GB で ~94。**8–16GB の真 streaming 域は per-layer 同期が構造的に残る**（experts がディスク）。
+→ デプロイは「載るなら GPU-routed resident、載らないなら streaming」の二段。残課題は (1) two-gather
+融合カーネルで F を 78→~90 に、(2) 16GB に 12GB を収める KV/OS 切り詰め。
