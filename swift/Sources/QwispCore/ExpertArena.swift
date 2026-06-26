@@ -113,6 +113,14 @@ public final class LayerExpertCache {
         tick = [Int](repeating: 0, count: C)
     }
 
+    /// lastInds(直近 fast forward の routing)の distinct expert を prefetch（cross-layer 予測の駆動）。
+    public func prefetchLastInds() {
+        guard let li = lastInds else { return }
+        var seen = Set<Int>(); var U: [Int] = []
+        for e in li.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { U.append(i) } }
+        _ = ensure(U)
+    }
+
     /// experts(U) を cache に確保（miss は pread）し、各 U[i] の slot を返す。
     /// miss の slot 割当を先に済ませ、全 miss×9 テンソルの pread を一括並列化。
     public func ensure(_ experts: [Int]) -> [Int: Int] {
