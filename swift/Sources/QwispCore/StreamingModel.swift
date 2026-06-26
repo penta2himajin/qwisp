@@ -485,6 +485,7 @@ public enum StreamingDecode {
         var diagDone = false
         let forceReject = ProcessInfo.processInfo.environment["QWISP_FORCE_REJECT"] == "1"
         let acceptResync = ProcessInfo.processInfo.environment["QWISP_ACCEPT_RESYNC"] == "1"
+        if ProcessInfo.processInfo.environment["QWISP_F32_ATTN"] == "1" { AttentionLayer.f32SDPA = true }
         StreamingMoEBlock.probeNoSync = false
         let (H, lg) = try model.prefillChunked(promptIds, caches: mainCaches)
         var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)

@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXRandom
 
 /// GatedDeltaNet の recurrent 核（gated_delta_ops 相当）の Swift 移植（M2b-1 crux）.
 /// Python mlx_lm/models/gated_delta.py の純ops版を忠実移植。後で Metal kernel 化で速度。
@@ -147,6 +148,50 @@ public enum GatedDelta {
             outputShapes: [[B, T, Hv, Dv], [B, Hv, Dv, Dk]],
             outputDTypes: [inT, .float32])
         return (out[0], out[1])
+    }
+}
+
+extension GatedDelta {
+    /// updateKernel(T=2) と 逐次 T=1×2（state carry）の bit 一致を検証。
+    /// spec の batched verify vs sequential accept の drift 真因を切り分ける。
+    public static func tConsistencyTest() -> String {
+        let B = 1, T = 2, Hk = 16, Hv = 32, Dk = 128, Dv = 128
+        // 決定論的な擬似乱数入力（mlx の random は seed 固定で再現可能）
+        MLXRandom.seed(0)
+        let q = MLXRandom.normal([B, T, Hk, Dk]).asType(.float16)
+        let k = MLXRandom.normal([B, T, Hk, Dk]).asType(.float16)
+        let v = MLXRandom.normal([B, T, Hv, Dv]).asType(.float16)
+        let a = MLXRandom.normal([B, T, Hv])
+        let b = MLXRandom.normal([B, T, Hv])
+        let aLog = MLXRandom.normal([Hv])
+        let dtBias = MLXRandom.normal([Hv])
+
+        // batched: 1 回の T=2 呼び出し
+        let (yB, sB) = updateKernel(q, k, v, a, b, aLog, dtBias, state: nil)
+        yB.eval(); sB.eval()
+
+        // sequential: T=1 を 2 回、state を carry
+        let (y0, s0) = updateKernel(q[0..., 0 ..< 1], k[0..., 0 ..< 1], v[0..., 0 ..< 1],
+                                    a[0..., 0 ..< 1], b[0..., 0 ..< 1], aLog, dtBias, state: nil)
+        let (y1, s1) = updateKernel(q[0..., 1 ..< 2], k[0..., 1 ..< 2], v[0..., 1 ..< 2],
+                                    a[0..., 1 ..< 2], b[0..., 1 ..< 2], aLog, dtBias, state: s0)
+        let yS = MLX.concatenated([y0, y1], axis: 1)
+        yS.eval(); s1.eval()
+
+        func rel(_ x: MLXArray, _ y: MLXArray) -> Float {
+            MLX.max(MLX.abs(x.asType(.float32) - y.asType(.float32))).item(Float.self)
+                / (MLX.max(MLX.abs(y.asType(.float32))).item(Float.self) + 1e-9)
+        }
+        // 位置別の out 差分（pos0 は両者 T=1 で必ず一致するはず、pos1 が問題位置）
+        let relY0 = rel(yB[0..., 0 ..< 1], y0)
+        let relY1 = rel(yB[0..., 1 ..< 2], y1)
+        let relState = rel(sB, s1)
+        let ok = relY1 < 1e-3 && relState < 1e-3
+        return String(format: """
+            [GDN-TTEST] updateKernel T=2 vs 逐次 T=1×2:
+              out pos0 rel=%.3e  out pos1 rel=%.3e  final-state rel=%.3e  -> %@
+            """, relY0, relY1, relState,
+            ok ? "一致 ✅（kernel は sequential-consistent）" : "乖離 ❌（kernel の T>1 経路が逐次と非一致＝drift 真因）")
     }
 }
 

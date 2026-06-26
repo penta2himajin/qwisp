@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXFast
+import MLXRandom
 
 /// Qwen3NextAttention.__call__ の Swift 移植（M2b-2 full-attention 層）.
 /// GQA(16 q-heads / 2 kv-heads, head_dim=256) + q/k RMSNorm + partial RoPE(64dim) +
@@ -21,6 +22,10 @@ public struct AttentionLayer {
     let kNorm: MLXArray       // [headDim]
 
     var scale: Float { Float(pow(Double(headDim), -0.5)) }
+
+    /// SDPA を float32 で実行（.causal/.none 経路の f16 揺れ ~7e-4 を ~1e-6 に縮め、
+    /// spec の batched verify が逐次 greedy と drift するのを防ぐ）。
+    nonisolated(unsafe) public static var f32SDPA: Bool = false
 
     public init(numHeads: Int, numKVHeads: Int, headDim: Int, ropeDim: Int, ropeBase: Float,
                 eps: Float, qProj: Proj, kProj: Proj, vProj: Proj, oProj: Proj,
@@ -60,11 +65,63 @@ public struct AttentionLayer {
 
         // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
+        let inDtype = queries.dtype
+        var (q2, k2, v2) = (queries, allKeys, allValues)
+        if AttentionLayer.f32SDPA {
+            q2 = queries.asType(.float32); k2 = allKeys.asType(.float32); v2 = allValues.asType(.float32)
+        }
         var output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: allKeys, values: allValues, scale: scale, mask: maskMode)
+            queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
+        if AttentionLayer.f32SDPA { output = output.asType(inDtype) }
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]
 
         return oProj.apply(output * MLX.sigmoid(gate))
+    }
+}
+
+extension AttentionLayer {
+    /// 検証 [u,v](L=2, .causal) vs 逐次 u→v(L=1, .none) が bit 一致するか。
+    /// spec の batched verify が逐次 accept と drift する真因切り分け（KV-prefix 付き）。
+    public static func sConsistencyTest(dtype: DType = .float16) -> String {
+        let H = 2048, P = 16
+        MLXRandom.seed(0)
+        func rp(_ outd: Int, _ ind: Int = H) -> Proj { .plain((MLXRandom.normal([outd, ind]) * 0.02).asType(dtype)) }
+        let attn = AttentionLayer(
+            numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
+            qProj: rp(16 * 256 * 2), kProj: rp(2 * 256), vProj: rp(2 * 256), oProj: rp(H, 16 * 256),
+            qNorm: MLXArray.ones([256]).asType(dtype), kNorm: MLXArray.ones([256]).asType(dtype))
+        let xPrefix = (MLXRandom.normal([1, P, H]) * 0.5).asType(dtype)
+        let u = (MLXRandom.normal([1, 1, H]) * 0.5).asType(dtype)
+        let v = (MLXRandom.normal([1, 1, H]) * 0.5).asType(dtype)
+
+        // prefix を 2 本の cache に同一構築（同一入力→決定論的）
+        func freshPrefixCache() -> KVCache { let c = KVCache(); _ = attn(xPrefix, cache: c); return c }
+
+        // batched: [u,v] を L=2(.causal) で 1 回
+        let cB = freshPrefixCache()
+        let uv = MLX.concatenated([u, v], axis: 1)
+        let yB = attn(uv, cache: cB)
+        yB.eval(); cB.keys!.eval()
+
+        // sequential: u→v を L=1(.none) で 2 回
+        let cS = freshPrefixCache()
+        let yu = attn(u, cache: cS)
+        let yv = attn(v, cache: cS)
+        yu.eval(); yv.eval(); cS.keys!.eval()
+
+        func rel(_ x: MLXArray, _ y: MLXArray) -> Float {
+            MLX.max(MLX.abs(x.asType(.float32) - y.asType(.float32))).item(Float.self)
+                / (MLX.max(MLX.abs(y.asType(.float32))).item(Float.self) + 1e-9)
+        }
+        let relU = rel(yB[0..., 0 ..< 1], yu)
+        let relV = rel(yB[0..., 1 ..< 2], yv)
+        let relKV = rel(cB.keys!, cS.keys!)
+        let ok = relU < 1e-5 && relV < 1e-5
+        return String(format: """
+            [ATTN-TTEST %@] 検証[u,v](L=2 .causal) vs 逐次 u→v(L=1 .none):
+              out u rel=%.3e  out v rel=%.3e  KV rel=%.3e  -> %@
+            """, dtype == .float32 ? "f32" : "f16", relU, relV, relKV,
+            ok ? "bit一致 ✅" : "乖離（経路差; f16=~7e-4 drift 源 / f32 で縮むか確認）")
     }
 }
 

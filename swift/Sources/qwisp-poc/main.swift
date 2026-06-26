@@ -4,6 +4,15 @@ import QwispCore
 print("[qwisp-poc] starting ...")
 print(QwispCore.smoke())
 
+// GDN kernel T-consistency 検査: updateKernel(T=2) vs 逐次 T=1×2（state carry）が bit 一致するか。
+// spec の accept-state drift の真因切り分け（QWISP_GDN_TTEST=1）。
+if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
+    print(GatedDelta.tConsistencyTest())
+    print(AttentionLayer.sConsistencyTest(dtype: .float16))
+    print(AttentionLayer.sConsistencyTest(dtype: .float32))
+    exit(0)
+}
+
 // streaming-only モード（クリーンな RSS 計測用）: `qwisp-poc stream` で起動
 if CommandLine.arguments.contains("stream") {
     let md = ProcessInfo.processInfo.environment["QWISP_MODEL"]
