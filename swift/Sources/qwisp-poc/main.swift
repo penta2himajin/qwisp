@@ -108,6 +108,16 @@ if FileManager.default.fileExists(atPath: headRef) {
     print("[M2b-3 head] skip: head ref not found (run: PY -m qwisp.real_head_ref)")
 }
 
+// M2b-3: FULL forward(40層) を実モデルロードで Python と一致検証
+let fullRef = "/tmp/qwisp_full_ref.safetensors"
+if FileManager.default.fileExists(atPath: fullRef),
+   FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
+    do { print(try FullModelValidation.run(modelDir: modelDir, refPath: fullRef)) }
+    catch { print("[M2b-3 full] error: \(error)") }
+} else {
+    print("[M2b-3 full] skip: full ref or model dir not found")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
