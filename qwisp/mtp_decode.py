@@ -139,7 +139,7 @@ def greedy(lm, prompt, max_tokens):
     return out[:max_tokens]
 
 
-def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b):
+def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False):
     src4 = ExpertSource(model_dir)
     src2 = ExpertSource(dir2)
     c4 = ExpertCache(src4, budget_per_layer=hot_b)
@@ -151,7 +151,7 @@ def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b):
             layer = int(m.group(1)) if m else 0
             c = counts.get(id(blk), np.zeros(256, np.int64))
             hot = set(np.argsort(c)[-hot_b:].tolist())
-            blk.switch_mlp = MixedSwitchGLU(layer, hot, c4, c2)
+            blk.switch_mlp = MixedSwitchGLU(layer, hot, c4, c2, fast_hot=fast_hot)
     return [c4, c2]
 
 
@@ -164,6 +164,7 @@ def main():
     ap.add_argument("--gen", type=int, default=96)
     ap.add_argument("--ctx", type=int, default=128)
     ap.add_argument("--profile", action="store_true", help="ステップ内訳を計測表示")
+    ap.add_argument("--fast-hot", action="store_true", help="持続 hot バッファ + GPU remap")
     args = ap.parse_args()
 
     print("[dec] loading ...", file=sys.stderr)
@@ -177,17 +178,18 @@ def main():
         ids = ids + tok.encode(base)
     prompt = ids[:args.ctx]
 
-    # 正しさ: light/heavy 両方が greedy と一致するか
-    g = greedy(lm, prompt, args.gen)
+    # 正しさ: light/heavy 両方が greedy と一致するか（full-residency 参照）
+    g_ref = greedy(lm, prompt, args.gen)
     for lab, lt in (("light", True), ("heavy", False)):
         sp, steps, accd = speculative(lm, head, prompt, args.gen, light=lt)
-        match = sum(1 for a, b in zip(g, sp) if a == b)
-        print(f"[dec] correctness({lab}): {match}/{len(g)} "
+        match = sum(1 for a, b in zip(g_ref, sp) if a == b)
+        print(f"[dec] correctness({lab}): {match}/{len(g_ref)} "
               f"(steps={steps}, draft_accept={accd/steps:.3f})")
 
     # 速度: greedy(AR) vs spec(heavy/light)、必要なら mixed streaming で
     if args.mixed:
-        attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B)
+        attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
+                     fast_hot=args.fast_hot)
         print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B})",
               file=sys.stderr)
 
@@ -197,12 +199,13 @@ def main():
     (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
     (sp_h, steps_h, _), t_h = timed(lambda: speculative(lm, head, prompt, args.gen, light=False))
     (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, profile=args.profile))
-    eng = "mixed-stream" if args.mixed else "full-resident"
+    eng = ("mixed-stream" + ("+fasthot" if args.fast_hot else "")) if args.mixed else "full-resident"
+    m_l = sum(1 for a, b in zip(g_ref, sp_l) if a == b)        # fast_hot 含む正しさ
     print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
     print(f"  AR greedy        : {args.gen/t_ar:6.1f} tok/s")
     print(f"  MTP D1 spec heavy: {args.gen/t_h:6.1f} tok/s  ({t_ar/t_h:.2f}x)")
     print(f"  MTP D1 spec light: {args.gen/t_l:6.1f} tok/s  ({t_ar/t_l:.2f}x)  "
-          f"draft_accept={accd/steps_l:.3f}")
+          f"draft_accept={accd/steps_l:.3f}  match={m_l}/{len(g_ref)}")
 
 
 if __name__ == "__main__":

@@ -29,11 +29,13 @@ def main():
     ap.add_argument("--cold-B", type=int, default=37)
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--steps", type=int, default=40)
+    ap.add_argument("--fast-hot", action="store_true", help="持続 hot バッファ + GPU remap")
     args = ap.parse_args()
 
     model, tok = load(args.model)
     lm = model.language_model
-    caches = attach_mixed(model, lm, tok, args.model, args.dir2, args.hot, args.cold_B)
+    caches = attach_mixed(model, lm, tok, args.model, args.dir2, args.hot, args.cold_B,
+                          fast_hot=args.fast_hot)
     c4, c2 = caches
 
     # MixedSwitchGLU を計測ラップ（tolist 同期時間 / gather IO 時間 / miss 数）

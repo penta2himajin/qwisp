@@ -33,18 +33,36 @@ _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 class MixedSwitchGLU(nn.Module):
     """hot=4bit / cold=2bit の two-gather。hot_set は静的 top-B。"""
 
-    def __init__(self, layer, hot_set, c4, c2):
+    def __init__(self, layer, hot_set, c4, c2, fast_hot=False):
         super().__init__()
         self._layer = layer
         self._hot = hot_set        # set[int]（4bit 維持）
         self._c4 = c4              # 4bit ExpertCache
         self._c2 = c2              # 2bit ExpertCache
+        # fast_hot: hot 側を持続 stacked バッファ + GPU remap で gather（concat/CPU 依存除去, docs/09）
+        self._fast_hot = fast_hot
+        self._hotbuf = None
+        self._hot_lut = None       # GPU [256] expert→slot
+        self._is_hot = None        # GPU [256] bool
 
     # verify 窓の上限。これ以下は mixed two-gather、超なら prefill(4bit 単一 gather)。
     W_MAX = 8
 
-    def _grp(self, x, U, remap, cache, bits):
-        sub = cache.gather(self._layer, U)
+    def _ensure_hot(self):
+        if self._hotbuf is not None:
+            return
+        hot_sorted = sorted(self._hot)
+        self._hotbuf = self._c4.gather(self._layer, hot_sorted)   # 一度だけ stacked [nhot,...]
+        lut = np.zeros(256, np.int32)
+        ishot = np.zeros(256, bool)
+        for slot, e in enumerate(hot_sorted):
+            lut[e] = slot
+            ishot[e] = True
+        self._hot_lut = mx.array(lut)
+        self._is_hot = mx.array(ishot)
+
+    def _qmm_sub(self, x, sub, remap, bits):
+        """事前 gather 済 sub（持続バッファ等）で two-gather 本体。"""
         xe = mx.expand_dims(x, (-2, -3))
 
         def qmm(xx, proj):
@@ -53,6 +71,9 @@ class MixedSwitchGLU(nn.Module):
                                  group_size=64, bits=bits, mode="affine", sorted_indices=False)
         h = swiglu(qmm(xe, "gate_proj"), qmm(xe, "up_proj"))
         return qmm(h, "down_proj").squeeze(-2)  # [B,W,K,dim]
+
+    def _grp(self, x, U, remap, cache, bits):
+        return self._qmm_sub(x, cache.gather(self._layer, U), remap, bits)
 
     def _side(self, x, inds_np, sel, cache, bits):
         """sel=True の精度側を 1 gather で計算 → [B,W,K,dim]。非 sel は dummy(remap 0)で masked。
@@ -75,6 +96,17 @@ class MixedSwitchGLU(nn.Module):
             return self._grp(x, U.tolist(), remap, self._c4, 4)
 
         # decode/verify（W<=W_MAX）: hot=4bit / cold=2bit を masked-combine で two-gather
+        if self._fast_hot:
+            # hot 側: 持続バッファ + GPU remap（cache.gather/concat 無し）。cold 側のみ従来 cache。
+            self._ensure_hot()
+            remap_hot = self._hot_lut[inds]                    # GPU [B,W,K]
+            y_hot = self._qmm_sub(x, self._hotbuf, remap_hot, 4)
+            hot_mask_np = np.isin(inds_np, list(self._hot))
+            y_cold = self._side(x, inds_np, ~hot_mask_np, self._c2, 2)
+            if y_cold is None:
+                return y_hot
+            return mx.where(self._is_hot[inds][..., None], y_hot, y_cold)
+
         hot_mask_np = np.isin(inds_np, list(self._hot))        # [B,W,K] bool
         y_hot = self._side(x, inds_np, hot_mask_np, self._c4, 4)
         y_cold = self._side(x, inds_np, ~hot_mask_np, self._c2, 2)
