@@ -164,10 +164,25 @@ def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False,
     return [c4, c2], pf
 
 
+def attach_gpu_routed(model, lm, tok, model_dir, dir2, hot_b):
+    """GPU-routed mixed（全 expert を持続 GPU バッファに常駐, tolist 無し）。docs/09 §4.7。"""
+    from .gpu_routed import GPURoutedMixedSwitchGLU
+    src4 = ExpertSource(model_dir)
+    src2 = ExpertSource(dir2)
+    counts = _calibrate(model, tok)
+    for name, blk in lm.named_modules():
+        if isinstance(blk, Qwen3NextSparseMoeBlock):
+            layer = int(_LAYER_RE.search(name).group(1))
+            c = counts.get(id(blk), np.zeros(256, np.int64))
+            hot = set(np.argsort(c)[-hot_b:].tolist())
+            blk.switch_mlp = GPURoutedMixedSwitchGLU(layer, hot, src4, src2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--mixed", default=None, help="2bit dir（指定で mixed streaming）")
+    ap.add_argument("--gpu-routed", default=None, help="2bit dir（指定で GPU-routed mixed 常駐）")
     ap.add_argument("--hot", type=int, default=64)
     ap.add_argument("--cold-B", type=int, default=88)
     ap.add_argument("--gen", type=int, default=96)
@@ -196,10 +211,13 @@ def main():
         print(f"[dec] correctness({lab}): {match}/{len(g_ref)} "
               f"(steps={steps}, draft_accept={accd/steps:.3f})")
 
-    # 速度: greedy(AR) vs spec(light) ± prefetch、必要なら mixed streaming で
+    # 速度: greedy(AR) vs spec(light) ± prefetch、エンジンを選択
     pf = None
     caches = None
-    if args.mixed:
+    if args.gpu_routed:
+        attach_gpu_routed(model, lm, tok, args.model, args.gpu_routed, args.hot)
+        print(f"[dec] GPU-routed mixed resident attached (hot={args.hot})", file=sys.stderr)
+    elif args.mixed:
         caches, pf = attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
                                   fast_hot=args.fast_hot, prefetch=args.prefetch)
         print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B}"
@@ -209,7 +227,8 @@ def main():
         t0 = time.perf_counter(); r = fn(); return r, time.perf_counter() - t0
 
     (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
-    eng = ("mixed-stream" + ("+fasthot" if args.fast_hot else "")) if args.mixed else "full-resident"
+    eng = ("gpu-routed-mixed" if args.gpu_routed else
+           ("mixed-stream" + ("+fasthot" if args.fast_hot else "")) if args.mixed else "full-resident")
     print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
     print(f"  AR greedy           : {args.gen/t_ar:6.1f} tok/s")
     # warmup 影響を排すため 2 回ずつ交互計測
