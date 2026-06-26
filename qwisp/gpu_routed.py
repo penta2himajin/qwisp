@@ -44,6 +44,10 @@ class GPURoutedMixedSwitchGLU(nn.Module):
         self._lut_hot = mx.array(lut_hot)
         self._lut_cold = mx.array(lut_cold)
         self._is_hot = mx.array(ishot)
+        # prefill partition 用の numpy 版（CPU で position を分割する）
+        self._lut_hot_np = lut_hot
+        self._lut_cold_np = lut_cold
+        self._is_hot_np = ishot
 
     @staticmethod
     def _stack(src, layer, experts):
@@ -66,16 +70,50 @@ class GPURoutedMixedSwitchGLU(nn.Module):
         return q(h, "down_proj").squeeze(-2)
 
     _probe_sync = False    # 診断: True で per-layer tolist 同期だけ足す（drain コスト分離）
+    # この token 数を超えたら prefill partition（redundant 2x matmul を消す, docs/09）。
+    # 以下は decode/verify（grid 小, sync ゼロ優先で full two-gather）。
+    PREFILL_T = 8
 
     def __call__(self, x, inds):
         if self._probe_sync:
             _ = inds.tolist()         # GPU drain を強制（streaming の tolist を模擬）
-        # tolist 無し: 全部 GPU 演算。remap も is_hot も GPU LUT 引き。
+        tok = 1
+        for d in inds.shape[:-1]:
+            tok *= d
+        if tok > self.PREFILL_T:
+            return self._prefill_partition(x, inds)
+        # decode/verify（grid 小）: tolist 無し full two-gather。remap も is_hot も GPU LUT 引き。
         remap_hot = self._lut_hot[inds]
         remap_cold = self._lut_cold[inds]
         y_hot = self._qmm(x, self._hotbuf, remap_hot, 4)
         y_cold = self._qmm(x, self._coldbuf, remap_cold, 2)
         return mx.where(self._is_hot[inds][..., None], y_hot, y_cold)
+
+    def _prefill_partition(self, x, inds):
+        """prefill: 全 (token,expert) position を hot/cold に分割し、各側を subset の matmul
+        だけ実行→scatter で戻す。full two-gather の 2N matmul を N に半減。
+        large-T なので tolist 同期1回は完全に償却される。出力は decode と同形 [*lead,K,H]。"""
+        inds_np = np.asarray(inds.tolist())                 # [*lead, K]
+        lead = inds_np.shape[:-1]
+        K = inds_np.shape[-1]
+        Ttok = int(np.prod(lead)) if lead else 1
+        H = x.shape[-1]
+        xf = x.reshape(Ttok, H)                              # [Ttok, H]
+        flat_e = inds_np.reshape(-1)                         # [N]  expert id / position
+        flat_hot = self._is_hot_np[flat_e]                  # [N]  bool
+        tok_of_pos = np.repeat(np.arange(Ttok, dtype=np.int32), K)  # [N]
+        N = flat_e.shape[0]
+        out = mx.zeros((N, H), dtype=x.dtype)
+        for sel, buf, lut, bits in ((flat_hot, self._hotbuf, self._lut_hot_np, 4),
+                                    (~flat_hot, self._coldbuf, self._lut_cold_np, 2)):
+            pos = np.nonzero(sel)[0]
+            if pos.size == 0:
+                continue
+            x_sub = xf[mx.array(tok_of_pos[pos])]           # [n, H]  token 行を gather（重複可）
+            remap = mx.array(lut[flat_e[pos]].reshape(-1, 1))   # [n,1]  expert→slot
+            y = self._qmm(x_sub, buf, remap, bits)          # [n,1,H]
+            out[mx.array(pos)] = y.reshape(pos.size, H)
+        return out.reshape(*lead, K, H)
 
 
 def load_gpu_routed(model_dir, dir2, hot_b=64):
