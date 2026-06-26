@@ -17,6 +17,11 @@ if FileManager.default.fileExists(atPath: refPath) {
     } catch {
         print("[M3] error: \(error)")
     }
+    do {
+        print(try MoELayerValidation.run(refPath: refPath))
+    } catch {
+        print("[M2a] error: \(error)")
+    }
 } else {
     print("[M1/M3] skip: ref not found at \(refPath) (run: PY -m qwisp.swift_ref)")
 }

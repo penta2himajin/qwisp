@@ -36,9 +36,11 @@ $(find .xcode-build -name qwisp-poc -type f -perm +111 | head -1)
 ## マイルストーン
 
 - **M0** ✅ build + smoke（mlx-swift 疎通・GPU 演算）
-- **M1** gatherQuantizedMatmul を Python とビット一致比較（`qwisp.swift_ref` が参照を生成）
-- **M2** streaming/mixed decode forward を移植 → tok/s 比較（~10% 回収の実測）
-- **M3** buffer 所有権の検証（持続 MTLBuffer in-place / no-copy mmap）= Python で詰んだ手法群の再挑戦
+- **M1** ✅ gatherQuantizedMatmul を Python とビット一致（`qwisp.swift_ref` が参照生成）
+- **M2a** ✅ switch_mlp forward（gather_qmm×3+swiglu）を持続 arena で bit一致
+- **M2b** 全40層+attention forward → end-to-end decode tok/s（release build, pipeline）
+- **M2c** MTP head + 投機ループ
+- **M3** ✅ 持続 MTLBuffer の in-place 更新 viable（5µs, Python 1.4ms）= concat 排除の鍵
 - **M4** SwiftUI アプリ化
 
 ## 構成
