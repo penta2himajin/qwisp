@@ -13,6 +13,7 @@ import argparse
 import mlx.core as mx
 from mlx_lm import load
 from qwisp.mtp_head import build_head, _main_forward
+import qwisp.mtp_decode as MD
 
 
 def main():
@@ -48,6 +49,13 @@ def main():
     acc = float(mx.mean((draft[lo:hi] == tgt).astype(mx.float32)).item())
     print(f"[mtp-ref] acceptance={acc:.3f} (n={hi - lo}, doc=0.886)")
 
+    # 実プロンプト(ctx)で greedy/spec を回し token 列を dump（Swift 投機の正しさ検証用）
+    spec_prompt = ids[:args.ctx]
+    g_out, _ = MD.greedy(lm, spec_prompt, 48)
+    sp_out, st, accd, _ = MD.speculative(lm, head, spec_prompt, 48, light=True)
+    spm = sum(1 for a, b in zip(g_out, sp_out) if a == b)
+    print(f"[mtp-ref] spec: greedy一致 {spm}/48 accept={accd / st:.3f} (real prompt)")
+
     # 全系列を dump（causal attention 文脈を Swift で一致させるため）
     mx.save_safetensors(args.out, {
         "hidden": post[0, :-1],                       # h_prev [L-1, H]
@@ -55,6 +63,9 @@ def main():
         "draft": draft.astype(mx.int32),              # 期待 argmax [L-1]
         "lo_hi": mx.array([lo, hi], mx.int32),
         "target": full[0, lo + 2:hi + 2].astype(mx.int32),
+        "spec_prompt": mx.array(spec_prompt, mx.int32),
+        "spec_greedy": mx.array(g_out, mx.int32),
+        "spec_spec": mx.array(sp_out, mx.int32),
     })
     print(f"[mtp-ref] saved → {args.out} (L-1={full.shape[1] - 1}, eval [{lo},{hi}))")
 

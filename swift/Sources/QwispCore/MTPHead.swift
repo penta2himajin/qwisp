@@ -64,14 +64,15 @@ public final class MTPHead {
                         biases: store.req("language_model.model.embed_tokens.biases"), bits: 4)
     }
 
-    /// hPrev:[1,L,H] main post-norm hidden, tok:[1,L] 条件トークン → 次々トークン logits[1,L,V]
-    public func callAsFunction(_ hPrev: MLXArray, _ tok: MLXArray) -> MLXArray {
+    /// hPrev:[1,L,H] main post-norm hidden, tok:[1,L] 条件トークン → 次々トークン logits[1,L,V]。
+    /// cache を渡すと self_attn が KV 蓄積（投機ループの draft/prefill 用）。
+    public func callAsFunction(_ hPrev: MLXArray, _ tok: MLXArray, cache: KVCache? = nil) -> MLXArray {
         let emb = embedTok(tok)
         let e = MLXFast.rmsNorm(emb, weight: preEmb, eps: eps)
         let hh = MLXFast.rmsNorm(hPrev, weight: preHid, eps: eps)
         let cat = MLX.concatenated([e, hh], axis: -1)            // [1,L,2H]  (emb_hid 順)
         var x = MLX.matmul(cat, fc.transposed())                 // [1,L,H]
-        let r = attn(MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps))  // L>1→causal
+        let r = attn(MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps), cache: cache)
         x = x + r
         let B = x.dim(0), L = x.dim(1), H = x.dim(2)
         let post = MLXFast.rmsNorm(x, weight: postAttentionLayernorm, eps: eps)

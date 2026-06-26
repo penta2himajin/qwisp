@@ -20,6 +20,16 @@ public final class KVCache {
         offset += k.dim(2)
         return (keys!, values!)
     }
+
+    /// 末尾 n 位置を巻き戻す（reject 用）。
+    public func trim(_ n: Int) {
+        guard let k = keys, let v = values else { return }
+        let L = k.dim(2)
+        if n >= L { keys = nil; values = nil; offset = 0; return }
+        keys = k[0..., 0..., 0 ..< (L - n), 0...]
+        values = v[0..., 0..., 0 ..< (L - n), 0...]
+        offset -= n
+    }
 }
 
 /// GatedDeltaNet の cache: conv 状態(直近 K-1 トークンの qkv) と recurrent 状態。
@@ -38,5 +48,12 @@ public final class LayerCache {
     /// この層 cache が保持する全状態（毎 step eval して lazy グラフの増殖を防ぐ）。
     public var stateArrays: [MLXArray] {
         [kv.keys, kv.values, gdn.convState, gdn.recState].compactMap { $0 }
+    }
+
+    // reject 用 snapshot/restore。GDN(線形)は state 参照を退避、KV(full)は trim で巻き戻す。
+    public struct Snapshot { let conv: MLXArray?; let rec: MLXArray? }
+    public func snapshot() -> Snapshot { Snapshot(conv: gdn.convState, rec: gdn.recState) }
+    public func restore(_ s: Snapshot, isLinear: Bool, trim n: Int) {
+        if isLinear { gdn.convState = s.conv; gdn.recState = s.rec } else { kv.trim(n) }
     }
 }

@@ -127,6 +127,15 @@ public final class QwispModel {
 
     public func makeCaches() -> [LayerCache] { (0 ..< numLayers).map { _ in LayerCache() } }
 
+    /// cached forward で (post-norm hidden, logits) を返す（MTP 投機用。hidden=lm.model() 相当）。
+    public func forwardHidden(_ ids: MLXArray, caches: [LayerCache]) -> (hidden: MLXArray, logits: MLXArray) {
+        var h = embed(ids)
+        for (i, layer) in layers.enumerated() { h = layer(h, cache: caches[i]) }
+        let hidden = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return (hidden, headProj().apply(hidden))
+    }
+    public var isLinearFlags: [Bool] { layers.map { $0.isLinear } }
+
     /// cache を使う forward（prefill: S>1, decode: S=1）。caches は in-place 更新される。
     public func callAsFunction(_ ids: MLXArray, caches: [LayerCache], f32: Bool = false) -> MLXArray {
         var h = embed(ids)
