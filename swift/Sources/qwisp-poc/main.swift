@@ -79,6 +79,15 @@ if FileManager.default.fileExists(atPath: realLayerRef) {
     print("[M2b-3] skip: real-layer ref not found (run: PY -m qwisp.real_layer_ref)")
 }
 
+// M2b-3: 実モデル layer-0 MoE block を REAL 量子化重みで検証
+let realMoeRef = "/tmp/qwisp_real_moe_ref.safetensors"
+if FileManager.default.fileExists(atPath: realMoeRef) {
+    do { print(try MoEBlockValidation.run(refPath: realMoeRef)) }
+    catch { print("[M2b-3 moe] error: \(error)") }
+} else {
+    print("[M2b-3 moe] skip: real-moe ref not found (run: PY -m qwisp.real_moe_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
