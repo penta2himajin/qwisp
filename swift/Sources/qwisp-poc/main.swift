@@ -61,6 +61,15 @@ if FileManager.default.fileExists(atPath: gdnLayerRef) {
     print("[M2b-1 layer] skip: ref not found (run: PY -m qwisp.gdn_layer_ref)")
 }
 
+// M2b-2: full-attention 層の検証
+let attnRef = "/tmp/qwisp_attn_ref.safetensors"
+if FileManager.default.fileExists(atPath: attnRef) {
+    do { print(try AttentionLayerValidation.run(refPath: attnRef)) }
+    catch { print("[M2b-2] error: \(error)") }
+} else {
+    print("[M2b-2] skip: attn ref not found (run: PY -m qwisp.attn_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
