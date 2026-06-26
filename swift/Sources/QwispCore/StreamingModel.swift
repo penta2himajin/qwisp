@@ -174,6 +174,66 @@ public enum StreamingDecode {
             C, RE, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
+    /// margin 適応 fast decode: fast logits の top1-top2 gap が小さい(near-tie=harmful 候補)token
+    /// だけ sync 訂正。benign miss は margin 大で素通し→選択的に安定化。
+    public static func runMarginFast(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[margin] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let TH = Float(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "6") ?? 6
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        func margin(_ l: MLXArray) -> (MLXArray, MLXArray) {       // (next, marginScalar)
+            let m1 = MLX.max(l, axis: -1, keepDims: true)
+            let masked = MLX.where(l .>= m1, MLXArray(Float(-1e9)), l)
+            let m2 = MLX.max(masked, axis: -1, keepDims: true)
+            return (MLX.argMax(l, axis: -1).reshaped([1, 1]), (m1 - m2).reshaped([1]))
+        }
+
+        var out: [Int] = []; var syncTokens = 0
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            let prev = cur
+            let snaps = caches.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true
+            (_, lg) = try model.forwardHidden(prev, caches: caches)
+            var (next, mg) = margin(lg[0])
+            MLX.eval([next, mg] + caches.flatMap { $0.stateArrays })
+            if mg.item(Float.self) < TH {                         // near-tie → sync 訂正
+                syncTokens += 1
+                for (i, c) in caches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                StreamingMoEBlock.probeNoSync = false
+                (_, lg) = try model.forwardHidden(prev, caches: caches)
+                next = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            }
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [margin] margin適応 fast(C=%d, TH=%.1f): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  sync %d/%d token
+            """,
+            C, TH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, syncTokens, N)
+    }
+
     /// MTP D1 投機 on streaming（verify が ~1.85 トークン/forward を生成→per-layer sync を償却）。
     public static func runSpeculative(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }

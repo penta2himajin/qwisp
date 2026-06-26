@@ -17,6 +17,8 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[M2c×stream] error: \(error)") }
         do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[fast] error: \(error)") }
+        do { print(try StreamingDecode.runMarginFast(modelDir: md, refPath: mtpRef)) }
+        catch { print("[margin] error: \(error)") }
     }
     exit(0)
 }
