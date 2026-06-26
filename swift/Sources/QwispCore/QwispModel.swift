@@ -122,6 +122,17 @@ public final class QwispModel {
         return headProj().apply(h)
     }
 
+    public func makeCaches() -> [LayerCache] { (0 ..< numLayers).map { _ in LayerCache() } }
+
+    /// cache を使う forward（prefill: S>1, decode: S=1）。caches は in-place 更新される。
+    public func callAsFunction(_ ids: MLXArray, caches: [LayerCache], f32: Bool = false) -> MLXArray {
+        var h = embed(ids)
+        if f32 { h = h.asType(.float32) }
+        for (i, layer) in layers.enumerated() { h = layer(h, cache: caches[i]) }
+        h = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return headProj().apply(h)
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
@@ -134,6 +145,55 @@ public final class QwispModel {
         }
         let normed = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
         return (headProj().apply(normed), h0, captured, normed)
+    }
+}
+
+public enum DecodeValidation {
+    public static func run(modelDir: String, refPath: String) throws -> String {
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let ids = r["ids"] else { return "ERROR: decode ref に ids 無し" }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let model = QwispModel(store: store)
+        let T = ids.dim(-1)
+
+        // (1) cache 正しさ: no-cache full の最終位置 logits と prefill+1decode の logits を f32 比較
+        let full = model(ids, f32: true)
+        let lastFull = full[0, T - 1]
+        let caches = model.makeCaches()
+        _ = model(ids[0..., 0 ..< (T - 1)], caches: caches, f32: true)   // prefill
+        let dec = model(ids[0..., (T - 1)...], caches: caches, f32: true) // 1 token decode
+        let lastDec = dec[0, 0]
+        lastFull.eval(); lastDec.eval()
+        let cacheRel = MLX.max(MLX.abs(lastFull.asType(.float32) - lastDec.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(lastFull.asType(.float32))).item(Float.self) + 1e-9)
+        let amFull = MLX.argMax(lastFull, axis: -1).item(Int.self)
+        let amDec = MLX.argMax(lastDec, axis: -1).item(Int.self)
+
+        // (2) tok/s: f16 で prefill→32 step greedy decode を計測
+        let gCaches = model.makeCaches()
+        var logits = model(ids, caches: gCaches)
+        var next = MLX.argMax(logits[0, T - 1], axis: -1).reshaped([1, 1])
+        next.eval()
+        let N = 32
+        var toks: [Int] = []
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            logits = model(next, caches: gCaches)
+            next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            next.eval()
+            toks.append(next.item(Int.self))
+        }
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let tokPerSec = Double(N) / secs
+
+        let cacheOK = cacheRel < 1e-4 && amFull == amDec
+        return String(format: """
+            [M2b-3] decode cache 正しさ(f32): last_logits_rel=%.2e argmax(%d==%d) %@
+               tok/s 粗計測(f16, prefill T=%d→%d step decode): %.1f tok/s (%.1f ms/tok)  最初の生成=%@
+            """,
+            cacheRel, amFull, amDec, cacheOK ? "OK ✅" : "MISMATCH ❌",
+            T, N, tokPerSec, secs / Double(N) * 1000, "\(toks.prefix(6))")
     }
 }
 

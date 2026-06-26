@@ -47,14 +47,14 @@ public enum GatedDelta {
         return (MLX.stacked(ys, axis: 1), state)
     }
 
-    /// gated_delta_update（use_kernel=False 経路）: beta=sigmoid(b), g=compute_g
+    /// gated_delta_update（use_kernel=False 経路）: beta=sigmoid(b), g=compute_g。
+    /// state を渡すと（decode の carry）そこから継続、nil なら零状態から開始。返り値の state は更新後。
     public static func update(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ a: MLXArray,
-                              _ b: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray)
-        -> (MLXArray, MLXArray) {
+                              _ b: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
+                              state: MLXArray? = nil) -> (MLXArray, MLXArray) {
         let beta = MLX.sigmoid(b)
         let g = computeG(aLog, a, dtBias)
-        let empty = MLXArray.zeros([0])
-        return ops(q, k, v, g, beta, empty)
+        return ops(q, k, v, g, beta, state ?? MLXArray.zeros([0]))
     }
 }
 

@@ -118,6 +118,13 @@ if FileManager.default.fileExists(atPath: fullRef),
     print("[M2b-3 full] skip: full ref or model dir not found")
 }
 
+// M2b-3: decode cache 正しさ + tok/s 粗計測
+if FileManager.default.fileExists(atPath: fullRef),
+   FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
+    do { print(try DecodeValidation.run(modelDir: modelDir, refPath: fullRef)) }
+    catch { print("[M2b-3 decode] error: \(error)") }
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")

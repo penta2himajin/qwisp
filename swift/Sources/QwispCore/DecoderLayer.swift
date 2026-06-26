@@ -23,9 +23,9 @@ public struct DecoderLayer {
         self.gdn = gdn; self.attn = attn; self.mlp = mlp
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, cache: LayerCache? = nil) -> MLXArray {
         let normed = MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps)
-        let r = isLinear ? gdn!(normed) : attn!(normed)
+        let r = isLinear ? gdn!(normed, cache: cache?.gdn) : attn!(normed, cache: cache?.kv)
         let h = x + r
         // mlp は [T,H] を取るので [B,S,H]→[B*S,H] に畳んで戻す
         let postNorm = MLXFast.rmsNorm(h, weight: postAttentionLayernorm, eps: eps)

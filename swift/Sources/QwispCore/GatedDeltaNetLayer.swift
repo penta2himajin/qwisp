@@ -66,16 +66,20 @@ public struct GatedDeltaNetLayer {
         return MLXFast.rmsNorm(x, weight: w, eps: eps)
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, cache: GDNCache? = nil) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let qkv = inProjQKV.apply(x)                                  // [B,S,convDim]
         let z = inProjZ.apply(x).reshaped([B, S, numVHeads, headVDim])
         let b = inProjB.apply(x)                                      // [B,S,numVHeads]
         let a = inProjA.apply(x)                                      // [B,S,numVHeads]
 
-        // conv_state = zeros[B, K-1, convDim] を前置（因果 padding）
-        let convState = MLXArray.zeros([B, convKernel - 1, convDim], dtype: x.dtype)
+        // conv_state: cache があれば直近 K-1、無ければ零（因果 padding）
+        let convState = cache?.convState
+            ?? MLXArray.zeros([B, convKernel - 1, convDim], dtype: x.dtype)
         let convInput = MLX.concatenated([convState, qkv], axis: 1)   // [B, S+K-1, convDim]
+        if let c = cache {
+            c.convState = MLX.contiguous(convInput[0..., (convInput.dim(1) - (convKernel - 1))...])
+        }
         let convOut = silu(MLX.conv1d(convInput, conv1dW, stride: 1, padding: 0,
                                       dilation: 1, groups: convDim))   // [B,S,convDim]
 
@@ -88,7 +92,9 @@ public struct GatedDeltaNetLayer {
         let qN = (invScale * invScale) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
         let kN = invScale * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
 
-        let (coreOut, _) = GatedDelta.update(qN, kN, v1, a, b, aLog, dtBias)  // [B,S,Hv,Dv]
+        let (coreOut, newState) = GatedDelta.update(qN, kN, v1, a, b, aLog, dtBias,
+                                                    state: cache?.recState)  // [B,S,Hv,Dv]
+        if let c = cache { c.recState = newState }
 
         // RMSNormGated(out, z): silu(z) * rms_norm(out, normWeight)
         let normed = MLXFast.rmsNorm(coreOut, weight: normWeight, eps: eps)

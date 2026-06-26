@@ -31,12 +31,12 @@ public struct AttentionLayer {
         self.qNorm = qNorm; self.kNorm = kNorm
     }
 
-    func rope(_ x: MLXArray) -> MLXArray {
+    func rope(_ x: MLXArray, _ offset: Int) -> MLXArray {
         MLXFast.RoPE(x, dimensions: ropeDim, traditional: false, base: ropeBase,
-                     scale: 1.0, offset: 0)
+                     scale: 1.0, offset: offset)
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, cache: KVCache? = nil) -> MLXArray {
         let B = x.dim(0), L = x.dim(1)
 
         let qOut = qProj.apply(x).reshaped([B, L, numHeads, 2 * headDim])
@@ -51,11 +51,17 @@ public struct AttentionLayer {
         keys = MLXFast.rmsNorm(keys, weight: kNorm, eps: eps).transposed(0, 2, 1, 3)
         values = values.transposed(0, 2, 1, 3)
 
-        queries = rope(queries)
-        keys = rope(keys)
+        let offset = cache?.offset ?? 0
+        queries = rope(queries, offset)
+        keys = rope(keys, offset)
 
+        var allKeys = keys, allValues = values
+        if let c = cache { (allKeys, allValues) = c.update(keys, values) }
+
+        // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
         var output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
+            queries: queries, keys: allKeys, values: allValues, scale: scale, mask: maskMode)
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]
 
         return oProj.apply(output * MLX.sigmoid(gate))
