@@ -52,6 +52,15 @@ if FileManager.default.fileExists(atPath: gdnRef) {
     print("[M2b-1] skip: gdn ref not found (run: PY -m qwisp.gdn_ref)")
 }
 
+// M2b-1: GatedDeltaNet 層 wrapping の検証
+let gdnLayerRef = "/tmp/qwisp_gdn_layer_ref.safetensors"
+if FileManager.default.fileExists(atPath: gdnLayerRef) {
+    do { print(try GatedDeltaNetLayerValidation.run(refPath: gdnLayerRef)) }
+    catch { print("[M2b-1 layer] error: \(error)") }
+} else {
+    print("[M2b-1 layer] skip: ref not found (run: PY -m qwisp.gdn_layer_ref)")
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
