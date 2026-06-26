@@ -156,6 +156,46 @@ public enum Tell {
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
+    /// (A) mmap-gather: 全 expert を mmap のまま resident MoE で GPU-side gather（arena/ensure/per-layer
+    /// sync 撤廃, exact）。OS demand paging で working set だけ常駐。sync 撤廃で routing tax が消え
+    /// 8GB 内で速いか（thrash しないか）を検証。tok/s・RSS・品質を測る。
+    public static func runMmapGather(modelDir: String, refPath: String) throws -> String {
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MmapGather] skip" }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()                          // experts は mmap のまま（paged）
+        let rssLoad = StreamingDecode.rssGB()
+        let model = QwispModel(store: store)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let caches = model.makeCaches()
+
+        // prefill（resident gather なので arena overflow 無し, chunk 不要）
+        var lg = model.callAsFunction(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        var out: [Int] = []
+        // warmup 1 token（初回 page-in を計時から除外）
+        lg = model.callAsFunction(cur, caches: caches)
+        var nxt = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays })
+        out.append(cur.item(Int.self)); cur = nxt
+
+        let t0 = DispatchTime.now()
+        for _ in 1 ..< N {
+            out.append(cur.item(Int.self))
+            lg = model.callAsFunction(cur, caches: caches)
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        }
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let rssPeak = StreamingDecode.rssGB()
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [MmapGather] mmap全expert + resident gather(sync無): %.1f tok/s  品質 %d/%d=%.0f%%  RSS load=%.1f peak=%.1fGB
+            """, Double(N - 1) / secs, match, N, Double(match) / Double(N) * 100, rssLoad, rssPeak)
+    }
+
     /// SWIFT 流 ①: 各層を単独 skip したときの matchness(skip-L argmax == full argmax 率)を計測。
     /// どの層が「抜いても出力を保つ=skip 可能」か、GDN/attn どちらが skip 可能かを判明させる。
     public static func runSwiftCalib(modelDir: String, refPath: String) throws -> String {
