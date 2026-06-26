@@ -34,4 +34,9 @@ public final class LayerCache {
     public let kv = KVCache()
     public let gdn = GDNCache()
     public init() {}
+
+    /// この層 cache が保持する全状態（毎 step eval して lazy グラフの増殖を防ぐ）。
+    public var stateArrays: [MLXArray] {
+        [kv.keys, kv.values, gdn.convState, gdn.recState].compactMap { $0 }
+    }
 }

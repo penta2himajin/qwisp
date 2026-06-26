@@ -29,6 +29,9 @@ public final class WeightStore {
         let nonExpert = arrays.filter { !$0.key.contains(".switch_mlp.") }.map { $0.value }
         MLX.eval(nonExpert)
     }
+
+    /// 全 tensor を eval（experts 含む常駐）。resident regime のベンチ用。
+    public func residentAll() { MLX.eval(Array(arrays.values)) }
 }
 
 /// qwen3_5_moe full forward（cache=None prefill）。embed→DecoderLayer×40→norm→lm_head。
@@ -153,7 +156,7 @@ public enum DecodeValidation {
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let ids = r["ids"] else { return "ERROR: decode ref に ids 無し" }
         let store = try WeightStore(modelDir: modelDir)
-        store.residentNonExperts()
+        store.residentAll()   // resident regime: experts も常駐させて mmap オーバーヘッド排除
         let model = QwispModel(store: store)
         let T = ids.dim(-1)
 
@@ -174,26 +177,47 @@ public enum DecodeValidation {
         let gCaches = model.makeCaches()
         var logits = model(ids, caches: gCaches)
         var next = MLX.argMax(logits[0, T - 1], axis: -1).reshaped([1, 1])
-        next.eval()
+        MLX.eval([next] + gCaches.flatMap { $0.stateArrays })
         let N = 32
         var toks: [Int] = []
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
             logits = model(next, caches: gCaches)
             next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
-            next.eval()
+            // next と cache 状態を毎 step eval（lazy グラフが step 毎に増殖するのを防ぐ）
+            MLX.eval([next] + gCaches.flatMap { $0.stateArrays })
             toks.append(next.item(Int.self))
         }
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let tokPerSec = Double(N) / secs
 
+        // 内訳プロファイル: lm_head 単体 vs embed+40層+norm（cache 無しの単発で粗く）
+        func timeIt(_ reps: Int, _ f: () -> MLXArray) -> Double {
+            for _ in 0 ..< 3 { f().eval() }
+            let s = DispatchTime.now()
+            for _ in 0 ..< reps { f().eval() }
+            return Double(DispatchTime.now().uptimeNanoseconds - s.uptimeNanoseconds) / 1e6 / Double(reps)
+        }
+        let one = ids[0..., 0 ..< 1]
+        let pcache = model.makeCaches()
+        _ = model(ids[0..., 0 ..< (T - 1)], caches: pcache)  // 状態を進めておく
+        MLX.eval(pcache.flatMap { $0.stateArrays })
+        let hid = MLXArray.zeros([1, 1, 2048], dtype: .float16)
+        let msHead = timeIt(30) { model.headProj().apply(hid) }
+        let msStep = timeIt(30) {
+            let c = model.makeCaches()
+            return model(one, caches: c)
+        }
+
         let cacheOK = cacheRel < 1e-4 && amFull == amDec
         return String(format: """
             [M2b-3] decode cache 正しさ(f32): last_logits_rel=%.2e argmax(%d==%d) %@
                tok/s 粗計測(f16, prefill T=%d→%d step decode): %.1f tok/s (%.1f ms/tok)  最初の生成=%@
+               内訳: lm_head=%.1f ms  embed+40層+norm+head(1step)=%.1f ms  → head が %.0f%%
             """,
             cacheRel, amFull, amDec, cacheOK ? "OK ✅" : "MISMATCH ❌",
-            T, N, tokPerSec, secs / Double(N) * 1000, "\(toks.prefix(6))")
+            T, N, tokPerSec, secs / Double(N) * 1000, "\(toks.prefix(6))",
+            msHead, msStep, msHead / msStep * 100)
     }
 }
 
