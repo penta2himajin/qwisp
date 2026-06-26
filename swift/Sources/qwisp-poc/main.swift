@@ -10,13 +10,12 @@ if CommandLine.arguments.contains("stream") {
         ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
     do { print(try StreamingDecode.run(modelDir: md, refPath: "/tmp/qwisp_full_ref.safetensors")) }
     catch { print("[S3] error: \(error)") }
-    if FileManager.default.fileExists(atPath: "/tmp/qwisp_mtp_ref.safetensors"),
+    let mtpRef = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
+    if FileManager.default.fileExists(atPath: mtpRef),
        FileManager.default.fileExists(atPath: "\(md)/mtp.safetensors") {
-        do { print(try StreamingDecode.runSpeculative(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
-        catch { print("[M2c×stream] error: \(error)") }
-        do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+        do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[fast] error: \(error)") }
-        do { print(try StreamingDecode.runSpeculativeFast(modelDir: md, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+        do { print(try StreamingDecode.runSpeculativeFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[M2c×fast] error: \(error)") }
     }
     exit(0)
