@@ -156,6 +156,60 @@ public enum Tell {
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
+    /// SWIFT 流 ①: 各層を単独 skip したときの matchness(skip-L argmax == full argmax 率)を計測。
+    /// どの層が「抜いても出力を保つ=skip 可能」か、GDN/attn どちらが skip 可能かを判明させる。
+    public static func runSwiftCalib(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SwiftCalib] skip" }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: 64)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "16") ?? 16, gR.count)
+        let mc = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: mc)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + mc.flatMap { $0.stateArrays })
+        var matchL = [Int](repeating: 0, count: L)
+        for _ in 0 ..< N {
+            // 各層単独 skip の argmax（committed state から, snapshot→skip-L forward→restore）
+            var skipArg = [Int](repeating: -1, count: L)
+            for layer in 0 ..< L {
+                let snaps = mc.map { $0.snapshot() }
+                let (_, sl) = try model.forwardHiddenSkip(cur, caches: mc, skip: [layer])
+                skipArg[layer] = MLX.argMax(sl[0, 0], axis: -1).item(Int.self)
+                for (i, c) in mc.enumerated() where i != layer { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            }
+            // full forward（commit）
+            let (_, fl) = try model.forwardHidden(cur, caches: mc)
+            let full = MLX.argMax(fl[0, 0], axis: -1).item(Int.self)
+            for layer in 0 ..< L where skipArg[layer] == full { matchL[layer] += 1 }
+            cur = MLXArray([Int32(full)], [1, 1]); MLX.eval([cur] + mc.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false
+
+        // matchness 降順で「skip しても出力を保つ」層を列挙
+        let ranked = (0 ..< L).map { (l: $0, m: Double(matchL[$0]) / Double(N), lin: isLin[$0]) }
+            .sorted { $0.m > $1.m }
+        let skippable = ranked.filter { $0.m >= 0.95 }
+        let ginfo = skippable.map { "\($0.l)\($0.lin ? "G" : "A")" }.joined(separator: ",")
+        let nG = skippable.filter { $0.lin }.count, nA = skippable.filter { !$0.lin }.count
+        return String(format: """
+            [SwiftCalib] %d step, 各層単独 skip の matchness。skip可(matchness≥0.95)=%d/%d 層 (GDN %d/attn %d)
+              skip可層(番号+G/A): %@
+              最 skip 可 top8: %@
+            """, N, skippable.count, L, nG, nA, ginfo,
+            ranked.prefix(8).map { String(format: "%d%@=%.2f", $0.l, $0.lin ? "G" : "A", $0.m) }.joined(separator: " "))
+    }
+
     /// SS-MoE DK: no-sync hot-pin draft を K トークン先まで → 1 回の batched exact verify(lossless)。
     /// 高 accept(0.94+)を multi-token で償却し no-sync 天井に安全到達。reject 時のみ accepted prefix を
     /// exact 再走（GDN partial-commit 回避）。QWISP_DRAFT_K で K。
@@ -208,11 +262,15 @@ public enum Tell {
         var skip = Set<Int>()
         if skipStride >= 2 { for i in 1 ..< (L - 1) where i % skipStride == (skipStride - 1) { skip.insert(i) } }
 
+        let prof = ProcessInfo.processInfo.environment["QWISP_SPECK_PROF"] == "1"
+        var tDraft: UInt64 = 0, tVerify: UInt64 = 0, tCommit: UInt64 = 0
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []; var steps = 0, accTok = 0
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
             // draft K（no-sync + layer-skip, state は捨てる）
+            var ts = now()
             let snaps0 = mc.map { $0.snapshot() }
             StreamingMoEBlock.probeNoSync = true
             var drafts: [Int] = []; var dcur = uArr
@@ -225,6 +283,7 @@ public enum Tell {
             }
             // skip した層は未実行＝未前進なので trim しない（非skip層のみ巻き戻し）
             for (i, c) in mc.enumerated() where !skip.contains(i) { c.restore(snaps0[i], isLinear: isLin[i], trim: K) }
+            if prof { tDraft += now() - ts; ts = now() }
             // verify batched [u, d1..dK]（exact, seqMultiToken lossless）
             StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = true
             let snaps1 = mc.map { $0.snapshot() }
@@ -232,6 +291,7 @@ public enum Tell {
             let seq = MLX.concatenated([uArr, draftArr], axis: 1)            // [1, K+1]
             let (_, vlg) = try model.forwardHidden(seq, caches: mc)
             let evals = MLX.argMax(vlg[0, 0 ..< (K + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            if prof { tVerify += now() - ts; ts = now() }
             // accept: drafts[i]==evals[i] が続く長さ p
             var p = 0
             while p < K && drafts[p] == evals[p] { p += 1 }
@@ -252,10 +312,17 @@ public enum Tell {
                 uArr = MLXArray([Int32(evals[p])], [1, 1])                   // 訂正トークン
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             }
+            if prof { tCommit += now() - ts }
         }
         StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        if prof {
+            let s = Double(steps)
+            FileHandle.standardError.write(String(format:
+                "[SPECK-PROF/step] draft(K×no-sync)=%.1f verify(seqMT exact)=%.1f commit/reject=%.1f (ms)  steps=%d\n",
+                Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tCommit)/s/1e6, steps).data(using: .utf8)!)
+        }
         return String(format: """
             [HotColdSpecK] no-sync draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
             """, K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
