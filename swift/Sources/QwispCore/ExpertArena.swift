@@ -83,6 +83,16 @@ public final class LayerExpertCache {
     public private(set) var misses = 0
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
 
+    // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
+    var lastInds: MLXArray?
+    /// lastInds のうち cache 未収容（fast で wrong-slot になった）expert 数。
+    public func missCount() -> Int {
+        guard let li = lastInds else { return 0 }
+        var m = 0
+        for e in li.asArray(Int32.self) where slotOf[Int(e)] == nil { m += 1 }
+        return m
+    }
+
     // GPU-side slot table（expert id -> slot, 未cache=0）。sync 無し remap 用。
     var slotTableDirty = true
     var slotTableGPU: MLXArray?
@@ -167,6 +177,7 @@ public final class StreamingMoEBlock {
 
         // 天井計測: GPU-side slot table で remap、per-layer sync/ensure を完全に省く（miss は近似）
         if StreamingMoEBlock.probeNoSync, let c = cache {
+            c.lastInds = inds.asType(.int32)                     // adaptive miss 検出用
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
             let xe = x.expandedDimensions(axes: [-2, -3])

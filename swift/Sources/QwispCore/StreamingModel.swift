@@ -147,7 +147,7 @@ public enum StreamingDecode {
                                             source: source, cacheC: C)
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
-        let N = 48
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
         let caches = model.makeCaches()
 
         // prefill(sync, chunked) + cache warmup
@@ -193,7 +193,7 @@ public enum StreamingDecode {
         let rssLoad = rssGB()
 
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
-        let N = 48
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, spRef.dim(0))
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         // 先に streaming greedy が Python greedy と一致するか（forward の正しさを切り分け）
         let sgCaches = model.makeCaches()
@@ -257,10 +257,9 @@ public enum StreamingDecode {
                 acc += 1; out.append(d)
                 _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)
                 uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
-            } else {
+            } else {                                       // reject → [u] のみ再投入(look-ahead 重複回避)
                 for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
-                let uv = MLX.concatenated([uArr, vw[0 ..< 1].reshaped([1, 1])], axis: 1)
-                let (H1, _) = try model.forwardHidden(uv, caches: mainCaches)
+                let (H1, _) = try model.forwardHidden(uArr, caches: mainCaches)
                 uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
             }
             MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })

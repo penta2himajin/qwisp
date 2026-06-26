@@ -13,10 +13,10 @@ if CommandLine.arguments.contains("stream") {
     let mtpRef = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
     if FileManager.default.fileExists(atPath: mtpRef),
        FileManager.default.fileExists(atPath: "\(md)/mtp.safetensors") {
+        do { print(try StreamingDecode.runSpeculative(modelDir: md, refPath: mtpRef)) }
+        catch { print("[M2c×stream] error: \(error)") }
         do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[fast] error: \(error)") }
-        do { print(try StreamingDecode.runSpeculativeFast(modelDir: md, refPath: mtpRef)) }
-        catch { print("[M2c×fast] error: \(error)") }
     }
     exit(0)
 }
@@ -162,10 +162,13 @@ if FileManager.default.fileExists(atPath: "/tmp/qwisp_mtp_ref.safetensors"),
 }
 
 // M2c: MTP 投機デコード（実プロンプトで greedy 一致 + Python spec 一致 + speedup）
-if FileManager.default.fileExists(atPath: "/tmp/qwisp_mtp_ref.safetensors"),
+let mtpRefMain = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
+if CommandLine.arguments.contains("spec"),
+   FileManager.default.fileExists(atPath: mtpRefMain),
    FileManager.default.fileExists(atPath: "\(modelDir)/mtp.safetensors") {
-    do { print(try SpeculativeDecode.run(modelDir: modelDir, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+    do { print(try SpeculativeDecode.run(modelDir: modelDir, refPath: mtpRefMain)) }
     catch { print("[M2c spec] error: \(error)") }
+    exit(0)
 }
 
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）

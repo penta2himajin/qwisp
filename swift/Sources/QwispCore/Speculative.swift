@@ -60,10 +60,11 @@ public enum SpeculativeDecode {
                 out.append(d)
                 _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)        // catch-up
                 uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
-            } else {                                                   // reject → roll back, feed [u,v]
+            } else {                                                   // reject → 巻戻し、[u] のみ再投入
+                // ★Python の [u,v] 再投入は look-ahead v が cache に重複し長文で破綻。
+                //   commit は u のみ→cache を u で終端（u の hidden は reject された d に依存しない）。
                 for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
-                let uv = MLX.concatenated([uArr, vw[0 ..< 1].reshaped([1, 1])], axis: 1)
-                let (H1, _) = model.forwardHidden(uv, caches: mainCaches)
+                let (H1, _) = model.forwardHidden(uArr, caches: mainCaches)   // [u] 1トークン
                 uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
             }
             MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })
@@ -85,7 +86,8 @@ public enum SpeculativeDecode {
         let model = QwispModel(store: store)
         let head = try MTPHead(modelDir: modelDir, store: store)
 
-        let N = 48
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48,
+                          gRef.dim(0))
         let g = greedy(model, ids, N)
         let (sp, steps, acc, secs) = speculative(model, head, ids, N)
         let gR = gRef.asArray(Int32.self).map { Int($0) }
