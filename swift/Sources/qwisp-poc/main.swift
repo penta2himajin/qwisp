@@ -146,6 +146,13 @@ if FileManager.default.fileExists(atPath: "\(modelDir)/config.json") {
     catch { print("[S2] error: \(error)") }
 }
 
+// M2c: MTP head の検証（mtp.safetensors を自前ロード）
+if FileManager.default.fileExists(atPath: "/tmp/qwisp_mtp_ref.safetensors"),
+   FileManager.default.fileExists(atPath: "\(modelDir)/mtp.safetensors") {
+    do { print(try MTPHeadValidation.run(modelDir: modelDir, refPath: "/tmp/qwisp_mtp_ref.safetensors")) }
+    catch { print("[M2c] error: \(error)") }
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")

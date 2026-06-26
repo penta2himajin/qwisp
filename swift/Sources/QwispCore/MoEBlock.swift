@@ -19,15 +19,17 @@ public struct MoEBlock {
     let shGate: Proj, shUp: Proj, shDown: Proj
     let sharedGate: Proj           // 8bit → [T, 1]
     let expertBits: Int
+    let expertGroupSize: Int
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int,
+                expertGroupSize: Int = 64,
                 gate: Proj,
                 swGateW: MLXArray, swGateS: MLXArray, swGateB: MLXArray,
                 swUpW: MLXArray, swUpS: MLXArray, swUpB: MLXArray,
                 swDownW: MLXArray, swDownS: MLXArray, swDownB: MLXArray,
                 shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj) {
         self.topK = topK; self.numExperts = numExperts; self.normTopk = normTopk
-        self.expertBits = expertBits; self.gate = gate
+        self.expertBits = expertBits; self.expertGroupSize = expertGroupSize; self.gate = gate
         self.swGateW = swGateW; self.swGateS = swGateS; self.swGateB = swGateB
         self.swUpW = swUpW; self.swUpS = swUpS; self.swUpB = swUpB
         self.swDownW = swDownW; self.swDownS = swDownS; self.swDownB = swDownB
@@ -37,7 +39,7 @@ public struct MoEBlock {
     private func gatherQmm(_ x: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray,
                            _ inds: MLXArray) -> MLXArray {
         gatherQuantizedMatmul(x, w, scales: s, biases: b, rhsIndices: inds,
-                              transpose: true, groupSize: 64, bits: expertBits, mode: .affine,
+                              transpose: true, groupSize: expertGroupSize, bits: expertBits, mode: .affine,
                               sortedIndices: false)
     }
 
