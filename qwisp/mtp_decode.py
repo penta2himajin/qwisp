@@ -71,7 +71,7 @@ def _rollback_light(kv, snap, n):
         kv[i].state = s
 
 
-def speculative(lm, head, prompt, max_tokens, light=True):
+def speculative(lm, head, prompt, max_tokens, light=True, profile=False):
     """MTP D1 投機デコード。返り値: (tokens, n_steps, n_accept_draft)。
     light=True: hybrid 用の軽量巻き戻し（KVCache=trim / ArraysCache=shallow snapshot）。"""
     main_kv = lm.make_cache()
@@ -87,15 +87,19 @@ def speculative(lm, head, prompt, max_tokens, light=True):
     out = []
     steps = 0
     acc_draft = 0
+    prof = {"draft": 0.0, "verify": 0.0, "catchup": 0.0, "reject": 0.0}
     while len(out) < max_tokens:
         steps += 1
+        t0 = time.perf_counter()
         # draft d from (last_h, u)
         dl = head(last_h, mx.array([[u]]), cache=mtp_kv)
         d = int(mx.argmax(dl[0, -1]).item())
+        prof["draft"] += time.perf_counter() - t0; t0 = time.perf_counter()
         # verify: main on [u,d]（reject 巻き戻し用に snapshot）
         snap = _snap_light(main_kv) if light else _snap(main_kv)
         H2, lg2 = _fwd(lm, mx.array([[u, d]]), main_kv)
         v = int(mx.argmax(lg2[0, 0]).item())
+        prof["verify"] += time.perf_counter() - t0; t0 = time.perf_counter()
         out.append(u)
         if v == d:                                     # accept draft
             acc_draft += 1
@@ -103,6 +107,8 @@ def speculative(lm, head, prompt, max_tokens, light=True):
             w = int(mx.argmax(lg2[0, 1]).item())
             head(H2[:, 0:1], mx.array([[d]]), cache=mtp_kv)   # catch-up mtp 位置
             u, last_h = w, H2[:, 1:2]
+            mx.eval([c.state for c in main_kv] + [mtp_kv.state])
+            prof["catchup"] += time.perf_counter() - t0
         else:                                          # reject: pre-[u,d] に戻し u のみ再処理
             if light:
                 _rollback_light(main_kv, snap, 2)
@@ -110,7 +116,13 @@ def speculative(lm, head, prompt, max_tokens, light=True):
                 _restore(main_kv, snap)
             H1, _ = _fwd(lm, mx.array([[u]]), main_kv)
             u, last_h = v, H1[:, 0:1]
-        mx.eval([c.state for c in main_kv] + [mtp_kv.state])
+            mx.eval([c.state for c in main_kv] + [mtp_kv.state])
+            prof["reject"] += time.perf_counter() - t0
+    if profile:
+        tot = sum(prof.values())
+        print("[prof] " + "  ".join(f"{k}={v/steps*1e3:.1f}ms({v/tot*100:.0f}%)"
+                                    for k, v in prof.items()) + f"  steps={steps}",
+              file=sys.stderr)
     return out[:max_tokens], steps, acc_draft
 
 
@@ -151,6 +163,7 @@ def main():
     ap.add_argument("--cold-B", type=int, default=88)
     ap.add_argument("--gen", type=int, default=96)
     ap.add_argument("--ctx", type=int, default=128)
+    ap.add_argument("--profile", action="store_true", help="ステップ内訳を計測表示")
     args = ap.parse_args()
 
     print("[dec] loading ...", file=sys.stderr)
@@ -183,7 +196,7 @@ def main():
 
     (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
     (sp_h, steps_h, _), t_h = timed(lambda: speculative(lm, head, prompt, args.gen, light=False))
-    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True))
+    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, profile=args.profile))
     eng = "mixed-stream" if args.mixed else "full-resident"
     print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
     print(f"  AR greedy        : {args.gen/t_ar:6.1f} tok/s")
