@@ -71,6 +71,175 @@ public enum Tell {
             coverage(16), coverage(32), coverage(48), coverage(64), coverage(96), coverage(128))
     }
 
+    /// SS-MoE D1: no-sync(hot subset-expert) forward を draft に、exact forward で verify(lossless)。
+    /// MTP head の代わりに no-sync 自己 draft。受理率で SS-MoE(subset-expert draft)の有望度を測る。
+    public static func runHotColdSpec(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpec] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+
+        // calib → hot pin（draft の no-sync を高精度化）
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset }))
+        }
+
+        // fresh prefill → D1 self-spec（no-sync draft + exact verify）
+        let mc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: mc)
+        var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
+        MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+        var out: [Int] = []; var steps = 0, acc = 0
+        let t0 = DispatchTime.now()
+        while out.count < N {
+            steps += 1
+            // draft: no-sync forward of u → d（state は捨てる: snapshot→forward→restore）
+            let snaps = mc.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true
+            let (_, dlg) = try model.forwardHidden(uArr, caches: mc)
+            let dArr = MLX.argMax(dlg[0..., (dlg.dim(1) - 1)...], axis: -1)
+            MLX.eval([dArr])
+            for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            // verify: exact [u, d]（seqMultiToken で lossless）
+            StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = true
+            let snaps2 = mc.map { $0.snapshot() }
+            let ud = MLX.concatenated([uArr, dArr], axis: 1)
+            let (_, lg2) = try model.forwardHidden(ud, caches: mc)
+            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)
+            AttentionLayer.seqMultiToken = false
+            let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
+            let d = Int(vals[0]), v = Int(vals[1])
+            out.append(uArr.item(Int.self))
+            if v == d {                                   // accept 2
+                acc += 1; out.append(d)
+                uArr = vw[1 ..< 2].reshaped([1, 1])
+            } else {                                      // reject → [u] のみ commit
+                for (i, c) in mc.enumerated() { c.restore(snaps2[i], isLinear: isLin[i], trim: 2) }
+                _ = try model.forwardHidden(uArr, caches: mc)
+                uArr = vw[0 ..< 1].reshaped([1, 1])
+            }
+            MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdSpec] no-sync draft + exact verify(C=%d): %.1f tok/s  accept=%.3f  品質 %d/%d=%.0f%%
+            """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
+    }
+
+    /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。
+    /// probe(exact を真値に、no-sync を snapshot/restore で side 比較)が全一致なら no-sync(47, 速)、
+    /// 不一致(drift 兆候)なら exact M2 経路(lossless)へ。プロンプト難度に自動適応。
+    public static func runHotColdAuto(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAuto] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
+        let probeK = Int(ProcessInfo.processInfo.environment["QWISP_PROBE"] ?? "8") ?? 8
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+
+        // calib + hot pin
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset }))
+        }
+
+        // fresh prefill → probe: 各 step で no-sync(side) vs exact(真値) を比較
+        let caches2 = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: caches2)
+        cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        var out: [Int] = []
+        var probeMiss = 0
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< probeK {
+            out.append(cur.item(Int.self))
+            // side: no-sync 予測（snapshot→no-sync forward→restore）
+            let snaps = caches2.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true
+            let (_, lgn) = try model.forwardHidden(cur, caches: caches2)
+            let nosyncTok = MLX.argMax(lgn[0, 0], axis: -1).item(Int.self)
+            for (i, c) in caches2.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            // 真値: exact forward（advance）
+            StreamingMoEBlock.probeNoSync = false
+            (_, lg) = try model.forwardHidden(cur, caches: caches2)
+            let exactTok = MLX.argMax(lg[0, 0], axis: -1).item(Int.self)
+            if nosyncTok != exactTok { probeMiss += 1 }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        }
+        let easy = probeMiss == 0
+        // 残りを選択 mode で decode
+        StreamingMoEBlock.probeNoSync = easy
+        for _ in probeK ..< N {
+            out.append(cur.item(Int.self))
+            (_, lg) = try model.forwardHidden(cur, caches: caches2)
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdAuto] hot top-%d, probe=%d miss=%d → mode=%@: %.1f tok/s  品質 %d/%d=%.0f%%
+            """, C, probeK, probeMiss, easy ? "no-sync(47)" : "exact(lossless)",
+            Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
     /// hot/cold ③ 適応 sync: hot 常駐 + per-layer 判定。calib で各層 hot coverage を測り、
     /// coverage≥θ の易層は no-sync（hot で賄う）、θ 未満の hard 層だけ exact sync（cold をロード=正確）。
     public static func runHotColdAdaptive(modelDir: String, refPath: String) throws -> String {
