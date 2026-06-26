@@ -78,69 +78,77 @@ def speculative(lm, head, prompt, max_tokens, light=True, profile=False, pf=None
     mtp_kv = KVCache()
     p = mx.array(prompt)[None]
     H, lg = _fwd(lm, p, main_kv)                       # prefill
-    u = int(mx.argmax(lg[0, -1]).item())
+    u_arr = mx.argmax(lg[:, -1:], axis=-1)             # [1,1] GPU 配列（materialize しない）
+    u = int(u_arr.item())
     last_h = H[:, -1:]                                  # h_{P-1} [1,1,H]
-    # MTP prefill: 位置 0..P-2（x_i=fc(emb(t_{i+1}),h_i)）
-    head(H[:, :-1], p[:, 1:], cache=mtp_kv)
+    head(H[:, :-1], p[:, 1:], cache=mtp_kv)            # MTP prefill
     mx.eval(mtp_kv.state)
 
     out = []
     steps = 0
     acc_draft = 0
-    prof = {"draft": 0.0, "verify": 0.0, "catchup": 0.0, "reject": 0.0}
+    prof = {"draft": 0.0, "verify": 0.0, "rest": 0.0}
+    dec_t0 = time.perf_counter()                        # prefill 除外の decode 計時
     while len(out) < max_tokens:
         steps += 1
         t0 = time.perf_counter()
-        # draft d from (last_h, u)
-        dl = head(last_h, mx.array([[u]]), cache=mtp_kv)
-        d = int(mx.argmax(dl[0, -1]).item())
+        # draft: d を materialize せず GPU 配列のまま [u,d] を作る（同期削減の肝）
+        dl = head(last_h, u_arr, cache=mtp_kv)
+        d_arr = mx.argmax(dl[:, -1:], axis=-1)         # [1,1]
+        ud = mx.concatenate([u_arr, d_arr], axis=1)    # [1,2] 配列直接 feed
         prof["draft"] += time.perf_counter() - t0; t0 = time.perf_counter()
-        # verify: main on [u,d]（reject 巻き戻し用に snapshot）
         snap = _snap_light(main_kv) if light else _snap(main_kv)
         if pf is not None:
-            pf.kick()                              # 前 forward の cold を背景ロード（この verify と overlap）
-        H2, lg2 = _fwd(lm, mx.array([[u, d]]), main_kv)
-        v = int(mx.argmax(lg2[0, 0]).item())
+            pf.kick()
+        H2, lg2 = _fwd(lm, ud, main_kv)
+        vw = mx.argmax(lg2[0, :2], axis=-1)            # v=pos0, w=pos1
+        # d,v,w を 1 回の tolist で（per-step 同期 1 回）
+        d, v, w = (int(x) for x in mx.concatenate([d_arr[0], vw]).tolist())
         if pf is not None:
             pf.snapshot()
         prof["verify"] += time.perf_counter() - t0; t0 = time.perf_counter()
         out.append(u)
-        if v == d:                                     # accept draft
+        if v == d:                                     # accept → 2トークン
             acc_draft += 1
             out.append(d)
-            w = int(mx.argmax(lg2[0, 1]).item())
-            head(H2[:, 0:1], mx.array([[d]]), cache=mtp_kv)   # catch-up mtp 位置
-            u, last_h = w, H2[:, 1:2]
-            mx.eval([c.state for c in main_kv] + [mtp_kv.state])
-            prof["catchup"] += time.perf_counter() - t0
+            head(H2[:, 0:1], d_arr, cache=mtp_kv)      # catch-up mtp
+            u, u_arr, last_h = w, vw[1:2].reshape(1, 1), H2[:, 1:2]
         else:                                          # reject: pre-[u,d] に戻し u のみ再処理
             if light:
                 _rollback_light(main_kv, snap, 2)
             else:
                 _restore(main_kv, snap)
-            H1, _ = _fwd(lm, mx.array([[u]]), main_kv)
-            u, last_h = v, H1[:, 0:1]
-            mx.eval([c.state for c in main_kv] + [mtp_kv.state])
-            prof["reject"] += time.perf_counter() - t0
+            H1, _ = _fwd(lm, vw[0:1].reshape(1, 1), main_kv)
+            u, u_arr, last_h = v, vw[0:1].reshape(1, 1), H1[:, 0:1]
+        prof["rest"] += time.perf_counter() - t0
+    mx.eval(last_h)                                    # 末尾の lazy 残を flush して decode 計時を正す
+    dec_secs = time.perf_counter() - dec_t0
     if profile:
         tot = sum(prof.values())
         print("[prof] " + "  ".join(f"{k}={v/steps*1e3:.1f}ms({v/tot*100:.0f}%)"
                                     for k, v in prof.items()) + f"  steps={steps}",
               file=sys.stderr)
-    return out[:max_tokens], steps, acc_draft
+    return out[:max_tokens], steps, acc_draft, dec_secs
 
 
 def greedy(lm, prompt, max_tokens):
+    """naive AR（decode-only 秒も返す）。配列直接 feed + async で per-token 同期を緩和。"""
     kv = lm.make_cache()
     p = mx.array(prompt)[None]
     _, lg = _fwd(lm, p, kv)
-    t = int(mx.argmax(lg[0, -1]).item())
-    out = [t]
-    while len(out) < max_tokens:
-        _, lg = _fwd(lm, mx.array([[t]]), kv)
-        t = int(mx.argmax(lg[0, -1]).item())
-        out.append(t)
-    return out[:max_tokens]
+    y = mx.argmax(lg[:, -1:], axis=-1)                  # [1,1] 配列
+    mx.async_eval(y)
+    arrs = [y]
+    dec_t0 = time.perf_counter()
+    for _ in range(max_tokens - 1):
+        _, lg = _fwd(lm, y, kv)                          # 配列直接 feed
+        y = mx.argmax(lg[:, -1:], axis=-1)
+        mx.async_eval(y)
+        arrs.append(y)
+    mx.eval(y)
+    dec_secs = time.perf_counter() - dec_t0
+    out = [int(a.item()) for a in arrs][:max_tokens]
+    return out, dec_secs
 
 
 def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False,
@@ -204,14 +212,14 @@ def main():
     prompt = ids[:args.ctx]
 
     # 正しさ: light/heavy 両方が greedy と一致するか（full-residency 参照）
-    g_ref = greedy(lm, prompt, args.gen)
+    g_ref, _ = greedy(lm, prompt, args.gen)
     for lab, lt in (("light", True), ("heavy", False)):
-        sp, steps, accd = speculative(lm, head, prompt, args.gen, light=lt)
+        sp, steps, accd, _ = speculative(lm, head, prompt, args.gen, light=lt)
         match = sum(1 for a, b in zip(g_ref, sp) if a == b)
         print(f"[dec] correctness({lab}): {match}/{len(g_ref)} "
               f"(steps={steps}, draft_accept={accd/steps:.3f})")
 
-    # 速度: greedy(AR) vs spec(light) ± prefetch、エンジンを選択
+    # 速度: greedy(AR) vs spec(light)、エンジンを選択。tok/s は **decode-only**（prefill 除外）。
     pf = None
     caches = None
     if args.gpu_routed:
@@ -223,26 +231,17 @@ def main():
         print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B}"
               f"{' +prefetch' if args.prefetch else ''})", file=sys.stderr)
 
-    def timed(fn):
-        t0 = time.perf_counter(); r = fn(); return r, time.perf_counter() - t0
-
-    (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
+    g, ar_secs = greedy(lm, prompt, args.gen)                 # decode-only 秒
+    sp_l, steps_l, accd, sp_secs = speculative(lm, head, prompt, args.gen, light=True, profile=args.profile)
     eng = ("gpu-routed-mixed" if args.gpu_routed else
            ("mixed-stream" + ("+fasthot" if args.fast_hot else "")) if args.mixed else "full-resident")
-    print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
-    print(f"  AR greedy           : {args.gen/t_ar:6.1f} tok/s")
-    # warmup 影響を排すため 2 回ずつ交互計測
-    if pf is not None:
-        (sp_p, _, _), t_p = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, pf=pf))
-        ph = sum(c.prefetch_hits for c in caches)
-    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, profile=args.profile))
     m_l = sum(1 for a, b in zip(g_ref, sp_l) if a == b)
-    print(f"  MTP D1 spec light   : {args.gen/t_l:6.1f} tok/s  ({t_ar/t_l:.2f}x)  "
+    ar_tps = (args.gen - 1) / ar_secs
+    sp_tps = args.gen / sp_secs
+    print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}  (decode-only tok/s, prefill 除外)")
+    print(f"  AR greedy           : {ar_tps:6.1f} tok/s")
+    print(f"  MTP D1 spec light   : {sp_tps:6.1f} tok/s  ({sp_tps/ar_tps:.2f}x)  "
           f"draft_accept={accd/steps_l:.3f}  match={m_l}/{len(g_ref)}")
-    if pf is not None:
-        m_p = sum(1 for a, b in zip(g_ref, sp_p) if a == b)
-        print(f"  MTP D1 spec +prefetch: {args.gen/t_p:6.1f} tok/s  ({t_ar/t_p:.2f}x)  "
-              f"match={m_p}/{len(g_ref)}  prefetch_hits={ph}  (順序: pf を先に計測)")
 
 
 if __name__ == "__main__":
