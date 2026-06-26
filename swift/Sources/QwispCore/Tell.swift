@@ -987,6 +987,9 @@ public enum Tell {
         // 前 token の各層 gate 入力（chunk-0 の bootstrap 用, temporal）
         var prevGate: [MLXArray]? = nil
 
+        let prof = ProcessInfo.processInfo.environment["QWISP_M2_PROF"] == "1"
+        var tEval: UInt64 = 0, tEnsure: UInt64 = 0, tFinal: UInt64 = 0, pSteps = 0
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []
         let t0 = DispatchTime.now()
         for ti in 0 ..< N {
@@ -1017,20 +1020,31 @@ public enum Tell {
                 // 予測元: chunk 0 は前 token 同層 gate 入力(temporal)、以降は前 chunk 最終 gate 入力
                 let src = pos > 0 ? model.expertCaches[pos - 1].lastGateInput! : prevGate![pos]
                 let preds = (pos ..< end).map { i in model.predictLayerInds(i, pos > 0 ? src : prevGate![i]) }
+                var ts = now()
                 MLX.eval(preds)
+                if prof { tEval += now() - ts; ts = now() }
                 for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(distinct(preds[k])) }
+                if prof { tEnsure += now() - ts }
                 h = try model.runChunk(h, pos, end, caches: caches)
                 pos = end
             }
             let logits = model.finalLogits(h)
             let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            let ts = now()
             MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+            if prof { tFinal += now() - ts; pSteps += 1 }
             prevGate = lastGate(model)
             out.append(prev.item(Int.self)); cur = next
         }
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
+        if prof, pSteps > 0 {
+            let s = Double(pSteps)
+            FileHandle.standardError.write(String(format:
+                "[M2-PROF/tok] eval(preds=stall)=%.1f ensure(IO)=%.1f final-drain=%.1f (ms) chunks/tok=%d\n",
+                Double(tEval)/s/1e6, Double(tEnsure)/s/1e6, Double(tFinal)/s/1e6, (L + CH - 1) / CH).data(using: .utf8)!)
+        }
         return String(format: """
             [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
