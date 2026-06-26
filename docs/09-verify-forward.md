@@ -108,7 +108,19 @@ inds LUT で直接 gather_qmm**（CPU 往復・tolist ゼロ）。結果 **F=24.
 両側 GPU-route で解消。
 
 **適用条件と射程**: GPU-routing は per-layer の miss 同期が不可能＝**全 expert 常駐前提**。
-mixed 全常駐 = 12GB → **18–24GB Mac で ~78 tok/s**（現 streaming ~13 の 5–6×）。全4bit常駐(18GB)なら
-24–32GB で ~94。**8–16GB の真 streaming 域は per-layer 同期が構造的に残る**（experts がディスク）。
-→ デプロイは「載るなら GPU-routed resident、載らないなら streaming」の二段。残課題は (1) two-gather
-融合カーネルで F を 78→~90 に、(2) 16GB に 12GB を収める KV/OS 切り詰め。
+mixed 全常駐 = 12GB → **18–24GB Mac**。全4bit常駐(18GB)なら 24–32GB。**8–16GB の真 streaming 域は
+per-layer 同期が構造的に残る**（experts がディスク）。
+
+### 4.8 end-to-end 実測（MTP 統合 + 最適化ループ）
+`mtp_decode --gpu-routed` で MTP 投機を GPU-routed engine 上に統合。正しさ **96/96**。
+
+| 計測ループ | AR tok/s | +MTP D1 |
+|:-----------|:--------:|:-------:|
+| naive（per-token mx.eval, 研究用）| 20.1 | 25.0（1.25×）|
+| **stream_generate（mlx_lm 最適化, async）** | **58.3** | — |
+
+naive ループは per-token 同期で ~30ms/token の overhead。**最適化ループ（stream_generate）で
+GPU-routed mixed resident = 58 tok/s**（forward 天井 78 に接近、現 streaming ~6–13 の 5–9×）。
+→ デプロイは「**載るなら GPU-routed resident + stream_generate**、載らないなら streaming」の二段。
+残課題: (1) MTP を async ループに統合（58×~1.4≈80 見込み）、(2) two-gather 融合カーネルで 78→~90、
+(3) 16GB に 12GB を収める KV/OS 切り詰め。
