@@ -154,9 +154,11 @@ class MTPHead(nn.Module):
         return y + sh
 
     def __call__(self, h_prev, next_tok, concat_order="emb_hid", mask_mode="causal",
-                 cache=None):
+                 cache=None, return_hidden=False):
         """h_prev:[B,L,H] main hidden, next_tok:[B,L] 条件トークン → 次々トークンの logits。
-        cache=KVCache を渡すと self_attn が KV 蓄積（投機ループ用、offset で RoPE）。"""
+        cache=KVCache を渡すと self_attn が KV 蓄積（投機ループ用、offset で RoPE）。
+        return_hidden=True で (logits, x) を返す。x は final-norm 前の head 内部 hidden で、
+        D2+ の自己連鎖ドラフト（EAGLE 流）に h_prev として食わせる。"""
         emb = self._embed(next_tok)
         e = self.pre_fc_norm_embedding(emb)
         hh = self.pre_fc_norm_hidden(h_prev)
@@ -172,7 +174,8 @@ class MTPHead(nn.Module):
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         x = x + r
         x = x + self._moe(self.post_attention_layernorm(x))
-        return self._lm_head(self.norm(x))
+        logits = self._lm_head(self.norm(x))
+        return (logits, x) if return_hidden else logits
 
 
 def build_head(model_dir, lm):
