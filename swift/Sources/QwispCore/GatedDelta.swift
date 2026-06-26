@@ -47,7 +47,7 @@ public enum GatedDelta {
         return (MLX.stacked(ys, axis: 1), state)
     }
 
-    /// gated_delta_update（use_kernel=False 経路）: beta=sigmoid(b), g=compute_g。
+    /// gated_delta_update（use_kernel=False 経路, ops）: beta=sigmoid(b), g=compute_g。
     /// state を渡すと（decode の carry）そこから継続、nil なら零状態から開始。返り値の state は更新後。
     public static func update(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ a: MLXArray,
                               _ b: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
@@ -55,6 +55,98 @@ public enum GatedDelta {
         let beta = MLX.sigmoid(b)
         let g = computeG(aLog, a, dtBias)
         return ops(q, k, v, g, beta, state ?? MLXArray.zeros([0]))
+    }
+
+    // mlx_lm/models/gated_delta.py の _make_gated_delta_kernel(has_mask=False, vectorized=False) を移植.
+    // 関数本体のみ（signature は input/output 名から自動生成）。recurrence 全体を kernel 内で回す。
+    static let stepKernelSource = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        """
+
+    static let stepKernel = MLXFast.metalKernel(
+        name: "gated_delta_step",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: stepKernelSource)
+
+    /// fused Metal kernel 経路（use_kernel=True 相当）。q,k は repeat しない([B,T,Hk,Dk])。
+    public static func updateKernel(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ a: MLXArray,
+                                    _ b: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
+                                    state: MLXArray? = nil) -> (MLXArray, MLXArray) {
+        let beta = MLX.sigmoid(b)
+        let g = computeG(aLog, a, dtBias)                 // [B,T,Hv] float32
+        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let st = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+        let inT = q.dtype
+        let out = stepKernel(
+            [q, k, v, g, beta, st, T],
+            template: [("InT", inT), ("StT", DType.float32),
+                       ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, Dv, B * Hv),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], [B, Hv, Dv, Dk]],
+            outputDTypes: [inT, .float32])
+        return (out[0], out[1])
     }
 }
 

@@ -92,8 +92,8 @@ public struct GatedDeltaNetLayer {
         let qN = (invScale * invScale) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
         let kN = invScale * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
 
-        let (coreOut, newState) = GatedDelta.update(qN, kN, v1, a, b, aLog, dtBias,
-                                                    state: cache?.recState)  // [B,S,Hv,Dv]
+        let (coreOut, newState) = GatedDelta.updateKernel(qN, kN, v1, a, b, aLog, dtBias,
+                                                          state: cache?.recState)  // [B,S,Hv,Dv]
         if let c = cache { c.recState = newState }
 
         // RMSNormGated(out, z): silu(z) * rms_norm(out, normWeight)
