@@ -25,4 +25,7 @@ if FileManager.default.fileExists(atPath: refPath) {
 } else {
     print("[M1/M3] skip: ref not found at \(refPath) (run: PY -m qwisp.swift_ref)")
 }
+
+// 速度検証: 40層 arena-MoE pipeline（ref 不要）
+print(ArenaBench.run())
 print("[qwisp-poc] done.")

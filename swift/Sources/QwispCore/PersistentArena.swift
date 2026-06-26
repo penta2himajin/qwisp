@@ -49,6 +49,18 @@ public enum PersistentArenaTest {
         let s1 = (ta + 0.0).sum().item(Float.self)             // 共有なら 102.0
         let sharedBacking = abs(s1 - s0 - 98.0) < 1e-3
 
+        // C4: native mlx 配列(高速・mlx 常駐)を asMTLBuffer(noCopy:true) で in-place 変更→反映するか
+        // 成立すれば「native の速度 + in-place 可能」＝rawPointer overhead を回避できる本命。
+        let nat = MLXRandom.normal([8]) * 0.0 + 1.0          // [1,1,...,1]
+        nat.eval()
+        let n0 = nat.sum().item(Float.self)                  // 8.0
+        var nativeReflects = false
+        if let nbuf = nat.asMTLBuffer(device: device, noCopy: true) {
+            nbuf.contents().assumingMemoryBound(to: Float.self)[0] += 1000.0
+            let n1 = (nat + 0.0).sum().item(Float.self)
+            nativeReflects = (n1 - n0 > 999.0)
+        }
+
         // 持続 array を一度だけ作る（C2 で同一 array を in-place 更新して反映を見る）
         let wArr = wrap(wbuf, [E, OUT, inPacked], .uint32)
         let sArr = wrap(sbuf, [E, OUT, gsCount], .float16)
@@ -88,6 +100,7 @@ public enum PersistentArenaTest {
         return """
         [M3] 持続バッファ(自前 MTLBuffer)検証:
           C0 rawPointer backing 共有: \(sharedBacking ? "YES ✅ (in-place 即反映)" : "NO (mlx がコピー)")  (s0=\(s0) s1=\(s1))
+          C4 native配列を noCopy で in-place 変更が反映: \(nativeReflects ? "YES ✅ (=native速度+mutable の本命)" : "NO ❌ (native は mutate 不可→rawPointer 要)")
           C1 所有バッファで gather_qmm: rel=\(String(format: "%.2e", rel1)) \(c1 ? "OK ✅ bit一致" : "NG ❌")
           C2 同一 array で in-place 更新が反映(expert \(sel)): \(changed ? "YES ✅" : "NO ❌")
           C3 1 expert in-place 更新コスト: \(String(format: "%.4f", updMs)) ms  (vs Python 全コピー ~1.4ms)
