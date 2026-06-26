@@ -41,8 +41,20 @@ public struct AttentionLayer {
                      scale: 1.0, offset: offset)
     }
 
+    /// 検証([u,v] 等 L>1)の attention を 1 トークンずつ逐次(L=1,.none)で処理する。
+    /// greedy decode と同じ経路・同じ f16 丸めになり、batched(.causal) との ~7e-4 乖離を消す
+    /// → MTP spec の accept-state drift を絶つ（true greedy-lossless verify）。
+    nonisolated(unsafe) public static var seqMultiToken: Bool = false
+
     public func callAsFunction(_ x: MLXArray, cache: KVCache? = nil) -> MLXArray {
         let B = x.dim(0), L = x.dim(1)
+
+        // 逐次モード: L>1 を 1 token ずつ再帰呼び（cache が順に u→v を取り込む＝greedy 等価）
+        if AttentionLayer.seqMultiToken && L > 1 {
+            var outs: [MLXArray] = []
+            for t in 0 ..< L { outs.append(callAsFunction(x[0..., t ..< (t + 1)], cache: cache)) }
+            return MLX.concatenated(outs, axis: 1)
+        }
 
         let qOut = qProj.apply(x).reshaped([B, L, numHeads, 2 * headDim])
         var queries = qOut[0..., 0..., 0..., 0 ..< headDim]            // [B,L,H,headDim]

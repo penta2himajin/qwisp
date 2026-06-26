@@ -318,6 +318,8 @@ public enum Tell {
         evalAll()
         prevGate = lastGate(model)
 
+        // verify([u,v]) の attention を逐次化＝true greedy-lossless（既定 ON, prefill 後に有効化）。
+        if ProcessInfo.processInfo.environment["QWISP_BATCHED_VERIFY"] != "1" { AttentionLayer.seqMultiToken = true }
         var out: [Int] = []; var steps = 0, acc = 0
         let t0 = DispatchTime.now()
         while out.count < N {
@@ -346,6 +348,7 @@ public enum Tell {
             evalAll()
         }
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
+        AttentionLayer.seqMultiToken = false   // global static を後続に漏らさない
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         return String(format: """

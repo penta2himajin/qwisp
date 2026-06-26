@@ -486,6 +486,8 @@ public enum StreamingDecode {
         let forceReject = ProcessInfo.processInfo.environment["QWISP_FORCE_REJECT"] == "1"
         let acceptResync = ProcessInfo.processInfo.environment["QWISP_ACCEPT_RESYNC"] == "1"
         if ProcessInfo.processInfo.environment["QWISP_F32_ATTN"] == "1" { AttentionLayer.f32SDPA = true }
+        // verify の attention を逐次化＝true greedy-lossless（既定 ON）。QWISP_BATCHED_VERIFY=1 で旧 batched。
+        let seqAttn = ProcessInfo.processInfo.environment["QWISP_BATCHED_VERIFY"] != "1"
         StreamingMoEBlock.probeNoSync = false
         let (H, lg) = try model.prefillChunked(promptIds, caches: mainCaches)
         var uArr = MLX.argMax(lg[0..., (lg.dim(1) - 1)...], axis: -1)
@@ -493,6 +495,8 @@ public enum StreamingDecode {
         _ = head(H[0..., 0 ..< (P - 1)], promptIds[0..., 1...], cache: mtpKV)
         MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays })
 
+        // prefill/head 後にのみ有効化: verify([u,v])の attention を逐次化（prefill は batched のまま）
+        if seqAttn { AttentionLayer.seqMultiToken = true }
         var out: [Int] = []; var steps = 0, acc = 0
         let t0 = DispatchTime.now()
         while out.count < maxTokens {
@@ -549,6 +553,7 @@ public enum StreamingDecode {
         }
         uArr.eval()
         StreamingMoEBlock.probeNoSync = false
+        AttentionLayer.seqMultiToken = false   // global static を後続(M0/M2/M4)に漏らさない
         return (Array(out.prefix(maxTokens)), steps, acc,
                 Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9)
     }
