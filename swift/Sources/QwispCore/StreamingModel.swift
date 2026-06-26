@@ -95,6 +95,8 @@ public final class StreamingQwispModel {
         return headProj().apply(n)
     }
     public var layerCount: Int { numLayers }
+    /// Tell M1: 層 i の expert を任意 hidden h から予測（cross-layer）。
+    public func predictLayerInds(_ i: Int, _ h: MLXArray) -> MLXArray { layers[i].mlp.predictInds(h) }
 
     func headProj() -> Proj {
         .quantized(store.req("language_model.lm_head.weight"),

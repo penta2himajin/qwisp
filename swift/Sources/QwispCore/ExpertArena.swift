@@ -170,6 +170,13 @@ public final class StreamingMoEBlock {
         self.sharedGate = sharedGate; self.arena = arena; self.cache = cache
     }
 
+    /// 任意 hidden h からこの層の top-k expert inds を予測（cross-layer 予測用、gather しない）。
+    public func predictInds(_ h: MLXArray) -> MLXArray {
+        let gates = MLX.softmax(gate.apply(h), axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
+        return order[0..., (numExperts - topK)...].asType(.int32)
+    }
+
     private func gatherQmm(_ x: MLXArray, _ store: ExpertArena, _ proj: String, _ remap: MLXArray) -> MLXArray {
         gatherQuantizedMatmul(x, store.arr(proj, "weight"), scales: store.arr(proj, "scales"),
                               biases: store.arr(proj, "biases"), rhsIndices: remap,

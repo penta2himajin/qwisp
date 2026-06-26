@@ -82,4 +82,65 @@ public enum Tell {
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
+
+    /// M1: one-pass。pass-1 を除去し、chunk の入力 hidden から chunk 内各層の expert を cross-layer
+    /// 予測(gate を hidden に適用)→prefetch→GPU-remap で chunk を実行。pass-1 の 17ms が消える。
+    public static func runM1(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "4") ?? 4
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        func distinct(_ a: MLXArray) -> [Int] {
+            var seen = Set<Int>(); var u: [Int] = []
+            for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
+            return u
+        }
+
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            let prev = cur
+            StreamingMoEBlock.probeNoSync = true
+            var h = model.embedPub(prev)
+            var pos = 0
+            while pos < L {
+                let end = Swift.min(pos + CH, L)
+                // chunk 入力 h から chunk 内各層の expert を予測（layer pos は真の入力, 以降 cross-layer）
+                let preds = (pos ..< end).map { model.predictLayerInds($0, h) }
+                MLX.eval(preds)                                  // この chunk の予測 inds を確定（1 drain）
+                for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(distinct(preds[k])) }
+                h = try model.runChunk(h, pos, end, caches: caches)   // GPU-remap で実行
+                pos = end
+            }
+            let logits = model.finalLogits(h)
+            let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M1] one-pass cross-layer(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
 }
