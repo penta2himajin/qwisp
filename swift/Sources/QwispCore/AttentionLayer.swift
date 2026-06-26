@@ -13,25 +13,23 @@ public struct AttentionLayer {
     let ropeBase: Float      // 1e7
     let eps: Float
 
-    let qProj: MLXArray       // [numHeads*headDim*2, H]
-    let kProj: MLXArray       // [numKVHeads*headDim, H]
-    let vProj: MLXArray
-    let oProj: MLXArray       // [H, numHeads*headDim]
+    let qProj: Proj           // → [numHeads*headDim*2]
+    let kProj: Proj           // → [numKVHeads*headDim]
+    let vProj: Proj
+    let oProj: Proj           // → [H]
     let qNorm: MLXArray       // [headDim]
     let kNorm: MLXArray       // [headDim]
 
     var scale: Float { Float(pow(Double(headDim), -0.5)) }
 
     public init(numHeads: Int, numKVHeads: Int, headDim: Int, ropeDim: Int, ropeBase: Float,
-                eps: Float, qProj: MLXArray, kProj: MLXArray, vProj: MLXArray, oProj: MLXArray,
+                eps: Float, qProj: Proj, kProj: Proj, vProj: Proj, oProj: Proj,
                 qNorm: MLXArray, kNorm: MLXArray) {
         self.numHeads = numHeads; self.numKVHeads = numKVHeads; self.headDim = headDim
         self.ropeDim = ropeDim; self.ropeBase = ropeBase; self.eps = eps
         self.qProj = qProj; self.kProj = kProj; self.vProj = vProj; self.oProj = oProj
         self.qNorm = qNorm; self.kNorm = kNorm
     }
-
-    static func linear(_ x: MLXArray, _ w: MLXArray) -> MLXArray { MLX.matmul(x, w.transposed()) }
 
     func rope(_ x: MLXArray) -> MLXArray {
         MLXFast.RoPE(x, dimensions: ropeDim, traditional: false, base: ropeBase,
@@ -41,12 +39,12 @@ public struct AttentionLayer {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let B = x.dim(0), L = x.dim(1)
 
-        let qOut = AttentionLayer.linear(x, qProj).reshaped([B, L, numHeads, 2 * headDim])
+        let qOut = qProj.apply(x).reshaped([B, L, numHeads, 2 * headDim])
         var queries = qOut[0..., 0..., 0..., 0 ..< headDim]            // [B,L,H,headDim]
         let gate = qOut[0..., 0..., 0..., headDim...].reshaped([B, L, -1])  // [B,L,H*headDim]
 
-        var keys = AttentionLayer.linear(x, kProj).reshaped([B, L, numKVHeads, headDim])
-        var values = AttentionLayer.linear(x, vProj).reshaped([B, L, numKVHeads, headDim])
+        var keys = kProj.apply(x).reshaped([B, L, numKVHeads, headDim])
+        var values = vProj.apply(x).reshaped([B, L, numKVHeads, headDim])
 
         // q/k RMSNorm（最終軸 headDim, weight 有り）→ transpose to [B,heads,L,headDim]
         queries = MLXFast.rmsNorm(queries, weight: qNorm, eps: eps).transposed(0, 2, 1, 3)
@@ -60,7 +58,7 @@ public struct AttentionLayer {
             queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]
 
-        return AttentionLayer.linear(output * MLX.sigmoid(gate), oProj)
+        return oProj.apply(output * MLX.sigmoid(gate))
     }
 }
 
@@ -74,7 +72,8 @@ public enum AttentionLayerValidation {
         }
         let attn = AttentionLayer(
             numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
-            qProj: qp, kProj: kp, vProj: vp, oProj: op, qNorm: qn, kNorm: kn)
+            qProj: .plain(qp), kProj: .plain(kp), vProj: .plain(vp), oProj: .plain(op),
+            qNorm: qn, kNorm: kn)
         let out = attn(x)
         out.eval()
         let d = MLX.max(MLX.abs(out - expOut)).item(Float.self)

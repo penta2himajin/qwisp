@@ -88,6 +88,17 @@ if FileManager.default.fileExists(atPath: realMoeRef) {
     print("[M2b-3 moe] skip: real-moe ref not found (run: PY -m qwisp.real_moe_ref)")
 }
 
+// M2b-3: 完全な DecoderLayer（linear 層0 / full-attn 層3）を REAL 量子化重みで検証
+for (ref, lbl) in [("/tmp/qwisp_dec0_ref.safetensors", "DecoderLayer-0"),
+                   ("/tmp/qwisp_dec3_ref.safetensors", "DecoderLayer-3")] {
+    if FileManager.default.fileExists(atPath: ref) {
+        do { print(try DecoderLayerValidation.run(refPath: ref, label: lbl)) }
+        catch { print("[M2b-3 \(lbl)] error: \(error)") }
+    } else {
+        print("[M2b-3 \(lbl)] skip: ref not found (run: PY -m qwisp.real_decoder_ref)")
+    }
+}
+
 // 速度検証: 40層 arena-MoE pipeline（ref 不要）
 print(ArenaBench.run())
 print("[qwisp-poc] done.")
