@@ -318,10 +318,13 @@ public enum StreamingDecode {
         for _ in 0 ..< N {
             let prev = cur
             let snaps = caches.map { $0.snapshot() }
-            // pass-1: 予測（fast GPU-remap）→ 各層 inds 捕捉
-            StreamingMoEBlock.probeNoSync = true
+            // pass-1: 軽量予測（routed gather 省略, shared expert のみ）→ 各層 inds 捕捉
+            let lightPredict = ProcessInfo.processInfo.environment["QWISP_LIGHT"] == "1"  // 既定=full(品質)
+            StreamingMoEBlock.predictOnly = lightPredict
+            StreamingMoEBlock.probeNoSync = !lightPredict
             _ = try model.forwardHidden(prev, caches: caches)
             MLX.eval(caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            StreamingMoEBlock.predictOnly = false
             // prefetch 予測 experts
             for c in model.expertCaches { c.prefetchLastInds() }
             // pass-1 の KV/GDN 変化を rollback

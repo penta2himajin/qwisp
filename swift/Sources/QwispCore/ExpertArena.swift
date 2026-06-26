@@ -159,6 +159,7 @@ public final class StreamingMoEBlock {
     let layer: Int
     nonisolated(unsafe) public static var syncNanos: UInt64 = 0   // inds.asArray(GPU→CPU drain) 累積
     nonisolated(unsafe) public static var probeNoSync = false      // 天井計測: GPU remap, 毎層 sync 無し
+    nonisolated(unsafe) public static var predictOnly = false      // 軽量予測 pass: routed gather 省略、inds だけ捕捉
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -183,6 +184,13 @@ public final class StreamingMoEBlock {
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopk { scores = scores / scores.sum(axis: -1, keepDims: true) }
 
+        // 軽量予測 pass: routed gather を省き、inds だけ捕捉して shared expert のみ返す。
+        if StreamingMoEBlock.predictOnly, let c = cache {
+            c.lastInds = inds.asType(.int32)
+            let sg = shGate.apply(x), su = shUp.apply(x)
+            let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
+            return MLX.sigmoid(sharedGate.apply(x)) * sharedY
+        }
         // 天井計測: GPU-side slot table で remap、per-layer sync/ensure を完全に省く（miss は近似）
         if StreamingMoEBlock.probeNoSync, let c = cache {
             c.lastInds = inds.asType(.int32)                     // adaptive miss 検出用
