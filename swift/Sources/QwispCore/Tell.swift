@@ -284,8 +284,11 @@ public enum Tell {
             // skip した層は未実行＝未前進なので trim しない（非skip層のみ巻き戻し）
             for (i, c) in mc.enumerated() where !skip.contains(i) { c.restore(snaps0[i], isLinear: isLin[i], trim: K) }
             if prof { tDraft += now() - ts; ts = now() }
-            // verify batched [u, d1..dK]（exact, seqMultiToken lossless）
-            StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = true
+            // verify batched [u, d1..dK]。QWISP_VERIFY_NOSYNC=1 で no-sync 化(draft が cache に載せた
+            // expert を流用し per-layer sync を消す=near-lossless で高速)。QWISP_VERIFY_SEQ=0 で seqMT 無効。
+            let vseq = ProcessInfo.processInfo.environment["QWISP_VERIFY_SEQ"] != "0"
+            let vNoSync = ProcessInfo.processInfo.environment["QWISP_VERIFY_NOSYNC"] == "1"
+            StreamingMoEBlock.probeNoSync = vNoSync; AttentionLayer.seqMultiToken = vseq
             let snaps1 = mc.map { $0.snapshot() }
             let draftArr = MLXArray(drafts.map { Int32($0) }, [1, K])
             let seq = MLX.concatenated([uArr, draftArr], axis: 1)            // [1, K+1]
