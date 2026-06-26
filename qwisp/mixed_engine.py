@@ -12,6 +12,7 @@ import argparse
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import mlx.core as mx
@@ -44,6 +45,7 @@ class MixedSwitchGLU(nn.Module):
         self._hotbuf = None
         self._hot_lut = None       # GPU [256] expert→slot
         self._is_hot = None        # GPU [256] bool
+        self._recorder = None      # {layer: [cold experts]} 共有 dict（async prefetch のヒント）
 
     # verify 窓の上限。これ以下は mixed two-gather、超なら prefill(4bit 単一 gather)。
     W_MAX = 8
@@ -108,6 +110,8 @@ class MixedSwitchGLU(nn.Module):
             return mx.where(self._is_hot[inds][..., None], y_hot, y_cold)
 
         hot_mask_np = np.isin(inds_np, list(self._hot))        # [B,W,K] bool
+        if self._recorder is not None:                         # 次回 prefetch のヒント（cold 集合）
+            self._recorder[self._layer] = np.unique(inds_np[~hot_mask_np]).tolist()
         y_hot = self._side(x, inds_np, hot_mask_np, self._c4, 4)
         y_cold = self._side(x, inds_np, ~hot_mask_np, self._c2, 2)
         if y_cold is None:
@@ -116,6 +120,27 @@ class MixedSwitchGLU(nn.Module):
             return y_cold
         m = mx.array(hot_mask_np)[..., None]                   # [B,W,K,1]
         return mx.where(m, y_hot, y_cold)
+
+
+class Prefetcher:
+    """async cold prefetch: 前 forward の各層 cold 集合をヒントに、次 forward の GPU 計算と
+    重ねて c2 へ背景ロード（時間的局所性で hit 化）。docs/09 §3(2)。"""
+
+    def __init__(self, c2, recorder, workers=8):
+        self._c2 = c2
+        self._recorder = recorder       # 現 forward が書き込む {layer: [cold]}
+        self._hint = {}                 # 前 forward のスナップショット
+        self._pool = ThreadPoolExecutor(max_workers=workers)
+
+    def kick(self):
+        """前 forward のヒントで背景 warm を発射（待たない）。"""
+        for layer, experts in self._hint.items():
+            if experts:
+                self._pool.submit(self._c2.warm, layer, experts)
+
+    def snapshot(self):
+        """forward 後: 今回の routing を次回ヒントに。"""
+        self._hint = dict(self._recorder)
 
 
 def build_mixed(model_dir, dir2, hot_b):

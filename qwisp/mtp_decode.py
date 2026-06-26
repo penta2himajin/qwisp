@@ -28,7 +28,7 @@ from .expert_source import ExpertSource
 from .cache import ExpertCache
 from .loader import load_streaming
 from .streaming_moe import StreamingSwitchGLU
-from .mixed_engine import MixedSwitchGLU, _calibrate
+from .mixed_engine import MixedSwitchGLU, _calibrate, Prefetcher
 from .mtp_head import build_head, load_mtp_weights, MTPHead
 
 _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
@@ -71,7 +71,7 @@ def _rollback_light(kv, snap, n):
         kv[i].state = s
 
 
-def speculative(lm, head, prompt, max_tokens, light=True, profile=False):
+def speculative(lm, head, prompt, max_tokens, light=True, profile=False, pf=None):
     """MTP D1 投機デコード。返り値: (tokens, n_steps, n_accept_draft)。
     light=True: hybrid 用の軽量巻き戻し（KVCache=trim / ArraysCache=shallow snapshot）。"""
     main_kv = lm.make_cache()
@@ -97,8 +97,12 @@ def speculative(lm, head, prompt, max_tokens, light=True, profile=False):
         prof["draft"] += time.perf_counter() - t0; t0 = time.perf_counter()
         # verify: main on [u,d]（reject 巻き戻し用に snapshot）
         snap = _snap_light(main_kv) if light else _snap(main_kv)
+        if pf is not None:
+            pf.kick()                              # 前 forward の cold を背景ロード（この verify と overlap）
         H2, lg2 = _fwd(lm, mx.array([[u, d]]), main_kv)
         v = int(mx.argmax(lg2[0, 0]).item())
+        if pf is not None:
+            pf.snapshot()
         prof["verify"] += time.perf_counter() - t0; t0 = time.perf_counter()
         out.append(u)
         if v == d:                                     # accept draft
@@ -139,20 +143,25 @@ def greedy(lm, prompt, max_tokens):
     return out[:max_tokens]
 
 
-def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False, io_workers=8):
+def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False,
+                 io_workers=8, prefetch=False):
     src4 = ExpertSource(model_dir)
     src2 = ExpertSource(dir2)
     c4 = ExpertCache(src4, budget_per_layer=hot_b, io_workers=io_workers)
     c2 = ExpertCache(src2, budget_per_layer=cold_b, io_workers=io_workers)
     counts = _calibrate(model, tok)
+    recorder = {} if prefetch else None
     for name, blk in lm.named_modules():
         if isinstance(blk, Qwen3NextSparseMoeBlock):
             m = _LAYER_RE.search(name)
             layer = int(m.group(1)) if m else 0
             c = counts.get(id(blk), np.zeros(256, np.int64))
             hot = set(np.argsort(c)[-hot_b:].tolist())
-            blk.switch_mlp = MixedSwitchGLU(layer, hot, c4, c2, fast_hot=fast_hot)
-    return [c4, c2]
+            sg = MixedSwitchGLU(layer, hot, c4, c2, fast_hot=fast_hot)
+            sg._recorder = recorder
+            blk.switch_mlp = sg
+    pf = Prefetcher(c2, recorder) if prefetch else None
+    return [c4, c2], pf
 
 
 def main():
@@ -165,6 +174,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=128)
     ap.add_argument("--profile", action="store_true", help="ステップ内訳を計測表示")
     ap.add_argument("--fast-hot", action="store_true", help="持続 hot バッファ + GPU remap")
+    ap.add_argument("--prefetch", action="store_true", help="async cold prefetch を有効化")
     args = ap.parse_args()
 
     print("[dec] loading ...", file=sys.stderr)
@@ -186,26 +196,34 @@ def main():
         print(f"[dec] correctness({lab}): {match}/{len(g_ref)} "
               f"(steps={steps}, draft_accept={accd/steps:.3f})")
 
-    # 速度: greedy(AR) vs spec(heavy/light)、必要なら mixed streaming で
+    # 速度: greedy(AR) vs spec(light) ± prefetch、必要なら mixed streaming で
+    pf = None
+    caches = None
     if args.mixed:
-        attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
-                     fast_hot=args.fast_hot)
-        print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B})",
-              file=sys.stderr)
+        caches, pf = attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
+                                  fast_hot=args.fast_hot, prefetch=args.prefetch)
+        print(f"[dec] mixed streaming attached (hot={args.hot}/cold-B={args.cold_B}"
+              f"{' +prefetch' if args.prefetch else ''})", file=sys.stderr)
 
     def timed(fn):
         t0 = time.perf_counter(); r = fn(); return r, time.perf_counter() - t0
 
     (g, _), t_ar = timed(lambda: (greedy(lm, prompt, args.gen), 0))
-    (sp_h, steps_h, _), t_h = timed(lambda: speculative(lm, head, prompt, args.gen, light=False))
-    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, profile=args.profile))
     eng = ("mixed-stream" + ("+fasthot" if args.fast_hot else "")) if args.mixed else "full-resident"
-    m_l = sum(1 for a, b in zip(g_ref, sp_l) if a == b)        # fast_hot 含む正しさ
     print(f"\n[dec] engine={eng}  gen={args.gen}  ctx={args.ctx}")
-    print(f"  AR greedy        : {args.gen/t_ar:6.1f} tok/s")
-    print(f"  MTP D1 spec heavy: {args.gen/t_h:6.1f} tok/s  ({t_ar/t_h:.2f}x)")
-    print(f"  MTP D1 spec light: {args.gen/t_l:6.1f} tok/s  ({t_ar/t_l:.2f}x)  "
+    print(f"  AR greedy           : {args.gen/t_ar:6.1f} tok/s")
+    # warmup 影響を排すため 2 回ずつ交互計測
+    if pf is not None:
+        (sp_p, _, _), t_p = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, pf=pf))
+        ph = sum(c.prefetch_hits for c in caches)
+    (sp_l, steps_l, accd), t_l = timed(lambda: speculative(lm, head, prompt, args.gen, light=True, profile=args.profile))
+    m_l = sum(1 for a, b in zip(g_ref, sp_l) if a == b)
+    print(f"  MTP D1 spec light   : {args.gen/t_l:6.1f} tok/s  ({t_ar/t_l:.2f}x)  "
           f"draft_accept={accd/steps_l:.3f}  match={m_l}/{len(g_ref)}")
+    if pf is not None:
+        m_p = sum(1 for a, b in zip(g_ref, sp_p) if a == b)
+        print(f"  MTP D1 spec +prefetch: {args.gen/t_p:6.1f} tok/s  ({t_ar/t_p:.2f}x)  "
+              f"match={m_p}/{len(g_ref)}  prefetch_hits={ph}  (順序: pf を先に計測)")
 
 
 if __name__ == "__main__":

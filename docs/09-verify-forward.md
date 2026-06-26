@@ -74,7 +74,19 @@ gather 91ms の内訳: **pread(IO)=89ms（682 slice=76miss×9 tensor の syscall
 | MTP spec light | 6.3 tok/s | **7.9 tok/s** |
 | 正しさ | — | 96/96 維持 |
 
-### 4.5 残る天井
+### 4.5 async cold prefetch = 無効（負の結果）
+前 forward の各層 cold 集合をヒントに背景 warm（`Prefetcher`, `ExpertCache.warm`, スレッド安全化）。
+**結果: 効果なし。`prefetch_hits=0`**（warm が新規ロードゼロ）。見かけの +20% は計測順の warmup で、
+pf を先に計測すると逆転（pf 6.1 / no-pf 7.7）＝順序効果。**正しさ 96/96**。
+- **理由**: 時間的ヒント＝前 forward の cold＝**直前に使った＝まだ resident**（LRU が保持）→ warm スキップ。
+  実 miss は「最近未使用の新規 expert」で履歴から予測不能。**LRU が時間的局所性を既に汲み尽くしている**
+  （学習予測器 0.54 < cache 0.85 だった理由と同根, [[predictor_eval]]）。
+- streaming の miss は本質的に churn で、予測には >0.85 coverage の cross-layer 予測器が要る（未達）。
+- コードは opt-in（`--prefetch`, default off）で負の結果として保持。
+
+### 4.6 残る天井
 並列 pread 後の内訳: **per-layer tolist 同期 86ms/56%**（GPU-drain churn, docs/07）／gather 60ms/38%。
-次の根治は §3 の (3) Blink 流 GPU-side routing（固定 shape グラフで host 同期除去）＝mlx 制約調査が要る
-高難度策。async cold prefetch(2) で gather の IO を GPU compute と overlap する余地も残る。
+低リスク策（持続 hot バッファ=回帰 / async prefetch=無効）は出尽くした。**残るは §3(3) Blink 流
+GPU-side routing**（固定 shape グラフで host 同期除去）一択で、mlx 制約の正面突破（`mx.compile`+
+固定バッファ gather の feasibility 実験、最悪 Metal カーネル自作）が要る高難度策。または許容 RAM を
+上げて resident 比率を増やす（streaming 税そのものを減らす）かの設計判断。

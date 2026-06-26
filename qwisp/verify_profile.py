@@ -35,8 +35,8 @@ def main():
 
     model, tok = load(args.model)
     lm = model.language_model
-    caches = attach_mixed(model, lm, tok, args.model, args.dir2, args.hot, args.cold_B,
-                          fast_hot=args.fast_hot, io_workers=args.io_workers)
+    caches, _ = attach_mixed(model, lm, tok, args.model, args.dir2, args.hot, args.cold_B,
+                             fast_hot=args.fast_hot, io_workers=args.io_workers)
     c4, c2 = caches
 
     # MixedSwitchGLU を計測ラップ（tolist 同期時間 / gather IO 時間 / miss 数）
