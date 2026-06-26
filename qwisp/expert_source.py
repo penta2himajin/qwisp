@@ -66,6 +66,23 @@ class ExpertSource:
                     [self.slice(layer, proj, part, e) for e in experts], axis=0)
         return sub
 
+    def load_expert_slices(self, layer: int, experts, pool=None) -> dict:
+        """miss 用: 各 expert の 9 テンソル(proj×part)を並列 pread → {e: {proj.part: mx.array}}.
+
+        os.pread は GIL を解放するので ThreadPoolExecutor で latency を重ねられる（682 syscall/fwd 対策）。
+        pool=None なら逐次。
+        """
+        out = {e: {} for e in experts}
+        jobs = [(e, p, q) for e in experts for p in PROJS for q in PARTS]
+        if pool is None:
+            for e, p, q in jobs:
+                out[e][f"{p}.{q}"] = self.slice(layer, p, q, e)
+            return out
+        futs = [(e, f"{p}.{q}", pool.submit(self.slice, layer, p, q, e)) for e, p, q in jobs]
+        for e, k, f in futs:
+            out[e][k] = f.result()
+        return out
+
     def per_expert_bytes(self, layer: int = 0) -> int:
         total = 0
         for proj in PROJS:

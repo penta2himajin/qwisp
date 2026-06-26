@@ -11,6 +11,7 @@ v0.1 は LRU。v0.2 で MTP 予測器 prefetch を足す（gather 前に next-to
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 
@@ -18,38 +19,35 @@ from .expert_source import PARTS, PROJS
 
 
 class ExpertCache:
-    def __init__(self, source, budget_per_layer: int):
+    def __init__(self, source, budget_per_layer: int, io_workers: int = 16):
         self.src = source
         self.B = budget_per_layer
         self._store: dict[tuple[int, int], dict[str, mx.array]] = {}
         self._lru: dict[int, "OrderedDict[int, None]"] = {}
         self.hits = 0
         self.misses = 0
-
-    def _ensure(self, layer: int, e: int) -> dict[str, mx.array]:
-        key = (layer, e)
-        lru = self._lru.setdefault(layer, OrderedDict())
-        cached = self._store.get(key)
-        if cached is not None:
-            self.hits += 1
-            lru.move_to_end(e)
-            return cached
-        self.misses += 1
-        slices = {f"{p}.{q}": self.src.slice(layer, p, q, e) for p in PROJS for q in PARTS}
-        self._store[key] = slices
-        lru[e] = None
-        return slices
+        # miss は os.pread×9/expert＝syscall latency 律速 → スレッドプールで並列化（GIL 解放）。
+        self._pool = ThreadPoolExecutor(max_workers=io_workers) if io_workers > 0 else None
 
     def gather(self, layer: int, U: list[int]) -> dict[str, mx.array]:
-        per = [self._ensure(layer, e) for e in U]  # 現 U は先に全 load（evict 前）
+        lru = self._lru.setdefault(layer, OrderedDict())
+        miss = [e for e in U if (layer, e) not in self._store]
+        if miss:
+            loaded = self.src.load_expert_slices(layer, miss, self._pool)  # 並列 pread
+            for e in miss:
+                self._store[(layer, e)] = loaded[e]
+        self.hits += len(U) - len(miss)
+        self.misses += len(miss)
+        for e in U:                                # LRU 更新（現 U は most-recent）
+            lru[e] = None
+            lru.move_to_end(e)
+        per = [self._store[(layer, e)] for e in U]
         sub = {}
         for p in PROJS:
             for q in PARTS:
                 pp = f"{p}.{q}"
                 sub[pp] = mx.concatenate([s[pp] for s in per], axis=0)
-        # B を超えた分を evict（most-recent＝現 U は残る）
-        lru = self._lru[layer]
-        while len(lru) > self.B:
+        while len(lru) > self.B:                   # B 超過を evict（現 U は残る）
             old, _ = lru.popitem(last=False)
             self._store.pop((layer, old), None)
         return sub
