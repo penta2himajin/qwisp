@@ -93,17 +93,24 @@ public enum Tell {
             for i in lo ..< hi { _ = model.expertCaches[i].ensure(pred[i]) }
         }
 
+        let prof = ProcessInfo.processInfo.environment["QWISP_M0_PROF"] == "1"
+        var tP1: UInt64 = 0, tPred: UInt64 = 0, tBuild: UInt64 = 0, tWait: UInt64 = 0, tFinal: UInt64 = 0
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
         var out: [Int] = []
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
             let prev = cur
             let snaps = caches.map { $0.snapshot() }
             // pass-1: 予測（full GPU-remap）
+            var ts = now()
             StreamingMoEBlock.probeNoSync = true
             _ = try model.forwardHidden(prev, caches: caches)
             MLX.eval(caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            if prof { tP1 += now() - ts; ts = now() }
             let pred = model.expertCaches.map { distinct($0.lastInds ?? MLXArray([Int32]())) }
             for (i, c) in caches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            if prof { tPred += now() - ts }
 
             // pass-2: chunked + overlapped prefetch（chunk N の eval 中に chunk N+1 を先読み）
             StreamingMoEBlock.probeNoSync = true
@@ -115,19 +122,31 @@ public enum Tell {
                 let nLo = end, nHi = Swift.min(end + CH, L)
                 let sem = DispatchSemaphore(value: 0)
                 if nLo < L { DispatchQueue.global(qos: .userInitiated).async { prefetch(nLo, nHi, pred); sem.signal() } }
+                ts = now()
                 h = try model.runChunk(h, pos, end, caches: caches)   // この chunk の graph build
                 MLX.asyncEval([h] + caches[pos ..< end].flatMap { $0.stateArrays })  // 非同期実行
+                if prof { tBuild += now() - ts; ts = now() }
                 if nLo < L { sem.wait() }                            // 次 chunk prefetch 完了を待つ
+                if prof { tWait += now() - ts }
                 pos = end
             }
+            ts = now()
             let logits = model.finalLogits(h)
             let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            if prof { tFinal += now() - ts }
             out.append(prev.item(Int.self)); cur = next
         }
         StreamingMoEBlock.probeNoSync = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
+        if prof {
+            let n = Double(N)
+            FileHandle.standardError.write(String(format:
+                "[M0-PROF/tok] pass1=%.1f pred-readback=%.1f pass2-build=%.1f prefetch-wait=%.1f final-drain=%.1f (ms)\n",
+                Double(tP1)/n/1e6, Double(tPred)/n/1e6, Double(tBuild)/n/1e6,
+                Double(tWait)/n/1e6, Double(tFinal)/n/1e6).data(using: .utf8)!)
+        }
         return String(format: """
             [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
@@ -274,6 +293,89 @@ public enum Tell {
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
             [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
+    /// M5 = M2 one-pass + depth-1 software pipeline。
+    /// 仮説: chunk N の expert matmul を asyncEval で GPU に流しつつ、chunk N+1 の予測+gather を
+    /// CPU/IO で重ねれば、M2 の per-chunk eval stall(~23ms)を build(~15ms)へ近づけられるか検証。
+    public static func runM5(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M5] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "2") ?? 2
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        var prevGate: [MLXArray]? = nil
+
+        func predEnsure(_ lo: Int, _ hi: Int, _ src: [MLXArray]) {
+            // src: 各層 lo..hi の予測元 gate 入力。preds を eval して distinct→ensure(gather)。
+            let preds = (lo ..< hi).map { i in model.predictLayerInds(i, src[i - lo]) }
+            MLX.eval(preds)
+            for (k, i) in (lo ..< hi).enumerated() { _ = model.expertCaches[i].ensure(distinctInts(preds[k])) }
+        }
+
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for ti in 0 ..< N {
+            let prev = cur
+            StreamingMoEBlock.captureGateInput = true
+            if ti == 0 {
+                StreamingMoEBlock.probeNoSync = false
+                let (_, lgt) = try model.forwardHidden(prev, caches: caches)
+                let next = MLX.argMax(lgt[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+                prevGate = lastGate(model)
+                out.append(prev.item(Int.self)); cur = next
+                continue
+            }
+            StreamingMoEBlock.probeNoSync = true
+            var h = model.embedPub(prev)
+            // chunk 0 は prevGate(temporal, dependency-free)で先に gather
+            predEnsure(0, Swift.min(CH, L), Array(prevGate![0 ..< Swift.min(CH, L)]))
+            var pos = 0
+            while pos < L {
+                let end = Swift.min(pos + CH, L)
+                h = try model.runChunk(h, pos, end, caches: caches)
+                // chunk の expert matmul を非同期で GPU へ。gate 入力(end-1)も併せて materialize 予約。
+                var evals: [MLXArray] = [h] + caches[pos ..< end].flatMap { $0.stateArrays }
+                if end < L, let lgi = model.expertCaches[end - 1].lastGateInput { evals.append(lgi) }
+                MLX.asyncEval(evals)
+                // 次 chunk の予測+gather を重ねる（expert matmul(current) と overlap 狙い）。
+                if end < L {
+                    let nEnd = Swift.min(end + CH, L)
+                    let src = model.expertCaches[end - 1].lastGateInput!   // gate 入力で同期
+                    predEnsure(end, nEnd, Array(repeating: src, count: nEnd - end))
+                }
+                pos = end
+            }
+            let logits = model.finalLogits(h)
+            let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
+            prevGate = lastGate(model)
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M5] M2+pipeline(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }

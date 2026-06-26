@@ -30,6 +30,8 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[Tell] error: \(error)") }
         do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M2] error: \(error)") }
+        do { print(try Tell.runM5(modelDir: md, refPath: mtpRef)) }
+        catch { print("[Tell M5] error: \(error)") }
         do { print(try Tell.runM4(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M4] error: \(error)") }
         do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }
