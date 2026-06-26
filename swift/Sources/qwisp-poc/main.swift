@@ -4,6 +4,15 @@ import QwispCore
 print("[qwisp-poc] starting ...")
 print(QwispCore.smoke())
 
+// streaming-only モード（クリーンな RSS 計測用）: `qwisp-poc stream` で起動
+if CommandLine.arguments.contains("stream") {
+    let md = ProcessInfo.processInfo.environment["QWISP_MODEL"]
+        ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
+    do { print(try StreamingDecode.run(modelDir: md, refPath: "/tmp/qwisp_full_ref.safetensors")) }
+    catch { print("[S3] error: \(error)") }
+    exit(0)
+}
+
 // M1: gatherQuantizedMatmul の Python ビット一致検証
 let refPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "/tmp/qwisp_ref.safetensors"
 if FileManager.default.fileExists(atPath: refPath) {
