@@ -74,6 +74,65 @@ public enum SpeculativeDecode {
         return (Array(out.prefix(maxTokens)), steps, acc, secs)
     }
 
+    /// D2 投機（2 段 draft → [u,d1,d2] を 1 verify）。**実測で非有用**: EAGLE head の
+    /// hidden 連鎖は 2 段目 draft(d2)の精度が低く accept≈1(D1 同等)、draft×2+catch-up+re-feed
+    /// の overhead で resident 45.6<D1 65 tok/s。参考実装として残置。本線は D1(speculative)。
+    static func speculativeD2(_ model: QwispModel, _ head: MTPHead, _ promptIds: MLXArray,
+                             _ maxTokens: Int) -> (toks: [Int], steps: Int, acc: Int, secs: Double) {
+        let mainCaches = model.makeCaches()
+        let mtpKV = KVCache()
+        let isLin = model.isLinearFlags
+        let P = promptIds.dim(-1)
+        var (H, lg) = model.forwardHidden(promptIds, caches: mainCaches)
+        var uArr = MLX.argMax(lg[0..., (P - 1)...], axis: -1)
+        var lastH = H[0..., (P - 1)...]
+        _ = head(H[0..., 0 ..< (P - 1)], promptIds[0..., 1...], cache: mtpKV)
+        func evalAll() { MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mainCaches.flatMap { $0.stateArrays }) }
+        evalAll()
+
+        var out: [Int] = []; var steps = 0, acc = 0
+        let t0 = DispatchTime.now()
+        while out.count < maxTokens {
+            steps += 1
+            // 2 段 draft（mtp cache 連鎖）
+            let (lg1, hh1) = head.callWithHidden(lastH, uArr, cache: mtpKV)
+            let d1Arr = MLX.argMax(lg1[0..., 0...], axis: -1)
+            let (lg2, _) = head.callWithHidden(hh1, d1Arr, cache: mtpKV)
+            let d2Arr = MLX.argMax(lg2[0..., 0...], axis: -1)
+            let udd = MLX.concatenated([uArr, d1Arr, d2Arr], axis: 1)         // [1,3]
+            let snaps = mainCaches.map { $0.snapshot() }
+            let (H3, lgv) = model.forwardHidden(udd, caches: mainCaches)
+            let vw = MLX.argMax(lgv[0, 0 ..< 3], axis: -1)                    // [3]=v0,v1,v2
+            let vals = MLX.concatenated([d1Arr[0], d2Arr[0], vw]).asArray(Int32.self)
+            let d1 = Int(vals[0]), d2 = Int(vals[1]), v0 = Int(vals[2]), v1 = Int(vals[3])
+            out.append(uArr.item(Int.self))
+            mtpKV.trim(1)                                                     // draft2(d1) を除去、draft1(u) は維持
+            if v0 == d1 {
+                out.append(d1)
+                if v1 == d2 {                                                // full accept (3)
+                    acc += 2; out.append(d2)
+                    _ = head(MLX.concatenated([H3[0..., 0 ..< 1], H3[0..., 1 ..< 2]], axis: 1),
+                             MLX.concatenated([d1Arr, d2Arr], axis: 1), cache: mtpKV)  // catch-up d1,d2
+                    uArr = vw[2 ..< 3].reshaped([1, 1]); lastH = H3[0..., 2 ..< 3]
+                } else {                                                     // accept d1, reject d2 (2)
+                    acc += 1
+                    for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 3) }
+                    _ = model.forwardHidden(MLX.concatenated([uArr, d1Arr], axis: 1), caches: mainCaches)
+                    _ = head(H3[0..., 0 ..< 1], d1Arr, cache: mtpKV)         // catch-up d1
+                    uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H3[0..., 1 ..< 2]
+                }
+            } else {                                                         // reject d1 (1)
+                for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 3) }
+                _ = model.forwardHidden(uArr, caches: mainCaches)            // [u] のみ再投入
+                uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H3[0..., 0 ..< 1]
+            }
+            evalAll()
+        }
+        uArr.eval()
+        return (Array(out.prefix(maxTokens)), steps, acc,
+                Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9)
+    }
+
     public static func run(modelDir: String, refPath: String) throws -> String {
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"],

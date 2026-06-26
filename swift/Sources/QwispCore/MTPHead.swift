@@ -65,8 +65,13 @@ public final class MTPHead {
     }
 
     /// hPrev:[1,L,H] main post-norm hidden, tok:[1,L] 条件トークン → 次々トークン logits[1,L,V]。
-    /// cache を渡すと self_attn が KV 蓄積（投機ループの draft/prefill 用）。
     public func callAsFunction(_ hPrev: MLXArray, _ tok: MLXArray, cache: KVCache? = nil) -> MLXArray {
+        callWithHidden(hPrev, tok, cache: cache).logits
+    }
+
+    /// D2+ 用: (logits, 内部 hidden x[final-norm 前])。x を次 draft の h_prev に連鎖（EAGLE）。
+    public func callWithHidden(_ hPrev: MLXArray, _ tok: MLXArray, cache: KVCache? = nil)
+        -> (logits: MLXArray, hidden: MLXArray) {
         let emb = embedTok(tok)
         let e = MLXFast.rmsNorm(emb, weight: preEmb, eps: eps)
         let hh = MLXFast.rmsNorm(hPrev, weight: preHid, eps: eps)
@@ -81,7 +86,7 @@ public final class MTPHead {
         let head = Proj.quantized(store.req("language_model.lm_head.weight"),
                                   store.req("language_model.lm_head.scales"),
                                   store.req("language_model.lm_head.biases"), 4)
-        return head.apply(normed)
+        return (head.apply(normed), x)
     }
 }
 
