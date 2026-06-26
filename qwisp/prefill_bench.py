@@ -36,7 +36,8 @@ def time_prefill(lm, ids, reps):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model"); ap.add_argument("dir2")
-    ap.add_argument("--ctx", type=int, default=1024)
+    ap.add_argument("--ctx-list", type=str, default="512,1024,2048,4096",
+                    help="カンマ区切りの prefill 長スイープ")
     ap.add_argument("--hot", type=int, default=64)
     ap.add_argument("--reps", type=int, default=3)
     args = ap.parse_args()
@@ -47,31 +48,26 @@ def main():
 
     base = "def quicksort(a):\n    if len(a)<=1: return a\n    p=a[len(a)//2]\n    return quicksort([x for x in a if x<p])+[p]+quicksort([x for x in a if x>p])\n"
     enc = tok.encode(base)
-    ids = []
-    while len(ids) < args.ctx:
-        ids += enc
-    ids = mx.array(ids[:args.ctx])[None]
-    print(f"[prefill] ctx={args.ctx} tokens", file=sys.stderr)
+    ctxs = [int(c) for c in args.ctx_list.split(",")]
 
-    # partition OFF（旧 full two-gather: PREFILL_T を超大に）
-    GPURoutedMixedSwitchGLU.PREFILL_T = 10**9
-    t_off, lg_off = time_prefill(lm, ids, args.reps)
-
-    # partition ON（既定 8）
-    GPURoutedMixedSwitchGLU.PREFILL_T = 8
-    t_on, lg_on = time_prefill(lm, ids, args.reps)
-
-    # 正しさ: last-token logits 一致
-    a = lg_on[0, -1]; b = lg_off[0, -1]
-    diff = float(mx.max(mx.abs(a - b)).item())
-    rel = diff / (float(mx.max(mx.abs(b)).item()) + 1e-9)
-    am_on = int(mx.argmax(a).item()); am_off = int(mx.argmax(b).item())
-
-    print(f"\n[prefill] ctx={args.ctx} hot={args.hot} reps={args.reps}")
-    print(f"  full two-gather (旧) : {t_off*1e3:8.1f} ms")
-    print(f"  partition       (新) : {t_on*1e3:8.1f} ms   ({t_off/t_on:.2f}x 速い)")
-    print(f"  正しさ last-logits  : max|Δ|={diff:.2e} rel={rel:.2e} argmax {am_on}=={am_off} "
-          f"{'OK' if (rel < 1e-3 and am_on == am_off) else 'MISMATCH'}")
+    print(f"\n[prefill] hot={args.hot} reps={args.reps}  (chunked-512 prefill, 単一forward近似)")
+    print(f"{'ctx':>6} {'full(旧)ms':>11} {'part(新)ms':>11} {'speedup':>8} {'正しさ':>16}")
+    print("-" * 56)
+    for ctx in ctxs:
+        ids = []
+        while len(ids) < ctx:
+            ids += enc
+        ids = mx.array(ids[:ctx])[None]
+        GPURoutedMixedSwitchGLU.PREFILL_T = 10**9          # OFF
+        t_off, lg_off = time_prefill(lm, ids, args.reps)
+        GPURoutedMixedSwitchGLU.PREFILL_T = 8              # ON
+        t_on, lg_on = time_prefill(lm, ids, args.reps)
+        a = lg_on[0, -1]; b = lg_off[0, -1]
+        rel = float(mx.max(mx.abs(a - b)).item()) / (float(mx.max(mx.abs(b)).item()) + 1e-9)
+        ok = (rel < 1e-3 and int(mx.argmax(a).item()) == int(mx.argmax(b).item()))
+        print(f"{ctx:>6} {t_off*1e3:>11.1f} {t_on*1e3:>11.1f} {t_off/t_on:>7.2f}x "
+              f"{('OK rel='+format(rel,'.0e')):>16}" if ok else
+              f"{ctx:>6} {t_off*1e3:>11.1f} {t_on*1e3:>11.1f} {t_off/t_on:>7.2f}x       MISMATCH")
 
 
 if __name__ == "__main__":

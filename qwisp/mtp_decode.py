@@ -174,9 +174,10 @@ def attach_mixed(model, lm, tok, model_dir, dir2, hot_b, cold_b, fast_hot=False,
     return [c4, c2], pf
 
 
-def attach_gpu_routed(model, lm, tok, model_dir, dir2, hot_b):
-    """GPU-routed mixed（全 expert を持続 GPU バッファに常駐, tolist 無し）。docs/09 §4.7。"""
-    from .gpu_routed import GPURoutedMixedSwitchGLU
+def attach_gpu_routed(model, lm, tok, model_dir, dir2, hot_b, adaptive_T=None):
+    """GPU-routed mixed（全 expert を持続 GPU バッファに常駐, tolist 無し）。docs/09 §4.7。
+    adaptive_T 指定で層別 hot サイズ（calibration-aware）。"""
+    from .gpu_routed import GPURoutedMixedSwitchGLU, hot_set_for
     src4 = ExpertSource(model_dir)
     src2 = ExpertSource(dir2)
     counts = _calibrate(model, tok)
@@ -184,7 +185,7 @@ def attach_gpu_routed(model, lm, tok, model_dir, dir2, hot_b):
         if isinstance(blk, Qwen3NextSparseMoeBlock):
             layer = int(_LAYER_RE.search(name).group(1))
             c = counts.get(id(blk), np.zeros(256, np.int64))
-            hot = set(np.argsort(c)[-hot_b:].tolist())
+            hot = hot_set_for(c, hot_b, adaptive_T)
             blk.switch_mlp = GPURoutedMixedSwitchGLU(layer, hot, src4, src2)
 
 
@@ -200,6 +201,8 @@ def main():
     ap.add_argument("--profile", action="store_true", help="ステップ内訳を計測表示")
     ap.add_argument("--fast-hot", action="store_true", help="持続 hot バッファ + GPU remap")
     ap.add_argument("--prefetch", action="store_true", help="async cold prefetch を有効化")
+    ap.add_argument("--adaptive-T", type=float, default=None,
+                    help="GPU-routed の層別 hot サイズ（頻度累積マス閾, 例 0.8）")
     args = ap.parse_args()
 
     print("[dec] loading ...", file=sys.stderr)
@@ -225,8 +228,9 @@ def main():
     pf = None
     caches = None
     if args.gpu_routed:
-        attach_gpu_routed(model, lm, tok, args.model, args.gpu_routed, args.hot)
-        print(f"[dec] GPU-routed mixed resident attached (hot={args.hot})", file=sys.stderr)
+        attach_gpu_routed(model, lm, tok, args.model, args.gpu_routed, args.hot, args.adaptive_T)
+        print(f"[dec] GPU-routed mixed resident attached (hot={args.hot}"
+              f"{f' adaptive_T={args.adaptive_T}' if args.adaptive_T else ''})", file=sys.stderr)
     elif args.mixed:
         caches, pf = attach_mixed(model, lm, tok, args.model, args.mixed, args.hot, args.cold_B,
                                   fast_hot=args.fast_hot, prefetch=args.prefetch)

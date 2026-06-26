@@ -23,6 +23,22 @@ from .expert_source import ExpertSource, PROJS, PARTS
 _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 
 
+def hot_set_for(counts, hot_b, adaptive_T=None, lo=16, hi=128):
+    """層の routing カウント(np[256])から hot 集合を返す。
+    adaptive_T 指定時は頻度累積マスが T を超える最小 K（[lo,hi] クランプ）＝層別 hot サイズ。
+    None なら固定 top hot_b。calibration-aware sizing（precision_search の adaptive_hb と同義）。"""
+    c = np.asarray(counts, dtype=np.float64)
+    order = np.argsort(c)[::-1]
+    if adaptive_T is None:
+        k = hot_b
+    else:
+        csort = c[order]
+        cum = np.cumsum(csort) / max(csort.sum(), 1.0)
+        k = int(np.searchsorted(cum, adaptive_T) + 1)
+        k = max(lo, min(hi, k))
+    return set(order[:k].tolist())
+
+
 class GPURoutedMixedSwitchGLU(nn.Module):
     """hot(4bit)/cold(2bit) を持続 GPU バッファに常駐させ GPU inds で gather（tolist 無し）。"""
 
@@ -116,11 +132,12 @@ class GPURoutedMixedSwitchGLU(nn.Module):
         return out.reshape(*lead, K, H)
 
 
-def load_gpu_routed(model_dir, dir2, hot_b=64):
+def load_gpu_routed(model_dir, dir2, hot_b=64, adaptive_T=None):
     """lean ローダ: full 18GB を経由せず lazy→streaming で calibrate→GPU バッファ構築.
 
     peak RSS ≈ 非expert 1.8GB + mixed 全常駐 12GB（4bit 全常駐 18GB を materialize しない）。
     16GB Mac に収めるための経路。返り値 (model, tok)。
+    adaptive_T 指定で層別 hot サイズ（calibration-aware, precision_search 由来）。
     """
     from .loader import load_streaming
     from .mixed_engine import _calibrate
@@ -132,6 +149,6 @@ def load_gpu_routed(model_dir, dir2, hot_b=64):
         if isinstance(blk, Qwen3NextSparseMoeBlock):
             layer = int(_LAYER_RE.search(name).group(1))
             c = counts.get(id(blk), np.zeros(256, np.int64))
-            hot = set(np.argsort(c)[-hot_b:].tolist())
+            hot = hot_set_for(c, hot_b, adaptive_T)
             blk.switch_mlp = GPURoutedMixedSwitchGLU(layer, hot, src4, src2)
     return model, tok
