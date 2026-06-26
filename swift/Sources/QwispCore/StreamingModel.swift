@@ -83,6 +83,19 @@ public final class StreamingQwispModel {
 
     public func makeCaches() -> [LayerCache] { (0 ..< numLayers).map { _ in LayerCache() } }
 
+    /// Tell 用: 層範囲 [lo, hi) だけ処理して hidden を返す（chunk overlap 用）。
+    public func runChunk(_ h: MLXArray, _ lo: Int, _ hi: Int, caches: [LayerCache]) throws -> MLXArray {
+        var x = h
+        for i in lo ..< hi { x = try layers[i](x, cache: caches[i]) }
+        return x
+    }
+    public func embedPub(_ ids: MLXArray) -> MLXArray { embed(ids) }
+    public func finalLogits(_ h: MLXArray) -> MLXArray {
+        let n = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return headProj().apply(n)
+    }
+    public var layerCount: Int { numLayers }
+
     func headProj() -> Proj {
         .quantized(store.req("language_model.lm_head.weight"),
                    store.req("language_model.lm_head.scales"),

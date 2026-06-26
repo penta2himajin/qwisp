@@ -1,0 +1,85 @@
+import Foundation
+import MLX
+import Metal
+
+/// Tell runtime（William Tell = 的=expert を先読みして射抜く）.
+/// mlx の batched eval を回避し、chunk 単位で asyncEval しながら次 chunk の expert を
+/// background prefetch で先読み → prefetch I/O を GPU 計算に隠す。cross-layer 予測 prefetch の
+/// efficient 化（Fate one-pass 相当）を mlx 上で実現する独自スケジューラ。
+public enum Tell {
+    /// M0: 2-pass(pass-1 予測 → pass-2 chunked + overlapped prefetch)。near-lossless で速度を稼ぐ。
+    public static func runM0(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "10") ?? 10
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        // 各層の予測 distinct experts を抽出
+        func distinct(_ a: MLXArray) -> [Int] {
+            var seen = Set<Int>(); var u: [Int] = []
+            for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
+            return u
+        }
+        func prefetch(_ lo: Int, _ hi: Int, _ pred: [[Int]]) {
+            for i in lo ..< hi { _ = model.expertCaches[i].ensure(pred[i]) }
+        }
+
+        var out: [Int] = []
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            let prev = cur
+            let snaps = caches.map { $0.snapshot() }
+            // pass-1: 予測（full GPU-remap）
+            StreamingMoEBlock.probeNoSync = true
+            _ = try model.forwardHidden(prev, caches: caches)
+            MLX.eval(caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            let pred = model.expertCaches.map { distinct($0.lastInds ?? MLXArray([Int32]())) }
+            for (i, c) in caches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+
+            // pass-2: chunked + overlapped prefetch（chunk N の eval 中に chunk N+1 を先読み）
+            StreamingMoEBlock.probeNoSync = true
+            var h = model.embedPub(prev)
+            prefetch(0, Swift.min(CH, L), pred)              // chunk 0 を同期 prefetch
+            var pos = 0
+            while pos < L {
+                let end = Swift.min(pos + CH, L)
+                let nLo = end, nHi = Swift.min(end + CH, L)
+                let sem = DispatchSemaphore(value: 0)
+                if nLo < L { DispatchQueue.global(qos: .userInitiated).async { prefetch(nLo, nHi, pred); sem.signal() } }
+                h = try model.runChunk(h, pos, end, caches: caches)   // この chunk の graph build
+                MLX.asyncEval([h] + caches[pos ..< end].flatMap { $0.stateArrays })  // 非同期実行
+                if nLo < L { sem.wait() }                            // 次 chunk prefetch 完了を待つ
+                pos = end
+            }
+            let logits = model.finalLogits(h)
+            let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """,
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+}
