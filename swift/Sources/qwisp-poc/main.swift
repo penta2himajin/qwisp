@@ -48,6 +48,10 @@ if CommandLine.arguments.contains("stream") {
             do { print(try Tell.runHotColdOnline(modelDir: md, refPath: mtpRef)) }
             catch { print("[HotColdOnline] error: \(error)") }
         }
+        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_ADAPT"] == "1" {
+            do { print(try Tell.runHotColdAdaptive(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdAdaptive] error: \(error)") }
+        }
         do { print(try Tell.runM4(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M4] error: \(error)") }
         do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }

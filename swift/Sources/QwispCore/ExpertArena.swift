@@ -163,6 +163,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var predictOnly = false      // 軽量予測 pass: routed gather 省略、inds だけ捕捉
     nonisolated(unsafe) public static var captureGateInput = false // Tell M2: 各層の gate 入力を capture
     nonisolated(unsafe) public static var captureInds = false      // calib: 全 mode で routing inds を記録
+    nonisolated(unsafe) public static var syncLayers: Set<Int>? = nil  // 適応 sync: この層集合は exact(no-sync 無効)
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -203,8 +204,11 @@ public final class StreamingMoEBlock {
             let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
             return MLX.sigmoid(sharedGate.apply(x)) * sharedY
         }
-        // 天井計測: GPU-side slot table で remap、per-layer sync/ensure を完全に省く（miss は近似）
-        if StreamingMoEBlock.probeNoSync, let c = cache {
+        // 適応 sync: syncLayers に含まれる層は no-sync を無効化し exact 経路へ（hard 層だけ正確化）。
+        let noSync = StreamingMoEBlock.probeNoSync
+            && !(StreamingMoEBlock.syncLayers?.contains(layer) ?? false)
+        // 天井計測 / 適応 no-sync: GPU-side slot table で remap、per-layer sync/ensure を省く（miss は近似）
+        if noSync, let c = cache {
             c.lastInds = inds.asType(.int32)                     // adaptive miss 検出用
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
