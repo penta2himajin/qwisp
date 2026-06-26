@@ -68,6 +68,20 @@ public final class LayerExpertCache {
     var clock = 0
     public private(set) var hits = 0
     public private(set) var misses = 0
+    nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
+
+    // GPU-side slot table（expert id -> slot, 未cache=0）。sync 無し remap 用。
+    var slotTableDirty = true
+    var slotTableGPU: MLXArray?
+    public func gpuSlotTable(numExperts: Int) -> MLXArray {
+        if slotTableDirty || slotTableGPU == nil {
+            var t = [Int32](repeating: 0, count: numExperts)
+            for (e, s) in slotOf { t[e] = Int32(s) }
+            let arr = MLXArray(t, [numExperts]); arr.eval()
+            slotTableGPU = arr; slotTableDirty = false
+        }
+        return slotTableGPU!
+    }
 
     public init(device: MTLDevice, source: ExpertSource, layer: Int, C: Int) throws {
         self.arena = try ExpertArena(device: device, source: source, N: C, refLayer: layer)
@@ -78,6 +92,8 @@ public final class LayerExpertCache {
 
     /// experts(U) を cache に確保（miss は pread）し、各 U[i] の slot を返す。
     public func ensure(_ experts: [Int]) -> [Int: Int] {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        defer { LayerExpertCache.ensureNanos += DispatchTime.now().uptimeNanoseconds - t0 }
         var result: [Int: Int] = [:]
         for e in experts {
             clock += 1
@@ -94,6 +110,7 @@ public final class LayerExpertCache {
             }
             arena.loadOne(layer, e, slot: slot)
             expertAt[slot] = e; slotOf[e] = slot; tick[slot] = clock; result[e] = slot
+            slotTableDirty = true
         }
         return result
     }
@@ -107,6 +124,8 @@ public final class StreamingMoEBlock {
     let arena: ExpertArena
     let cache: LayerExpertCache?
     let layer: Int
+    nonisolated(unsafe) public static var syncNanos: UInt64 = 0   // inds.asArray(GPU→CPU drain) 累積
+    nonisolated(unsafe) public static var probeNoSync = false      // 天井計測: GPU remap, 毎層 sync 無し
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -131,8 +150,25 @@ public final class StreamingMoEBlock {
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopk { scores = scores / scores.sum(axis: -1, keepDims: true) }
 
+        // 天井計測: GPU-side slot table で remap、per-layer sync/ensure を完全に省く（miss は近似）
+        if StreamingMoEBlock.probeNoSync, let c = cache {
+            let table = c.gpuSlotTable(numExperts: numExperts)
+            let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
+            let xe = x.expandedDimensions(axes: [-2, -3])
+            let g = gatherQmm(xe, c.arena, "gate_proj", remap)
+            let u = gatherQmm(xe, c.arena, "up_proj", remap)
+            let h = (g * MLX.sigmoid(g)) * u
+            let d = gatherQmm(h, c.arena, "down_proj", remap).squeezed(axis: -2)
+            let y = (d * scores.expandedDimensions(axis: -1)).sum(axis: -2)
+            let sg = shGate.apply(x), su = shUp.apply(x)
+            let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
+            return y + MLX.sigmoid(sharedGate.apply(x)) * sharedY
+        }
+
         // distinct experts U（CPU 同期）
+        let ts = DispatchTime.now().uptimeNanoseconds
         let flat = inds.asType(.int32).asArray(Int32.self)
+        StreamingMoEBlock.syncNanos += DispatchTime.now().uptimeNanoseconds - ts
         var seen = Set<Int>(); var U: [Int] = []
         for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
 

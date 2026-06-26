@@ -125,6 +125,7 @@ public enum StreamingDecode {
 
         let N = 32
         var toks: [Int] = []
+        LayerExpertCache.ensureNanos = 0; StreamingMoEBlock.syncNanos = 0
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
             logits = try model(next, caches: caches)
@@ -133,6 +134,22 @@ public enum StreamingDecode {
             toks.append(next.item(Int.self))
         }
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let ensureMs = Double(LayerExpertCache.ensureNanos) / 1e6 / Double(N)
+        let syncMs = Double(StreamingMoEBlock.syncNanos) / 1e6 / Double(N)
+
+        // 天井計測: GPU remap, per-layer sync 無し（warmup 後の cache を凍結利用、出力は近似）
+        StreamingMoEBlock.probeNoSync = true
+        var pn = next
+        for _ in 0 ..< 4 { let l = try model(pn, caches: caches); pn = MLX.argMax(l[0, 0], axis: -1).reshaped([1, 1]); pn.eval() }
+        let tp = DispatchTime.now()
+        for _ in 0 ..< N {
+            let l = try model(pn, caches: caches)
+            pn = MLX.argMax(l[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([pn] + caches.flatMap { $0.stateArrays })
+        }
+        let probeSecs = Double(DispatchTime.now().uptimeNanoseconds - tp.uptimeNanoseconds) / 1e9
+        StreamingMoEBlock.probeNoSync = false
+        let probeTps = Double(N) / probeSecs
         let rssPeak = rssGB()
         let hits = model.expertCaches.reduce(0) { $0 + $1.hits }
         let misses = model.expertCaches.reduce(0) { $0 + $1.misses }
@@ -141,9 +158,11 @@ public enum StreamingDecode {
         return String(format: """
             [S3] streaming decode(8GB狙い, LRU cache C=%d/層, experts 非常駐):
                %.1f tok/s (%.1f ms/tok)  RSS: load=%.1fGB peak=%.1fGB
-               cache hit=%.0f%% (hit=%d miss=%d)  生成=%@
+               cache hit=%.0f%% (hit=%d miss=%d)  内訳/tok: sync=%.1fms ensure(load+IO)=%.1fms
+               天井(GPU remap, sync無): %.1f tok/s ← sync 除去の上限
+               生成=%@
             """,
             C, Double(N) / secs, secs / Double(N) * 1000, rssLoad, rssPeak,
-            hitRate, hits, misses, "\(toks.prefix(6))")
+            hitRate, hits, misses, syncMs, ensureMs, probeTps, "\(toks.prefix(6))")
     }
 }
