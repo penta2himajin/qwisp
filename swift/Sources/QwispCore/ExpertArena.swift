@@ -108,6 +108,7 @@ public final class LayerExpertCache {
     public var pinnedSlots: Set<Int> = [] // hot pin: LRU 退避から保護する slot
     var hotMaskArr: MLXArray?          // GPU hot/cached マスク [numExperts]（1=cached）
     var hotMaskVer = -1
+    public var buddyTable: MLXArray?   // BuddyMoE: cold expert → 最類似 hot expert の slot（slot-0 garbage 回避）
     public func gpuSlotTable(numExperts: Int) -> MLXArray {
         if slotTableDirty || slotTableGPU == nil {
             var t = [Int32](repeating: 0, count: numExperts)
@@ -136,6 +137,22 @@ public final class LayerExpertCache {
         guard let li = lastInds else { return true }
         for e in li.asArray(Int32.self) where slotOf[Int(e)] == nil { return false }
         return true
+    }
+
+    /// BuddyMoE: cold expert を「最も共活性化する hot expert」の slot に remap する table を構築。
+    /// hot は現在 slotOf にいる expert。coact[e][h] = calib で e と h が同 token で共 routed した回数。
+    /// 各 cold e → argmax_h(coact[e][h]) の slot（co-activation 無ければ slot-0 fallback）。
+    public func buildBuddyTable(coact: [[Int]], numExperts: Int) {
+        let hot = Array(slotOf.keys)
+        var bmap = [Int32](repeating: 0, count: numExperts)
+        for e in 0 ..< numExperts {
+            if let s = slotOf[e] { bmap[e] = Int32(s); continue }    // hot: 自身
+            var bestH = -1, bestC = -1
+            for h in hot { let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
+            bmap[e] = (bestH >= 0 && bestC > 0) ? Int32(slotOf[bestH]!) : 0   // cold: buddy slot
+        }
+        let arr = MLXArray(bmap, [numExperts]); arr.eval()
+        buddyTable = arr
     }
 
     /// experts を常駐ロードし、その slot を pinned に登録（以後 LRU 退避されない）。
@@ -310,7 +327,9 @@ public final class StreamingMoEBlock {
                     scores = ms                                    // 寄与0のみ（scale は下がるが amplify 無し）
                 }
             }
-            let table = c.gpuSlotTable(numExperts: numExperts)
+            // buddy(mode3): cold を slot-0 でなく buddy slot へ remap（scores は元のまま=cold の重みで buddy 出力）
+            let table = (StreamingMoEBlock.skipMode == 3 && c.buddyTable != nil)
+                ? c.buddyTable! : c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
             let xe = x.expandedDimensions(axes: [-2, -3])
             let prof = StreamingMoEBlock.profileLayers

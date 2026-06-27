@@ -752,8 +752,12 @@ public enum Tell {
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
 
-        // --- phase 1: calibration（exact decode で頻度集計）---
+        let skipMode = Int(ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] ?? "0") ?? 0
+        // --- phase 1: calibration（exact decode で頻度集計 + buddy 用 co-activation）---
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        // co-activation[layer][e][e'] = 同 token で共 routed した回数（mode3 のみ確保）
+        var coact: [[[Int]]] = skipMode == 3
+            ? [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE), count: nMoE) : []
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
@@ -762,17 +766,29 @@ public enum Tell {
             (_, lg) = try model.forwardHidden(cur, caches: caches)
             MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
             for (mi, ec) in model.expertCaches.enumerated() {
-                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+                if let li = ec.lastInds {
+                    let es = li.asArray(Int32.self).map { Int($0) }
+                    for e in es { counts[mi][e] += 1 }
+                    if skipMode == 3 {
+                        for a in 0 ..< es.count { for b in (a + 1) ..< es.count {
+                            coact[mi][es[a]][es[b]] += 1; coact[mi][es[b]][es[a]] += 1
+                        } }
+                    }
+                }
             }
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([cur] + caches.flatMap { $0.stateArrays })
         }
         StreamingMoEBlock.captureInds = false
 
-        // --- phase 2: top-C hot を各層 pin（ensure で常駐ロード）---
+        // --- phase 2: top-C hot を各層 pin（ensure で常駐ロード）+ buddy table 構築 ---
         for (mi, ec) in model.expertCaches.enumerated() {
-            let hot = Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset })
+            // tie は index 昇順で決定的に（非安定ソートの run 間ブレ＝hot set 変動を排除）
+            let hot = Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset })
             _ = ec.ensure(hot)
+            if skipMode == 3 { ec.buildBuddyTable(coact: coact[mi], numExperts: nE) }
         }
 
         // --- phase 3: 実プロンプトから pure no-sync decode（ensure 無し＝hot 固定）---
@@ -782,8 +798,7 @@ public enum Tell {
         cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         StreamingMoEBlock.probeNoSync = true   // 以降 no-sync（hot 固定 slotTable で gather）
-        let skipMode = Int(ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] ?? "0") ?? 0
-        StreamingMoEBlock.skipMode = skipMode       // 1=cold寄与0, 2=0+renorm（slot-0 garbage 回避）
+        StreamingMoEBlock.skipMode = skipMode       // 1=cold寄与0, 2=0+renorm, 3=buddy 代替
         var out: [Int] = []
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
@@ -795,7 +810,7 @@ public enum Tell {
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
-        let skipTag = skipMode == 1 ? "+skip" : (skipMode == 2 ? "+skip-renorm" : "")
+        let skipTag = skipMode == 1 ? "+skip" : (skipMode == 2 ? "+skip-renorm" : (skipMode == 3 ? "+buddy" : ""))
         return String(format: """
             [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
