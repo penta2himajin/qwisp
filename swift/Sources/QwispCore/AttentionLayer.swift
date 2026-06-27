@@ -76,15 +76,31 @@ public struct AttentionLayer {
         if let c = cache { (allKeys, allValues) = c.update(keys, values) }
 
         // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
-        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
         let inDtype = queries.dtype
-        var (q2, k2, v2) = (queries, allKeys, allValues)
+        var output: MLXArray
         if AttentionLayer.f32SDPA {
-            q2 = queries.asType(.float32); k2 = allKeys.asType(.float32); v2 = allValues.asType(.float32)
+            // A1(issue #2): 順序安定 f32 attention。fused SDPA は batched(flash tiling)と逐次で
+            // reduction 順序が違い f32 でも一致しない。明示 matmul+softmax は reduction が
+            // headDim/key 軸＝query 数 L に非依存ゆえ batched(L>1) と逐次(L=1) が一致 → seqMT 無し lossless 狙い。
+            let g = numHeads / numKVHeads
+            let S = allKeys.dim(2)
+            let qf = queries.reshaped([B, numKVHeads, g, L, headDim]).asType(.float32)
+            let kf = allKeys.reshaped([B, numKVHeads, 1, S, headDim]).asType(.float32)
+            let vf = allValues.reshaped([B, numKVHeads, 1, S, headDim]).asType(.float32)
+            var scores = MLX.matmul(qf, kf.transposed(0, 1, 2, 4, 3)) * scale   // [B,kvH,g,L,S]
+            if L > 1 {                                                          // causal（offset 込み）
+                let qIdx = MLXArray((0 ..< L).map { Int32(offset + $0) }).reshaped([L, 1])
+                let kIdx = MLXArray((0 ..< S).map { Int32($0) }).reshaped([1, S])
+                let mask = (kIdx .<= qIdx).reshaped([1, 1, 1, L, S])
+                scores = MLX.where(mask, scores, MLXArray(Float(-1e30)))
+            }
+            let w = MLX.softmax(scores, axis: -1)                              // f32, key 軸
+            output = MLX.matmul(w, vf).reshaped([B, numHeads, L, headDim]).asType(inDtype)
+        } else {
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
+            output = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: allKeys, values: allValues, scale: scale, mask: maskMode)
         }
-        var output = MLXFast.scaledDotProductAttention(
-            queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
-        if AttentionLayer.f32SDPA { output = output.asType(inDtype) }
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]
 
         return oProj.apply(output * MLX.sigmoid(gate))
