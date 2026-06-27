@@ -22,12 +22,35 @@ public final class StreamingDecoderLayer {
 
     public func callAsFunction(_ x: MLXArray, cache: LayerCache?) throws -> MLXArray {
         if StreamingMoEBlock.captureLayerInput { mlp.cache?.preAttnInput = x }   // 予測器 calib
+        if StreamingMoEBlock.profileLayers { return try profiledForward(x, cache: cache) }
         let normed = MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps)
         let r = isLinear ? gdn!(normed, cache: cache?.gdn) : attn!(normed, cache: cache?.kv)
         let h = x + r
         let postNorm = MLXFast.rmsNorm(h, weight: postAttentionLayernorm, eps: eps)
         let B = h.dim(0), S = h.dim(1), H = h.dim(2)
         let mlpOut = try mlp(postNorm.reshaped([B * S, H])).reshaped([B, S, H])
+        return h + mlpOut
+    }
+
+    /// barrier 計測版: norm / (gdn|attn) / MoE を eval 区切りで個別計時。
+    func profiledForward(_ x: MLXArray, cache: LayerCache?) throws -> MLXArray {
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        MLX.eval(x)
+        var t = now()
+        let normed = MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps)
+        MLX.eval(normed); StreamingMoEBlock.tNorm += now() - t; t = now()
+        let r = isLinear ? gdn!(normed, cache: cache?.gdn) : attn!(normed, cache: cache?.kv)
+        let stateAfter = isLinear ? [cache?.gdn.convState, cache?.gdn.recState].compactMap { $0 }
+                                  : [cache?.kv.keys, cache?.kv.values].compactMap { $0 }
+        MLX.eval([r] + stateAfter)
+        if isLinear { StreamingMoEBlock.tGDN += now() - t } else { StreamingMoEBlock.tAttn += now() - t }
+        let h = x + r
+        t = now()
+        let postNorm = MLXFast.rmsNorm(h, weight: postAttentionLayernorm, eps: eps)
+        MLX.eval(postNorm); StreamingMoEBlock.tNorm += now() - t
+        let B = h.dim(0), S = h.dim(1), H = h.dim(2)
+        let mlpOut = try mlp(postNorm.reshaped([B * S, H])).reshaped([B, S, H])
+        MLX.eval(mlpOut)   // MoE 内訳は StreamingMoEBlock 側で計時
         return h + mlpOut
     }
 }

@@ -166,6 +166,13 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var captureInds = false      // calib: 全 mode で routing inds を記録
     nonisolated(unsafe) public static var syncLayers: Set<Int>? = nil  // 適応 sync: この層集合は exact(no-sync 無効)
     nonisolated(unsafe) public static var captureLayerInput = false // 予測器 calib: 層の pre-attention 入力を記録
+    // 層内分解プロファイル（barrier 計測）
+    nonisolated(unsafe) public static var profileLayers = false
+    nonisolated(unsafe) public static var tGDN: UInt64 = 0
+    nonisolated(unsafe) public static var tAttn: UInt64 = 0
+    nonisolated(unsafe) public static var tMoEgather: UInt64 = 0
+    nonisolated(unsafe) public static var tMoEshared: UInt64 = 0
+    nonisolated(unsafe) public static var tNorm: UInt64 = 0
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -215,14 +222,19 @@ public final class StreamingMoEBlock {
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
             let xe = x.expandedDimensions(axes: [-2, -3])
+            let prof = StreamingMoEBlock.profileLayers
+            var t0 = DispatchTime.now().uptimeNanoseconds
             let g = gatherQmm(xe, c.arena, "gate_proj", remap)
             let u = gatherQmm(xe, c.arena, "up_proj", remap)
             let h = (g * MLX.sigmoid(g)) * u
             let d = gatherQmm(h, c.arena, "down_proj", remap).squeezed(axis: -2)
             let y = (d * scores.expandedDimensions(axis: -1)).sum(axis: -2)
+            if prof { y.eval(); StreamingMoEBlock.tMoEgather += DispatchTime.now().uptimeNanoseconds - t0; t0 = DispatchTime.now().uptimeNanoseconds }
             let sg = shGate.apply(x), su = shUp.apply(x)
             let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
-            return y + MLX.sigmoid(sharedGate.apply(x)) * sharedY
+            let out = y + MLX.sigmoid(sharedGate.apply(x)) * sharedY
+            if prof { out.eval(); StreamingMoEBlock.tMoEshared += DispatchTime.now().uptimeNanoseconds - t0 }
+            return out
         }
 
         // distinct experts U（CPU 同期）

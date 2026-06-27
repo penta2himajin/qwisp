@@ -1039,7 +1039,10 @@ public enum Tell {
         var prevGate: [MLXArray]? = nil
 
         let prof = ProcessInfo.processInfo.environment["QWISP_M2_PROF"] == "1"
+        let prof2 = ProcessInfo.processInfo.environment["QWISP_M2_PROF2"] == "1"
         var tEval: UInt64 = 0, tEnsure: UInt64 = 0, tFinal: UInt64 = 0, pSteps = 0
+        var tEmbed: UInt64 = 0, tDistinct: UInt64 = 0, tRunChunk: UInt64 = 0, tLastGate: UInt64 = 0
+        if prof2 { StreamingMoEBlock.profileLayers = true }
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []
         let t0 = DispatchTime.now()
@@ -1064,27 +1067,37 @@ public enum Tell {
                 MLX.eval(tpreds)
                 for i in 0 ..< L { _ = model.expertCaches[i].ensure(distinct(tpreds[i])) }
             }
+            var tt = now()
             var h = model.embedPub(prev)
+            if prof2 { MLX.eval(h); tEmbed += now() - tt }
             var pos = 0
             while pos < L {
                 let end = Swift.min(pos + CH, L)
                 // 予測元: chunk 0 は前 token 同層 gate 入力(temporal)、以降は前 chunk 最終 gate 入力
                 let src = pos > 0 ? model.expertCaches[pos - 1].lastGateInput! : prevGate![pos]
+                tt = now()
                 let preds = (pos ..< end).map { i in model.predictLayerInds(i, pos > 0 ? src : prevGate![i]) }
-                var ts = now()
-                MLX.eval(preds)
-                if prof { tEval += now() - ts; ts = now() }
-                for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(distinct(preds[k])) }
-                if prof { tEnsure += now() - ts }
+                MLX.eval(preds)                                       // ← 予測(gate matmul)のみ計時(前runChunkは下のbarrierで確定済)
+                if prof || prof2 { tEval += now() - tt; tt = now() }
+                let dists = (pos ..< end).map { distinct(preds[$0 - pos]) }   // CPU readback(inds→list)
+                if prof2 { tDistinct += now() - tt; tt = now() }
+                for (k, i) in (pos ..< end).enumerated() { _ = model.expertCaches[i].ensure(dists[k]) }
+                if prof || prof2 { tEnsure += now() - tt; tt = now() }
                 h = try model.runChunk(h, pos, end, caches: caches)
+                if prof2 {                                           // runChunk(実forward計算)を barrier で確定→計時
+                    MLX.eval([h] + caches[pos ..< end].flatMap { $0.stateArrays }
+                             + (pos ..< end).compactMap { model.expertCaches[$0].lastGateInput })
+                    tRunChunk += now() - tt
+                }
                 pos = end
             }
+            tt = now()
             let logits = model.finalLogits(h)
             let next = MLX.argMax(logits[0, 0], axis: -1).reshaped([1, 1])
-            let ts = now()
             MLX.eval([next] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
-            if prof { tFinal += now() - ts; pSteps += 1 }
+            if prof || prof2 { tFinal += now() - tt; tt = now(); pSteps += 1 }
             prevGate = lastGate(model)
+            if prof2 { tLastGate += now() - tt }
             out.append(prev.item(Int.self)); cur = next
         }
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
@@ -1095,6 +1108,20 @@ public enum Tell {
             FileHandle.standardError.write(String(format:
                 "[M2-PROF/tok] eval(preds=stall)=%.1f ensure(IO)=%.1f final-drain=%.1f (ms) chunks/tok=%d\n",
                 Double(tEval)/s/1e6, Double(tEnsure)/s/1e6, Double(tFinal)/s/1e6, (L + CH - 1) / CH).data(using: .utf8)!)
+        }
+        if prof2, pSteps > 0 {
+            StreamingMoEBlock.profileLayers = false
+            let s = Double(pSteps); func m(_ x: UInt64) -> Double { Double(x)/s/1e6 }
+            let tot = m(tEmbed)+m(tEval)+m(tDistinct)+m(tEnsure)+m(tRunChunk)+m(tFinal)+m(tLastGate)
+            FileHandle.standardError.write(String(format:
+                "[M2-PROF2/tok barrier] embed=%.2f predict(gate)=%.2f distinct(readback)=%.2f ensure(IO)=%.2f "
+                + "runChunk(attn/gdn/moe)=%.2f final(norm/lmhead)=%.2f lastGate=%.2f | 合計=%.1fms\n",
+                m(tEmbed), m(tEval), m(tDistinct), m(tEnsure), m(tRunChunk), m(tFinal), m(tLastGate), tot).data(using: .utf8)!)
+            FileHandle.standardError.write(String(format:
+                "[M2-PROF2 runChunk内訳/tok] GDN(30層)=%.2f attn(10層)=%.2f MoE-gather(40層)=%.2f "
+                + "MoE-shared(40層)=%.2f norm=%.2f (ms)\n",
+                m(StreamingMoEBlock.tGDN), m(StreamingMoEBlock.tAttn), m(StreamingMoEBlock.tMoEgather),
+                m(StreamingMoEBlock.tMoEshared), m(StreamingMoEBlock.tNorm)).data(using: .utf8)!)
         }
         return String(format: """
             [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
