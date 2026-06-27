@@ -28,6 +28,10 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[fast] error: \(error)") }
         do { print(try Tell.runM0(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell] error: \(error)") }
+        if ProcessInfo.processInfo.environment["QWISP_M6"] == "1" {
+            do { print(try Tell.runM0Multi(modelDir: md, refPath: mtpRef)) }
+            catch { print("[Tell M6] error: \(error)") }
+        }
         do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M2] error: \(error)") }
         do { print(try Tell.runM5(modelDir: md, refPath: mtpRef)) }

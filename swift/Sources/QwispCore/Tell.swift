@@ -856,6 +856,9 @@ public enum Tell {
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
         let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
         let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "10") ?? 10
+        // prefetch margin: pass-1 で top-K を捕捉（pass-2 の miss を減らし strict-lossless 化）
+        StreamingMoEBlock.captureK = Int(ProcessInfo.processInfo.environment["QWISP_M0_TOPK"] ?? "0") ?? 0
+        defer { StreamingMoEBlock.captureK = 0 }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -942,6 +945,63 @@ public enum Tell {
             [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+    }
+
+    /// M6: cache 不動点反復(multi-pass)。routing が収束するまで forward を繰り返し、cache を
+    /// その forward の routing と一致させる→pass 間不整合を消し strict-lossless 狙い。収束 pass 数も計測。
+    public static func runM0Multi(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[M6] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let maxP = Int(ProcessInfo.processInfo.environment["QWISP_MAXPASS"] ?? "4") ?? 4
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let L = model.layerCount
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let caches = model.makeCaches()
+        func distinct(_ a: MLXArray) -> Set<Int> { Set(a.asArray(Int32.self).map { Int($0) }) }
+
+        StreamingMoEBlock.probeNoSync = false
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        var out: [Int] = []; var passTotal = 0
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            let prev = cur
+            let snaps = caches.map { $0.snapshot() }
+            var prevR: [Set<Int>]? = nil
+            var lastLg = lg
+            StreamingMoEBlock.probeNoSync = true
+            for pass in 0 ..< maxP {
+                passTotal += 1
+                if pass > 0 { for (i, c) in caches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) } }
+                let (_, lgt) = try model.forwardHidden(prev, caches: caches)
+                MLX.eval([lgt] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+                lastLg = lgt
+                let R = model.expertCaches.map { distinct($0.lastInds ?? MLXArray([Int32]())) }
+                for (i, ec) in model.expertCaches.enumerated() { _ = ec.ensure(Array(R[i])) }   // prefetch
+                if let pr = prevR, zip(pr, R).allSatisfy({ $0 == $1 }) { break }   // 収束
+                prevR = R
+            }
+            StreamingMoEBlock.probeNoSync = false
+            let next = MLX.argMax(lastLg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            out.append(prev.item(Int.self)); cur = next
+        }
+        StreamingMoEBlock.probeNoSync = false
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [Tell M6] cache 不動点反復(C=%d, maxP=%d): %.1f tok/s  品質 %d/%d=%.0f%%  平均pass=%.2f
+            """, C, maxP, Double(N) / secs, match, N, Double(match) / Double(N) * 100, Double(passTotal) / Double(N))
     }
 
     /// M1: one-pass。pass-1 を除去し、chunk の入力 hidden から chunk 内各層の expert を cross-layer

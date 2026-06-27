@@ -173,6 +173,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var captureInds = false      // calib: 全 mode で routing inds を記録
     nonisolated(unsafe) public static var syncLayers: Set<Int>? = nil  // 適応 sync: この層集合は exact(no-sync 無効)
     nonisolated(unsafe) public static var captureLayerInput = false // 予測器 calib: 層の pre-attention 入力を記録
+    nonisolated(unsafe) public static var captureK = 0              // >topK で lastInds に top-K を捕捉（M0 prefetch margin）
     // 層内分解プロファイル（barrier 計測）
     nonisolated(unsafe) public static var profileLayers = false
     nonisolated(unsafe) public static var tGDN: UInt64 = 0
@@ -230,7 +231,14 @@ public final class StreamingMoEBlock {
             && !(StreamingMoEBlock.syncLayers?.contains(layer) ?? false)
         // 天井計測 / 適応 no-sync: GPU-side slot table で remap、per-layer sync/ensure を省く（miss は近似）
         if noSync, let c = cache {
-            c.lastInds = inds.asType(.int32)                     // adaptive miss 検出用
+            // prefetch margin: captureK>topK なら top-captureK を lastInds に（gather は inds=top8 のまま）
+            if StreamingMoEBlock.captureK > topK {
+                let ck = StreamingMoEBlock.captureK
+                let ordK = MLX.argPartition(gates, kth: numExperts - ck, axis: -1)
+                c.lastInds = ordK[0..., (numExperts - ck)...].asType(.int32)
+            } else {
+                c.lastInds = inds.asType(.int32)                 // adaptive miss 検出用
+            }
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
             let xe = x.expandedDimensions(axes: [-2, -3])
