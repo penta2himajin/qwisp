@@ -173,6 +173,11 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var tMoEgather: UInt64 = 0
     nonisolated(unsafe) public static var tMoEshared: UInt64 = 0
     nonisolated(unsafe) public static var tNorm: UInt64 = 0
+    // GDN 内訳
+    nonisolated(unsafe) public static var tGdnInproj: UInt64 = 0
+    nonisolated(unsafe) public static var tGdnConv: UInt64 = 0
+    nonisolated(unsafe) public static var tGdnKernel: UInt64 = 0
+    nonisolated(unsafe) public static var tGdnOut: UInt64 = 0
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,

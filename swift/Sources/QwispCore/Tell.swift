@@ -1122,6 +1122,10 @@ public enum Tell {
                 + "MoE-shared(40層)=%.2f norm=%.2f (ms)\n",
                 m(StreamingMoEBlock.tGDN), m(StreamingMoEBlock.tAttn), m(StreamingMoEBlock.tMoEgather),
                 m(StreamingMoEBlock.tMoEshared), m(StreamingMoEBlock.tNorm)).data(using: .utf8)!)
+            FileHandle.standardError.write(String(format:
+                "[M2-PROF2 GDN内訳/tok] in_proj(4本)=%.2f conv1d+norm=%.2f recurrent-kernel=%.2f out_proj=%.2f (ms)\n",
+                m(StreamingMoEBlock.tGdnInproj), m(StreamingMoEBlock.tGdnConv),
+                m(StreamingMoEBlock.tGdnKernel), m(StreamingMoEBlock.tGdnOut)).data(using: .utf8)!)
         }
         return String(format: """
             [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%

@@ -67,11 +67,15 @@ public struct GatedDeltaNetLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, cache: GDNCache? = nil) -> MLXArray {
+        let prof = StreamingMoEBlock.profileLayers
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        var t = now()
         let B = x.dim(0), S = x.dim(1)
         let qkv = inProjQKV.apply(x)                                  // [B,S,convDim]
         let z = inProjZ.apply(x).reshaped([B, S, numVHeads, headVDim])
         let b = inProjB.apply(x)                                      // [B,S,numVHeads]
         let a = inProjA.apply(x)                                      // [B,S,numVHeads]
+        if prof { MLX.eval([qkv, z, b, a]); StreamingMoEBlock.tGdnInproj += now() - t; t = now() }
 
         // conv_state: cache があれば直近 K-1、無ければ零（因果 padding）
         let convState = cache?.convState
@@ -91,16 +95,20 @@ public struct GatedDeltaNetLayer {
         let invScale = Float(pow(Double(headKDim), -0.5))
         let qN = (invScale * invScale) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
         let kN = invScale * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
+        if prof { MLX.eval([qN, kN, v1] + ((cache?.convState).map { [$0] } ?? [])); StreamingMoEBlock.tGdnConv += now() - t; t = now() }
 
         let (coreOut, newState) = GatedDelta.updateKernel(qN, kN, v1, a, b, aLog, dtBias,
                                                           state: cache?.recState)  // [B,S,Hv,Dv]
         if let c = cache { c.recState = newState }
+        if prof { MLX.eval([coreOut, newState]); StreamingMoEBlock.tGdnKernel += now() - t; t = now() }
 
         // RMSNormGated(out, z): silu(z) * rms_norm(out, normWeight)
         let normed = MLXFast.rmsNorm(coreOut, weight: normWeight, eps: eps)
         let gated = silu(z.asType(.float32)) * normed.asType(.float32)
         let outV = gated.asType(coreOut.dtype).reshaped([B, S, -1])  // [B,S,valueDim]
-        return outProj.apply(outV)
+        let out = outProj.apply(outV)
+        if prof { MLX.eval(out); StreamingMoEBlock.tGdnOut += now() - t }
+        return out
     }
 }
 
