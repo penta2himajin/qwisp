@@ -104,6 +104,10 @@ public final class LayerExpertCache {
     // GPU-side slot table（expert id -> slot, 未cache=0）。sync 無し remap 用。
     var slotTableDirty = true
     var slotTableGPU: MLXArray?
+    var slotVersion = 0                 // slotOf 変更ごとに bump（GPU 配列の再構築判定）
+    public var pinnedSlots: Set<Int> = [] // hot pin: LRU 退避から保護する slot
+    var hotMaskArr: MLXArray?          // GPU hot/cached マスク [numExperts]（1=cached）
+    var hotMaskVer = -1
     public func gpuSlotTable(numExperts: Int) -> MLXArray {
         if slotTableDirty || slotTableGPU == nil {
             var t = [Int32](repeating: 0, count: numExperts)
@@ -112,6 +116,24 @@ public final class LayerExpertCache {
             slotTableGPU = arr; slotTableDirty = false
         }
         return slotTableGPU!
+    }
+
+    /// 現在 cache に居る expert を 1、未cache を 0 とする GPU マスク [numExperts]。
+    /// hybrid の per-token hot-miss 計数（routed が cache 内か）に使う。slotVersion で再構築判定。
+    public func hotMask(numExperts: Int) -> MLXArray {
+        if hotMaskArr == nil || hotMaskVer != slotVersion {
+            var m = [Int32](repeating: 0, count: numExperts)
+            for (e, _) in slotOf { m[e] = 1 }
+            let arr = MLXArray(m, [numExperts]); arr.eval()
+            hotMaskArr = arr; hotMaskVer = slotVersion
+        }
+        return hotMaskArr!
+    }
+
+    /// experts を常駐ロードし、その slot を pinned に登録（以後 LRU 退避されない）。
+    public func pin(_ experts: [Int]) {
+        _ = ensure(experts)
+        for e in experts { if let s = slotOf[e] { pinnedSlots.insert(s) } }
     }
 
     public init(device: MTLDevice, source: ExpertSource, layer: Int, C: Int) throws {
@@ -143,13 +165,17 @@ public final class LayerExpertCache {
             var slot = -1
             for s in 0 ..< C where expertAt[s] == -1 { slot = s; break }
             if slot == -1 {
-                var oldest = 0
-                for s in 1 ..< C where tick[s] < tick[oldest] { oldest = s }
+                // LRU 退避: pinned slot は対象外（hot を保護）
+                var oldest = -1
+                for s in 0 ..< C where !pinnedSlots.contains(s) {
+                    if oldest == -1 || tick[s] < tick[oldest] { oldest = s }
+                }
+                precondition(oldest != -1, "全 slot が pinned: cold をロードできない（C > pin 数に）")
                 slot = oldest
                 slotOf.removeValue(forKey: expertAt[slot])
             }
             expertAt[slot] = e; slotOf[e] = slot; tick[slot] = clock
-            result[e] = slot; missList.append((e, slot)); slotTableDirty = true
+            result[e] = slot; missList.append((e, slot)); slotTableDirty = true; slotVersion += 1
         }
         // 全 miss × 9 テンソルを一括並列 pread（層内 miss をまとめてレイテンシ重畳）
         if !missList.isEmpty {
@@ -179,6 +205,8 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var captureLayerInput = false // 予測器 calib: 層の pre-attention 入力を記録
     nonisolated(unsafe) public static var captureK = 0              // >topK で lastInds に top-K を捕捉（M0 prefetch margin）
     nonisolated(unsafe) public static var marginK = 0               // >topK で lastMarginInds/lastConf を捕捉（M0 選択的マージン）
+    nonisolated(unsafe) public static var countHotMiss = false      // hybrid: no-sync 中、routed が cache 外の数を GPU 累積
+    nonisolated(unsafe) public static var hotMissAccum: MLXArray? = nil  // 全 MoE 層の hot-miss 累積（token 毎に reset）
     // 層内分解プロファイル（barrier 計測）
     nonisolated(unsafe) public static var profileLayers = false
     nonisolated(unsafe) public static var tGDN: UInt64 = 0
@@ -251,6 +279,14 @@ public final class StreamingMoEBlock {
                 let ordM = MLX.argPartition(gates, kth: numExperts - mk, axis: -1)
                 c.lastMarginInds = ordM[0..., (numExperts - mk)...].asType(.int32)
                 c.lastConf = MLX.takeAlong(gates, inds, axis: -1).sum(axis: -1)   // [T] 各 row の top-K mass
+            }
+            // hybrid: この層で routed が cache 外（slot 0 alias になる）数を GPU 累積。
+            // token 全層で 0 なら no-sync gather は exact 経路と bit 一致＝採用しても lossless。
+            if StreamingMoEBlock.countHotMiss {
+                let mask = c.hotMask(numExperts: numExperts)
+                let hits = MLX.take(mask, inds.asType(.int32).reshaped([-1]), axis: 0).sum()
+                let miss = MLXArray(Int32(inds.shape.reduce(1, *))) - hits
+                StreamingMoEBlock.hotMissAccum = StreamingMoEBlock.hotMissAccum.map { $0 + miss } ?? miss
             }
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)

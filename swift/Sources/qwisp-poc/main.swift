@@ -31,16 +31,25 @@ if CommandLine.arguments.contains("stream") {
         do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
         catch { print("[fast] error: \(error)") }
         }
+        let onlyHybrid = ProcessInfo.processInfo.environment["QWISP_ONLY_HYBRID"] == "1"
+        if onlyHybrid {
+            do { print(try Tell.runHotColdHybrid(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdHybrid] error: \(error)") }
+        }
+        if !onlyHybrid {
         do { print(try Tell.runM0(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell] error: \(error)") }
         if ProcessInfo.processInfo.environment["QWISP_M6"] == "1" {
             do { print(try Tell.runM0Multi(modelDir: md, refPath: mtpRef)) }
             catch { print("[Tell M6] error: \(error)") }
         }
+        if !onlyM0 {
         do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M2] error: \(error)") }
         do { print(try Tell.runM5(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M5] error: \(error)") }
+        }
+        }
         if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_CALIB"] == "1" {
             do { print(try Tell.runHotColdCalib(modelDir: md, refPath: mtpRef)) }
             catch { print("[HotCold] error: \(error)") }

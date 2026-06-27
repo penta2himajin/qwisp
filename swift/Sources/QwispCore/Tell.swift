@@ -798,6 +798,111 @@ public enum Tell {
             """, C, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
+    /// hot/cold hybrid: hot-pin no-sync を draft とし、per-token で「全 routed が cache 内か」を
+    /// GPU カウンタで測る。miss==0 の token は no-sync gather が exact と bit 一致＝採用（lossless 保証）。
+    /// miss>0 の token だけ restore→exact 1-forward に escalate（ensure は pinned 外の LRU 領域へ）。
+    /// nl=易→大半 no-sync で ~47、code=難→大半 escalate で ~M0/M2、両者とも構成上 lossless が狙い。
+    public static func runHotColdHybrid(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdHybrid] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        // pinned hot 数。escalate 時の cold ロード用に LRU 枠を最低 8 残す（pin=C だと ensure 不能）。
+        let nPin = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_PIN"] ?? "48") ?? 48,
+                             Swift.max(C - 8, 1))
+        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device,
+                                            source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let caches = model.makeCaches()
+
+        // phase 1: calib（exact decode で頻度集計）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+            MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        }
+        StreamingMoEBlock.captureInds = false
+
+        // phase 2: top-nPin hot を各層 pin（残り C-nPin は escalate 時の cold LRU 枠）
+        for (mi, ec) in model.expertCaches.enumerated() {
+            let hot = Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(nPin).map { $0.offset })
+            ec.pin(hot)
+        }
+
+        // phase 3: hybrid decode（fresh prefill）
+        let caches2 = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        (_, lg) = try model.prefillChunked(ids, caches: caches2)
+        cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+        // accept gate: marginThresh>0 なら logit-margin gate（near-lossless, 確信高い no-sync を採用）、
+        // ==0 なら membership gate（all-hot のみ採用＝厳密 lossless だが strict）。
+        let marginThresh = Float(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "0") ?? 0
+        let useMargin = marginThresh > 0
+        var out: [Int] = []
+        var escalations = 0
+        StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = !useMargin
+        let t0 = DispatchTime.now()
+        for _ in 0 ..< N {
+            out.append(cur.item(Int.self))
+            let snaps = caches2.map { $0.snapshot() }
+            StreamingMoEBlock.hotMissAccum = nil
+            let (_, lgn) = try model.forwardHidden(cur, caches: caches2)      // no-sync draft
+            let v = lgn[0, 0]
+            let nosyncTok = MLX.argMax(v, axis: -1).reshaped([1, 1])
+            let accept: Bool
+            if useMargin {
+                // no-sync 出力の top1-top2 margin。大＝近似が argmax を反転しない確信が高い→採用。
+                let sv = MLX.sorted(v, axis: -1); let n = sv.dim(0)
+                let marginArr = sv[n - 1] - sv[n - 2]
+                MLX.eval([nosyncTok, marginArr] + caches2.flatMap { $0.stateArrays })
+                accept = marginArr.item(Float.self) >= marginThresh
+            } else {
+                let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+                MLX.eval([nosyncTok, missArr] + caches2.flatMap { $0.stateArrays })
+                accept = missArr.item(Int.self) == 0                         // all-hot＝exact と bit 一致
+            }
+            if accept {
+                cur = nosyncTok
+            } else {
+                escalations += 1
+                for (i, c) in caches2.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+                (_, lg) = try model.forwardHidden(cur, caches: caches2)      // exact 1-forward（ensure→LRU枠）
+                cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+                StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = !useMargin
+            }
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+        StreamingMoEBlock.hotMissAccum = nil
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let match = zip(out, gR).filter { $0 == $1 }.count
+        return String(format: """
+            [HotColdHybrid] pin=%d/C=%d gate=%@: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  escalate=%d/%d(%.0f%%)
+            """, nPin, C, useMargin ? String(format: "margin≥%.1f", marginThresh) : "membership",
+            Double(N) / secs, match, N, Double(match) / Double(N) * 100,
+            escalations, N, Double(escalations) / Double(N) * 100)
+    }
+
     /// 各層の gate 入力の「最後の位置」だけ取る（chunk-0 予測の thrash 回避）。
     static func lastGate(_ model: StreamingQwispModel) -> [MLXArray] {
         // gate 入力は 2D [S, H]（MoE は [B*S, H] を受ける）。seq 軸=axis0 の最終行のみ取る。
