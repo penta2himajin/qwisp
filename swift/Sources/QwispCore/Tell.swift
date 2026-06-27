@@ -860,10 +860,47 @@ public enum Tell {
         // partial-resume: escalate 時、no-sync draft の最初の miss 層 k を特定し、層 0..k-1 の計算を
         // 流用して層 k から exact tail だけ再走（厳密 lossless, escalate コストを k に比例して削減）。
         let partial = ProcessInfo.processInfo.environment["QWISP_PARTIAL"] == "1"
+        // prefetch-verify(Q3b expert 予測常駐): 各 token no-sync draft で全層 inds 取得 → draft inds を
+        // 一括 prefetch 常駐 → no-sync verify（resident）→ residual hotMiss を計数。draft 予測の
+        // 取りこぼし(後段層で draft の corrupted-hidden 由来 inds がズレる分)を実測。
+        let prefetchVerify = ProcessInfo.processInfo.environment["QWISP_PREFETCH"] == "1"
         let L = model.layerCount
         var out: [Int] = []
         var escalations = 0
         var firstMissSum = 0
+        if prefetchVerify {
+            StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.captureInds = true
+            var residualSum = 0
+            let t0 = DispatchTime.now()
+            for _ in 0 ..< N {
+                out.append(cur.item(Int.self))
+                let snaps = caches2.map { $0.snapshot() }
+                // pass-1: no-sync draft → 全層 draft inds（GPU, per層 sync 無し）
+                StreamingMoEBlock.countHotMiss = false
+                _ = try model.forwardHidden(cur, caches: caches2)
+                MLX.eval(caches2.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+                // prefetch: 各層 draft distinct inds を常駐化（pinned 保持で LRU 枠へ pread）
+                for ec in model.expertCaches { ec.prefetchLastInds() }
+                // restore（draft の cache 前進を巻き戻す）→ pass-2 no-sync verify（resident）
+                for (i, c) in caches2.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil
+                let (_, lg2) = try model.forwardHidden(cur, caches: caches2)
+                let vTok = MLX.argMax(lg2[0, 0], axis: -1).reshaped([1, 1])
+                let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+                MLX.eval([vTok, missArr] + caches2.flatMap { $0.stateArrays })
+                let rm = missArr.item(Int.self)
+                residualSum += rm; if rm > 0 { escalations += 1 }
+                cur = vTok
+            }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = false
+            StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+            let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+            let match = zip(out, gR).filter { $0 == $1 }.count
+            return String(format: """
+                [HotColdHybrid] pin=%d/C=%d gate=prefetch-verify: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  residual-miss平均=%.1f/tok(>0:%d/%d tok)
+                """, nPin, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100,
+                Double(residualSum) / Double(N), escalations, N)
+        }
         if partial {
             StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = false
             StreamingMoEBlock.captureInds = true
