@@ -1511,10 +1511,6 @@ extension Tell {
         let isLin = model.isLinearFlags
         let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
-        // A1(issue #2): full-attn の SDPA を f32 化。batched verify(seqMT off)が逐次と一致するか検証用。
-        // gSwift 参照も同条件にするため calib/参照より前に設定。
-        AttentionLayer.f32SDPA = Tell.envFlag("QWISP_F32_ATTN")
-        defer { AttentionLayer.f32SDPA = false }
 
         // phase 1: calib（hot-pin 用の頻度集計。verify は exact ゆえ buddy 不要）
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
