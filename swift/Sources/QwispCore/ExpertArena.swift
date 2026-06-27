@@ -214,6 +214,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var captureK = 0              // >topK で lastInds に top-K を捕捉（M0 prefetch margin）
     nonisolated(unsafe) public static var marginK = 0               // >topK で lastMarginInds/lastConf を捕捉（M0 選択的マージン）
     nonisolated(unsafe) public static var countHotMiss = false      // hybrid: no-sync 中、routed が cache 外の数を GPU 累積
+    nonisolated(unsafe) public static var skipMode = 0              // no-sync 近似改善: 1=cold寄与を0(no renorm), 2=0にして hot再正規化, 3=buddy代替
     nonisolated(unsafe) public static var hotMissAccum: MLXArray? = nil  // 全 MoE 層の hot-miss 累積（token 毎に reset）
     // 層内分解プロファイル（barrier 計測）
     nonisolated(unsafe) public static var profileLayers = false
@@ -295,6 +296,19 @@ public final class StreamingMoEBlock {
                 let hits = MLX.take(mask, inds.asType(.int32).reshaped([-1]), axis: 0).sum()
                 let miss = MLXArray(Int32(inds.shape.reduce(1, *))) - hits
                 StreamingMoEBlock.hotMissAccum = StreamingMoEBlock.hotMissAccum.map { $0 + miss } ?? miss
+            }
+            // skip: cold(slot-0 alias になる)expert の gate 重みを 0 にし slot-0 garbage 混入を防ぐ。
+            // mode1=寄与0のみ(scale 保持), mode2=hot で再正規化(amplify)。GPU 完結, 追加 sync 無し。
+            if StreamingMoEBlock.skipMode == 1 || StreamingMoEBlock.skipMode == 2 {
+                let mask = c.hotMask(numExperts: numExperts)
+                let hotness = MLX.take(mask, inds.asType(.int32), axis: 0).asType(scores.dtype)  // [T,K]
+                let ms = scores * hotness
+                if StreamingMoEBlock.skipMode == 2 {
+                    let denom = ms.sum(axis: -1, keepDims: true)   // hot で再正規化（全 cold 行は元へ）
+                    scores = MLX.where(denom .> 1e-6, ms / MLX.maximum(denom, MLXArray(Float(1e-6)).asType(ms.dtype)), scores)
+                } else {
+                    scores = ms                                    // 寄与0のみ（scale は下がるが amplify 無し）
+                }
             }
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)

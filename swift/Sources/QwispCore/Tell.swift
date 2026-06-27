@@ -782,6 +782,8 @@ public enum Tell {
         cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         StreamingMoEBlock.probeNoSync = true   // 以降 no-sync（hot 固定 slotTable で gather）
+        let skipMode = Int(ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] ?? "0") ?? 0
+        StreamingMoEBlock.skipMode = skipMode       // 1=cold寄与0, 2=0+renorm（slot-0 garbage 回避）
         var out: [Int] = []
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
@@ -790,12 +792,13 @@ public enum Tell {
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         }
-        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
+        let skipTag = skipMode == 1 ? "+skip" : (skipMode == 2 ? "+skip-renorm" : "")
         return String(format: """
-            [HotColdFast] hot-pin top-%d + pure no-sync (calib=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
-            """, C, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
     /// hot/cold hybrid: hot-pin no-sync を draft とし、per-token で「全 routed が cache 内か」を
