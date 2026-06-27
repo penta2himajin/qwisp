@@ -795,6 +795,23 @@ public enum Tell {
         }
         StreamingMoEBlock.captureInds = false
 
+        // Swift-exact-greedy 参照（f16-near-lossless 評価用。Python-ref は長 horizon で f16 乖離する
+        // ので、同一エンジンの exact greedy を真値に no-sync/buddy の品質を測る）。QWISP_SWIFT_REF=1。
+        var gSwift: [Int] = []
+        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+            let cref = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+        }
+
         // --- phase 2: top-C hot を各層 pin（ensure で常駐ロード）+ buddy table 構築 ---
         for (mi, ec) in model.expertCaches.enumerated() {
             // tie は index 昇順で決定的に（非安定ソートの run 間ブレ＝hot set 変動を排除）
@@ -825,9 +842,13 @@ public enum Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         let skipTag = skipMode == 1 ? "+skip" : (skipMode == 2 ? "+skip-renorm" : (skipMode == 3 ? "+buddy" : ""))
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(out, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
-            """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@
+            """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
     /// hot/cold hybrid: hot-pin no-sync を draft とし、per-token で「全 routed が cache 内か」を
@@ -854,10 +875,13 @@ public enum Tell {
         let isLin = model.isLinearFlags
         let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
         let nE = 256, nMoE = model.expertCaches.count
+        let buddy = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"   // no-sync draft を buddy 代替
         let caches = model.makeCaches()
 
-        // phase 1: calib（exact decode で頻度集計）
+        // phase 1: calib（exact decode で頻度集計 + buddy 用 co-activation）
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        var coact: [[[Int]]] = buddy
+            ? [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE), count: nMoE) : []
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
@@ -866,18 +890,27 @@ public enum Tell {
             (_, lg) = try model.forwardHidden(cur, caches: caches)
             MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
             for (mi, ec) in model.expertCaches.enumerated() {
-                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+                if let li = ec.lastInds {
+                    let es = li.asArray(Int32.self).map { Int($0) }
+                    for e in es { counts[mi][e] += 1 }
+                    if buddy { for a in 0 ..< es.count { for b in (a + 1) ..< es.count {
+                        coact[mi][es[a]][es[b]] += 1; coact[mi][es[b]][es[a]] += 1 } } }
+                }
             }
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([cur] + caches.flatMap { $0.stateArrays })
         }
         StreamingMoEBlock.captureInds = false
 
-        // phase 2: top-nPin hot を各層 pin（残り C-nPin は escalate 時の cold LRU 枠）
+        // phase 2: top-nPin hot を各層 pin（残り C-nPin は escalate 時の cold LRU 枠）+ buddy table
         for (mi, ec) in model.expertCaches.enumerated() {
             let hot = Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(nPin).map { $0.offset })
             ec.pin(hot)
+            if buddy { ec.buildBuddyTable(coact: coact[mi], numExperts: nE) }
         }
+        // buddy: no-sync draft 中のみ skipMode=3（escalate は probeNoSync=false で無影響）。
+        StreamingMoEBlock.skipMode = buddy ? 3 : 0
+        defer { StreamingMoEBlock.skipMode = 0 }
 
         // phase 3: hybrid decode（fresh prefill）
         let caches2 = model.makeCaches()
