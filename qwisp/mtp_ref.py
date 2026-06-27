@@ -29,7 +29,9 @@ def main():
     lm = model.language_model
     head = build_head(args.model, lm)
 
-    base = "def quicksort(a):\n    if len(a)<=1: return a\n    p=a[len(a)//2]\n"
+    import os
+    base = os.environ.get("QWISP_REF_PROMPT",
+                          "def quicksort(a):\n    if len(a)<=1: return a\n    p=a[len(a)//2]\n")
     ids = tok.encode(base)
     while len(ids) < args.ctx:
         ids = ids + tok.encode(base)
@@ -51,8 +53,9 @@ def main():
 
     # 実プロンプト(ctx)で greedy/spec を回し token 列を dump（Swift 投機の正しさ検証用）
     spec_prompt = ids[:args.ctx]
-    g_out, _ = MD.greedy(lm, spec_prompt, 48)
-    sp_out, st, accd, _ = MD.speculative(lm, head, spec_prompt, 48, light=True)
+    nspec = int(os.environ.get("QWISP_REF_NSPEC", "48"))
+    g_out, _ = MD.greedy(lm, spec_prompt, nspec)
+    sp_out, st, accd, _ = MD.speculative(lm, head, spec_prompt, nspec, light=True)
     spm = sum(1 for a, b in zip(g_out, sp_out) if a == b)
     print(f"[mtp-ref] spec: greedy一致 {spm}/48 accept={accd / st:.3f} (real prompt)")
 
