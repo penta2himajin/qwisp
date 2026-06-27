@@ -859,6 +859,12 @@ public enum Tell {
         // prefetch margin: pass-1 で top-K を捕捉（pass-2 の miss を減らし strict-lossless 化）
         StreamingMoEBlock.captureK = Int(ProcessInfo.processInfo.environment["QWISP_M0_TOPK"] ?? "0") ?? 0
         defer { StreamingMoEBlock.captureK = 0 }
+        // 選択的マージン: 不確実層(top-K mass < τ)だけ top-marginK を prefetch（一律 top-K の cache 圧迫を回避）
+        let selK = Int(ProcessInfo.processInfo.environment["QWISP_M0_SELK"] ?? "0") ?? 0
+        let selTau = Float(ProcessInfo.processInfo.environment["QWISP_M0_TAU"] ?? "0.6") ?? 0.6
+        StreamingMoEBlock.marginK = selK
+        defer { StreamingMoEBlock.marginK = 0 }
+        var widenTotal = 0, widenTokens = 0   // 診断: 拡張した層数の累積
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -900,9 +906,22 @@ public enum Tell {
             var ts = now()
             StreamingMoEBlock.probeNoSync = true
             _ = try model.forwardHidden(prev, caches: caches)
-            MLX.eval(caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            MLX.eval(caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds }
+                     + model.expertCaches.compactMap { $0.lastMarginInds }
+                     + model.expertCaches.compactMap { $0.lastConf })
             if prof { tP1 += now() - ts; ts = now() }
-            let pred = model.expertCaches.map { distinct($0.lastInds ?? MLXArray([Int32]())) }
+            let pred: [[Int]]
+            if selK > 8 {
+                // 選択的マージン: 確信度 < τ の層は marginK 候補、それ以外は top-8 を prefetch
+                widenTokens += 1
+                pred = model.expertCaches.map { ec -> [Int] in
+                    let conf = ec.lastConf.map { $0.min().item(Float.self) } ?? 1.0
+                    if conf < selTau, let m = ec.lastMarginInds { widenTotal += 1; return distinct(m) }
+                    return distinct(ec.lastInds ?? MLXArray([Int32]()))
+                }
+            } else {
+                pred = model.expertCaches.map { distinct($0.lastInds ?? MLXArray([Int32]())) }
+            }
             for (i, c) in caches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
             if prof { tPred += now() - ts }
 
@@ -941,10 +960,14 @@ public enum Tell {
                 Double(tP1)/n/1e6, Double(tPred)/n/1e6, Double(tBuild)/n/1e6,
                 Double(tWait)/n/1e6, Double(tFinal)/n/1e6).data(using: .utf8)!)
         }
+        let selDiag = selK > 8
+            ? String(format: "  [selK=%d τ=%.2f 拡張層=%.1f/%d層/tok]",
+                     selK, selTau, Double(widenTotal) / Double(Swift.max(widenTokens, 1)), L)
+            : ""
         return String(format: """
-            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%%@
             """,
-            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, selDiag)
     }
 
     /// M6: cache 不動点反復(multi-pass)。routing が収束するまで forward を繰り返し、cache を

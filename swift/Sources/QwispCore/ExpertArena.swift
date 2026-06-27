@@ -89,6 +89,10 @@ public final class LayerExpertCache {
     var lastInds: MLXArray?
     public var lastGateInput: MLXArray?   // Tell M2: この層の MoE 入力(=真の gate 入力)を capture
     public var preAttnInput: MLXArray?    // 予測器 calib: この層の pre-attention 入力（層入力）を capture
+    // 選択的マージン prefetch（M0）: 広い top-marginK と確信度(top-K mass)を別捕捉。
+    // 不確実層だけ marginK を prefetch するため、CPU 側で τ 判定に使う。
+    public var lastMarginInds: MLXArray?  // 広い top-marginK 候補
+    public var lastConf: MLXArray?        // 各 row の top-K softmax mass（[T]）
     /// lastInds のうち cache 未収容（fast で wrong-slot になった）expert 数。
     public func missCount() -> Int {
         guard let li = lastInds else { return 0 }
@@ -174,6 +178,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var syncLayers: Set<Int>? = nil  // 適応 sync: この層集合は exact(no-sync 無効)
     nonisolated(unsafe) public static var captureLayerInput = false // 予測器 calib: 層の pre-attention 入力を記録
     nonisolated(unsafe) public static var captureK = 0              // >topK で lastInds に top-K を捕捉（M0 prefetch margin）
+    nonisolated(unsafe) public static var marginK = 0               // >topK で lastMarginInds/lastConf を捕捉（M0 選択的マージン）
     // 層内分解プロファイル（barrier 計測）
     nonisolated(unsafe) public static var profileLayers = false
     nonisolated(unsafe) public static var tGDN: UInt64 = 0
@@ -238,6 +243,14 @@ public final class StreamingMoEBlock {
                 c.lastInds = ordK[0..., (numExperts - ck)...].asType(.int32)
             } else {
                 c.lastInds = inds.asType(.int32)                 // adaptive miss 検出用
+            }
+            // 選択的マージン: top-8 とは別に、広い top-marginK と確信度(top-K mass)を捕捉。
+            // CPU 側で層ごとに τ 判定し、不確実層だけ marginK を prefetch する（追加 sync 無し）。
+            if StreamingMoEBlock.marginK > topK {
+                let mk = StreamingMoEBlock.marginK
+                let ordM = MLX.argPartition(gates, kth: numExperts - mk, axis: -1)
+                c.lastMarginInds = ordM[0..., (numExperts - mk)...].asType(.int32)
+                c.lastConf = MLX.takeAlong(gates, inds, axis: -1).sum(axis: -1)   // [T] 各 row の top-K mass
             }
             let table = c.gpuSlotTable(numExperts: numExperts)
             let remap = MLX.take(table, inds.asType(.int32), axis: 0).asType(.uint32)
