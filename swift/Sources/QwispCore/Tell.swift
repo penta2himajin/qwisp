@@ -312,6 +312,7 @@ public enum Tell {
         let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
         let K = Int(ProcessInfo.processInfo.environment["QWISP_DRAFT_K"] ?? "4") ?? 4
         let skipStride = Int(ProcessInfo.processInfo.environment["QWISP_SKIP_STRIDE"] ?? "0") ?? 0
+        let buddy = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"   // draft を buddy 代替で高精度化
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -326,6 +327,8 @@ public enum Tell {
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
 
+        var coact: [[[Int]]] = buddy
+            ? [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE), count: nMoE) : []
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
@@ -334,14 +337,23 @@ public enum Tell {
             (_, lg) = try model.forwardHidden(cur, caches: caches)
             MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
             for (mi, ec) in model.expertCaches.enumerated() {
-                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+                if let li = ec.lastInds {
+                    let es = li.asArray(Int32.self).map { Int($0) }
+                    for e in es { counts[mi][e] += 1 }
+                    if buddy { for a in 0 ..< es.count { for b in (a + 1) ..< es.count {
+                        coact[mi][es[a]][es[b]] += 1; coact[mi][es[b]][es[a]] += 1 } } }
+                }
             }
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
         }
         StreamingMoEBlock.captureInds = false
         for (mi, ec) in model.expertCaches.enumerated() {
-            _ = ec.ensure(Array(counts[mi].enumerated().sorted { $0.element > $1.element }.prefix(C).map { $0.offset }))
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+            if buddy { ec.buildBuddyTable(coact: coact[mi], numExperts: nE) }
         }
+        defer { StreamingMoEBlock.skipMode = 0 }
 
         let mc = model.makeCaches()
         StreamingMoEBlock.probeNoSync = false
@@ -364,6 +376,7 @@ public enum Tell {
             var ts = now()
             let snaps0 = mc.map { $0.snapshot() }
             StreamingMoEBlock.probeNoSync = true
+            StreamingMoEBlock.skipMode = buddy ? 3 : 0   // draft のみ buddy 代替（verify は exact）
             var drafts: [Int] = []; var dcur = uArr
             for _ in 0 ..< K {
                 let (_, dl) = skip.isEmpty
@@ -379,7 +392,8 @@ public enum Tell {
             // expert を流用し per-layer sync を消す=near-lossless で高速)。QWISP_VERIFY_SEQ=0 で seqMT 無効。
             let vseq = ProcessInfo.processInfo.environment["QWISP_VERIFY_SEQ"] != "0"
             let vNoSync = ProcessInfo.processInfo.environment["QWISP_VERIFY_NOSYNC"] == "1"
-            StreamingMoEBlock.probeNoSync = vNoSync; AttentionLayer.seqMultiToken = vseq
+            StreamingMoEBlock.probeNoSync = vNoSync; StreamingMoEBlock.skipMode = 0   // verify は exact gather
+            AttentionLayer.seqMultiToken = vseq
             let snaps1 = mc.map { $0.snapshot() }
             let draftArr = MLXArray(drafts.map { Int32($0) }, [1, K])
             let seq = MLX.concatenated([uArr, draftArr], axis: 1)            // [1, K+1]
@@ -418,8 +432,8 @@ public enum Tell {
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tCommit)/s/1e6, steps).data(using: .utf8)!)
         }
         return String(format: """
-            [HotColdSpecK] no-sync draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
-            """, K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
+            [HotColdSpecK] %@draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
+            """, buddy ? "buddy-" : "no-sync ", K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
     /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。

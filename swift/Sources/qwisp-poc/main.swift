@@ -32,7 +32,8 @@ if CommandLine.arguments.contains("stream") {
         catch { print("[fast] error: \(error)") }
         }
         let onlyHybrid = ProcessInfo.processInfo.environment["QWISP_ONLY_HYBRID"] == "1"
-        if onlyHybrid {
+        let speckOnly = ProcessInfo.processInfo.environment["QWISP_HOTCOLD_SPECK"] == "1"
+        if onlyHybrid && !speckOnly {
             do { print(try Tell.runHotColdHybrid(modelDir: md, refPath: mtpRef)) }
             catch { print("[HotColdHybrid] error: \(error)") }
         }
