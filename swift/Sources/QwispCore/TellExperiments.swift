@@ -1624,10 +1624,11 @@ extension Tell {
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SuffixSpec] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 48)
-        // arena 制約: verify の単一 exact forward が安全に扱える draft 長は ~4(=D+1≤5, distinct≲40)。
-        // C=64/128 とも maxK=5 で破綻＝arena 容量でなく verify 経路固有の固定上限(SpecK 既定 K=4 と同一、
-        // SpecK K≥5 も破綻)。→ maxK=4 に固定。C↑の利得は draft 長でなく verify 安価化(long 42.7→57.6)。
-        // 長 draft 解放には verify の per-forward distinct-expert 上限の調査/chunk 化が要る(別途)。
+        // 安全 draft 長 ~4 の真因(計装で確定, issue #2): arena でない(|U|=47<64,slot衝突0)。
+        // multi-token verify が f16 で single-token と drift し、T↑で batched 寄りになって near-tie 反転
+        // ＝seqMT が直すのは attention のみで conv1d/GDN/MoE の f16 batched≠逐次 が残る(A1 同根)。
+        // hard(反復)は near-tie を越えず maxK=8 でも lossless ＝入力依存境界。安全側で maxK=4 固定。
+        // 長 draft 解放には multi-token forward 全体の bit-exact(f32/逐次)化=軸A2/A3 が要る。
         let maxK = Swift.min(Tell.envInt("QWISP_DRAFT_K", 4), 4)
         let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 2)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
