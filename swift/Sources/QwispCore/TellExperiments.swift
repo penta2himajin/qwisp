@@ -1485,21 +1485,20 @@ extension Tell {
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// **MTP head 投機 × Tell exact verify**
-    /// - 機構: MTP(Multi-Token Prediction) head で draft → Tell exact verify(seqMultiToken)で lossless 照合
-    /// - lossless: **strict**（seqMT 逐次 verify で greedy 一致。MTP D1 で 1.61x）
-    /// - 速度: 8GB ~25 tok/s lossless（resident では ~68.9）
-    /// - 研究: Multi-Token Prediction (DeepSeek-V3; Gloeckle 2024)
-    /// - env: QWISP_RUN_M4 / QWISP_VERIFY_SEQ / QWISP_VERIFY_NOSYNC
-    /// - 旧名: M4 / M2c / runM4（git bfa2651, 382ccf7）
+    /// **depth-1 MTP head 投機 + clean exact verify（issue #1 準拠）**
+    /// - 機構: depth-1 MTP head で 1 token draft → SpecK と同じ clean batched `forwardHidden([u,d])`(seqMultiToken)で
+    ///   exact verify → draft==exact なら 2 token commit / 外れは exact 訂正。hot-pin top-C で verify expert を常駐化。
+    /// - lossless: **strict**（verify が exact ゆえ構成的。vs Swift-exact で確認）
+    /// - 速度: 8GB C=64 目標 ~35-38（draft を MTP head で無料化。律速は seqMT 逐次 verify ~54%）
+    /// - 研究: Speculative Decoding (Leviathan/Chen 2023) + Multi-Token Prediction (DeepSeek-V3; Gloeckle 2024)
+    /// - env: QWISP_RUN=mtp-spec-verify / QWISP_CACHE_C / QWISP_CALIB / QWISP_SWIFT_REF=1 / QWISP_SPECK_PROF
+    /// - 旧名: M4 / M2c。旧実装(MTP×tellForward, accept 0.855/20tok)を issue #1 準拠の clean 版へ置換(git bfa2651,382ccf7=旧)
     public static func runMTPSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MTPSpecVerify] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
-        let CH = Tell.envInt("QWISP_CHUNK", 2)
-        // 既定は exact verify（spec を lossless に再現）。QWISP_M4_PRED=1 で予測 verify（高速だが lossy）。
-        let exactVerify = ProcessInfo.processInfo.environment["QWISP_M4_PRED"] != "1"
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1511,61 +1510,104 @@ extension Tell {
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
-        let mainCaches = model.makeCaches()
+        let nE = 256, nMoE = model.expertCaches.count
+
+        // phase 1: calib（hot-pin 用の頻度集計。verify は exact ゆえ buddy 不要）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+
+        // Swift-exact-greedy 参照（lossless 検証）
+        var gSwift: [Int] = []
+        if Tell.envFlag("QWISP_SWIFT_REF") {
+            let cref = model.makeCaches()
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+        }
+
+        // phase 2: top-C hot-pin（verify の expert を常駐化, demand-load を減らす）
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+
+        // phase 3: depth-1 MTP draft + clean exact verify（Speculative.swift D1 を streaming に移植）
+        let mc = model.makeCaches()
         let mtpKV = KVCache()
         let P = ids.dim(-1)
-
-        // prefill（sync, gate 入力 capture）→ prevGate
-        // 注意: prompt 全体を 1 forward すると |U|>C で arena 破綻するため chunk 分割必須（specLoop と同じ）。
-        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = true
-        let (Hf, lgf) = try model.prefillChunked(ids, caches: mainCaches)
+        StreamingMoEBlock.probeNoSync = false
+        let (Hf, lgf) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lgf[0..., (lgf.dim(1) - 1)...], axis: -1)
         var lastH = Hf[0..., (P - 1)...]
         _ = head(Hf[0..., 0 ..< (P - 1)], ids[0..., 1...], cache: mtpKV)
-        var prevGate: [MLXArray]? = lastGate(model)
-        func evalAll() {
-            MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 }
-                     + mainCaches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastGateInput })
-        }
-        evalAll()
-        prevGate = lastGate(model)
-
-        // verify([u,v]) の attention を逐次化＝true greedy-lossless（既定 ON, prefill 後に有効化）。
-        if ProcessInfo.processInfo.environment["QWISP_BATCHED_VERIFY"] != "1" { AttentionLayer.seqMultiToken = true }
+        MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
+        if Tell.envStr("QWISP_BATCHED_VERIFY", "0") != "1" { AttentionLayer.seqMultiToken = true }
+        let prof = Tell.envFlag("QWISP_SPECK_PROF")
+        var tDraft: UInt64 = 0, tVerify: UInt64 = 0
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []; var steps = 0, acc = 0
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
-            let dl = head(lastH, uArr, cache: mtpKV)
+            var ts = now()
+            let dl = head(lastH, uArr, cache: mtpKV)                       // depth-1 draft（安い）
             let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
-            let ud = MLX.concatenated([uArr, dArr], axis: 1)
-            let snaps = mainCaches.map { $0.snapshot() }
-            let (H2, lg2) = try tellForward(model, ud, mainCaches, prevGate, CH, exact: exactVerify)   // ★Tell verify
-            let pg2 = lastGate(model)
-            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)
+            let ud = MLX.concatenated([uArr, dArr], axis: 1)              // [1,2]
+            if prof { MLX.eval([ud] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
+            let snaps = mc.map { $0.snapshot() }
+            let (H2, lg2) = try model.forwardHidden(ud, caches: mc)        // ★clean exact verify
+            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)               // [v, w]
             let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
             let d = Int(vals[0]), v = Int(vals[1])
             out.append(uArr.item(Int.self))
-            if v == d {
+            if v == d {                                                   // accept → 2 token
                 acc += 1; out.append(d)
-                _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)
+                _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)           // catch-up
                 uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
-                prevGate = pg2
-            } else {
-                for (i, c) in mainCaches.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
-                let (H1, _) = try tellForward(model, uArr, mainCaches, prevGate, CH, exact: exactVerify)   // [u] 再投入
+            } else {                                                      // reject → [u] のみ再投入
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
+                let (H1, _) = try model.forwardHidden(uArr, caches: mc)
                 uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
-                prevGate = lastGate(model)
             }
-            evalAll()
+            MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
+            if prof { tVerify += now() - ts }
         }
-        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureGateInput = false
-        AttentionLayer.seqMultiToken = false   // global static を後続に漏らさない
+        StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        let outN = Array(out.prefix(N))
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(outN, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(outN, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
+        if prof {
+            let s = Double(steps)
+            FileHandle.standardError.write(String(format:
+                "[MTPSpec-PROF/step] draft(MTP head)=%.1f verify(seqMT exact)=%.1f (ms)  steps=%d\n",
+                Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, steps).data(using: .utf8)!)
+        }
         return String(format: """
-            [MTPSpecVerify] MTP × Tell verify(%@, C=%d, chunk=%d): %.1f tok/s  accept=%.3f  品質(greedy一致) %d/%d=%.0f%%
-            """,
-            exactVerify ? "exact" : "pred", C, CH, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
+            [MTPSpecVerify] depth-1 MTP draft + clean exact verify(C=%d): %.1f tok/s  accept=%.3f  品質(vs Python) %d/%d=%.0f%%%@
+            """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 }
