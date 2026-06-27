@@ -131,11 +131,15 @@ m2(){ QWISP_RUN=cross-layer-predict ... ; }   # 同様
 - **SpecK だけが long でも Swift-exact 100%** = 毎トークン exact verify で照合するため構成的に保証。**8GB で真に lossless なのは SpecK のみ**。
 - **∴ メモリの「strict lossless = M0/M2 ~27」は誤り。正しくは「strict lossless = SpecK ~26-28、M0/M2 は near-lossless」。**
 
-### ★ 8GB RAM ベースライン = SpecK
+### ★ lossless ベースライン: SpecK → SuffixSpec に更新（2026-06-28, commit 658ae3d）
 
-**8GB RAM 環境の lossless ベースライン手法は SpecK（buddy draft + exact verify, C=64, K=4）= ~26-28 tok/s** とする。
-理由: 上記の通り 8GB で free-running long-horizon を真に lossless に保てる唯一の手法。M0/M2/margin/membership はいずれも near か低速。
-16GB 以上では同じ SpecK を C=128 へ拡張（~34-36, strict のまま 1.3x）。
+**現在の lossless ベースラインは SuffixSpec（SuffixDecoding draft + clean exact verify, 訓練なし, `QWISP_RUN=suffix-spec`）**:
+- prompt+生成履歴の suffix lookup で draft を**無料生成(0.00ms)** → SpecK の clean exact verify(seqMT)で照合。draft が何でも verify が保証ゆえ lossless。
+- 実測 vs Swift-greedy **全て 100% lossless**: **8GB C=64 = 42-44 / 16GB C=128 = 58 tok/s**（accept/step 3.0-3.13）。SpecK の **1.6-2.1x**。high-entropy long でも greedy 反復を suffix が捕捉。
+- 制約: verify 単一 exact forward は ~5token(maxK=4)が安全上限（arena 容量でなく経路固有、SpecK K≥5 も破綻）。長 draft 解放(verify chunk化)が次の伸び代。
+- 経緯: issue#1(depth-1 MTP draft=20tok, 律速は draft でなく verify)・issue#2 A1(batched-lossless f32 verify=順序安定 f32 でも 30%止まり)を反証し、issue#2 軸B(SuffixDecoding)で到達。GitHub issue #1/#2 参照。
+
+**SpecK（旧ベースライン, `QWISP_RUN=spec-verify`, ~27 / C=128 34-36）は SuffixSpec の verify 土台かつ比較基準として有効**。8GB で free-running long-horizon を真に lossless に保つ最小構成（M0/M2/margin/membership は near か低速）。
 
 ### 読み取り
 
