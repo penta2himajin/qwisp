@@ -67,7 +67,7 @@ xcodebuild build -scheme qwisp-poc -configuration Release \
 
 ```bash
 BIN=./.xcode-build-rel/Build/Products/Release/qwisp-poc
-run() { QWISP_ONLY_FAST=1 QWISP_HYBRID=1 QWISP_CACHE_C=64 QWISP_PIN=48 QWISP_SKIPMODE=3 \
+run() { QWISP_RUN=no-sync-gate-escalate QWISP_CACHE_C=64 QWISP_PIN=48 QWISP_SKIPMODE=3 \
   QWISP_CALIB=48 QWISP_GEN=128 QWISP_SWIFT_REF=1 QWISP_MARGIN=$1 \
   QWISP_MTP_REF=/tmp/qwisp_$2_ref.safetensors $BIN stream 2>&1 | grep NoSyncGateEscalate; }
 run 0 hard   # membership / hard(48tok)
@@ -93,7 +93,7 @@ run 2 long   # margin>=2  / long(128tok)
 ### SpecK（lossless 機構）実測
 
 ```bash
-run() { QWISP_ONLY_FAST=1 QWISP_SPECK=1 QWISP_CACHE_C=$1 QWISP_SKIPMODE=3 QWISP_DRAFT_K=4 \
+run() { QWISP_RUN=spec-verify QWISP_CACHE_C=$1 QWISP_SKIPMODE=3 QWISP_DRAFT_K=4 \
   QWISP_CALIB=48 QWISP_GEN=128 QWISP_SWIFT_REF=1 QWISP_MTP_REF=/tmp/qwisp_$2_ref.safetensors \
   $BIN stream 2>&1 | grep SpecVerify; }
 run 64 hard; run 64 long; run 128 hard; run 128 long
@@ -116,8 +116,8 @@ run 64 hard; run 64 long; run 128 hard; run 128 long
 「strict lossless = M0/M2 ~27」というメモリ記述を検証するため、M0/M2/SpecK を C=64・vs Swift-greedy で head-to-head 実測:
 
 ```bash
-m0(){ QWISP_ONLY_FAST=1 QWISP_RUN_M0=1 QWISP_CACHE_C=64 QWISP_GEN=128 QWISP_SWIFT_REF=1 QWISP_MTP_REF=/tmp/qwisp_$1_ref.safetensors $BIN stream 2>&1|grep "PredictPrefetch"; }
-m2(){ QWISP_ONLY_FAST=1 QWISP_RUN_M2=1 ... ; }   # 同様
+m0(){ QWISP_RUN=predict-prefetch QWISP_CACHE_C=64 QWISP_GEN=128 QWISP_SWIFT_REF=1 QWISP_MTP_REF=/tmp/qwisp_$1_ref.safetensors $BIN stream 2>&1|grep "PredictPrefetch"; }
+m2(){ QWISP_RUN=cross-layer-predict ... ; }   # 同様
 ```
 
 | 手法 | hard(48) tok/s / vs Swift | long(128) tok/s / **vs Swift** | lossless? |
@@ -174,10 +174,10 @@ m2(){ QWISP_ONLY_FAST=1 QWISP_RUN_M2=1 ... ; }   # 同様
 
 ### ★ (e) 実測: エンジンは MLX 準拠（teacher-forced 確認, 2026-06-27）
 
-`runTeacherForced`（`QWISP_TFORCE=1`）: reference gR を強制入力し、mlx-swift exact の per-token argmax を mlx_lm(gR) と比較。
+`measureMLXFidelity`（`QWISP_RUN=mlx-fidelity`）: reference gR を強制入力し、mlx-swift exact の per-token argmax を mlx_lm(gR) と比較。
 
 ```bash
-QWISP_ONLY_FAST=1 QWISP_TFORCE=1 QWISP_CACHE_C=64 QWISP_GEN=128 QWISP_MTP_REF=/tmp/qwisp_long_ref.safetensors $BIN stream
+QWISP_RUN=mlx-fidelity QWISP_CACHE_C=64 QWISP_GEN=128 QWISP_MTP_REF=/tmp/qwisp_long_ref.safetensors $BIN stream
 ```
 
 | teacher-forced | per-token 一致 | mismatch |
@@ -202,7 +202,7 @@ QWISP_ONLY_FAST=1 QWISP_TFORCE=1 QWISP_CACHE_C=64 QWISP_GEN=128 QWISP_MTP_REF=/t
 - **(d) 16GB strict lossless の伸びしろ**: SpecK C=128 は K=4/accept~3.74。**K を上げる / C を 128→160（16GB 上限）** で
   accept・throughput がどこまで伸びるか未測。24GB は full-resident(C=256) no-sync=exact で ~59 が上限アンカー。
 - **(e) ✅解決: エンジンは MLX 準拠**（teacher-forced hard 100% / long 98.4%、不一致は f16 near-tie のみ gap~0.06）。
-  `runTeacherForced`/`QWISP_TFORCE=1`。8GB SpecK ベースラインの土台が確定。詳細は上の lossless 基準ポリシー節。
+  `measureMLXFidelity`/`QWISP_RUN=mlx-fidelity`。8GB SpecK ベースラインの土台が確定。詳細は上の lossless 基準ポリシー節。
 
 ## メモリとの差分（要更新）
 

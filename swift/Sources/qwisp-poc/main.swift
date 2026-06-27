@@ -20,31 +20,37 @@ if CommandLine.arguments.contains("stream") {
     let env = ProcessInfo.processInfo.environment
     let mtpRef = env["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
 
-    // 実験バリアント: 該当 QWISP_* が立っていれば TellExperiments.swift の単一 runner を
-    // 実行して終了。詳細・再現コマンドは notes/00-strict-vs-near-lossless.md。
-    func runExp(_ label: String, _ fn: (String, String) throws -> String) {
-        do { print(try fn(md, mtpRef)) } catch { print("[\(label)] error: \(error)") }
+    // 実験バリアント: QWISP_RUN=<name> で TellExperiments.swift の単一 runner を実行して終了。
+    // 既定(QWISP_RUN 無し)は本流2系統。詳細・再現は notes/00-strict-vs-near-lossless.md。
+    let runners: [(String, (String, String) throws -> String)] = [
+        ("spec-verify",           { try Tell.runSpecVerify(modelDir: $0, refPath: $1) }),
+        ("buddy-no-sync",         { try Tell.runBuddyNoSync(modelDir: $0, refPath: $1) }),
+        ("predict-prefetch",      { try Tell.runPredictPrefetch(modelDir: $0, refPath: $1) }),
+        ("cross-layer-predict",   { try Tell.runCrossLayerPredict(modelDir: $0, refPath: $1) }),
+        ("cross-layer-cheap",     { try Tell.runCrossLayerCheap(modelDir: $0, refPath: $1) }),
+        ("mtp-spec-verify",       { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) }),
+        ("pipeline-decode",       { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) }),
+        ("predict-fixpoint",      { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) }),
+        ("no-sync-gate-escalate", { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) }),
+        ("ss-moe-draft-verify",   { try Tell.runSSMoEDraftVerify(modelDir: $0, refPath: $1) }),
+        ("probe-auto",            { try Tell.runProbeAuto(modelDir: $0, refPath: $1) }),
+        ("adaptive-sync",         { try Tell.runAdaptiveSync(modelDir: $0, refPath: $1) }),
+        ("online-hot-set",        { try Tell.runOnlineHotSet(modelDir: $0, refPath: $1) }),
+        ("coverage",              { try Tell.measureCoverage(modelDir: $0, refPath: $1) }),
+        ("miss-coverage",         { try Tell.measureMissCoverage(modelDir: $0, refPath: $1) }),
+        ("skippability",          { try Tell.measureSkippability(modelDir: $0, refPath: $1) }),
+        ("predictor-recall",      { try Tell.measurePredictorRecall(modelDir: $0, refPath: $1) }),
+        ("mmap-gather",           { try Tell.measureMmapGather(modelDir: $0, refPath: $1) }),
+        ("mlx-fidelity",          { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) }),
+    ]
+    if let name = env["QWISP_RUN"] {
+        if let r = runners.first(where: { $0.0 == name }) {
+            do { print(try r.1(md, mtpRef)) } catch { print("[\(name)] error: \(error)") }
+        } else {
+            print("unknown QWISP_RUN=\(name)\n  available: \(runners.map { $0.0 }.joined(separator: ", "))")
+        }
         exit(0)
     }
-    if env["QWISP_TFORCE"] == "1"         { runExp("MLXFidelity") { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M0"] == "1"         { runExp("PredictPrefetch") { try Tell.runPredictPrefetch(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M1"] == "1"         { runExp("CrossLayerCheap") { try Tell.runCrossLayerCheap(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M2"] == "1"         { runExp("CrossLayerPredict") { try Tell.runCrossLayerPredict(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M5"] == "1"         { runExp("PipelineDecode") { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M4"] == "1"         { runExp("MTPSpecVerify") { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_M6"] == "1"             { runExp("PredictFixpoint") { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HYBRID"] == "1"         { runExp("NoSyncGateEscalate") { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) } }
-    if env["QWISP_SPECK"] == "1"          { runExp("SpecVerify") { try Tell.runSpecVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_FAST"] == "1"           { runExp("BuddyNoSync") { try Tell.runBuddyNoSync(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_CALIB"] == "1"  { runExp("Coverage") { try Tell.measureCoverage(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_DIAG"] == "1"   { runExp("MissCoverage") { try Tell.measureMissCoverage(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_ONLINE"] == "1" { runExp("OnlineHotSet") { try Tell.runOnlineHotSet(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_ADAPT"] == "1"  { runExp("AdaptiveSync") { try Tell.runAdaptiveSync(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_AUTO"] == "1"   { runExp("ProbeAuto") { try Tell.runProbeAuto(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_SPEC"] == "1"   { runExp("SSMoEDraftVerify") { try Tell.runSSMoEDraftVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_SWIFT_CALIB"] == "1"    { runExp("Skippability") { try Tell.measureSkippability(modelDir: $0, refPath: $1) } }
-    if env["QWISP_MMAP_GATHER"] == "1"    { runExp("MmapGather") { try Tell.measureMmapGather(modelDir: $0, refPath: $1) } }
-    if env["QWISP_PRED_CALIB"] == "1"     { runExp("PredictorRecall") { try Tell.measurePredictorRecall(modelDir: $0, refPath: $1) } }
 
     // 既定: 本流 2 系統（SpecK=8GB strict lossless ベースライン / Fast=最速 near-lossless）
     do { print(try Tell.runSpecVerify(modelDir: md, refPath: mtpRef)) } catch { print("[SpecVerify] error: \(error)") }
