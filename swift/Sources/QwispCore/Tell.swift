@@ -7,6 +7,11 @@ import Metal
 /// background prefetch で先読み → prefetch I/O を GPU 計算に隠す。cross-layer 予測 prefetch の
 /// efficient 化（Fate one-pass 相当）を mlx 上で実現する独自スケジューラ。
 public enum Tell {
+    // env 読み出しヘルパ（ProcessInfo の冗長な記述を集約）。Tell.envXxx で全 runner から利用。
+    static func envInt(_ k: String, _ d: Int) -> Int { Int(ProcessInfo.processInfo.environment[k] ?? "") ?? d }
+    static func envFloat(_ k: String, _ d: Float) -> Float { Float(ProcessInfo.processInfo.environment[k] ?? "") ?? d }
+    static func envStr(_ k: String, _ d: String) -> String { ProcessInfo.processInfo.environment[k] ?? d }
+    static func envFlag(_ k: String) -> Bool { ProcessInfo.processInfo.environment[k] == "1" }
     /// **buddy-draft speculative decode（8GB strict lossless ベースライン）**
     /// - 機構: buddy no-sync で K トークン draft → exact batched verify(seqMultiToken)で照合、draft==exact の prefix を採用、外れは exact 訂正
     /// - lossless: **strict**（long horizon でも vs Swift-exact 100%。唯一の真 lossless）
@@ -18,10 +23,10 @@ public enum Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpecK] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
-        let K = Int(ProcessInfo.processInfo.environment["QWISP_DRAFT_K"] ?? "4") ?? 4
-        let skipStride = Int(ProcessInfo.processInfo.environment["QWISP_SKIP_STRIDE"] ?? "0") ?? 0
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 32)
+        let K = Tell.envInt("QWISP_DRAFT_K", 4)
+        let skipStride = Tell.envInt("QWISP_SKIP_STRIDE", 0)
         let buddy = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"   // draft を buddy 代替で高精度化
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -32,7 +37,7 @@ public enum Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -68,7 +73,7 @@ public enum Tell {
         // Swift-exact-greedy 参照（lossless 検証用。SpecK は構成上 strict lossless なので 100% のはず。
         // long128tok は vs-Python が f16 で無意味なので vs Swift-greedy で測る）。QWISP_SWIFT_REF=1。
         var gSwift: [Int] = []
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+        if Tell.envFlag("QWISP_SWIFT_REF") {
             let cref = model.makeCaches()
             StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
             var (_, rlg) = try model.prefillChunked(ids, caches: cref)
@@ -92,7 +97,7 @@ public enum Tell {
         var skip = Set<Int>()
         if skipStride >= 2 { for i in 1 ..< (L - 1) where i % skipStride == (skipStride - 1) { skip.insert(i) } }
 
-        let prof = ProcessInfo.processInfo.environment["QWISP_SPECK_PROF"] == "1"
+        let prof = Tell.envFlag("QWISP_SPECK_PROF")
         var tDraft: UInt64 = 0, tVerify: UInt64 = 0, tCommit: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []; var steps = 0, accTok = 0
@@ -118,7 +123,7 @@ public enum Tell {
             // verify batched [u, d1..dK]。QWISP_VERIFY_NOSYNC=1 で no-sync 化(draft が cache に載せた
             // expert を流用し per-layer sync を消す=near-lossless で高速)。QWISP_VERIFY_SEQ=0 で seqMT 無効。
             let vseq = ProcessInfo.processInfo.environment["QWISP_VERIFY_SEQ"] != "0"
-            let vNoSync = ProcessInfo.processInfo.environment["QWISP_VERIFY_NOSYNC"] == "1"
+            let vNoSync = Tell.envFlag("QWISP_VERIFY_NOSYNC")
             StreamingMoEBlock.probeNoSync = vNoSync; StreamingMoEBlock.skipMode = 0   // verify は exact gather
             AttentionLayer.seqMultiToken = vseq
             let snaps1 = mc.map { $0.snapshot() }
@@ -218,8 +223,8 @@ public enum Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdFast] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -228,13 +233,13 @@ public enum Tell {
                                             source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
 
-        let skipMode = Int(ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] ?? "0") ?? 0
-        let outsim = ProcessInfo.processInfo.environment["QWISP_BUDDY_OUTSIM"] == "1"  // output 類似度 buddy
-        let aMax = Int(ProcessInfo.processInfo.environment["QWISP_OUTSIM_A"] ?? "8") ?? 8  // 出力 fingerprint 用活性数
+        let skipMode = Tell.envInt("QWISP_SKIPMODE", 0)
+        let outsim = Tell.envFlag("QWISP_BUDDY_OUTSIM")  // output 類似度 buddy
+        let aMax = Tell.envInt("QWISP_OUTSIM_A", 8)  // 出力 fingerprint 用活性数
         // --- phase 1: calibration（exact decode で頻度集計 + buddy 用 co-activation/活性）---
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
         // co-activation[layer][e][e'] = 同 token で共 routed した回数（mode3 && !outsim のみ）
@@ -272,7 +277,7 @@ public enum Tell {
         // Swift-exact-greedy 参照（f16-near-lossless 評価用。Python-ref は長 horizon で f16 乖離する
         // ので、同一エンジンの exact greedy を真値に no-sync/buddy の品質を測る）。QWISP_SWIFT_REF=1。
         var gSwift: [Int] = []
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+        if Tell.envFlag("QWISP_SWIFT_REF") {
             let cref = model.makeCaches()
             StreamingMoEBlock.probeNoSync = false
             var (_, rlg) = try model.prefillChunked(ids, caches: cref)

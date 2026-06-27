@@ -17,7 +17,7 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotCold] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -26,7 +26,7 @@ extension Tell {
                                             source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256
         let caches = model.makeCaches()
         let nMoE = model.expertCaches.count
@@ -85,8 +85,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpec] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 32)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -96,7 +96,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -180,7 +180,7 @@ extension Tell {
         let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: 64)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         _ = gRef
-        let N = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "512") ?? 512   // data 量（gR 非依存）
+        let N = Tell.envInt("QWISP_GEN", 512)   // data 量（gR 非依存）
         let nMoE = model.expertCaches.count
         let H = 2048
         let caches = model.makeCaches()
@@ -213,7 +213,7 @@ extension Tell {
             dict["Y_\(l)"] = MLXArray(Yacc[l], [Yacc[l].count / 8, 8])    // [N, 8]
         }
         dict["meta"] = MLXArray([Int32(N), Int32(nMoE), Int32(H)], [3])
-        let outPath = ProcessInfo.processInfo.environment["QWISP_PRED_OUT"] ?? "/tmp/qwisp_predictor_data.safetensors"
+        let outPath = Tell.envStr("QWISP_PRED_OUT", "/tmp/qwisp_predictor_data.safetensors")
         try MLX.save(arrays: dict, url: URL(fileURLWithPath: outPath))
         return "[PredCalib] dumped X/Y for \(nMoE)層 × \(N) tok (H=\(H)) → \(outPath)"
     }
@@ -232,7 +232,7 @@ extension Tell {
         let model = QwispModel(store: store)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let caches = model.makeCaches()
 
         // prefill（resident gather なので arena overflow 無し, chunk 不要）
@@ -278,7 +278,7 @@ extension Tell {
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "16") ?? 16, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 16), gR.count)
         let mc = model.makeCaches()
 
         StreamingMoEBlock.probeNoSync = false
@@ -326,9 +326,9 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAuto] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "32") ?? 32
-        let probeK = Int(ProcessInfo.processInfo.environment["QWISP_PROBE"] ?? "8") ?? 8
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 32)
+        let probeK = Tell.envInt("QWISP_PROBE", 8)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -338,7 +338,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -412,9 +412,9 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAdaptive] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
-        let theta = Double(ProcessInfo.processInfo.environment["QWISP_THETA"] ?? "0.995") ?? 0.995
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        let theta = Double(Tell.envStr("QWISP_THETA", "0.995")) ?? 0.995
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -423,7 +423,7 @@ extension Tell {
                                             source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -499,8 +499,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdOnline] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "16") ?? 16
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 16)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -509,7 +509,7 @@ extension Tell {
                                             source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -569,8 +569,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdDiag] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -579,7 +579,7 @@ extension Tell {
                                             source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let caches = model.makeCaches()
 
@@ -649,11 +649,11 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdHybrid] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
         // pinned hot 数。escalate 時の cold ロード用に LRU 枠を最低 8 残す（pin=C だと ensure 不能）。
-        let nPin = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_PIN"] ?? "48") ?? 48,
+        let nPin = Swift.min(Tell.envInt("QWISP_PIN", 48),
                              Swift.max(C - 8, 1))
-        let calibN = Int(ProcessInfo.processInfo.environment["QWISP_CALIB"] ?? "48") ?? 48
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -663,7 +663,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
         let buddy = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"   // no-sync draft を buddy 代替
         let caches = model.makeCaches()
@@ -695,7 +695,7 @@ extension Tell {
         // Swift-exact-greedy 参照（strict-vs-near 判定用。membership は構成上これと 100% 一致するはず、
         // margin は hard ref で <100% なら near である決定的証拠）。QWISP_SWIFT_REF=1。
         var gSwift: [Int] = []
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+        if Tell.envFlag("QWISP_SWIFT_REF") {
             let cref = model.makeCaches()
             StreamingMoEBlock.probeNoSync = false
             var (_, rlg) = try model.prefillChunked(ids, caches: cref)
@@ -727,15 +727,15 @@ extension Tell {
         MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         // accept gate: marginThresh>0 なら logit-margin gate（near-lossless, 確信高い no-sync を採用）、
         // ==0 なら membership gate（all-hot のみ採用＝厳密 lossless だが strict）。
-        let marginThresh = Float(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "0") ?? 0
+        let marginThresh = Tell.envFloat("QWISP_MARGIN", 0)
         let useMargin = marginThresh > 0
         // partial-resume: escalate 時、no-sync draft の最初の miss 層 k を特定し、層 0..k-1 の計算を
         // 流用して層 k から exact tail だけ再走（厳密 lossless, escalate コストを k に比例して削減）。
-        let partial = ProcessInfo.processInfo.environment["QWISP_PARTIAL"] == "1"
+        let partial = Tell.envFlag("QWISP_PARTIAL")
         // prefetch-verify(Q3b expert 予測常駐): 各 token no-sync draft で全層 inds 取得 → draft inds を
         // 一括 prefetch 常駐 → no-sync verify（resident）→ residual hotMiss を計数。draft 予測の
         // 取りこぼし(後段層で draft の corrupted-hidden 由来 inds がズレる分)を実測。
-        let prefetchVerify = ProcessInfo.processInfo.environment["QWISP_PREFETCH"] == "1"
+        let prefetchVerify = Tell.envFlag("QWISP_PREFETCH")
         let L = model.layerCount
         var out: [Int] = []
         var escalations = 0
@@ -921,7 +921,7 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[TeacherForced] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -929,7 +929,7 @@ extension Tell {
         let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "128") ?? 128, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 128), gR.count)
         let caches = model.makeCaches()
         StreamingMoEBlock.probeNoSync = false   // exact gather（demand-load）
 
@@ -981,14 +981,14 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "10") ?? 10
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let CH = Tell.envInt("QWISP_CHUNK", 10)
         // prefetch margin: pass-1 で top-K を捕捉（pass-2 の miss を減らし strict-lossless 化）
-        StreamingMoEBlock.captureK = Int(ProcessInfo.processInfo.environment["QWISP_M0_TOPK"] ?? "0") ?? 0
+        StreamingMoEBlock.captureK = Tell.envInt("QWISP_M0_TOPK", 0)
         defer { StreamingMoEBlock.captureK = 0 }
         // 選択的マージン: 不確実層(top-K mass < τ)だけ top-marginK を prefetch（一律 top-K の cache 圧迫を回避）
-        let selK = Int(ProcessInfo.processInfo.environment["QWISP_M0_SELK"] ?? "0") ?? 0
-        let selTau = Float(ProcessInfo.processInfo.environment["QWISP_M0_TAU"] ?? "0.6") ?? 0.6
+        let selK = Tell.envInt("QWISP_M0_SELK", 0)
+        let selTau = Tell.envFloat("QWISP_M0_TAU", 0.6)
         StreamingMoEBlock.marginK = selK
         defer { StreamingMoEBlock.marginK = 0 }
         var widenTotal = 0, widenTokens = 0   // 診断: 拡張した層数の累積
@@ -1002,7 +1002,7 @@ extension Tell {
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let caches = model.makeCaches()
 
         StreamingMoEBlock.probeNoSync = false
@@ -1012,7 +1012,7 @@ extension Tell {
 
         // Swift-exact-greedy 参照（M0 は構成上 strict lossless なので 100% のはず）。QWISP_SWIFT_REF=1。
         var gSwift: [Int] = []
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+        if Tell.envFlag("QWISP_SWIFT_REF") {
             let cref = model.makeCaches()
             StreamingMoEBlock.probeNoSync = false
             var (_, rlg) = try model.prefillChunked(ids, caches: cref)
@@ -1036,7 +1036,7 @@ extension Tell {
             for i in lo ..< hi { _ = model.expertCaches[i].ensure(pred[i]) }
         }
 
-        let prof = ProcessInfo.processInfo.environment["QWISP_M0_PROF"] == "1"
+        let prof = Tell.envFlag("QWISP_M0_PROF")
         var tP1: UInt64 = 0, tPred: UInt64 = 0, tBuild: UInt64 = 0, tWait: UInt64 = 0, tFinal: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
@@ -1126,8 +1126,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[M6] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let maxP = Int(ProcessInfo.processInfo.environment["QWISP_MAXPASS"] ?? "4") ?? 4
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let maxP = Tell.envInt("QWISP_MAXPASS", 4)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1137,7 +1137,7 @@ extension Tell {
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "64") ?? 64, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
         let caches = model.makeCaches()
         func distinct(_ a: MLXArray) -> Set<Int> { Set(a.asArray(Int32.self).map { Int($0) }) }
 
@@ -1185,8 +1185,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "4") ?? 4
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let CH = Tell.envInt("QWISP_CHUNK", 4)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1196,7 +1196,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let caches = model.makeCaches()
 
         StreamingMoEBlock.probeNoSync = false
@@ -1251,9 +1251,9 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "4") ?? 4
-        GatedDeltaNetLayer.fuseGDN = ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] == "1"
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let CH = Tell.envInt("QWISP_CHUNK", 4)
+        GatedDeltaNetLayer.fuseGDN = Tell.envFlag("QWISP_FUSE_GDN")
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1263,7 +1263,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let caches = model.makeCaches()
 
         StreamingMoEBlock.probeNoSync = false
@@ -1273,7 +1273,7 @@ extension Tell {
 
         // Swift-exact-greedy 参照（M2 は temporal 予測ゆえ真に lossless か未確認＝要検証）。QWISP_SWIFT_REF=1。
         var gSwift: [Int] = []
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+        if Tell.envFlag("QWISP_SWIFT_REF") {
             let cref = model.makeCaches()
             StreamingMoEBlock.probeNoSync = false
             var (_, rlg) = try model.prefillChunked(ids, caches: cref)
@@ -1296,8 +1296,8 @@ extension Tell {
         // 前 token の各層 gate 入力（chunk-0 の bootstrap 用, temporal）
         var prevGate: [MLXArray]? = nil
 
-        let prof = ProcessInfo.processInfo.environment["QWISP_M2_PROF"] == "1"
-        let prof2 = ProcessInfo.processInfo.environment["QWISP_M2_PROF2"] == "1"
+        let prof = Tell.envFlag("QWISP_M2_PROF")
+        let prof2 = Tell.envFlag("QWISP_M2_PROF2")
         var tEval: UInt64 = 0, tEnsure: UInt64 = 0, tFinal: UInt64 = 0, pSteps = 0
         var tEmbed: UInt64 = 0, tDistinct: UInt64 = 0, tRunChunk: UInt64 = 0, tLastGate: UInt64 = 0
         if prof2 { StreamingMoEBlock.profileLayers = true }
@@ -1320,7 +1320,7 @@ extension Tell {
             }
             StreamingMoEBlock.probeNoSync = true
             // M3 multi-source: token 開始時に全層 temporal 予測(prevGate[i] 同層)を一括 prefetch（stall 無し）
-            let multiSrc = ProcessInfo.processInfo.environment["QWISP_MULTI"] == "1"
+            let multiSrc = Tell.envFlag("QWISP_MULTI")
             if multiSrc, let pg = prevGate {
                 let tpreds = (0 ..< L).map { model.predictLayerInds($0, pg[$0]) }
                 MLX.eval(tpreds)
@@ -1409,8 +1409,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M5] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "2") ?? 2
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let CH = Tell.envInt("QWISP_CHUNK", 2)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1420,7 +1420,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let L = model.layerCount
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let caches = model.makeCaches()
 
         StreamingMoEBlock.probeNoSync = false
@@ -1496,8 +1496,8 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M4] skip" }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
-        let CH = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK"] ?? "2") ?? 2
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let CH = Tell.envInt("QWISP_CHUNK", 2)
         // 既定は exact verify（spec を lossless に再現）。QWISP_M4_PRED=1 で予測 verify（高速だが lossy）。
         let exactVerify = ProcessInfo.processInfo.environment["QWISP_M4_PRED"] != "1"
         let store = try WeightStore(modelDir: modelDir)
@@ -1510,7 +1510,7 @@ extension Tell {
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, gR.count)
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let mainCaches = model.makeCaches()
         let mtpKV = KVCache()
         let P = ids.dim(-1)
