@@ -156,6 +156,57 @@ public enum Tell {
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
+    /// 予測器 calib: exact decode で (層の pre-attention 入力 X, 真 top-8 routing Y) を層別に収集し
+    /// safetensors に dump。Python で ridge/非線形予測器を fit し coverage を測る（訓練抜き予測器の検証）。
+    public static func runPredictorCalib(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PredCalib] skip" }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: 64)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        _ = gRef
+        let N = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "512") ?? 512   // data 量（gR 非依存）
+        let nMoE = model.expertCaches.count
+        let H = 2048
+        let caches = model.makeCaches()
+
+        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.captureInds = true; StreamingMoEBlock.captureLayerInput = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        var Xacc = [[MLXArray]](repeating: [], count: nMoE)   // per layer: list of [1,H]
+        var Yacc = [[Int32]](repeating: [], count: nMoE)      // per layer: flat top-8 ids
+        for _ in 0 ..< N {
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays }
+                     + model.expertCaches.compactMap { $0.lastInds }
+                     + model.expertCaches.compactMap { $0.preAttnInput })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let x = ec.preAttnInput, let li = ec.lastInds {
+                    Xacc[mi].append(x.reshaped([1, H]).asType(.float32))
+                    Yacc[mi].append(contentsOf: li.asArray(Int32.self))   // [8]
+                }
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureLayerInput = false
+
+        var dict: [String: MLXArray] = [:]
+        for l in 0 ..< nMoE {
+            dict["X_\(l)"] = MLX.concatenated(Xacc[l], axis: 0)           // [N, H]
+            dict["Y_\(l)"] = MLXArray(Yacc[l], [Yacc[l].count / 8, 8])    // [N, 8]
+        }
+        dict["meta"] = MLXArray([Int32(N), Int32(nMoE), Int32(H)], [3])
+        let outPath = ProcessInfo.processInfo.environment["QWISP_PRED_OUT"] ?? "/tmp/qwisp_predictor_data.safetensors"
+        try MLX.save(arrays: dict, url: URL(fileURLWithPath: outPath))
+        return "[PredCalib] dumped X/Y for \(nMoE)層 × \(N) tok (H=\(H)) → \(outPath)"
+    }
+
     /// (A) mmap-gather: 全 expert を mmap のまま resident MoE で GPU-side gather（arena/ensure/per-layer
     /// sync 撤廃, exact）。OS demand paging で working set だけ常駐。sync 撤廃で routing tax が消え
     /// 8GB 内で速いか（thrash しないか）を検証。tok/s・RSS・品質を測る。

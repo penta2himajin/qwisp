@@ -72,6 +72,10 @@ if CommandLine.arguments.contains("stream") {
             do { print(try Tell.runMmapGather(modelDir: md, refPath: mtpRef)) }
             catch { print("[MmapGather] error: \(error)") }
         }
+        if ProcessInfo.processInfo.environment["QWISP_PRED_CALIB"] == "1" {
+            do { print(try Tell.runPredictorCalib(modelDir: md, refPath: mtpRef)) }
+            catch { print("[PredCalib] error: \(error)") }
+        }
         do { print(try Tell.runM4(modelDir: md, refPath: mtpRef)) }
         catch { print("[Tell M4] error: \(error)") }
         do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }

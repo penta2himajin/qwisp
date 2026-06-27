@@ -21,6 +21,7 @@ public final class StreamingDecoderLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, cache: LayerCache?) throws -> MLXArray {
+        if StreamingMoEBlock.captureLayerInput { mlp.cache?.preAttnInput = x }   // 予測器 calib
         let normed = MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps)
         let r = isLinear ? gdn!(normed, cache: cache?.gdn) : attn!(normed, cache: cache?.kv)
         let h = x + r

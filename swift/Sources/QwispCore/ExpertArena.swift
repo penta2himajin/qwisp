@@ -86,6 +86,7 @@ public final class LayerExpertCache {
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
     public var lastGateInput: MLXArray?   // Tell M2: この層の MoE 入力(=真の gate 入力)を capture
+    public var preAttnInput: MLXArray?    // 予測器 calib: この層の pre-attention 入力（層入力）を capture
     /// lastInds のうち cache 未収容（fast で wrong-slot になった）expert 数。
     public func missCount() -> Int {
         guard let li = lastInds else { return 0 }
@@ -164,6 +165,7 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var captureGateInput = false // Tell M2: 各層の gate 入力を capture
     nonisolated(unsafe) public static var captureInds = false      // calib: 全 mode で routing inds を記録
     nonisolated(unsafe) public static var syncLayers: Set<Int>? = nil  // 適応 sync: この層集合は exact(no-sync 無効)
+    nonisolated(unsafe) public static var captureLayerInput = false // 予測器 calib: 層の pre-attention 入力を記録
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
