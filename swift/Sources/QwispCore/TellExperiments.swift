@@ -3,14 +3,17 @@ import MLX
 import Metal
 
 /// Tell の探索/計測バリアント置き場。
-/// 本流は Tell.swift の 2 系統（runHotColdSpecK=8GB strict lossless ベースライン /
-/// runHotColdFast=最速 near-lossless buddy no-sync）。ここはそれ以外の M 系・hybrid・
-/// 各種 calib・診断(runTeacherForced 等)を保管し、QWISP_* ゲート経由で呼び出す。
+/// 本流は Tell.swift の 2 系統（runSpecVerify=8GB strict lossless ベースライン /
+/// runBuddyNoSync=最速 near-lossless buddy no-sync）。ここはそれ以外の M 系・hybrid・
+/// 各種 calib・診断(measureMLXFidelity 等)を保管し、QWISP_* ゲート経由で呼び出す。
 /// 詳細・実測は notes/00-strict-vs-near-lossless.md を参照。
 extension Tell {
-    /// hot/cold 設計の Stage-1 計測: 実 decode の per-layer expert 使用頻度を集計し、
-    /// 「top-B hot expert が routing の何 % をカバーするか」を出す（hot/cold の有望度判定）。
-    public static func runHotColdCalib(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] top-B hot expert の routing coverage**
+    /// - 機構: 実 decode の per-layer expert 使用頻度を集計、top-B が routing の何%を覆うか
+    /// - 結果例: top-64 が code 86% / nl 94%（B128=100%）
+    /// - env: QWISP_HOTCOLD_CALIB
+    /// - 旧名: HotColdCalib / runHotColdCalib（git a54785a）
+    public static func measureCoverage(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotCold] skip" }
@@ -72,9 +75,13 @@ extension Tell {
             coverage(16), coverage(32), coverage(48), coverage(64), coverage(96), coverage(128))
     }
 
-    /// SS-MoE D1: no-sync(hot subset-expert) forward を draft に、exact forward で verify(lossless)。
-    /// MTP head の代わりに no-sync 自己 draft。受理率で SS-MoE(subset-expert draft)の有望度を測る。
-    public static func runHotColdSpec(modelDir: String, refPath: String) throws -> String {
+    /// **SS-MoE 流 no-sync draft + exact verify（初期投機・死路）**
+    /// - 機構: hot-pin no-sync draft を exact verify で照合（SpecK=runSpecVerify の前身）
+    /// - lossless: strict だが ❌**速度出ず**（accept 0.94-0.97 でも sync 律速で ~20-24 < M0）
+    /// - 研究: SS-MoE (no-sync draft + exact verify)
+    /// - env: QWISP_HOTCOLD_SPEC
+    /// - 旧名: HotColdSpec / runHotColdSpec（git e398e10）
+    public static func runSSMoEDraftVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpec] skip" }
@@ -157,9 +164,12 @@ extension Tell {
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
-    /// 予測器 calib: exact decode で (層の pre-attention 入力 X, 真 top-8 routing Y) を層別に収集し
-    /// safetensors に dump。Python で ridge/非線形予測器を fit し coverage を測る（訓練抜き予測器の検証）。
-    public static func runPredictorCalib(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] pre-attention expert 予測器の recall**
+    /// - 機構: 学習不要(閉形式 ridge)の pre-attention 予測器を構築し routing recall を測る
+    /// - 結果: GDN hybrid ゆえ ~82-84% 止まり（標準 attention 論文値 94.69% に未達）
+    /// - env: QWISP_PRED_CALIB
+    /// - 旧名: PredictorCalib / runPredictorCalib（git 43f3607）
+    public static func measurePredictorRecall(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PredCalib] skip" }
@@ -208,10 +218,12 @@ extension Tell {
         return "[PredCalib] dumped X/Y for \(nMoE)層 × \(N) tok (H=\(H)) → \(outPath)"
     }
 
-    /// (A) mmap-gather: 全 expert を mmap のまま resident MoE で GPU-side gather（arena/ensure/per-layer
-    /// sync 撤廃, exact）。OS demand paging で working set だけ常駐。sync 撤廃で routing tax が消え
-    /// 8GB 内で速いか（thrash しないか）を検証。tok/s・RSS・品質を測る。
-    public static func runMmapGather(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] mmap 全 expert resident gather**
+    /// - 機構: 全 expert を mmap 常駐し sync 無し gather（8GB に locality 無しの確認）
+    /// - 結果: ~45 tok/s だが RSS ~24GB 要（8GB 不可、arena+sync が 8GB の正解）
+    /// - env: QWISP_MMAP_GATHER
+    /// - 旧名: MmapGather / runMmapGather（git fed8578）
+    public static func measureMmapGather(modelDir: String, refPath: String) throws -> String {
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MmapGather] skip" }
         let store = try WeightStore(modelDir: modelDir)
@@ -248,9 +260,12 @@ extension Tell {
             """, Double(N - 1) / secs, match, N, Double(match) / Double(N) * 100, rssLoad, rssPeak)
     }
 
-    /// SWIFT 流 ①: 各層を単独 skip したときの matchness(skip-L argmax == full argmax 率)を計測。
-    /// どの層が「抜いても出力を保つ=skip 可能」か、GDN/attn どちらが skip 可能かを判明させる。
-    public static func runSwiftCalib(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] layer-skip 可能性の calib**
+    /// - 機構: 各層を skip しても出力が保たれるか（draft 軽量化の余地）を測る
+    /// - 結果例: skippable code 3/40 ・ nl 37/40（prompt 依存）
+    /// - env: QWISP_SWIFT_CALIB
+    /// - 旧名: SwiftCalib / runSwiftCalib（git ba3c138）
+    public static func measureSkippability(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SwiftCalib] skip" }
@@ -302,10 +317,12 @@ extension Tell {
             ranked.prefix(8).map { String(format: "%d%@=%.2f", $0.l, $0.lin ? "G" : "A", $0.m) }.joined(separator: " "))
     }
 
-    /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。
-    /// probe(exact を真値に、no-sync を snapshot/restore で side 比較)が全一致なら no-sync(47, 速)、
-    /// 不一致(drift 兆候)なら exact M2 経路(lossless)へ。プロンプト難度に自動適応。
-    public static func runHotColdAuto(modelDir: String, refPath: String) throws -> String {
+    /// **prompt 毎 probe で no-sync/exact 自動切替**
+    /// - 機構: 短い probe で no-sync の安全性を判定—全一致なら no-sync(高速)、drift 兆候なら exact 経路(lossless)へ
+    /// - lossless: probe 依存（probe が誤れば非保証）
+    /// - env: QWISP_HOTCOLD_AUTO
+    /// - 旧名: Auto / runHotColdAuto（git a54785a）
+    public static func runProbeAuto(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAuto] skip" }
@@ -386,9 +403,12 @@ extension Tell {
             Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// hot/cold ③ 適応 sync: hot 常駐 + per-layer 判定。calib で各層 hot coverage を測り、
-    /// coverage≥θ の易層は no-sync（hot で賄う）、θ 未満の hard 層だけ exact sync（cold をロード=正確）。
-    public static func runHotColdAdaptive(modelDir: String, refPath: String) throws -> String {
+    /// **静的 per-layer adaptive sync（死路）**
+    /// - 機構: 層ごとに sync 要否を静的に決め hard 層だけ正確化
+    /// - lossless: ❌neg（per-token + 予測が必要、静的では不足）
+    /// - env: QWISP_HOTCOLD_ADAPT
+    /// - 旧名: Adaptive / runHotColdAdaptive（git 864be4e）
+    public static func runAdaptiveSync(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAdaptive] skip" }
@@ -470,9 +490,12 @@ extension Tell {
             """, C, theta, syncReal.count, nMoE, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// hot/cold Step-2: オンライン適応 hot set + no-sync。毎 token 走行頻度の top-C を ensure し
-    /// （安定なら大半 hit で IO 小）、no-sync forward。静的 calib の distribution shift を吸収できるか。
-    public static func runHotColdOnline(modelDir: String, refPath: String) throws -> String {
+    /// **hot-set の online 更新**
+    /// - 機構: decode 中に hot expert 集合を逐次更新し coverage を上げる
+    /// - lossless: near（online coverage code 76.5%/nl 89.7%）
+    /// - env: QWISP_HOTCOLD_ONLINE
+    /// - 旧名: Online / runHotColdOnline（git a54785a）
+    public static func runOnlineHotSet(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdOnline] skip" }
@@ -537,9 +560,12 @@ extension Tell {
             """, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// hot/cold Stage-1 診断: exact decode の実 routing に対し、(a)静的calib hot set と
-    /// (b)オンライン適応 hot set の coverage を比較。code 失敗が distribution shift か予測不能かを切分け。
-    public static func runHotColdDiag(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] exact 比の per-token miss / worst-layer**
+    /// - 機構: static/online hot set の exact 比 coverage と worst-layer miss を診断
+    /// - 結果例: code static 63.8/online 76.5%、worst layer code 0%/nl 12%
+    /// - env: QWISP_HOTCOLD_DIAG
+    /// - 旧名: HotColdDiag / runHotColdDiag（git 864be4e）
+    public static func measureMissCoverage(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdDiag] skip" }
@@ -612,11 +638,14 @@ extension Tell {
             Double(hitOnline) / Double(totalRoute) * 100, worstTokMin)
     }
 
-    /// hot/cold hybrid: hot-pin no-sync を draft とし、per-token で「全 routed が cache 内か」を
-    /// GPU カウンタで測る。miss==0 の token は no-sync gather が exact と bit 一致＝採用（lossless 保証）。
-    /// miss>0 の token だけ restore→exact 1-forward に escalate（ensure は pinned 外の LRU 領域へ）。
-    /// nl=易→大半 no-sync で ~47、code=難→大半 escalate で ~M0/M2、両者とも構成上 lossless が狙い。
-    public static func runHotColdHybrid(modelDir: String, refPath: String) throws -> String {
+    /// **no-sync draft + per-token ゲート escalate**
+    /// - 機構: buddy no-sync draft を per-token 判定—membership(miss==0 で採用=strict)/margin(top1-top2 で採用=near)—外れは exact 1-forward へ escalate
+    /// - lossless: membership=**strict**(但し escalate 多発で遅い) / margin=**near**(long 発散)
+    /// - 速度: membership 8GB ~15-17 / margin ~36-49 tok/s
+    /// - 研究: SS-MoE; AdapMoE; Draft&Verify (Zhang 2023)
+    /// - env: QWISP_HYBRID / QWISP_MARGIN(0=membership) / QWISP_PIN / QWISP_PARTIAL / QWISP_PREFETCH
+    /// - 旧名: Hybrid / runHotColdHybrid（git a3f02c4, fdbbd11, ddc14e2）
+    public static func runNoSyncGateEscalate(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdHybrid] skip" }
@@ -883,11 +912,12 @@ extension Tell {
         return (normed, model.logitsFromNorm(normed))
     }
 
-    /// M0: 2-pass(pass-1 予測 → pass-2 chunked + overlapped prefetch)。near-lossless で速度を稼ぐ。
-    /// (e) エンジン MLX 忠実度: teacher-forced で mlx-swift exact が mlx_lm(原典 MLX) と per-token 一致するか。
-    /// reference gR を強制入力し各位置の argmax を gR と比較（自己回帰カオスを除去）。
-    /// 一致率が高ければ「エンジン MLX 準拠」。mismatch 位置では gR token の logit 順位と top1 との gap を診断。
-    public static func runTeacherForced(modelDir: String, refPath: String) throws -> String {
+    /// **[計測] エンジンの MLX 忠実度（teacher-forced）**
+    /// - 機構: reference gR を強制入力し mlx-swift exact の per-token argmax を mlx_lm と比較（自己回帰カオスを除去）
+    /// - 結果: hard 100% / long 98.4%（不一致は f16 near-tie のみ）＝エンジンは MLX 準拠
+    /// - env: QWISP_TFORCE
+    /// - 旧名: TeacherForced / runTeacherForced（git 2516e30）。詳細 notes/00
+    public static func measureMLXFidelity(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[TeacherForced] skip" }
@@ -940,7 +970,14 @@ extension Tell {
             """, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
     }
 
-    public static func runM0(modelDir: String, refPath: String) throws -> String {
+    /// **2-pass 自己予測 prefetch decode**
+    /// - 機構: pass1 no-sync で routing を自己予測→該当 expert を prefetch→pass2 を chunk overlap 実行（IO を計算裏に隠す）
+    /// - lossless: **near**（pass1 が corrupted hidden 由来で recall<100%、long で発散 vs Swift-exact ~11%）
+    /// - 速度: 8GB C=64 ~28-30 tok/s
+    /// - 研究: Fate one-pass; Pre-gated MoE (Hwang 2024); MoE-SpeQ; SP-MoE
+    /// - env: QWISP_RUN_M0 / QWISP_M0_SELK・QWISP_M0_TAU(選択的margin) / QWISP_M0_TOPK(neg)
+    /// - 旧名: M0 / runM0（git ac73c33, 1b770e4）
+    public static func runPredictPrefetch(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
@@ -1080,9 +1117,12 @@ extension Tell {
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag, selDiag)
     }
 
-    /// M6: cache 不動点反復(multi-pass)。routing が収束するまで forward を繰り返し、cache を
-    /// その forward の routing と一致させる→pass 間不整合を消し strict-lossless 狙い。収束 pass 数も計測。
-    public static func runM0Multi(modelDir: String, refPath: String) throws -> String {
+    /// **routing 不動点 multipass decode（死路）**
+    /// - 機構: cache と routing が一致するまで forward を反復（pass 間不整合を消し strict 狙い）
+    /// - lossless: strict だが ❌**~7 tok/s**（avg 5.4 pass）。M0 の 1-pass 最適性を補強
+    /// - env: QWISP_M6
+    /// - 旧名: M6 / runM0Multi
+    public static func runPredictFixpoint(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[M6] skip" }
@@ -1137,9 +1177,11 @@ extension Tell {
             """, C, maxP, Double(N) / secs, match, N, Double(match) / Double(N) * 100, Double(passTotal) / Double(N))
     }
 
-    /// M1: one-pass。pass-1 を除去し、chunk の入力 hidden から chunk 内各層の expert を cross-layer
-    /// 予測(gate を hidden に適用)→prefetch→GPU-remap で chunk を実行。pass-1 の 17ms が消える。
-    public static func runM1(modelDir: String, refPath: String) throws -> String {
+    /// **軽量 cross-layer 1-pass 予測（死路）**
+    /// - 機構: full hidden を使わない軽量予測で 1-pass を狙うが、予測 hidden がズレて失敗
+    /// - lossless: ❌neg（cross-layer は full hidden 必須＝M0 が勝ち）
+    /// - 旧名: M1 / runM1（git e12365a, d51937b）
+    public static func runCrossLayerCheap(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
@@ -1198,9 +1240,14 @@ extension Tell {
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// M2: Fate 流 one-pass。各層の真の gate 入力(=MoE 入力 x)を capture し、chunk N の最終 gate
-    /// 入力で chunk N+1 を予測(隣接層 cosine>83% で高精度)→prefetch→GPU-remap。pass-1 不要=高速。
-    public static func runM2(modelDir: String, refPath: String) throws -> String {
+    /// **cross-layer 予測 one-pass decode（Fate 相当）**
+    /// - 機構: 前 token / 前 chunk の gate 入力から各層 expert を予測し prefetch、1-pass で gather
+    /// - lossless: **near**（temporal 予測ゆえ recall<100%、long で発散 ~12%。GDN が予測深度を ~2層に制限）
+    /// - 速度: 8GB C=64 ~26-28 tok/s
+    /// - 研究: Fate one-pass cross-layer prefetch
+    /// - env: QWISP_RUN_M2 / QWISP_CHUNK / QWISP_MULTI(M3 multi-source)
+    /// - 旧名: M2 / runM2（git c390fb2）
+    public static func runCrossLayerPredict(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell] skip" }
@@ -1354,10 +1401,11 @@ extension Tell {
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
-    /// M5 = M2 one-pass + depth-1 software pipeline。
-    /// 仮説: chunk N の expert matmul を asyncEval で GPU に流しつつ、chunk N+1 の予測+gather を
-    /// CPU/IO で重ねれば、M2 の per-chunk eval stall(~23ms)を build(~15ms)へ近づけられるか検証。
-    public static func runM5(modelDir: String, refPath: String) throws -> String {
+    /// **pipeline decode（死路）**
+    /// - 機構: layer pipeline 化で sync を隠す試み
+    /// - lossless: strict だが ❌ ~27.4＝M2 超も M0 に勝てず
+    /// - 旧名: M5 / runM5（git 0715f5b）
+    public static func runPipelineDecode(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M5] skip" }
@@ -1437,9 +1485,14 @@ extension Tell {
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
-    /// M4 = MTP D1 投機 × Tell M2 verify。verify(2トークン)に cross-layer prefetch を適用し、
-    /// chunk stall を ~1.85トークンに償却。near-lossless 維持で M2(28) を超える狙い。
-    public static func runM4(modelDir: String, refPath: String) throws -> String {
+    /// **MTP head 投機 × Tell exact verify**
+    /// - 機構: MTP(Multi-Token Prediction) head で draft → Tell exact verify(seqMultiToken)で lossless 照合
+    /// - lossless: **strict**（seqMT 逐次 verify で greedy 一致。MTP D1 で 1.61x）
+    /// - 速度: 8GB ~25 tok/s lossless（resident では ~68.9）
+    /// - 研究: Multi-Token Prediction (DeepSeek-V3; Gloeckle 2024)
+    /// - env: QWISP_RUN_M4 / QWISP_VERIFY_SEQ / QWISP_VERIFY_NOSYNC
+    /// - 旧名: M4 / M2c / runM4（git bfa2651, 382ccf7）
+    public static func runMTPSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M4] skip" }

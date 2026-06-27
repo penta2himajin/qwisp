@@ -7,10 +7,14 @@ import Metal
 /// background prefetch で先読み → prefetch I/O を GPU 計算に隠す。cross-layer 予測 prefetch の
 /// efficient 化（Fate one-pass 相当）を mlx 上で実現する独自スケジューラ。
 public enum Tell {
-    /// SS-MoE DK: no-sync hot-pin draft を K トークン先まで → 1 回の batched exact verify(lossless)。
-    /// 高 accept(0.94+)を multi-token で償却し no-sync 天井に安全到達。reject 時のみ accepted prefix を
-    /// exact 再走（GDN partial-commit 回避）。QWISP_DRAFT_K で K。
-    public static func runHotColdSpecK(modelDir: String, refPath: String) throws -> String {
+    /// **buddy-draft speculative decode（8GB strict lossless ベースライン）**
+    /// - 機構: buddy no-sync で K トークン draft → exact batched verify(seqMultiToken)で照合、draft==exact の prefix を採用、外れは exact 訂正
+    /// - lossless: **strict**（long horizon でも vs Swift-exact 100%。唯一の真 lossless）
+    /// - 速度: 8GB C=64 ~27 / 16GB C=128 ~34-36 tok/s（accept/step ~3.7-4.0）
+    /// - 研究: Speculative Decoding (Leviathan 2023, Chen 2023); draft=BuddyMoE (2511.10054)
+    /// - env: QWISP_SPECK / QWISP_DRAFT_K / QWISP_SKIPMODE=3(buddy) / QWISP_CACHE_C
+    /// - 旧名: SpecK / runHotColdSpecK（git ed60472, 382ccf7）。詳細 notes/00-strict-vs-near-lossless.md
+    public static func runSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpecK] skip" }
@@ -203,9 +207,14 @@ public enum Tell {
         return arr
     }
 
-    /// hot/cold 試行: 頻度上位 hot expert を C slot に pin(常駐)→ pure no-sync decode。
-    /// hot resident で miss が減り no-sync drift が抑えられるか（速度はほぼ no-sync 天井）を検証。
-    public static func runHotColdFast(modelDir: String, refPath: String) throws -> String {
+    /// **pure no-sync buddy substitution（最速 near-lossless）**
+    /// - 機構: hot-pin した top-C を no-sync gather、cold は co-activation 最類似 hot に table 差替（verify 無し・per-token コスト0）
+    /// - lossless: **near**（C=64 で vs Swift-exact ~98%。C>64 では発散、verify 無しゆえ保証なし）
+    /// - 速度: 8GB C=64 ~56-58 tok/s（RSS 6.9GB）
+    /// - 研究: BuddyMoE (2511.10054), expert-skip (2402.14800)
+    /// - env: QWISP_FAST / QWISP_SKIPMODE=3 / QWISP_CACHE_C / QWISP_BUDDY_OUTSIM(neg)
+    /// - 旧名: Fast / runHotColdFast（git 0b923e0, f668e62）
+    public static func runBuddyNoSync(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdFast] skip" }
