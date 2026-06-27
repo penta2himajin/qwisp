@@ -16,7 +16,7 @@ extension Tell {
     public static func measureCoverage(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotCold] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Coverage] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -68,7 +68,7 @@ extension Tell {
         distinctAvg /= Double(nMoE)
 
         return String(format: """
-            [HotCold-CALIB] %d tok, %d MoE層, top-k=8/256。per-layer 活性 expert 平均=%.0f/256
+            [Coverage-CALIB] %d tok, %d MoE層, top-k=8/256。per-layer 活性 expert 平均=%.0f/256
               top-B hot coverage(routing の何%%): B16=%.0f%% B32=%.0f%% B48=%.0f%% B64=%.0f%% B96=%.0f%% B128=%.0f%%
             """,
             total, nMoE, distinctAvg,
@@ -84,7 +84,7 @@ extension Tell {
     public static func runSSMoEDraftVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpec] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SSMoEDraftVerify] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 32)
         let store = try WeightStore(modelDir: modelDir)
@@ -160,7 +160,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         return String(format: """
-            [HotColdSpec] no-sync draft + exact verify(C=%d): %.1f tok/s  accept=%.3f  品質 %d/%d=%.0f%%
+            [SSMoEDraftVerify] no-sync draft + exact verify(C=%d): %.1f tok/s  accept=%.3f  品質 %d/%d=%.0f%%
             """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }
 
@@ -172,7 +172,7 @@ extension Tell {
     public static func measurePredictorRecall(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PredCalib] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PredictorRecall] skip" }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -215,7 +215,7 @@ extension Tell {
         dict["meta"] = MLXArray([Int32(N), Int32(nMoE), Int32(H)], [3])
         let outPath = Tell.envStr("QWISP_PRED_OUT", "/tmp/qwisp_predictor_data.safetensors")
         try MLX.save(arrays: dict, url: URL(fileURLWithPath: outPath))
-        return "[PredCalib] dumped X/Y for \(nMoE)層 × \(N) tok (H=\(H)) → \(outPath)"
+        return "[PredictorRecall] dumped X/Y for \(nMoE)層 × \(N) tok (H=\(H)) → \(outPath)"
     }
 
     /// **[計測] mmap 全 expert resident gather**
@@ -268,7 +268,7 @@ extension Tell {
     public static func measureSkippability(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SwiftCalib] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Skippability] skip" }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -310,7 +310,7 @@ extension Tell {
         let ginfo = skippable.map { "\($0.l)\($0.lin ? "G" : "A")" }.joined(separator: ",")
         let nG = skippable.filter { $0.lin }.count, nA = skippable.filter { !$0.lin }.count
         return String(format: """
-            [SwiftCalib] %d step, 各層単独 skip の matchness。skip可(matchness≥0.95)=%d/%d 層 (GDN %d/attn %d)
+            [Skippability] %d step, 各層単独 skip の matchness。skip可(matchness≥0.95)=%d/%d 層 (GDN %d/attn %d)
               skip可層(番号+G/A): %@
               最 skip 可 top8: %@
             """, N, skippable.count, L, nG, nA, ginfo,
@@ -325,7 +325,7 @@ extension Tell {
     public static func runProbeAuto(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAuto] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[ProbeAuto] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 32)
         let probeK = Tell.envInt("QWISP_PROBE", 8)
@@ -398,7 +398,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [HotColdAuto] hot top-%d, probe=%d miss=%d → mode=%@: %.1f tok/s  品質 %d/%d=%.0f%%
+            [ProbeAuto] hot top-%d, probe=%d miss=%d → mode=%@: %.1f tok/s  品質 %d/%d=%.0f%%
             """, C, probeK, probeMiss, easy ? "no-sync(47)" : "exact(lossless)",
             Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
@@ -411,7 +411,7 @@ extension Tell {
     public static func runAdaptiveSync(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdAdaptive] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[AdaptiveSync] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         let theta = Double(Tell.envStr("QWISP_THETA", "0.995")) ?? 0.995
@@ -486,7 +486,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [HotColdAdaptive] hot top-%d + 適応sync(θ=%.3f): sync層=%d/%d  %.1f tok/s  品質 %d/%d=%.0f%%
+            [AdaptiveSync] hot top-%d + 適応sync(θ=%.3f): sync層=%d/%d  %.1f tok/s  品質 %d/%d=%.0f%%
             """, C, theta, syncReal.count, nMoE, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
@@ -498,7 +498,7 @@ extension Tell {
     public static func runOnlineHotSet(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdOnline] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[OnlineHotSet] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 16)
         let store = try WeightStore(modelDir: modelDir)
@@ -556,7 +556,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [HotColdOnline] online-adaptive hot top-%d + no-sync: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            [OnlineHotSet] online-adaptive hot top-%d + no-sync: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
@@ -568,7 +568,7 @@ extension Tell {
     public static func measureMissCoverage(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdDiag] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MissCoverage] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
@@ -631,7 +631,7 @@ extension Tell {
         }
         StreamingMoEBlock.captureInds = false
         return String(format: """
-            [HotColdDiag] C=%d calib=%d eval=%d。実 routing に対する hot-set coverage:
+            [MissCoverage] C=%d calib=%d eval=%d。実 routing に対する hot-set coverage:
               静的 calib hot = %.1f%%   オンライン適応 hot = %.1f%%   (per-token 最悪層 online=%.0f%%)
             """, C, calibN, N,
             Double(hitStatic) / Double(totalRoute) * 100,
@@ -648,7 +648,7 @@ extension Tell {
     public static func runNoSyncGateEscalate(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdHybrid] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[NoSyncGateEscalate] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         // pinned hot 数。escalate 時の cold ロード用に LRU 枠を最低 8 残す（pin=C だと ensure 不能）。
         let nPin = Swift.min(Tell.envInt("QWISP_PIN", 48),
@@ -769,7 +769,7 @@ extension Tell {
             let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
             let match = zip(out, gR).filter { $0 == $1 }.count
             return String(format: """
-                [HotColdHybrid] pin=%d/C=%d gate=prefetch-verify: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  residual-miss平均=%.1f/tok(>0:%d/%d tok)
+                [NoSyncGateEscalate] pin=%d/C=%d gate=prefetch-verify: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  residual-miss平均=%.1f/tok(>0:%d/%d tok)
                 """, nPin, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100,
                 Double(residualSum) / Double(N), escalations, N)
         }
@@ -809,7 +809,7 @@ extension Tell {
             let match = zip(out, gR).filter { $0 == $1 }.count
             let avgK = escalations > 0 ? Double(firstMissSum) / Double(escalations) : 0
             return String(format: """
-                [HotColdHybrid] pin=%d/C=%d gate=partial-resume: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  escalate=%d/%d(%.0f%%) 平均first-miss層=%.1f/%d
+                [NoSyncGateEscalate] pin=%d/C=%d gate=partial-resume: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  escalate=%d/%d(%.0f%%) 平均first-miss層=%.1f/%d
                 """, nPin, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100,
                 escalations, N, Double(escalations) / Double(N) * 100, avgK, L)
         }
@@ -855,7 +855,7 @@ extension Tell {
                      zip(out, gSwift).filter { $0 == $1 }.count, N,
                      Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [HotColdHybrid] pin=%d/C=%d gate=%@: %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@  escalate=%d/%d(%.0f%%)
+            [NoSyncGateEscalate] pin=%d/C=%d gate=%@: %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@  escalate=%d/%d(%.0f%%)
             """, nPin, C, useMargin ? String(format: "margin≥%.1f", marginThresh) : "membership",
             Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag,
             escalations, N, Double(escalations) / Double(N) * 100)
@@ -920,7 +920,7 @@ extension Tell {
     public static func measureMLXFidelity(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[TeacherForced] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MLXFidelity] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -965,7 +965,7 @@ extension Tell {
         var diag = mism.prefix(8).map { String(format: "p%d:pred=%d ref=%d(rank%d,gap%.3f)", $0.pos, $0.pred, $0.ref, $0.refRank, $0.gap) }.joined(separator: " | ")
         if diag.isEmpty { diag = "(no mismatch)" }
         return String(format: """
-            [TeacherForced] mlx-swift exact vs mlx_lm(gR) per-token: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
+            [MLXFidelity] mlx-swift exact vs mlx_lm(gR) per-token: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
               first mismatches: %@
             """, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
     }
@@ -1099,7 +1099,7 @@ extension Tell {
         if prof {
             let n = Double(N)
             FileHandle.standardError.write(String(format:
-                "[M0-PROF/tok] pass1=%.1f pred-readback=%.1f pass2-build=%.1f prefetch-wait=%.1f final-drain=%.1f (ms)\n",
+                "[PredictPrefetch-PROF/tok] pass1=%.1f pred-readback=%.1f pass2-build=%.1f prefetch-wait=%.1f final-drain=%.1f (ms)\n",
                 Double(tP1)/n/1e6, Double(tPred)/n/1e6, Double(tBuild)/n/1e6,
                 Double(tWait)/n/1e6, Double(tFinal)/n/1e6).data(using: .utf8)!)
         }
@@ -1112,7 +1112,7 @@ extension Tell {
                      zip(out, gSwift).filter { $0 == $1 }.count, N,
                      Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@
+            [PredictPrefetch] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag, selDiag)
     }
@@ -1125,7 +1125,7 @@ extension Tell {
     public static func runPredictFixpoint(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[M6] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PredictFixpoint] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let maxP = Tell.envInt("QWISP_MAXPASS", 4)
         let store = try WeightStore(modelDir: modelDir)
@@ -1173,7 +1173,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [Tell M6] cache 不動点反復(C=%d, maxP=%d): %.1f tok/s  品質 %d/%d=%.0f%%  平均pass=%.2f
+            [PredictFixpoint] cache 不動点反復(C=%d, maxP=%d): %.1f tok/s  品質 %d/%d=%.0f%%  平均pass=%.2f
             """, C, maxP, Double(N) / secs, match, N, Double(match) / Double(N) * 100, Double(passTotal) / Double(N))
     }
 
@@ -1235,7 +1235,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [Tell M1] one-pass cross-layer(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            [CrossLayerCheap] one-pass cross-layer(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
@@ -1365,10 +1365,10 @@ extension Tell {
         if prof, pSteps > 0 {
             let s = Double(pSteps)
             FileHandle.standardError.write(String(format:
-                "[M2-PROF/tok] eval(preds=stall)=%.1f ensure(IO)=%.1f final-drain=%.1f (ms) chunks/tok=%d\n",
+                "[CrossLayerPredict-PROF/tok] eval(preds=stall)=%.1f ensure(IO)=%.1f final-drain=%.1f (ms) chunks/tok=%d\n",
                 Double(tEval)/s/1e6, Double(tEnsure)/s/1e6, Double(tFinal)/s/1e6, (L + CH - 1) / CH).data(using: .utf8)!)
             FileHandle.standardError.write(String(format:
-                "[M2-PROF ensure内訳/tok] pread(IO)=%.2fms misses=%.1f/tok | ensure合計=%.2fms → CPU(slot/distinct)=%.2fms\n",
+                "[CrossLayerPredict-PROF ensure内訳/tok] pread(IO)=%.2fms misses=%.1f/tok | ensure合計=%.2fms → CPU(slot/distinct)=%.2fms\n",
                 Double(LayerExpertCache.preadNanos)/s/1e6, Double(LayerExpertCache.missTotal)/s,
                 Double(LayerExpertCache.ensureNanos)/s/1e6,
                 Double(LayerExpertCache.ensureNanos - LayerExpertCache.preadNanos)/s/1e6).data(using: .utf8)!)
@@ -1378,16 +1378,16 @@ extension Tell {
             let s = Double(pSteps); func m(_ x: UInt64) -> Double { Double(x)/s/1e6 }
             let tot = m(tEmbed)+m(tEval)+m(tDistinct)+m(tEnsure)+m(tRunChunk)+m(tFinal)+m(tLastGate)
             FileHandle.standardError.write(String(format:
-                "[M2-PROF2/tok barrier] embed=%.2f predict(gate)=%.2f distinct(readback)=%.2f ensure(IO)=%.2f "
+                "[CrossLayerPredict-PROF2/tok barrier] embed=%.2f predict(gate)=%.2f distinct(readback)=%.2f ensure(IO)=%.2f "
                 + "runChunk(attn/gdn/moe)=%.2f final(norm/lmhead)=%.2f lastGate=%.2f | 合計=%.1fms\n",
                 m(tEmbed), m(tEval), m(tDistinct), m(tEnsure), m(tRunChunk), m(tFinal), m(tLastGate), tot).data(using: .utf8)!)
             FileHandle.standardError.write(String(format:
-                "[M2-PROF2 runChunk内訳/tok] GDN(30層)=%.2f attn(10層)=%.2f MoE-gather(40層)=%.2f "
+                "[CrossLayerPredict-PROF2 runChunk内訳/tok] GDN(30層)=%.2f attn(10層)=%.2f MoE-gather(40層)=%.2f "
                 + "MoE-shared(40層)=%.2f norm=%.2f (ms)\n",
                 m(StreamingMoEBlock.tGDN), m(StreamingMoEBlock.tAttn), m(StreamingMoEBlock.tMoEgather),
                 m(StreamingMoEBlock.tMoEshared), m(StreamingMoEBlock.tNorm)).data(using: .utf8)!)
             FileHandle.standardError.write(String(format:
-                "[M2-PROF2 GDN内訳/tok] in_proj(4本)=%.2f conv1d+norm=%.2f recurrent-kernel=%.2f out_proj=%.2f (ms)\n",
+                "[CrossLayerPredict-PROF2 GDN内訳/tok] in_proj(4本)=%.2f conv1d+norm=%.2f recurrent-kernel=%.2f out_proj=%.2f (ms)\n",
                 m(StreamingMoEBlock.tGdnInproj), m(StreamingMoEBlock.tGdnConv),
                 m(StreamingMoEBlock.tGdnKernel), m(StreamingMoEBlock.tGdnOut)).data(using: .utf8)!)
         }
@@ -1396,7 +1396,7 @@ extension Tell {
                      zip(out, gSwift).filter { $0 == $1 }.count, N,
                      Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@
+            [CrossLayerPredict] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag)
     }
@@ -1408,7 +1408,7 @@ extension Tell {
     public static func runPipelineDecode(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M5] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[PipelineDecode] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let CH = Tell.envInt("QWISP_CHUNK", 2)
         let store = try WeightStore(modelDir: modelDir)
@@ -1480,7 +1480,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         return String(format: """
-            [Tell M5] M2+pipeline(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            [PipelineDecode] M2+pipeline(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
             """,
             C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
@@ -1495,7 +1495,7 @@ extension Tell {
     public static func runMTPSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Tell M4] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MTPSpecVerify] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let CH = Tell.envInt("QWISP_CHUNK", 2)
         // 既定は exact verify（spec を lossless に再現）。QWISP_M4_PRED=1 で予測 verify（高速だが lossy）。
@@ -1564,7 +1564,7 @@ extension Tell {
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         return String(format: """
-            [Tell M4] MTP × Tell verify(%@, C=%d, chunk=%d): %.1f tok/s  accept=%.3f  品質(greedy一致) %d/%d=%.0f%%
+            [MTPSpecVerify] MTP × Tell verify(%@, C=%d, chunk=%d): %.1f tok/s  accept=%.3f  品質(greedy一致) %d/%d=%.0f%%
             """,
             exactVerify ? "exact" : "pred", C, CH, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100)
     }

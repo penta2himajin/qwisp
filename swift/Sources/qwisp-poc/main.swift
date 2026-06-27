@@ -26,29 +26,29 @@ if CommandLine.arguments.contains("stream") {
         do { print(try fn(md, mtpRef)) } catch { print("[\(label)] error: \(error)") }
         exit(0)
     }
-    if env["QWISP_TFORCE"] == "1"         { runExp("TeacherForced") { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M0"] == "1"         { runExp("M0") { try Tell.runPredictPrefetch(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M1"] == "1"         { runExp("M1") { try Tell.runCrossLayerCheap(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M2"] == "1"         { runExp("M2") { try Tell.runCrossLayerPredict(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M5"] == "1"         { runExp("M5") { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) } }
-    if env["QWISP_RUN_M4"] == "1"         { runExp("M4") { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_M6"] == "1"             { runExp("M0Multi") { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HYBRID"] == "1"         { runExp("Hybrid") { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) } }
-    if env["QWISP_SPECK"] == "1"          { runExp("SpecK") { try Tell.runSpecVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_FAST"] == "1"           { runExp("Fast") { try Tell.runBuddyNoSync(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_CALIB"] == "1"  { runExp("Calib") { try Tell.measureCoverage(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_DIAG"] == "1"   { runExp("Diag") { try Tell.measureMissCoverage(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_ONLINE"] == "1" { runExp("Online") { try Tell.runOnlineHotSet(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_ADAPT"] == "1"  { runExp("Adaptive") { try Tell.runAdaptiveSync(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_AUTO"] == "1"   { runExp("Auto") { try Tell.runProbeAuto(modelDir: $0, refPath: $1) } }
-    if env["QWISP_HOTCOLD_SPEC"] == "1"   { runExp("Spec") { try Tell.runSSMoEDraftVerify(modelDir: $0, refPath: $1) } }
-    if env["QWISP_SWIFT_CALIB"] == "1"    { runExp("SwiftCalib") { try Tell.measureSkippability(modelDir: $0, refPath: $1) } }
+    if env["QWISP_TFORCE"] == "1"         { runExp("MLXFidelity") { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M0"] == "1"         { runExp("PredictPrefetch") { try Tell.runPredictPrefetch(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M1"] == "1"         { runExp("CrossLayerCheap") { try Tell.runCrossLayerCheap(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M2"] == "1"         { runExp("CrossLayerPredict") { try Tell.runCrossLayerPredict(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M5"] == "1"         { runExp("PipelineDecode") { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M4"] == "1"         { runExp("MTPSpecVerify") { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) } }
+    if env["QWISP_M6"] == "1"             { runExp("PredictFixpoint") { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HYBRID"] == "1"         { runExp("NoSyncGateEscalate") { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) } }
+    if env["QWISP_SPECK"] == "1"          { runExp("SpecVerify") { try Tell.runSpecVerify(modelDir: $0, refPath: $1) } }
+    if env["QWISP_FAST"] == "1"           { runExp("BuddyNoSync") { try Tell.runBuddyNoSync(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_CALIB"] == "1"  { runExp("Coverage") { try Tell.measureCoverage(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_DIAG"] == "1"   { runExp("MissCoverage") { try Tell.measureMissCoverage(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_ONLINE"] == "1" { runExp("OnlineHotSet") { try Tell.runOnlineHotSet(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_ADAPT"] == "1"  { runExp("AdaptiveSync") { try Tell.runAdaptiveSync(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_AUTO"] == "1"   { runExp("ProbeAuto") { try Tell.runProbeAuto(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_SPEC"] == "1"   { runExp("SSMoEDraftVerify") { try Tell.runSSMoEDraftVerify(modelDir: $0, refPath: $1) } }
+    if env["QWISP_SWIFT_CALIB"] == "1"    { runExp("Skippability") { try Tell.measureSkippability(modelDir: $0, refPath: $1) } }
     if env["QWISP_MMAP_GATHER"] == "1"    { runExp("MmapGather") { try Tell.measureMmapGather(modelDir: $0, refPath: $1) } }
-    if env["QWISP_PRED_CALIB"] == "1"     { runExp("PredCalib") { try Tell.measurePredictorRecall(modelDir: $0, refPath: $1) } }
+    if env["QWISP_PRED_CALIB"] == "1"     { runExp("PredictorRecall") { try Tell.measurePredictorRecall(modelDir: $0, refPath: $1) } }
 
     // 既定: 本流 2 系統（SpecK=8GB strict lossless ベースライン / Fast=最速 near-lossless）
-    do { print(try Tell.runSpecVerify(modelDir: md, refPath: mtpRef)) } catch { print("[SpecK] error: \(error)") }
-    do { print(try Tell.runBuddyNoSync(modelDir: md, refPath: mtpRef)) } catch { print("[Fast] error: \(error)") }
+    do { print(try Tell.runSpecVerify(modelDir: md, refPath: mtpRef)) } catch { print("[SpecVerify] error: \(error)") }
+    do { print(try Tell.runBuddyNoSync(modelDir: md, refPath: mtpRef)) } catch { print("[BuddyNoSync] error: \(error)") }
     exit(0)
 }
 

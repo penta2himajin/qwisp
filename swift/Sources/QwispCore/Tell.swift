@@ -22,7 +22,7 @@ public enum Tell {
     public static func runSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdSpecK] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SpecVerify] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 32)
         let K = Tell.envInt("QWISP_DRAFT_K", 4)
@@ -165,11 +165,11 @@ public enum Tell {
         if prof {
             let s = Double(steps)
             FileHandle.standardError.write(String(format:
-                "[SPECK-PROF/step] draft(K×no-sync)=%.1f verify(seqMT exact)=%.1f commit/reject=%.1f (ms)  steps=%d\n",
+                "[SpecVerify-PROF/step] draft(K×no-sync)=%.1f verify(seqMT exact)=%.1f commit/reject=%.1f (ms)  steps=%d\n",
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tCommit)/s/1e6, steps).data(using: .utf8)!)
         }
         return String(format: """
-            [HotColdSpecK] %@draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@
+            [SpecVerify] %@draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@
             """, buddy ? "buddy-" : "no-sync ", K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
@@ -222,7 +222,7 @@ public enum Tell {
     public static func runBuddyNoSync(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[HotColdFast] skip" }
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[BuddyNoSync] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
@@ -344,7 +344,7 @@ public enum Tell {
                      Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         let missTag = missTotal < 0 ? "" : String(format: "  miss=%d (%.2f/tok)", missTotal, Double(missTotal) / Double(N))
         return String(format: """
-            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@  RSS=%.1fGB
+            [BuddyNoSync] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@  RSS=%.1fGB
             """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag, missTag, rss)
     }
 }
