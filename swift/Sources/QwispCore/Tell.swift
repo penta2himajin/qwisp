@@ -857,8 +857,53 @@ public enum Tell {
         // ==0 なら membership gate（all-hot のみ採用＝厳密 lossless だが strict）。
         let marginThresh = Float(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "0") ?? 0
         let useMargin = marginThresh > 0
+        // partial-resume: escalate 時、no-sync draft の最初の miss 層 k を特定し、層 0..k-1 の計算を
+        // 流用して層 k から exact tail だけ再走（厳密 lossless, escalate コストを k に比例して削減）。
+        let partial = ProcessInfo.processInfo.environment["QWISP_PARTIAL"] == "1"
+        let L = model.layerCount
         var out: [Int] = []
         var escalations = 0
+        var firstMissSum = 0
+        if partial {
+            StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.captureInds = true
+            let t0 = DispatchTime.now()
+            for _ in 0 ..< N {
+                out.append(cur.item(Int.self))
+                let snaps = caches2.map { $0.snapshot() }
+                // pass-1: no-sync draft を層ごとに走らせ、各層 input hidden を保存
+                var hsave: [MLXArray] = []; hsave.reserveCapacity(L)
+                var h = model.embedPub(cur)
+                for i in 0 ..< L { hsave.append(h); h = try model.runChunk(h, i, i + 1, caches: caches2) }
+                let draftTok = MLX.argMax(model.finalLogits(h)[0, 0], axis: -1).reshaped([1, 1])
+                // 一括 eval（draftTok + 全 hsave + 全 lastInds + states）= 1 sync で materialize
+                MLX.eval([draftTok] + hsave + caches2.flatMap { $0.stateArrays }
+                         + model.expertCaches.compactMap { $0.lastInds })
+                // 最初の miss 層 k（MoE 層のうち lastInds が cache 外を含む最小 layer index）
+                var firstMiss = L
+                for ec in model.expertCaches where !ec.indsHot() { firstMiss = Swift.min(firstMiss, ec.layer) }
+                if firstMiss == L {
+                    cur = draftTok                                               // all-hot＝draft 採用
+                } else {
+                    escalations += 1; firstMissSum += firstMiss
+                    // cache[firstMiss..] を token 先頭へ部分 restore（[0..firstMiss-1] は exact なので保持）
+                    for i in firstMiss ..< L { caches2[i].restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                    StreamingMoEBlock.probeNoSync = false                        // exact tail
+                    let h2 = try model.runChunk(hsave[firstMiss], firstMiss, L, caches: caches2)
+                    cur = MLX.argMax(model.finalLogits(h2)[0, 0], axis: -1).reshaped([1, 1])
+                    MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
+                    StreamingMoEBlock.probeNoSync = true
+                }
+            }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = false
+            let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+            let match = zip(out, gR).filter { $0 == $1 }.count
+            let avgK = escalations > 0 ? Double(firstMissSum) / Double(escalations) : 0
+            return String(format: """
+                [HotColdHybrid] pin=%d/C=%d gate=partial-resume: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  escalate=%d/%d(%.0f%%) 平均first-miss層=%.1f/%d
+                """, nPin, C, Double(N) / secs, match, N, Double(match) / Double(N) * 100,
+                escalations, N, Double(escalations) / Double(N) * 100, avgK, L)
+        }
         StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = !useMargin
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {

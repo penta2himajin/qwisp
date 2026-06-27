@@ -130,6 +130,14 @@ public final class LayerExpertCache {
         return hotMaskArr!
     }
 
+    /// 直近 draft(lastInds) の routed top-K が全て cache 内か（partial-resume の first-miss 判定）。
+    /// lastInds は batched eval 済前提（materialized なら asArray は再計算無し）。
+    public func indsHot() -> Bool {
+        guard let li = lastInds else { return true }
+        for e in li.asArray(Int32.self) where slotOf[Int(e)] == nil { return false }
+        return true
+    }
+
     /// experts を常駐ロードし、その slot を pinned に登録（以後 LRU 退避されない）。
     public func pin(_ experts: [Int]) {
         _ = ensure(experts)
