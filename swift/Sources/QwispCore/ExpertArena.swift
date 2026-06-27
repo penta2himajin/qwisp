@@ -82,6 +82,8 @@ public final class LayerExpertCache {
     public private(set) var hits = 0
     public private(set) var misses = 0
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
+    nonisolated(unsafe) public static var preadNanos: UInt64 = 0    // loadMany(pread IO) のみ
+    nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
@@ -146,7 +148,12 @@ public final class LayerExpertCache {
             result[e] = slot; missList.append((e, slot)); slotTableDirty = true
         }
         // 全 miss × 9 テンソルを一括並列 pread（層内 miss をまとめてレイテンシ重畳）
-        if !missList.isEmpty { arena.loadMany(layer, missList) }
+        if !missList.isEmpty {
+            let pt = DispatchTime.now().uptimeNanoseconds
+            arena.loadMany(layer, missList)
+            LayerExpertCache.preadNanos += DispatchTime.now().uptimeNanoseconds - pt
+            LayerExpertCache.missTotal += missList.count
+        }
         return result
     }
 }

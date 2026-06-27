@@ -1044,6 +1044,7 @@ public enum Tell {
         var tEval: UInt64 = 0, tEnsure: UInt64 = 0, tFinal: UInt64 = 0, pSteps = 0
         var tEmbed: UInt64 = 0, tDistinct: UInt64 = 0, tRunChunk: UInt64 = 0, tLastGate: UInt64 = 0
         if prof2 { StreamingMoEBlock.profileLayers = true }
+        LayerExpertCache.preadNanos = 0; LayerExpertCache.missTotal = 0; LayerExpertCache.ensureNanos = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []
         let t0 = DispatchTime.now()
@@ -1109,6 +1110,11 @@ public enum Tell {
             FileHandle.standardError.write(String(format:
                 "[M2-PROF/tok] eval(preds=stall)=%.1f ensure(IO)=%.1f final-drain=%.1f (ms) chunks/tok=%d\n",
                 Double(tEval)/s/1e6, Double(tEnsure)/s/1e6, Double(tFinal)/s/1e6, (L + CH - 1) / CH).data(using: .utf8)!)
+            FileHandle.standardError.write(String(format:
+                "[M2-PROF ensure内訳/tok] pread(IO)=%.2fms misses=%.1f/tok | ensure合計=%.2fms → CPU(slot/distinct)=%.2fms\n",
+                Double(LayerExpertCache.preadNanos)/s/1e6, Double(LayerExpertCache.missTotal)/s,
+                Double(LayerExpertCache.ensureNanos)/s/1e6,
+                Double(LayerExpertCache.ensureNanos - LayerExpertCache.preadNanos)/s/1e6).data(using: .utf8)!)
         }
         if prof2, pSteps > 0 {
             StreamingMoEBlock.profileLayers = false
