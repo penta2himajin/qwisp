@@ -17,6 +17,20 @@ public enum Proj {
                                        groupSize: 64, bits: bits, mode: .affine)
         }
     }
+
+    /// 同入力の複数 quantized Proj を出力次元方向に concat して 1 本に融合（全て同 bits 前提）。
+    /// 量子化は行(out)ごと独立なので out 軸 concat は bit 一致。失敗時 nil。
+    public static func fuse(_ projs: [Proj]) -> Proj? {
+        var ws: [MLXArray] = [], ss: [MLXArray] = [], bs: [MLXArray] = []
+        var bits0 = -1
+        for p in projs {
+            guard case let .quantized(w, s, b, bits) = p else { return nil }
+            if bits0 == -1 { bits0 = bits } else if bits0 != bits { return nil }
+            ws.append(w); ss.append(s); bs.append(b)
+        }
+        return .quantized(MLX.concatenated(ws, axis: 0), MLX.concatenated(ss, axis: 0),
+                          MLX.concatenated(bs, axis: 0), bits0)
+    }
 }
 
 /// qwen3_5.GatedDeltaNet.__call__ 全体の Swift 移植（M2b-1 層 wrapping）.
@@ -46,6 +60,9 @@ public struct GatedDeltaNetLayer {
     let normWeight: MLXArray
     let aLog: MLXArray
     let dtBias: MLXArray
+    let fusedIn: Proj?    // qkv+z+b+a を 1 本に融合（4→1 matmul）
+
+    nonisolated(unsafe) public static var fuseGDN = false   // 融合 in_proj 経路を使う
 
     public init(numKHeads: Int, numVHeads: Int, headKDim: Int, headVDim: Int,
                 convKernel: Int, eps: Float,
@@ -58,6 +75,7 @@ public struct GatedDeltaNetLayer {
         self.inProjB = inProjB; self.inProjA = inProjA; self.outProj = outProj
         self.conv1dW = conv1dW; self.normWeight = normWeight
         self.aLog = aLog; self.dtBias = dtBias
+        self.fusedIn = Proj.fuse([inProjQKV, inProjZ, inProjB, inProjA])
     }
 
     /// weight=None 相当の rms_norm（最終軸正規化、スケール無し）= ones を渡して fused kernel と一致.
@@ -71,10 +89,19 @@ public struct GatedDeltaNetLayer {
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var t = now()
         let B = x.dim(0), S = x.dim(1)
-        let qkv = inProjQKV.apply(x)                                  // [B,S,convDim]
-        let z = inProjZ.apply(x).reshaped([B, S, numVHeads, headVDim])
-        let b = inProjB.apply(x)                                      // [B,S,numVHeads]
-        let a = inProjA.apply(x)                                      // [B,S,numVHeads]
+        let qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+        if GatedDeltaNetLayer.fuseGDN, let fused = fusedIn {
+            let f = fused.apply(x)                                    // [B,S,convDim+valueDim+2*numVHeads]
+            qkv = f[0..., 0..., 0 ..< convDim]
+            z = f[0..., 0..., convDim ..< (convDim + valueDim)].reshaped([B, S, numVHeads, headVDim])
+            b = f[0..., 0..., (convDim + valueDim) ..< (convDim + valueDim + numVHeads)]
+            a = f[0..., 0..., (convDim + valueDim + numVHeads)...]
+        } else {
+            qkv = inProjQKV.apply(x)                                  // [B,S,convDim]
+            z = inProjZ.apply(x).reshaped([B, S, numVHeads, headVDim])
+            b = inProjB.apply(x)                                      // [B,S,numVHeads]
+            a = inProjA.apply(x)                                      // [B,S,numVHeads]
+        }
         if prof { MLX.eval([qkv, z, b, a]); StreamingMoEBlock.tGdnInproj += now() - t; t = now() }
 
         // conv_state: cache があれば直近 K-1、無ければ零（因果 padding）
