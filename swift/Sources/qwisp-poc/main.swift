@@ -18,6 +18,30 @@ if CommandLine.arguments.contains("stream") {
     let md = ProcessInfo.processInfo.environment["QWISP_MODEL"]
         ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
     let onlyM0 = ProcessInfo.processInfo.environment["QWISP_ONLY_M0"] == "1"
+    // 16GB アーク: HotColdFast(no-sync)/Hybrid(lossless) だけを回す軽量ゲート（C 核心測定の高速反復用）
+    if ProcessInfo.processInfo.environment["QWISP_ONLY_FAST"] == "1" {
+        let mtpRef = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
+        if ProcessInfo.processInfo.environment["QWISP_TFORCE"] == "1" {
+            do { print(try Tell.runTeacherForced(modelDir: md, refPath: mtpRef)) }
+            catch { print("[TeacherForced] error: \(error)") }
+        } else if ProcessInfo.processInfo.environment["QWISP_RUN_M0"] == "1" {
+            do { print(try Tell.runM0(modelDir: md, refPath: mtpRef)) }
+            catch { print("[Tell M0] error: \(error)") }
+        } else if ProcessInfo.processInfo.environment["QWISP_RUN_M2"] == "1" {
+            do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
+            catch { print("[Tell M2] error: \(error)") }
+        } else if ProcessInfo.processInfo.environment["QWISP_SPECK"] == "1" {
+            do { print(try Tell.runHotColdSpecK(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdSpecK] error: \(error)") }
+        } else if ProcessInfo.processInfo.environment["QWISP_HYBRID"] == "1" {
+            do { print(try Tell.runHotColdHybrid(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdHybrid] error: \(error)") }
+        } else {
+            do { print(try Tell.runHotColdFast(modelDir: md, refPath: mtpRef)) }
+            catch { print("[HotColdFast] error: \(error)") }
+        }
+        exit(0)
+    }
     if !onlyM0 {
         do { print(try StreamingDecode.run(modelDir: md, refPath: "/tmp/qwisp_full_ref.safetensors")) }
         catch { print("[S3] error: \(error)") }

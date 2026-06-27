@@ -355,6 +355,23 @@ public enum Tell {
         }
         defer { StreamingMoEBlock.skipMode = 0 }
 
+        // Swift-exact-greedy 参照（lossless 検証用。SpecK は構成上 strict lossless なので 100% のはず。
+        // long128tok は vs-Python が f16 で無意味なので vs Swift-greedy で測る）。QWISP_SWIFT_REF=1。
+        var gSwift: [Int] = []
+        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+            let cref = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+        }
+
         let mc = model.makeCaches()
         StreamingMoEBlock.probeNoSync = false
         (_, lg) = try model.prefillChunked(ids, caches: mc)
@@ -425,6 +442,11 @@ public enum Tell {
         StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
+        let outN = Array(out.prefix(N))
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(outN, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(outN, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         if prof {
             let s = Double(steps)
             FileHandle.standardError.write(String(format:
@@ -432,8 +454,8 @@ public enum Tell {
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tCommit)/s/1e6, steps).data(using: .utf8)!)
         }
         return String(format: """
-            [HotColdSpecK] %@draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質 %d/%d=%.0f%%
-            """, buddy ? "buddy-" : "no-sync ", K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100)
+            [HotColdSpecK] %@draft K=%d skip=%d/%d + batched verify: %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@
+            """, buddy ? "buddy-" : "no-sync ", K, skip.count, L, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
     /// hot/cold ④ per-prompt auto: hot 常駐 + 短い probe で no-sync 安全性を判定。
@@ -885,6 +907,11 @@ public enum Tell {
         MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         StreamingMoEBlock.probeNoSync = true   // 以降 no-sync（hot 固定 slotTable で gather）
         StreamingMoEBlock.skipMode = skipMode       // 1=cold寄与0, 2=0+renorm, 3=buddy 代替
+        // coverage 計測: 全層・全 token の routed-but-not-cached(miss) 数を GPU 累積。
+        // C=128 で 0 なら no-sync gather が exact 経路と bit 一致＝構成上 strict lossless。
+        let countMiss = ProcessInfo.processInfo.environment["QWISP_COUNT_MISS"] != "0"
+        StreamingMoEBlock.countHotMiss = countMiss
+        StreamingMoEBlock.hotMissAccum = nil
         var out: [Int] = []
         let t0 = DispatchTime.now()
         for _ in 0 ..< N {
@@ -893,7 +920,11 @@ public enum Tell {
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([cur] + caches2.flatMap { $0.stateArrays })
         }
+        var missTotal = -1
+        if countMiss, let acc = StreamingMoEBlock.hotMissAccum { acc.eval(); missTotal = acc.item(Int.self) }
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        let rss = StreamingDecode.rssGB()
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
         let skipTag = skipMode == 1 ? "+skip" : (skipMode == 2 ? "+skip-renorm" : (skipMode == 3 ? "+buddy" : ""))
@@ -901,9 +932,10 @@ public enum Tell {
             : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
                      zip(out, gSwift).filter { $0 == $1 }.count, N,
                      Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
+        let missTag = missTotal < 0 ? "" : String(format: "  miss=%d (%.2f/tok)", missTotal, Double(missTotal) / Double(N))
         return String(format: """
-            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@
-            """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag)
+            [HotColdFast] hot-pin top-%d + pure no-sync%@ (calib=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@  RSS=%.1fGB
+            """, C, skipTag, calibN, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag, missTag, rss)
     }
 
     /// hot/cold hybrid: hot-pin no-sync を draft とし、per-token で「全 routed が cache 内か」を
@@ -956,6 +988,23 @@ public enum Tell {
             MLX.eval([cur] + caches.flatMap { $0.stateArrays })
         }
         StreamingMoEBlock.captureInds = false
+
+        // Swift-exact-greedy 参照（strict-vs-near 判定用。membership は構成上これと 100% 一致するはず、
+        // margin は hard ref で <100% なら near である決定的証拠）。QWISP_SWIFT_REF=1。
+        var gSwift: [Int] = []
+        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+            let cref = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+        }
 
         // phase 2: top-nPin hot を各層 pin（残り C-nPin は escalate 時の cold LRU 枠）+ buddy table
         for (mi, ec) in model.expertCaches.enumerated() {
@@ -1098,10 +1147,14 @@ public enum Tell {
         StreamingMoEBlock.hotMissAccum = nil
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out, gR).filter { $0 == $1 }.count
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(out, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [HotColdHybrid] pin=%d/C=%d gate=%@: %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%  escalate=%d/%d(%.0f%%)
+            [HotColdHybrid] pin=%d/C=%d gate=%@: %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@  escalate=%d/%d(%.0f%%)
             """, nPin, C, useMargin ? String(format: "margin≥%.1f", marginThresh) : "membership",
-            Double(N) / secs, match, N, Double(match) / Double(N) * 100,
+            Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag,
             escalations, N, Double(escalations) / Double(N) * 100)
     }
 
@@ -1157,6 +1210,62 @@ public enum Tell {
     }
 
     /// M0: 2-pass(pass-1 予測 → pass-2 chunked + overlapped prefetch)。near-lossless で速度を稼ぐ。
+    /// (e) エンジン MLX 忠実度: teacher-forced で mlx-swift exact が mlx_lm(原典 MLX) と per-token 一致するか。
+    /// reference gR を強制入力し各位置の argmax を gR と比較（自己回帰カオスを除去）。
+    /// 一致率が高ければ「エンジン MLX 準拠」。mismatch 位置では gR token の logit 順位と top1 との gap を診断。
+    public static func runTeacherForced(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[TeacherForced] skip" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "128") ?? 128, gR.count)
+        let caches = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false   // exact gather（demand-load）
+
+        // prefill → 位置0の予測（gR[0] のはず）
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var v = lg[0, lg.dim(1) - 1]
+        var preds: [Int] = []
+        var mism: [(pos: Int, pred: Int, ref: Int, refRank: Int, gap: Float)] = []
+        func record(_ i: Int, _ v: MLXArray) {
+            let pred = MLX.argMax(v, axis: -1).item(Int.self)
+            preds.append(pred)
+            if pred != gR[i] {
+                // gR[i] の logit 順位（降順で何番目か）と top1 との logit 差を診断
+                let sv = MLX.sorted(v, axis: -1); let n = sv.dim(0)
+                let top1 = sv[n - 1].item(Float.self)
+                let refLogit = v[gR[i]].item(Float.self)
+                let rank = (MLX.sum(v .> refLogit).item(Int.self))   // 自分より大きい logit の数 = 0-indexed rank
+                mism.append((i, pred, gR[i], rank, top1 - refLogit))
+            }
+        }
+        record(0, v)
+        MLX.eval([v] + caches.flatMap { $0.stateArrays })
+        for i in 0 ..< (N - 1) {
+            let inp = MLXArray([Int32(gR[i])], [1, 1])   // teacher-forced: reference token を強制入力
+            (_, lg) = try model.forwardHidden(inp, caches: caches)
+            v = lg[0, 0]
+            record(i + 1, v)
+            MLX.eval([v] + caches.flatMap { $0.stateArrays })
+        }
+        let match = zip(preds, gR).filter { $0 == $1 }.count
+        // mismatch のうち「gR が rank-1（僅差で2位）」= f16 near-tie 反転、「rank≫1」= 真の乖離
+        let nearTie = mism.filter { $0.refRank <= 2 }.count
+        var diag = mism.prefix(8).map { String(format: "p%d:pred=%d ref=%d(rank%d,gap%.3f)", $0.pos, $0.pred, $0.ref, $0.refRank, $0.gap) }.joined(separator: " | ")
+        if diag.isEmpty { diag = "(no mismatch)" }
+        return String(format: """
+            [TeacherForced] mlx-swift exact vs mlx_lm(gR) per-token: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
+              first mismatches: %@
+            """, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
+    }
+
     public static func runM0(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
@@ -1189,6 +1298,22 @@ public enum Tell {
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+
+        // Swift-exact-greedy 参照（M0 は構成上 strict lossless なので 100% のはず）。QWISP_SWIFT_REF=1。
+        var gSwift: [Int] = []
+        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+            let cref = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+        }
 
         // 各層の予測 distinct experts を抽出
         func distinct(_ a: MLXArray) -> [Int] {
@@ -1271,10 +1396,14 @@ public enum Tell {
             ? String(format: "  [selK=%d τ=%.2f 拡張層=%.1f/%d層/tok]",
                      selK, selTau, Double(widenTotal) / Double(Swift.max(widenTokens, 1)), L)
             : ""
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(out, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%%@
+            [Tell M0] chunk overlap 2-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@%@
             """,
-            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, selDiag)
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag, selDiag)
     }
 
     /// M6: cache 不動点反復(multi-pass)。routing が収束するまで forward を繰り返し、cache を
@@ -1421,6 +1550,23 @@ public enum Tell {
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([cur] + caches.flatMap { $0.stateArrays })
 
+        // Swift-exact-greedy 参照（M2 は temporal 予測ゆえ真に lossless か未確認＝要検証）。QWISP_SWIFT_REF=1。
+        var gSwift: [Int] = []
+        if ProcessInfo.processInfo.environment["QWISP_SWIFT_REF"] == "1" {
+            let cref = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false
+            var (_, rlg) = try model.prefillChunked(ids, caches: cref)
+            var rcur = MLX.argMax(rlg[0, rlg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            for _ in 0 ..< N {
+                gSwift.append(rcur.item(Int.self))
+                (_, rlg) = try model.forwardHidden(rcur, caches: cref)
+                rcur = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([rcur] + cref.flatMap { $0.stateArrays })
+            }
+            StreamingMoEBlock.probeNoSync = false
+        }
+
         func distinct(_ a: MLXArray) -> [Int] {
             var seen = Set<Int>(); var u: [Int] = []
             for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
@@ -1524,10 +1670,14 @@ public enum Tell {
                 m(StreamingMoEBlock.tGdnInproj), m(StreamingMoEBlock.tGdnConv),
                 m(StreamingMoEBlock.tGdnKernel), m(StreamingMoEBlock.tGdnOut)).data(using: .utf8)!)
         }
+        let swiftTag = gSwift.isEmpty ? ""
+            : String(format: "  [vs Swift-greedy %d/%d=%.0f%%]",
+                     zip(out, gSwift).filter { $0 == $1 }.count, N,
+                     Double(zip(out, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         return String(format: """
-            [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(greedy一致) %d/%d=%.0f%%
+            [Tell M2] Fate one-pass(C=%d, chunk=%d): %.1f tok/s  品質(vs Python) %d/%d=%.0f%%%@
             """,
-            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
+            C, CH, Double(N) / secs, match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
     /// M5 = M2 one-pass + depth-1 software pipeline。
