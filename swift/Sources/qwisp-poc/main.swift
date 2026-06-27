@@ -17,113 +17,38 @@ if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
 if CommandLine.arguments.contains("stream") {
     let md = ProcessInfo.processInfo.environment["QWISP_MODEL"]
         ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
-    let onlyM0 = ProcessInfo.processInfo.environment["QWISP_ONLY_M0"] == "1"
-    // 16GB アーク: HotColdFast(no-sync)/Hybrid(lossless) だけを回す軽量ゲート（C 核心測定の高速反復用）
-    if ProcessInfo.processInfo.environment["QWISP_ONLY_FAST"] == "1" {
-        let mtpRef = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
-        if ProcessInfo.processInfo.environment["QWISP_TFORCE"] == "1" {
-            do { print(try Tell.runTeacherForced(modelDir: md, refPath: mtpRef)) }
-            catch { print("[TeacherForced] error: \(error)") }
-        } else if ProcessInfo.processInfo.environment["QWISP_RUN_M0"] == "1" {
-            do { print(try Tell.runM0(modelDir: md, refPath: mtpRef)) }
-            catch { print("[Tell M0] error: \(error)") }
-        } else if ProcessInfo.processInfo.environment["QWISP_RUN_M2"] == "1" {
-            do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
-            catch { print("[Tell M2] error: \(error)") }
-        } else if ProcessInfo.processInfo.environment["QWISP_SPECK"] == "1" {
-            do { print(try Tell.runHotColdSpecK(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdSpecK] error: \(error)") }
-        } else if ProcessInfo.processInfo.environment["QWISP_HYBRID"] == "1" {
-            do { print(try Tell.runHotColdHybrid(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdHybrid] error: \(error)") }
-        } else {
-            do { print(try Tell.runHotColdFast(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdFast] error: \(error)") }
-        }
+    let env = ProcessInfo.processInfo.environment
+    let mtpRef = env["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
+
+    // 実験バリアント: 該当 QWISP_* が立っていれば TellExperiments.swift の単一 runner を
+    // 実行して終了。詳細・再現コマンドは notes/00-strict-vs-near-lossless.md。
+    func runExp(_ label: String, _ fn: (String, String) throws -> String) {
+        do { print(try fn(md, mtpRef)) } catch { print("[\(label)] error: \(error)") }
         exit(0)
     }
-    if !onlyM0 {
-        do { print(try StreamingDecode.run(modelDir: md, refPath: "/tmp/qwisp_full_ref.safetensors")) }
-        catch { print("[S3] error: \(error)") }
-    }
-    let mtpRef = ProcessInfo.processInfo.environment["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
-    if FileManager.default.fileExists(atPath: mtpRef),
-       FileManager.default.fileExists(atPath: "\(md)/mtp.safetensors") {
-        if !onlyM0 {
-        do { print(try StreamingDecode.runSpeculative(modelDir: md, refPath: mtpRef)) }
-        catch { print("[M2c×stream] error: \(error)") }
-        do { print(try StreamingDecode.runHybridFast(modelDir: md, refPath: mtpRef)) }
-        catch { print("[fast] error: \(error)") }
-        }
-        let onlyHybrid = ProcessInfo.processInfo.environment["QWISP_ONLY_HYBRID"] == "1"
-        let speckOnly = ProcessInfo.processInfo.environment["QWISP_HOTCOLD_SPECK"] == "1"
-        if onlyHybrid && !speckOnly {
-            do { print(try Tell.runHotColdHybrid(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdHybrid] error: \(error)") }
-        }
-        if !onlyHybrid {
-        do { print(try Tell.runM0(modelDir: md, refPath: mtpRef)) }
-        catch { print("[Tell] error: \(error)") }
-        if ProcessInfo.processInfo.environment["QWISP_M6"] == "1" {
-            do { print(try Tell.runM0Multi(modelDir: md, refPath: mtpRef)) }
-            catch { print("[Tell M6] error: \(error)") }
-        }
-        if !onlyM0 {
-        do { print(try Tell.runM2(modelDir: md, refPath: mtpRef)) }
-        catch { print("[Tell M2] error: \(error)") }
-        do { print(try Tell.runM5(modelDir: md, refPath: mtpRef)) }
-        catch { print("[Tell M5] error: \(error)") }
-        }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_CALIB"] == "1" {
-            do { print(try Tell.runHotColdCalib(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotCold] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_FAST"] == "1" {
-            do { print(try Tell.runHotColdFast(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdFast] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_DIAG"] == "1" {
-            do { print(try Tell.runHotColdDiag(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdDiag] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_ONLINE"] == "1" {
-            do { print(try Tell.runHotColdOnline(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdOnline] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_ADAPT"] == "1" {
-            do { print(try Tell.runHotColdAdaptive(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdAdaptive] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_AUTO"] == "1" {
-            do { print(try Tell.runHotColdAuto(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdAuto] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_SPEC"] == "1" {
-            do { print(try Tell.runHotColdSpec(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdSpec] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_HOTCOLD_SPECK"] == "1" {
-            do { print(try Tell.runHotColdSpecK(modelDir: md, refPath: mtpRef)) }
-            catch { print("[HotColdSpecK] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_SWIFT_CALIB"] == "1" {
-            do { print(try Tell.runSwiftCalib(modelDir: md, refPath: mtpRef)) }
-            catch { print("[SwiftCalib] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_MMAP_GATHER"] == "1" {
-            do { print(try Tell.runMmapGather(modelDir: md, refPath: mtpRef)) }
-            catch { print("[MmapGather] error: \(error)") }
-        }
-        if ProcessInfo.processInfo.environment["QWISP_PRED_CALIB"] == "1" {
-            do { print(try Tell.runPredictorCalib(modelDir: md, refPath: mtpRef)) }
-            catch { print("[PredCalib] error: \(error)") }
-        }
-        do { print(try Tell.runM4(modelDir: md, refPath: mtpRef)) }
-        catch { print("[Tell M4] error: \(error)") }
-        do { print(try StreamingDecode.runCrossLayerFast(modelDir: md, refPath: mtpRef)) }
-        catch { print("[xlayer] error: \(error)") }
-    }
+    if env["QWISP_TFORCE"] == "1"         { runExp("TeacherForced") { try Tell.runTeacherForced(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M0"] == "1"         { runExp("M0") { try Tell.runM0(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M1"] == "1"         { runExp("M1") { try Tell.runM1(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M2"] == "1"         { runExp("M2") { try Tell.runM2(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M5"] == "1"         { runExp("M5") { try Tell.runM5(modelDir: $0, refPath: $1) } }
+    if env["QWISP_RUN_M4"] == "1"         { runExp("M4") { try Tell.runM4(modelDir: $0, refPath: $1) } }
+    if env["QWISP_M6"] == "1"             { runExp("M0Multi") { try Tell.runM0Multi(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HYBRID"] == "1"         { runExp("Hybrid") { try Tell.runHotColdHybrid(modelDir: $0, refPath: $1) } }
+    if env["QWISP_SPECK"] == "1"          { runExp("SpecK") { try Tell.runHotColdSpecK(modelDir: $0, refPath: $1) } }
+    if env["QWISP_FAST"] == "1"           { runExp("Fast") { try Tell.runHotColdFast(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_CALIB"] == "1"  { runExp("Calib") { try Tell.runHotColdCalib(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_DIAG"] == "1"   { runExp("Diag") { try Tell.runHotColdDiag(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_ONLINE"] == "1" { runExp("Online") { try Tell.runHotColdOnline(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_ADAPT"] == "1"  { runExp("Adaptive") { try Tell.runHotColdAdaptive(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_AUTO"] == "1"   { runExp("Auto") { try Tell.runHotColdAuto(modelDir: $0, refPath: $1) } }
+    if env["QWISP_HOTCOLD_SPEC"] == "1"   { runExp("Spec") { try Tell.runHotColdSpec(modelDir: $0, refPath: $1) } }
+    if env["QWISP_SWIFT_CALIB"] == "1"    { runExp("SwiftCalib") { try Tell.runSwiftCalib(modelDir: $0, refPath: $1) } }
+    if env["QWISP_MMAP_GATHER"] == "1"    { runExp("MmapGather") { try Tell.runMmapGather(modelDir: $0, refPath: $1) } }
+    if env["QWISP_PRED_CALIB"] == "1"     { runExp("PredCalib") { try Tell.runPredictorCalib(modelDir: $0, refPath: $1) } }
+
+    // 既定: 本流 2 系統（SpecK=8GB strict lossless ベースライン / Fast=最速 near-lossless）
+    do { print(try Tell.runHotColdSpecK(modelDir: md, refPath: mtpRef)) } catch { print("[SpecK] error: \(error)") }
+    do { print(try Tell.runHotColdFast(modelDir: md, refPath: mtpRef)) } catch { print("[Fast] error: \(error)") }
     exit(0)
 }
 
