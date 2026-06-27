@@ -1,5 +1,11 @@
 # 10 — Tell：Qwisp コアランタイム
 
+> **⚠️ 2026-06-27 後半 大幅更新**：strict-vs-near の決着・命名統一・MLX 基準化により本書の一部結論を訂正。
+> - **8GB lossless ベースライン = `spec-verify`(SpecK)**。**「M2 strict / M0 near が天井」は誤り**で、M0/M2 は long horizon で発散＝near-lossless（真 lossless は SpecK のみ）。
+> - runner は記述名へ統一（`runHotCold*`/`M0-M6` 廃止）、dispatch は **`QWISP_RUN=<name>`** に集約。
+> - lossless 基準は**原典 MLX 準拠**（teacher-forced で確認済: mlx-swift は per-token で MLX と 98.4-100% 一致、不一致は f16 near-tie のみ）。
+> - **strict-vs-near と 8GB/16GB の現行結論の正典は `notes/00-strict-vs-near-lossless.md`**。本書 §2/§3/§7 は新名・新結論へ更新済、§4-6（構造的天井・negative・測定較正）は引き続き有効。
+
 > **位置づけ**：Tell は Qwisp の**コアランタイム**（独自スケジューラ＋最適化済みカーネルを内包）。各 `runXxx` は「実験」ではなく**ランタイムの実行戦略（経路）**であり、同時にベンチ入口を兼ねる。
 > **命名**：William Tell（一射必中でリンゴを射抜く名手）由来。Apple Silicon ＋ Tell の主題である exact/lossless（正確に当てる）の二重掛け。
 > **出典と鮮度**：本書は commit `34c1abb`（2026-06-27 08:27）までのコミットログから再構成。関数名・env・数値は `swift/Sources/QwispCore/Tell.swift` 実体と照合して維持すること。**near-lossless 領域（buddy 等）は現在進行形で、評価が短時間で反転している**（buddy は 07:41 に「starved 救出」→ 08:27 に撤回）。スナップショットとして読むこと。
@@ -19,24 +25,24 @@
 
 ## 2. 実行戦略（mode）一覧
 
-速度は dev機・本モデル（Qwen3.6-35B-A3B 4bit, 256 experts/top-8/40層）の概算 tok/s。
+速度は dev機・本モデル（Qwen3.6-35B-A3B 4bit, 256 experts/top-8/40層）の概算 tok/s（8GB C=64、特記あれば併記）。lossless は **vs Swift-exact**（同一エンジン exact）・long(128tok) 評価。
 
-| mode | 入口(env) | 速度 | lossless | 適用域 | 状態 |
-|---|---|---:|---|---|---|
-| **M2** | （1-pass 経路） | ~27 | **strict (100%)** | 8GB 汎用 | ★採用（保証 lossless） |
-| **M0** | 既定 / `QWISP_ONLY_M0` | ~30 | **near (98%)** | 8GB 汎用 | ★採用（near） |
-| buddy no-sync | `QWISP_SKIPMODE=3` | ~58 | near (98% **@C=64 のみ**) | 自然動作点 | near 候補（starved C は不可・§3） |
-| buddy hybrid | `SKIPMODE=3`+`QWISP_MARGIN≥2` | 51.6 | near (+5% exact escalate 保険) | 8GB | 候補 |
-| hot-pin no-sync | `QWISP_HOTCOLD_FAST` | 47 | nl 100% / code 22% | 予測可能 prompt 限定 | 一般には unsafe |
-| hybrid (membership/margin) | `QWISP_HOTCOLD_HYBRID`/`ONLY_HYBRID` | ~53 | margin=near / membership=strict | 8GB | buddy に発展 |
-| output-sim buddy | `QWISP_BUDDY_OUTSIM=1` | — | — | — | **negative**（co-act 比で利得なし） |
-| SS-MoE SpecK | `QWISP_HOTCOLD_SPEC` | 20–24 | strict | — | negative（速度出ず・§5） |
-| M5 pipeline | — | 27.4 | strict | — | negative（§5） |
-| M6 multipass | `QWISP_M6` | 7 | strict | — | negative（§5） |
-| mmap gather | `QWISP_MMAP_GATHER` | 45 / RSS 24GB | — | 24GB 専用 | 8GB に locality なし |
-| prefetch-verify | `QWISP_PREFETCH` | 23.7 | near | — | frontier 拡張せず |
+| `QWISP_RUN=` (旧名) | 機構 | 速度 | lossless(long) | 状態 |
+|---|---|---:|---|---|
+| **spec-verify** (SpecK) | buddy draft + exact verify（投機） | 27 / C=128 34-36 | **strict** | ★8GB lossless ベースライン |
+| **buddy-no-sync** (Fast) | 純 no-sync + buddy 差替（verify 無） | 56-58 | near(@C=64 のみ) | 最速 near（C>64 発散） |
+| no-sync-gate-escalate (Hybrid) | no-sync draft + per-token gate escalate | membership 15-17 / margin 36-49 | membership=strict(遅)/margin=near | margin は long 発散 |
+| predict-prefetch (M0) | 2-pass 自己予測 prefetch | 28-30 | **near**（long 11%） | 旧「lossless」は誤り |
+| cross-layer-predict (M2) | cross-layer 予測 1-pass（Fate） | 26-28 | **near**（long 12%） | 旧「lossless」は誤り |
+| mtp-spec-verify (M4) | MTP head 投機 × exact verify | 25 | **strict** | seqMT verify で lossless |
+| ss-moe-draft-verify (Spec) | SS-MoE no-sync draft + verify | 20–24 | strict | negative（速度出ず・§5） |
+| pipeline-decode (M5) | layer pipeline | 27.4 | — | negative（§5） |
+| predict-fixpoint (M6) | routing 不動点 multipass | 7 | strict | negative（§5） |
+| cross-layer-cheap (M1) | 軽量 1-pass 予測 | — | — | negative（予測 hidden ズレ） |
+| mmap-gather | mmap 全 expert resident gather | 45 / RSS 24GB | — | 24GB 専用（8GB locality 無） |
 
-補助 calib：`runHotColdCalib`（top-64 が code 86%/nl 94%）、`runHotColdDiag`（exact 比 coverage：code static 63.8/online 76.5%、nl 86.6/89.7%、worst layer code 0%/nl 12%）、`runPredictorCalib`（pre-attention 予測器、§4-2）、`runSwiftCalib`（skippability：code 3/40・nl 37/40）。
+補助 calib/診断（`QWISP_RUN=`）：`coverage`（top-64 が code 86%/nl 94%）、`miss-coverage`（exact 比 coverage：code static 63.8/online 76.5%、worst layer code 0%/nl 12%）、`predictor-recall`（pre-attention 予測器 82-84%・§4-2）、`skippability`（code 3/40・nl 37/40）、`mlx-fidelity`（teacher-forced で MLX 準拠を確認: hard 100%/long 98.4%）。
+- パラメータ env（dispatch でなく挙動制御・据置）：`QWISP_CACHE_C` / `QWISP_GEN` / `QWISP_DRAFT_K` / `QWISP_SKIPMODE=3`(buddy) / `QWISP_MARGIN` / `QWISP_PIN` / `QWISP_CALIB` / `QWISP_SWIFT_REF=1`(vs Swift-exact) / `QWISP_MTP_REF`。
 
 ---
 
@@ -44,7 +50,7 @@
 
 ### 確か（全訂正を生き残った構造的天井）
 
-- **保証付き lossless（8GB）：M2 ≈27 tok/s（strict 100%）／M0 ≈30 tok/s（near 98%）**。これが forward-compute 律速で決まる構造的天井（§4）。
+- **保証付き lossless（8GB）＝ `spec-verify`(SpecK) ≈27 tok/s**（buddy draft + exact verify、long(128tok) でも vs Swift-exact 100%）。**M0/M2 は long horizon で発散＝near-lossless**（旧記の「M2 strict/M0 near が 8GB lossless 天井」は **easy-short-ref artifact による誤り** → notes/00 で訂正済）。16GB は同 SpecK を C=128 へ（34-36, strict のまま）。forward-compute 律速の構造的天井（§4）自体は不変。
 - 参考：full-resident（24GB・streaming なし）の素 AR baseline ≈50–54 tok/s、bare forward ≈15ms（≈65 tok/s 上限）。streaming はこの差分を **routing tax** として払う。16–24GB の GPU-routed resident 路線は `docs/09`（別トラック）。
 
 ### 流動（near-lossless・直近で評価反転）
@@ -94,7 +100,11 @@
 
 ## 7. env フラグ早見
 
-`QWISP_ONLY_M0` / `QWISP_M0_SELK`・`QWISP_M0_TAU`（選択的 margin prefetch）/ `QWISP_M0_TOPK`（neg）/ `QWISP_M6` / `QWISP_SKIPMODE`（1=skip, 2=skip+renorm, 3=**buddy**）/ `QWISP_BUDDY_OUTSIM`（neg）/ `QWISP_MARGIN` / `QWISP_ONLY_HYBRID` / `QWISP_PARTIAL` / `QWISP_PREFETCH` / `QWISP_MMAP_GATHER` / `QWISP_HOTCOLD_{CALIB,FAST,DIAG,ONLINE,ADAPT,SPEC}` / `QWISP_SWIFT_REF`・`QWISP_SWIFT_CALIB` / `QWISP_VERIFY_SEQ`・`QWISP_VERIFY_NOSYNC`・`QWISP_BATCHED_VERIFY` / `QWISP_M2_PROF`・`QWISP_M2_PROF2`（profiling）/ `QWISP_FUSE_GDN`（neg）。
+**dispatch（どの runner を回すか）**: `QWISP_RUN=<name>`（無指定＝既定で spec-verify + buddy-no-sync を実行）。`<name>` 一覧は §2、または不正値で起動すると候補が表示される。`main.swift` の `runners` テーブルが実体。
+
+**パラメータ（挙動制御, dispatch とは独立）**: `QWISP_CACHE_C`(cache slot 数) / `QWISP_GEN`(生成長) / `QWISP_DRAFT_K`(投機 draft 長) / `QWISP_CALIB`(calib token 数) / `QWISP_SKIPMODE`（1=skip, 2=skip+renorm, 3=**buddy**）/ `QWISP_MARGIN`（gate しきい, 0=membership）/ `QWISP_PIN`(pin 数) / `QWISP_MTP_REF`(ref パス) / `QWISP_SWIFT_REF=1`（**vs Swift-exact** 評価; long の vs-Python は f16 で無意味）/ `QWISP_M0_SELK`・`QWISP_M0_TAU`（predict-prefetch 選択的 margin）/ `QWISP_M0_TOPK`(neg) / `QWISP_VERIFY_SEQ`・`QWISP_VERIFY_NOSYNC`（verify 制御）/ `QWISP_PARTIAL`・`QWISP_PREFETCH`（gate-escalate の variant）/ `QWISP_MULTI`(cross-layer multi-source) / `QWISP_*_PROF`（profiling）/ `QWISP_BUDDY_OUTSIM`・`QWISP_FUSE_GDN`(neg)。
+
+env 読み出しは `Tell.envInt/envFloat/envStr/envFlag` ヘルパに集約済（Tell.swift）。
 
 ---
 
