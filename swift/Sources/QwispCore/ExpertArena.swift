@@ -109,6 +109,7 @@ public final class LayerExpertCache {
     var hotMaskArr: MLXArray?          // GPU hot/cached マスク [numExperts]（1=cached）
     var hotMaskVer = -1
     public var buddyTable: MLXArray?   // BuddyMoE: cold expert → 最類似 hot expert の slot（slot-0 garbage 回避）
+    public var slotMap: [Int: Int] { slotOf }   // output-sim buddy 構築用（expert→slot）
     public func gpuSlotTable(numExperts: Int) -> MLXArray {
         if slotTableDirty || slotTableGPU == nil {
             var t = [Int32](repeating: 0, count: numExperts)

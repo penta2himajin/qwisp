@@ -746,6 +746,45 @@ public enum Tell {
             Double(hitOnline) / Double(totalRoute) * 100, worstTokMin)
     }
 
+    /// output-similarity buddy（研究推奨指標, Qwen は weight 相関無しなので output 必須）:
+    /// 全 256 expert を calib 活性 acts[A,H] に通し、出力 fingerprint の cosine で各 cold expert の
+    /// 最類似 hot expert を選ぶ。co-activation(共起=補完的) でなく functional equivalence(置換可) を測る。
+    static func outputSimBuddyTable(device: MTLDevice, source: ExpertSource, layer: Int,
+                                    acts: MLXArray, slotOf: [Int: Int], expertBits: Int,
+                                    numExperts: Int) throws -> MLXArray {
+        let tmp = try ExpertArena(device: device, source: source, N: numExperts, refLayer: layer)
+        try tmp.load(layer, Array(0 ..< numExperts))
+        let A = acts.dim(0), H = acts.dim(1)
+        let xe = acts.expandedDimensions(axes: [-2, -3])            // [A,1,1,H]
+        var rv = [Int32](); rv.reserveCapacity(A * numExperts)
+        for _ in 0 ..< A { for e in 0 ..< numExperts { rv.append(Int32(e)) } }
+        let remap = MLXArray(rv, [A, numExperts]).asType(.uint32)
+        func gq(_ x: MLXArray, _ proj: String) -> MLXArray {
+            gatherQuantizedMatmul(x, tmp.arr(proj, "weight"), scales: tmp.arr(proj, "scales"),
+                                  biases: tmp.arr(proj, "biases"), rhsIndices: remap, transpose: true,
+                                  groupSize: 64, bits: expertBits, mode: .affine, sortedIndices: false)
+        }
+        let g = gq(xe, "gate_proj")                                 // [A,E,1,I]
+        let u = gq(xe, "up_proj")
+        let h = (g * MLX.sigmoid(g)) * u
+        let d = gq(h, "down_proj").squeezed(axis: -2)               // [A,E,H]
+        let fp = d.transposed(1, 0, 2).reshaped([numExperts, A * H])  // [E, A*H]
+        let norm = MLX.sqrt((fp * fp).sum(axis: -1, keepDims: true)) + 1e-6
+        let fpn = fp / norm
+        let sim = MLX.matmul(fpn, fpn.transposed()); sim.eval()      // [E, E] cosine
+        let simArr = sim.asArray(Float.self)
+        let hot = Array(slotOf.keys)
+        var bmap = [Int32](repeating: 0, count: numExperts)
+        for e in 0 ..< numExperts {
+            if let s = slotOf[e] { bmap[e] = Int32(s); continue }
+            var bestH = -1; var bestSim: Float = -2
+            for hexp in hot { let sv = simArr[e * numExperts + hexp]; if sv > bestSim { bestSim = sv; bestH = hexp } }
+            bmap[e] = bestH >= 0 ? Int32(slotOf[bestH]!) : 0
+        }
+        let arr = MLXArray(bmap, [numExperts]); arr.eval()
+        return arr
+    }
+
     /// hot/cold 試行: 頻度上位 hot expert を C slot に pin(常駐)→ pure no-sync decode。
     /// hot resident で miss が減り no-sync drift が抑えられるか（速度はほぼ no-sync 天井）を検証。
     public static func runHotColdFast(modelDir: String, refPath: String) throws -> String {
@@ -767,33 +806,41 @@ public enum Tell {
         let caches = model.makeCaches()
 
         let skipMode = Int(ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] ?? "0") ?? 0
-        // --- phase 1: calibration（exact decode で頻度集計 + buddy 用 co-activation）---
+        let outsim = ProcessInfo.processInfo.environment["QWISP_BUDDY_OUTSIM"] == "1"  // output 類似度 buddy
+        let aMax = Int(ProcessInfo.processInfo.environment["QWISP_OUTSIM_A"] ?? "8") ?? 8  // 出力 fingerprint 用活性数
+        // --- phase 1: calibration（exact decode で頻度集計 + buddy 用 co-activation/活性）---
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
-        // co-activation[layer][e][e'] = 同 token で共 routed した回数（mode3 のみ確保）
-        var coact: [[[Int]]] = skipMode == 3
+        // co-activation[layer][e][e'] = 同 token で共 routed した回数（mode3 && !outsim のみ）
+        var coact: [[[Int]]] = (skipMode == 3 && !outsim)
             ? [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE), count: nMoE) : []
+        var acts: [[MLXArray]] = (skipMode == 3 && outsim) ? [[MLXArray]](repeating: [], count: nMoE) : []  // 出力類似度用
         StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        if skipMode == 3 && outsim { StreamingMoEBlock.captureGateInput = true }
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
         var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([cur] + caches.flatMap { $0.stateArrays })
         for _ in 0 ..< calibN {
             (_, lg) = try model.forwardHidden(cur, caches: caches)
-            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds }
+                     + (outsim ? model.expertCaches.compactMap { $0.lastGateInput } : []))
             for (mi, ec) in model.expertCaches.enumerated() {
                 if let li = ec.lastInds {
                     let es = li.asArray(Int32.self).map { Int($0) }
                     for e in es { counts[mi][e] += 1 }
-                    if skipMode == 3 {
+                    if skipMode == 3 && !outsim {
                         for a in 0 ..< es.count { for b in (a + 1) ..< es.count {
                             coact[mi][es[a]][es[b]] += 1; coact[mi][es[b]][es[a]] += 1
                         } }
                     }
                 }
+                if skipMode == 3 && outsim, acts[mi].count < aMax, let gi = ec.lastGateInput {
+                    acts[mi].append(gi[(gi.dim(0) - 1)...])   // [1,H] 最終位置
+                }
             }
             cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
             MLX.eval([cur] + caches.flatMap { $0.stateArrays })
         }
-        StreamingMoEBlock.captureInds = false
+        StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureGateInput = false
 
         // Swift-exact-greedy 参照（f16-near-lossless 評価用。Python-ref は長 horizon で f16 乖離する
         // ので、同一エンジンの exact greedy を真値に no-sync/buddy の品質を測る）。QWISP_SWIFT_REF=1。
@@ -819,7 +866,15 @@ public enum Tell {
                 .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
                 .prefix(C).map { $0.offset })
             _ = ec.ensure(hot)
-            if skipMode == 3 { ec.buildBuddyTable(coact: coact[mi], numExperts: nE) }
+            if skipMode == 3 {
+                if outsim {
+                    let A = MLX.concatenated(acts[mi], axis: 0)   // [A,H]
+                    ec.buddyTable = try outputSimBuddyTable(device: device, source: source, layer: ec.layer,
+                                                            acts: A, slotOf: ec.slotMap, expertBits: 4, numExperts: nE)
+                } else {
+                    ec.buildBuddyTable(coact: coact[mi], numExperts: nE)
+                }
+            }
         }
 
         // --- phase 3: 実プロンプトから pure no-sync decode（ensure 無し＝hot 固定）---
