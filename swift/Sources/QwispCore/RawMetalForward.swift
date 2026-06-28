@@ -41,26 +41,39 @@ public enum RawMetalForward {
                              constant uint&       GS     [[buffer(7)]],
                              uint t  [[thread_position_in_threadgroup]],
                              uint TG [[threads_per_threadgroup]],
-                             uint o  [[threadgroup_position_in_grid]]) {
+                             uint o  [[threadgroup_position_in_grid]],
+                             uint sgid [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
                 uint m = o / N, n = o % N;
                 uint kp = K / 8, kg = K / GS;
-                threadgroup float sh[256];
+                threadgroup float sh[8];
+                device const uint4* wq4 = (device const uint4*)(wq + n*kp);
+                device const half* xrow = x + m*K;
                 float acc = 0.0f;
-                // 各スレッドは base=t*8 から TG*8 stride で uint32 を 1 つずつ処理（8 k/load）
-                for (uint base = t*8; base < K; base += TG*8) {
-                    uint packed = wq[n*kp + (base >> 3)];
-                    uint g = base / GS;
+                // 各スレッドは base=t*32 から TG*32 stride で uint4(32 nibble=32 k)を一括 load
+                for (uint base = t*32; base < K; base += TG*32) {
+                    uint4 pk = wq4[base >> 5];
+                    uint g = base / GS;            // 32 k は同一 group(GS=64 の倍数前提)
                     float sc = (float)scales[n*kg + g], bi = (float)biases[n*kg + g];
-                    #pragma unroll(8)
-                    for (uint j = 0; j < 8; ++j) {
-                        uint nib = (packed >> (4u*j)) & 0xFu;
-                        acc += (float)x[m*K + base + j] * (sc * (float)nib + bi);
+                    uint ps[4] = {pk.x, pk.y, pk.z, pk.w};
+                    #pragma unroll(4)
+                    for (uint w8 = 0; w8 < 4; ++w8) {
+                        uint packed = ps[w8];
+                        #pragma unroll(8)
+                        for (uint j = 0; j < 8; ++j) {
+                            uint nib = (packed >> (4u*j)) & 0xFu;
+                            acc += (float)xrow[base + w8*8 + j] * (sc * (float)nib + bi);
+                        }
                     }
                 }
-                sh[t] = acc;
+                float ssum = simd_sum(acc);               // simdgroup(32 lane)内合算
+                if (lane == 0) sh[sgid] = ssum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint s = TG>>1; s>0; s>>=1) { if (t<s) sh[t]+=sh[t+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-                if (t == 0) out[m*N + n] = (half)sh[0];
+                if (t == 0) {
+                    float tot = 0.0f; uint ng = (TG + 31) / 32;
+                    for (uint i = 0; i < ng; ++i) tot += sh[i];
+                    out[m*N + n] = (half)tot;
+                }
             }
             """
             do {
