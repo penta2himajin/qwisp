@@ -1147,6 +1147,93 @@ public enum RawMetalForward {
         return out
     }
 
+    // ── attention 層 round-trip assembly（decode S=1, cold cache）─────────────────
+    struct AttnRawWeights {
+        let qWq: MLXArray, qSc: MLXArray, qBi: MLXArray   // q_proj → [H, 2*headDim] per head
+        let kWq: MLXArray, kSc: MLXArray, kBi: MLXArray
+        let vWq: MLXArray, vSc: MLXArray, vBi: MLXArray
+        let oWq: MLXArray, oSc: MLXArray, oBi: MLXArray
+        let qNorm: MLXArray, kNorm: MLXArray
+    }
+    /// attention decode 1 step を raw kernel で組む（cold cache: S=1, offset=0）。
+    /// q/k/v proj → q/k-norm(weight) → RoPE → SDPA(.none) → gated(out*sigmoid(gate)) → o_proj。
+    /// promoteF32: q_norm/k_norm が f32 のとき qk-norm が f32 昇格→RoPE/SDPA も f32（cascade）。
+    static func attnLayerRaw(_ x: MLXArray, _ w: AttnRawWeights, promoteF32: Bool,
+                             numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
+                             ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6) -> MLXArray? {
+        let H = x.dim(-1)
+        let x2 = x.reshaped([1, H])
+        let scale = Float(pow(Double(headDim), -0.5))
+        let qd2 = 2 * headDim
+        guard let qOut = qmm(x2, w.qWq, scales: w.qSc, biases: w.qBi, M: 1, K: H, N: numHeads * qd2),
+              let keys = qmm(x2, w.kWq, scales: w.kSc, biases: w.kBi, M: 1, K: H, N: numKV * headDim),
+              let values = qmm(x2, w.vWq, scales: w.vSc, biases: w.vBi, M: 1, K: H, N: numKV * headDim)
+        else { return nil }
+        let qOutR = qOut.reshaped([numHeads, qd2])
+        let queries = qOutR[0..., 0 ..< headDim]                  // [H, headDim]
+        let gate = qOutR[0..., headDim...].reshaped([1, numHeads * headDim])  // [1, H*headDim]
+        // qk-norm（weight 有り, promoteF32 で f32 昇格）
+        let wT: DType = promoteF32 ? .float32 : .float16
+        guard let qN = rmsNorm(queries, w.qNorm.asType(wT), eps: eps, D: headDim, promoteF32: promoteF32),
+              let kN = rmsNorm(keys.reshaped([numKV, headDim]), w.kNorm.asType(wT), eps: eps, D: headDim, promoteF32: promoteF32)
+        else { return nil }
+        // RoPE（offset 0）→ SDPA（S=1）。promoteF32 なら f32 経路（rope/sdpa は MLX で f32, それ以外 raw f16）。
+        let qRot: MLXArray, kRot: MLXArray, attnOut: MLXArray
+        if promoteF32 {
+            // f32 cascade: RoPE/SDPA を MLX(f32)で（raw f16 kernel は不適）。raw 化は SE 段で f32 variant を追加予定。
+            let q4 = qN.reshaped([1, numHeads, 1, headDim]).asType(.float32)
+            let k4 = kN.reshaped([1, numKV, 1, headDim]).asType(.float32)
+            qRot = MLXFast.RoPE(q4, dimensions: ropeDim, traditional: false, base: ropeBase, scale: 1.0, offset: 0)
+            kRot = MLXFast.RoPE(k4, dimensions: ropeDim, traditional: false, base: ropeBase, scale: 1.0, offset: 0)
+            let v4 = values.reshaped([1, numKV, 1, headDim]).asType(.float32)
+            attnOut = MLXFast.scaledDotProductAttention(queries: qRot, keys: kRot, values: v4, scale: scale, mask: .none)
+                .reshaped([numHeads, headDim])
+        } else {
+            guard let qr = rope(qN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0),
+                  let kr = rope(kN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0),
+                  let ao = sdpaDecode(qr, kr.reshaped([numKV, 1, headDim]), values.reshaped([numKV, 1, headDim]),
+                                      H: numHeads, KV: numKV, D: headDim, S: 1, scale: scale) else { return nil }
+            qRot = qr; kRot = kr; attnOut = ao
+        }
+        let outR = attnOut.reshaped([1, numHeads * headDim]).asType(.float16)
+        let gated = (outR.asType(.float32) * MLX.sigmoid(gate.asType(.float32))).asType(.float16)  // out*sigmoid(gate)
+        return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H)
+    }
+
+    /// 検証: attention 1 層 raw assembly vs MLX AttentionLayer（同量子化, decode S=1）。
+    /// - env: QWISP_RUN=raw-attn-test / QWISP_ATTN_REF(既定 /tmp/qwisp_attn_ref.safetensors)
+    public static func runAttnLayerTest() -> String {
+        let refPath = ProcessInfo.processInfo.environment["QWISP_ATTN_REF"] ?? "/tmp/qwisp_attn_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)),
+              let qp = r["q_proj"], let kp = r["k_proj"], let vp = r["v_proj"], let op = r["o_proj"],
+              let qn = r["q_norm"], let kn = r["k_norm"] else { return "[raw-attn] ref キー不足" }
+        let H = qp.dim(-1)
+        let x = MLXRandom.normal([1, 1, H]).asType(.float16)
+        func quant(_ wt: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+            let (q, s, b) = MLX.quantized(wt.asType(.float16), groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+        }
+        let (qWq, qSc, qBi) = quant(qp), (kWq, kSc, kBi) = quant(kp)
+        let (vWq, vSc, vBi) = quant(vp), (oWq, oSc, oBi) = quant(op)
+        let rw = AttnRawWeights(qWq: qWq, qSc: qSc, qBi: qBi, kWq: kWq, kSc: kSc, kBi: kBi,
+                                vWq: vWq, vSc: vSc, vBi: vBi, oWq: oWq, oSc: oSc, oBi: oBi, qNorm: qn, kNorm: kn)
+        // MLX 参照（同量子化, decode S=1, cold cache）
+        let refLayer = AttentionLayer(
+            numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
+            qProj: .quantized(qWq, qSc, qBi, 4), kProj: .quantized(kWq, kSc, kBi, 4),
+            vProj: .quantized(vWq, vSc, vBi, 4), oProj: .quantized(oWq, oSc, oBi, 4),
+            qNorm: qn, kNorm: kn)
+        let ref = refLayer(x, cache: KVCache()); ref.eval()
+        var out = "[raw-attn-test] attention 1 層 raw assembly vs MLX（同量子化, decode S=1）"
+        for pf in [false, true] {
+            guard let got = attnLayerRaw(x, rw, promoteF32: pf) else { out += "\n  promoteF32=\(pf): 実行失敗"; continue }
+            got.eval()
+            let rel = relErr(got.reshaped([got.size]), ref.reshaped([ref.size]))
+            out += String(format: "\n  promoteF32=%@: rel=%.3e %@", pf ? "true " : "false",
+                          rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ 近似" : "❌"))
+        }
+        return out
+    }
+
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
     /// - env: QWISP_RUN=raw-ops-test / QWISP_QMM_K(D, 既定2048) / QWISP_QMM_M(rows, 既定4)
     public static func runOpsTest() -> String {
