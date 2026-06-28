@@ -56,7 +56,7 @@ public enum Tell {
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
         AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
-        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false }
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false; StreamingMoEBlock.probeNoSync = false }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -108,9 +108,18 @@ public enum Tell {
         }
 
         // phase 3: suffix-lookup draft + clean exact verify
+        // ★ lever-1(issue#3): 全 expert resident(C>=nE)なら no-sync 経路(GPU slot-table remap)が
+        //   exact 経路と bit 一致(alias 不可能)＝per-layer routing round-trip 除去で ~1.7x lossless。
+        //   QWISP_NOSYNC=1 強制 / =0 無効 / 既定 auto(C>=256 で自動)。C<nE は cold routed が slot-0
+        //   alias で garbage ゆえ無効(escalation 路線は別 runner)。
+        let nosyncEnv = Tell.envStr("QWISP_NOSYNC", "auto")
+        let residentNoSync = nosyncEnv == "1" || (nosyncEnv != "0" && C >= nE)
+        if residentNoSync {
+            print("[SuffixSpec] no-sync exact 経路 ON (C=\(C)>=\(nE) 全 expert resident, round-trip 除去 ~1.7x lossless)")
+        }
         var hist = ids.asArray(Int32.self).map { Int($0) }     // 履歴（prompt + commit token）
         let mc = model.makeCaches()
-        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.probeNoSync = residentNoSync
         var (_, lg) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
