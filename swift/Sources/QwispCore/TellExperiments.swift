@@ -1673,6 +1673,8 @@ extension Tell {
                 .prefix(C).map { $0.offset }))
         }
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        let L0 = model.isLinearFlags.count                                   // 全層数
+        // (A) L 依存（per-forward 固定費 + marginal compute）
         var lines: [String] = []
         for L in [1, 2, 4, 8, 16, 24] {
             let bc = model.makeCaches()
@@ -1680,9 +1682,9 @@ extension Tell {
             MLX.eval(bc.flatMap { $0.stateArrays })
             let snaps = bc.map { $0.snapshot() }
             let seq = MLXArray(Array(repeating: Int32(100), count: L), [1, L])   // teacher-forced ダミー
-            // warmup（experts ensure 込み）
             let (hw, _) = try model.forwardHidden(seq, caches: bc); MLX.eval([hw] + bc.flatMap { $0.stateArrays })
             for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            LayerExpertCache.missTotal = 0
             var tAcc: UInt64 = 0
             for _ in 0 ..< reps {
                 let t = now()
@@ -1692,9 +1694,36 @@ extension Tell {
                 for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }   // 非計時
             }
             let ms = Double(tAcc) / Double(reps) / 1e6
-            lines.append(String(format: "L=%2d: %6.2f ms  (%.2f ms/token)", L, ms, ms / Double(L)))
+            lines.append(String(format: "L=%2d: %6.2f ms  (%.2f ms/token)  misses/forward=%.1f",
+                                L, ms, ms / Double(L), Double(LayerExpertCache.missTotal) / Double(reps)))
         }
-        return "[ForwardCost C=\(C), f32-full, hot-pin top-C]\n  " + lines.joined(separator: "\n  ")
+        // (B) 有効層数依存（L=1）: forwardHiddenSkip で末尾層を skip → per-layer 固定費を抽出
+        //   cost(active) ≈ const(embed+norm+head+launch床) + slope·active なら launch-chain 律速。
+        var lines2: [String] = []
+        for skipN in [0, 10, 20, 30] {
+            let active = L0 - skipN
+            let skip = Set((L0 - skipN) ..< L0)                              // 末尾 skipN 層を identity
+            let bc = model.makeCaches()
+            _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            let snaps = bc.map { $0.snapshot() }
+            let seq = MLXArray([Int32(100)], [1, 1])
+            let (hw, _) = try model.forwardHiddenSkip(seq, caches: bc, skip: skip); MLX.eval([hw])
+            for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            var tAcc: UInt64 = 0
+            for _ in 0 ..< reps {
+                let t = now()
+                let (h, _) = try model.forwardHiddenSkip(seq, caches: bc, skip: skip)
+                MLX.eval([h] + bc.flatMap { $0.stateArrays })
+                tAcc += now() - t
+                for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+            }
+            let ms = Double(tAcc) / Double(reps) / 1e6
+            lines2.append(String(format: "active=%2d 層: %6.2f ms  (%.3f ms/層)", active, ms, ms / Double(Swift.max(1, active))))
+        }
+        return "[ForwardCost C=\(C), f32-full, hot-pin top-C]\n  (A) L依存:\n  "
+            + lines.joined(separator: "\n  ")
+            + "\n  (B) 有効層数依存(L=1, 末尾skip):\n  " + lines2.joined(separator: "\n  ")
     }
 
     /// **SuffixDecoding draft + clean exact verify（issue #2 軸B, 訓練不要）**
