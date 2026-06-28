@@ -1758,7 +1758,8 @@ extension Tell {
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let reps = Tell.envInt("QWISP_FC_REPS", 20)
         GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
-        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        GatedDeltaNetLayer.fuseGDN = Tell.envFlag("QWISP_FUSE_GDN")   // A3: GDN in_proj 4→1 融合の効果
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; GatedDeltaNetLayer.fuseGDN = false }
         let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
         let arena = try ExpertArena(device: device, source: source, N: 64)
