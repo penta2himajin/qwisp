@@ -35,8 +35,9 @@ if CommandLine.arguments.contains("stream") {
     let env = ProcessInfo.processInfo.environment
     let mtpRef = env["QWISP_MTP_REF"] ?? "/tmp/qwisp_mtp_ref.safetensors"
 
-    // 実験バリアント: QWISP_RUN=<name> で TellExperiments.swift の単一 runner を実行して終了。
-    // 既定(QWISP_RUN 無し)は本流2系統。詳細・再現は notes/00-strict-vs-near-lossless.md。
+    // 実験バリアント: QWISP_RUN=<name> で単一 runner を実行して終了。
+    // 既定(QWISP_RUN 無し)は標準手法 SuffixSpec(Tell.swift)。他は TellExperiments.swift。
+    // 詳細・再現は notes/01-speedup-investigation.md / 00-strict-vs-near-lossless.md。
     let runners: [(String, (String, String) throws -> String)] = [
         ("spec-verify",           { try Tell.runSpecVerify(modelDir: $0, refPath: $1) }),
         ("buddy-no-sync",         { try Tell.runBuddyNoSync(modelDir: $0, refPath: $1) }),
@@ -70,9 +71,9 @@ if CommandLine.arguments.contains("stream") {
         exit(0)
     }
 
-    // 既定: 本流 2 系統（SpecK=8GB strict lossless ベースライン / Fast=最速 near-lossless）
-    do { print(try Tell.runSpecVerify(modelDir: md, refPath: mtpRef)) } catch { print("[SpecVerify] error: \(error)") }
-    do { print(try Tell.runBuddyNoSync(modelDir: md, refPath: mtpRef)) } catch { print("[BuddyNoSync] error: \(error)") }
+    // 既定: 標準手法 SuffixSpec（batched f32-full verify, lossless, Pareto 最適）。
+    // 旧 2 系統(SpecK/Fast)は QWISP_RUN=spec-verify / buddy-no-sync で利用可。
+    do { print(try Tell.runSuffixSpec(modelDir: md, refPath: mtpRef)) } catch { print("[SuffixSpec] error: \(error)") }
     exit(0)
 }
 
