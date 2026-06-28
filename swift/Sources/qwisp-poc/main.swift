@@ -23,6 +23,7 @@ if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
     print("[perQueryNone-quant] " + AttentionLayer.perQueryNoneQuantTest())
     AttentionLayer.perQueryNone = false
     print(CompileBench.run())                      // mx.compile が per-layer launch overhead を削るか
+    print(ExpertBitBench.run())                    // pillar B: MoE 3-bit gather qmm が 4-bit より速いか
     exit(0)
 }
 
