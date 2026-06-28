@@ -2227,6 +2227,102 @@ extension Tell {
             + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, tag)
     }
 
+    /// **[計測] 8GB exact-pipeline go/no-go: cross-layer 予測の per-layer/per-token hit 率**
+    /// 「層跨ぎ予測 prefetch で routing round-trip を除去（bit-exact）」が成立するかの決め手を測る。
+    /// 機構: 各 token を exact greedy で回し、各層の **真の top-8** を、前 token 同層 gate 入力(temporal, M2 signal)
+    /// から予測した **top-w 集合**が覆うか判定。報告:
+    ///   - per-expert recall(w=8): 真 top-8 のうち予測 top-8 に入る割合（memory の 82-84% と比較）。
+    ///   - **per-layer all-8-hit 率**: その層の真 top-8 が全部 予測 top-w に入る確率（= その層が no-sync で exact に
+    ///     回せる＝round-trip 不要な割合）。
+    ///   - **per-token all-layers-hit 率**: 全層が hit する token の割合（= その token は全層 no-sync＝round-trip 完全ゼロ）。
+    /// 高い w で per-token all-hit が高く、w<=C(=64) に収まれば exact-pipeline が成立（残り層だけ sync fallback）。
+    /// - env: QWISP_RUN=cross-layer-hitrate / QWISP_CACHE_C(既定64) / QWISP_GEN(既定64)
+    public static func runCrossLayerHitrate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[CrossLayerHitrate] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let widths = [8, 16, 32, 48]
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.captureGateInput = false; StreamingMoEBlock.captureInds = false
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let L = model.layerCount
+        let caches = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.captureGateInput = true; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays }
+            + model.expertCaches.compactMap { $0.lastGateInput })
+        func capGate() -> [MLXArray] { (0 ..< L).map { model.expertCaches[$0].lastGateInput! } }
+        var prevGate = capGate()
+        // 集計
+        var layerHit = [Int: Int](); var tokAllHit = [Int: Int]()
+        for w in widths { layerHit[w] = 0; tokAllHit[w] = 0 }
+        // 信号選択: temporal(前 token 同層 gate入力, full-token lead) / intra1(同 token 前層 gate入力, ~1層 lead)
+        let sig = Tell.envStr("QWISP_SIGNAL", "temporal")
+        var recallSum = 0.0; var lt = 0; var toks = 0
+        for _ in 1 ..< N {
+            // exact forward（真の routing + 各層 gate 入力を捕捉）
+            let (_, lgt) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lgt] + caches.flatMap { $0.stateArrays }
+                + model.expertCaches.compactMap { $0.lastInds }
+                + model.expertCaches.compactMap { $0.lastGateInput })
+            let true8 = (0 ..< L).map { Set(model.expertCaches[$0].lastInds!.asArray(Int32.self).map { Int($0) }) }
+            let thisGate = capGate()
+            // 予測元 signal（層毎）: forward 後に確定した入力で各幅予測（accuracy 計測）
+            let srcGate: [MLXArray] = (0 ..< L).map { i in
+                switch sig {
+                case "intra1": return i > 0 ? thisGate[i - 1] : prevGate[i]   // 同 token 前層
+                default:       return prevGate[i]                              // temporal
+                }
+            }
+            var predByW = [Int: [Set<Int>]]()
+            for w in widths {
+                let preds = (0 ..< L).map { model.predictLayerIndsK($0, srcGate[$0], w) }
+                MLX.eval(preds)
+                predByW[w] = preds.map { Set($0.asArray(Int32.self).map { Int($0) }) }
+            }
+            // per-expert recall（w=8）
+            for i in 0 ..< L {
+                let inter = true8[i].intersection(predByW[8]![i]).count
+                recallSum += Double(inter) / Double(Swift.max(1, true8[i].count))
+            }
+            // per-layer all-8-hit & per-token all-layers-hit（各幅）
+            for w in widths {
+                var allHit = true
+                for i in 0 ..< L {
+                    if true8[i].isSubset(of: predByW[w]![i]) { layerHit[w]! += 1 } else { allHit = false }
+                }
+                if allHit { tokAllHit[w]! += 1 }
+            }
+            lt += L; toks += 1
+            prevGate = thisGate
+            cur = MLX.argMax(lgt[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        let recall = recallSum / Double(Swift.max(1, lt)) * 100
+        var lines: [String] = []
+        for w in widths {
+            lines.append(String(format: "  w=%2d: per-layer all-8-hit=%5.1f%%  per-token all-layers-hit=%5.1f%%  (prefetch %d≤C=%d %@)",
+                                w, Double(layerHit[w]!) / Double(Swift.max(1, lt)) * 100,
+                                Double(tokAllHit[w]!) / Double(Swift.max(1, toks)) * 100,
+                                w, C, w <= C ? "✓fit" : "✗"))
+        }
+        return "[CrossLayerHitrate C=\(C), N=\(N), signal=\(sig)] 8GB exact-pipeline go/no-go\n"
+            + String(format: "  per-expert recall(w=8)=%.1f%% (memory 82-84% と比較), L=%d 層\n", recall, L)
+            + lines.joined(separator: "\n")
+            + "\n  判定: per-token all-layers-hit が高い w で exact-pipeline 有望(全層 no-sync=round-trip 0)。"
+            + "低ければ per-layer fallback 頻発で sync 並みに縮退。"
+    }
+
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
     /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
     /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。

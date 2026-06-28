@@ -122,6 +122,8 @@ public final class StreamingQwispModel {
     public var layerCount: Int { numLayers }
     /// Tell M1: 層 i の expert を任意 hidden h から予測（cross-layer）。
     public func predictLayerInds(_ i: Int, _ h: MLXArray) -> MLXArray { layers[i].mlp.predictInds(h) }
+    /// 幅可変版: 層 i の top-k 予測（exact-pipeline prefetch 幅振り用）。
+    public func predictLayerIndsK(_ i: Int, _ h: MLXArray, _ k: Int) -> MLXArray { layers[i].mlp.predictIndsK(h, k) }
 
     func headProj() -> Proj {
         .quantized(store.req("language_model.lm_head.weight"),
