@@ -416,52 +416,61 @@ public enum RawMetalForward {
               let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
               let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
               let bnw = nw.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return "[chain] buf nil" }
-        let mid = device.makeBuffer(length: N * 2, options: .storageModeShared)!     // 中間(GPU 常駐)
-        let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
-        func runChain() {
-            let cb = queue.makeCommandBuffer()!
-            let enc = cb.makeComputeCommandEncoder()!
-            // op1: qmm → mid
-            enc.setComputePipelineState(_qmmPipeline!)
-            enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
-            enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3); enc.setBuffer(mid, offset: 0, index: 4)
-            var kk = UInt32(K), nn = UInt32(N), g = UInt32(64)
-            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&g, length: 4, index: 7)
-            enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-            // op2: rmsNorm(mid) → out （同 encoder, 中間 buffer をそのまま読む）
-            enc.setComputePipelineState(_rmsPipeline!)
-            enc.setBuffer(mid, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
-            var dd = UInt32(N), ee = Float(1e-6), hw = UInt32(1)
-            enc.setBytes(&dd, length: 4, index: 3); enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hw, length: 4, index: 5)
-            let TG = min(N, 1024)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: TG, height: 1, depth: 1))
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        }
-        // 計時
+        let mid = device.makeBuffer(length: N * 2, options: .storageModeShared)!     // ping
+        let mid2 = device.makeBuffer(length: N * 2, options: .storageModeShared)!    // pong
         func cpuNs() -> UInt64 { var r = rusage(); getrusage(RUSAGE_SELF, &r)
             return UInt64(r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1_000_000_000 + UInt64(r.ru_utime.tv_usec+r.ru_stime.tv_usec)*1000 }
-        let reps = 300
-        for _ in 0..<5 { runChain() }
-        var t0 = DispatchTime.now().uptimeNanoseconds; var c0 = cpuNs()
-        for _ in 0..<reps { runChain() }
-        let rawWall = Double(DispatchTime.now().uptimeNanoseconds - t0)/Double(reps)/1e6
-        let rawCpu = Double(cpuNs()-c0)/Double(reps)/1e6
-        // MLX で同 2 op
-        for _ in 0..<5 { let m = MLX.quantizedMatmul(xin, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine); MLXFast.rmsNorm(m, weight: nw, eps: 1e-6).eval() }
-        t0 = DispatchTime.now().uptimeNanoseconds; c0 = cpuNs()
-        for _ in 0..<reps { let m = MLX.quantizedMatmul(xin, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine); MLXFast.rmsNorm(m, weight: nw, eps: 1e-6).eval() }
-        let mlxWall = Double(DispatchTime.now().uptimeNanoseconds - t0)/Double(reps)/1e6
-        let mlxCpu = Double(cpuNs()-c0)/Double(reps)/1e6
-        // bit-exact 確認
-        runChain()
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: N)
+        var kk = UInt32(K), nn = UInt32(N), g = UInt32(64), dd = UInt32(N), ee = Float(1e-6), hw = UInt32(1)
+        // depth 回(qmm→rmsNorm)を単一 encoder で連結。中間 buffer を ping-pong で GPU 常駐連結。
+        func runChain(_ depth: Int) -> MTLBuffer {
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            var src = bx as MTLBuffer
+            var a = mid, b = mid2
+            for _ in 0 ..< depth {
+                enc.setComputePipelineState(_qmmPipeline!)
+                enc.setBuffer(src, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
+                enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3); enc.setBuffer(a, offset: 0, index: 4)
+                enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&g, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                enc.setComputePipelineState(_rmsPipeline!)
+                enc.setBuffer(a, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(b, offset: 0, index: 2)
+                enc.setBytes(&dd, length: 4, index: 3); enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hw, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(N,1024), height: 1, depth: 1))
+                src = b; swap(&a, &b)
+            }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return src
+        }
+        func mlxChain(_ depth: Int) { var h = xin
+            for _ in 0..<depth { let m = MLX.quantizedMatmul(h, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine); h = MLXFast.rmsNorm(m, weight: nw, eps: 1e-6) }
+            h.eval() }
+        func bench(_ depth: Int) -> (rawCpu: Double, mlxCpu: Double, rawWall: Double, mlxWall: Double) {
+            let reps = 200
+            for _ in 0..<3 { _ = runChain(depth) }
+            var t0 = DispatchTime.now().uptimeNanoseconds; var c0 = cpuNs()
+            for _ in 0..<reps { _ = runChain(depth) }
+            let rw = Double(DispatchTime.now().uptimeNanoseconds-t0)/Double(reps)/1e6, rc = Double(cpuNs()-c0)/Double(reps)/1e6
+            for _ in 0..<3 { mlxChain(depth) }
+            t0 = DispatchTime.now().uptimeNanoseconds; c0 = cpuNs()
+            for _ in 0..<reps { mlxChain(depth) }
+            let mw = Double(DispatchTime.now().uptimeNanoseconds-t0)/Double(reps)/1e6, mc = Double(cpuNs()-c0)/Double(reps)/1e6
+            return (rc, mc, rw, mw)
+        }
+        // bit-exact(depth=1)
+        let last = runChain(1)
+        let ptr = last.contents().bindMemory(to: Float16.self, capacity: N)
         let got = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: N)), [1, N])
         let rel = relErr(got, refChain)
-        return "[chain-test qmm→rmsNorm, 単一 encoder] task#3 orchestration 核\n"
-            + String(format: "  bit-exact: rel=%.3e  %@\n", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
-            + String(format: "  raw(単一encoder): %.3f ms wall, %.3f ms CPU\n", rawWall, rawCpu)
-            + String(format: "  MLX(2 op 別)    : %.3f ms wall, %.3f ms CPU\n", mlxWall, mlxCpu)
-            + String(format: "  → CPU-encode %.2fx 削減(%.3f→%.3f ms)", mlxCpu/Swift.max(0.001,rawCpu), mlxCpu, rawCpu)
+        var lines = ""
+        for depth in [1, 5, 10, 20] {
+            let r = bench(depth)
+            lines += String(format: "\n  depth=%2d: raw %.2fms/%.0fus-CPU  MLX %.2fms/%.0fus-CPU  → encode %.2fx, wall %.2fx",
+                            depth, r.rawWall, r.rawCpu*1000, r.mlxWall, r.mlxCpu*1000,
+                            r.mlxCpu/Swift.max(0.001,r.rawCpu), r.mlxWall/Swift.max(0.001,r.rawWall))
+        }
+        return "[chain-test (qmm→rmsNorm)×depth, 単一 encoder] task#3 orchestration: encode 削減の compound\n"
+            + String(format: "  bit-exact(depth1): rel=%.3e %@", rel, rel < 2e-3 ? "✅" : "❌") + lines
+            + "\n  → depth↑ で encode 削減率↑ なら 40 層 forward の ~1.7x を裏付け"
     }
 
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
