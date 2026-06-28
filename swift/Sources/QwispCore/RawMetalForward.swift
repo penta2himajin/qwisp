@@ -184,6 +184,44 @@ public enum RawMetalForward {
     }
 
     nonisolated(unsafe) static var _ropePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _conv1dPipeline: MTLComputePipelineState?
+
+    /// raw-Metal grouped causal conv1d + silu（GDN, decode S=1）。input[K,C](K=conv窓), w[C,K] → out[C]。
+    /// out[c]=silu(Σ_k input[k,c]·w[c,k])、f32 累積（f32Conv 経路一致）。MLX conv1d(groups=C)+silu と照合。
+    static func conv1dSilu(_ input: MLXArray, _ w: MLXArray, K: Int, C: Int) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        if _conv1dPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void conv1d_silu(device const half* x [[buffer(0)]],   // [K, C]
+                                    device const half* w [[buffer(1)]],   // [C, K]
+                                    device half* out     [[buffer(2)]],   // [C]
+                                    constant uint& K [[buffer(3)]], constant uint& C [[buffer(4)]],
+                                    uint c [[thread_position_in_grid]]) {
+                if (c >= C) return;
+                float acc = 0.0f;
+                for (uint k = 0; k < K; ++k) acc += (float)x[k*C + c] * (float)w[c*K + k];
+                out[c] = (half)(acc / (1.0f + exp(-acc)));     // silu
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 _conv1dPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv1d_silu")!)
+            } catch { print("[raw-conv1d] compile: \(error)"); return nil }
+        }
+        guard let bx = input.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bw = w.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: C * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_conv1dPipeline!)
+        enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
+        var kk = UInt32(K), cc = UInt32(C); enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&cc, length: 4, index: 4)
+        let tgw = min(_conv1dPipeline!.maxTotalThreadsPerThreadgroup, 256)
+        enc.dispatchThreads(MTLSize(width: C, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: C)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: C)), [1, 1, C])
+    }
 
     /// raw-Metal RoPE(非 traditional/NeoX, partial rotary)。x[rows, HD]、各行 position=offset(decode S=1)。
     /// rotary 部 rd dim を半分ペア(i, i+rd/2)で回転、rd..HD は passthrough。MLXFast.RoPE(traditional:false) 一致。
@@ -265,6 +303,17 @@ public enum RawMetalForward {
                 out += String(format: "\n    max diff @ row=%d dim=%d: ref=%.4f got=%.4f", mi / HD, mi % HD, rfl[mi], gfl[mi])
             }
         } else { out += "  RoPE: kernel 失敗" }
+        // conv1d + silu (GDN grouped causal, K=4, decode S=1)
+        let Cc = 512, Kk = 4
+        let ci = MLXRandom.normal([1, Kk, Cc]).asType(.float16)
+        let cw = MLXRandom.normal([Cc, Kk, 1]).asType(.float16)
+        let conv = MLX.conv1d(ci.asType(.float32), cw.asType(.float32), stride: 1, padding: 0, dilation: 1, groups: Cc)
+        let refC = (conv * MLX.sigmoid(conv)).asType(.float16); refC.eval()   // silu
+        if let g = conv1dSilu(ci, cw.reshaped([Cc, Kk]), K: Kk, C: Cc) {
+            g.eval()
+            let rel = relErr(g.reshaped([1, 1, Cc]), refC)
+            out += String(format: "\n  conv1d+silu: rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
+        } else { out += "\n  conv1d: kernel 失敗" }
         return out
     }
 
