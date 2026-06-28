@@ -381,6 +381,79 @@ public enum RawMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [rows, HD])
     }
 
+    /// task#3 orchestration 核: qmm→rmsNorm を **単一 command buffer + 単一 encoder** で連結（中間は GPU 常駐 buffer、
+    /// 間で commit/MLX に戻らない）。bit-exact + encode CPU を MLX(2 op 別 dispatch)と比較。
+    /// 全層 orchestration の型を証明する。
+    public static func runChainTest() -> String {
+        guard let (device, queue) = ensure() else { return "ERROR: no device" }
+        // pipeline 準備（qmm/rmsNorm を一度 warm）
+        let K = 2048, N = 2048
+        let xin = MLXRandom.normal([1, K]).asType(.float16)
+        let wf = MLXRandom.normal([N, K]).asType(.float16)
+        let (wq, scales, biasesOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+        guard let biases = biasesOpt else { return "[chain] biases nil" }
+        let nw = MLXRandom.normal([N]).asType(.float16)
+        MLX.eval([xin, wq, scales, biases, nw])
+        _ = qmm(xin, wq, scales: scales, biases: biases, M: 1, K: K, N: N)   // pipeline warm
+        _ = rmsNorm(xin, nw, eps: 1e-6, D: K)
+        // 参照: MLX で qmm→rmsNorm
+        let mq = MLX.quantizedMatmul(xin, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+        let refChain = MLXFast.rmsNorm(mq, weight: nw, eps: 1e-6); refChain.eval()
+
+        // 単一 encoder で qmm→rmsNorm を連結
+        guard let bx = xin.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bnw = nw.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return "[chain] buf nil" }
+        let mid = device.makeBuffer(length: N * 2, options: .storageModeShared)!     // 中間(GPU 常駐)
+        let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
+        func runChain() {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            // op1: qmm → mid
+            enc.setComputePipelineState(_qmmPipeline!)
+            enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
+            enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3); enc.setBuffer(mid, offset: 0, index: 4)
+            var kk = UInt32(K), nn = UInt32(N), g = UInt32(64)
+            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&g, length: 4, index: 7)
+            enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            // op2: rmsNorm(mid) → out （同 encoder, 中間 buffer をそのまま読む）
+            enc.setComputePipelineState(_rmsPipeline!)
+            enc.setBuffer(mid, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
+            var dd = UInt32(N), ee = Float(1e-6), hw = UInt32(1)
+            enc.setBytes(&dd, length: 4, index: 3); enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hw, length: 4, index: 5)
+            let TG = min(N, 1024)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: TG, height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+        // 計時
+        func cpuNs() -> UInt64 { var r = rusage(); getrusage(RUSAGE_SELF, &r)
+            return UInt64(r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1_000_000_000 + UInt64(r.ru_utime.tv_usec+r.ru_stime.tv_usec)*1000 }
+        let reps = 300
+        for _ in 0..<5 { runChain() }
+        var t0 = DispatchTime.now().uptimeNanoseconds; var c0 = cpuNs()
+        for _ in 0..<reps { runChain() }
+        let rawWall = Double(DispatchTime.now().uptimeNanoseconds - t0)/Double(reps)/1e6
+        let rawCpu = Double(cpuNs()-c0)/Double(reps)/1e6
+        // MLX で同 2 op
+        for _ in 0..<5 { let m = MLX.quantizedMatmul(xin, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine); MLXFast.rmsNorm(m, weight: nw, eps: 1e-6).eval() }
+        t0 = DispatchTime.now().uptimeNanoseconds; c0 = cpuNs()
+        for _ in 0..<reps { let m = MLX.quantizedMatmul(xin, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4, mode: .affine); MLXFast.rmsNorm(m, weight: nw, eps: 1e-6).eval() }
+        let mlxWall = Double(DispatchTime.now().uptimeNanoseconds - t0)/Double(reps)/1e6
+        let mlxCpu = Double(cpuNs()-c0)/Double(reps)/1e6
+        // bit-exact 確認
+        runChain()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: N)
+        let got = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: N)), [1, N])
+        let rel = relErr(got, refChain)
+        return "[chain-test qmm→rmsNorm, 単一 encoder] task#3 orchestration 核\n"
+            + String(format: "  bit-exact: rel=%.3e  %@\n", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
+            + String(format: "  raw(単一encoder): %.3f ms wall, %.3f ms CPU\n", rawWall, rawCpu)
+            + String(format: "  MLX(2 op 別)    : %.3f ms wall, %.3f ms CPU\n", mlxWall, mlxCpu)
+            + String(format: "  → CPU-encode %.2fx 削減(%.3f→%.3f ms)", mlxCpu/Swift.max(0.001,rawCpu), mlxCpu, rawCpu)
+    }
+
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
     /// - env: QWISP_RUN=raw-ops-test / QWISP_QMM_K(D, 既定2048) / QWISP_QMM_M(rows, 既定4)
     public static func runOpsTest() -> String {
