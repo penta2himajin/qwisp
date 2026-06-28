@@ -424,7 +424,7 @@ public enum RawMetalForward {
     ///   → qmm と同一の数式・累積で rel 0.000e0。fast 条件 N%8==0 && K%512==0 && bits4/gs64。
     ///   x[1,K] 共有, wq[E,N,K/8] uint32, out[Ktop,N]。grid=(M=1, N/8, Ktop), group=(32,2,1)。
     static func gatherQmm(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, inds: MLXArray,
-                          Ktop: Int, K: Int, N: Int, gs: Int = 64) -> MLXArray? {
+                          Ktop: Int, K: Int, N: Int, gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         guard N % 8 == 0, K % 512 == 0, gs == 64 else { print("[raw-gqmm] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil }
         if _gqmmPipeline == nil {
@@ -460,6 +460,7 @@ public enum RawMetalForward {
                               device half*           y      [[buffer(5)]],   // [Ktop, N]
                               constant int& in_vec_size  [[buffer(6)]],
                               constant int& out_vec_size [[buffer(7)]],
+                              constant uint& lhsPer      [[buffer(8)]],   // 1=x を ki 行で index(down用), 0=共有(gate/up)
                               uint3 tid      [[threadgroup_position_in_grid]],
                               uint  simd_gid [[simdgroup_index_in_threadgroup]],
                               uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -482,7 +483,7 @@ public enum RawMetalForward {
                 ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
                 scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                 biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                x += tid.x * in_vec_size + simd_lid * values_per_thread;     // tid.x=0(M=1)
+                x += (lhsPer ? (size_t)ki : 0) * in_vec_size + simd_lid * values_per_thread;  // down は ki 行、gate/up は共有
                 y += ki * out_vec_size + out_row;
                 for (int k = 0; k < in_vec_size; k += block_size) {
                     U sum = ld16(x, x_thread);
@@ -517,8 +518,8 @@ public enum RawMetalForward {
         enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
         enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
         enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
-        var kk = Int32(K), nn = Int32(N)
-        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7)
+        var kk = Int32(K), nn = Int32(N), lhs = UInt32(lhsPerExpert ? 1 : 0)
+        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&lhs, length: 4, index: 8)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -1232,6 +1233,59 @@ public enum RawMetalForward {
                           rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ 近似" : "❌"))
         }
         return out
+    }
+
+    /// 検証: MoE block の raw gather 経路（routing/combine/shared は MLX glue, 4bit gather g/u/d は raw）vs MLX MoEBlock。
+    /// down gather は per-expert 入力(h[ki])。bit-exact なら raw gather が full MoE に組み込み可能。
+    /// - env: QWISP_RUN=raw-moe-test / QWISP_DEC0_REF(既定 /tmp/qwisp_dec0_ref.safetensors)
+    public static func runMoeBlockTest() -> String {
+        let refPath = ProcessInfo.processInfo.environment["QWISP_DEC0_REF"] ?? "/tmp/qwisp_dec0_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else { return "[raw-moe] ref 読込失敗 \(refPath)" }
+        func q(_ n: String, _ bits: Int) -> Proj? {
+            guard let w = r["\(n).weight"], let s = r["\(n).scales"], let b = r["\(n).biases"] else { return nil }
+            return .quantized(w, s, b, bits)
+        }
+        guard let gate = q("gate", 8), let shGate = q("shared_expert.gate_proj", 4),
+              let shUp = q("shared_expert.up_proj", 4), let shDown = q("shared_expert.down_proj", 4),
+              let sharedGate = q("shared_expert_gate", 8),
+              let swGW = r["switch_mlp.gate_proj.weight"], let swGS = r["switch_mlp.gate_proj.scales"], let swGB = r["switch_mlp.gate_proj.biases"],
+              let swUW = r["switch_mlp.up_proj.weight"], let swUS = r["switch_mlp.up_proj.scales"], let swUB = r["switch_mlp.up_proj.biases"],
+              let swDW = r["switch_mlp.down_proj.weight"], let swDS = r["switch_mlp.down_proj.scales"], let swDB = r["switch_mlp.down_proj.biases"]
+        else { return "[raw-moe] ref キー不足（gate/switch_mlp/shared_expert）" }
+        let Hin = swGS.dim(-1) * 64                                          // K = groups*gs = 2048
+        let topK = 8, E = 256, I = swGW.dim(-2)                              // I=intermediate=512
+        let blk = MoEBlock(topK: topK, numExperts: E, normTopk: true, expertBits: 4, gate: gate,
+                           swGateW: swGW, swGateS: swGS, swGateB: swGB, swUpW: swUW, swUpS: swUS, swUpB: swUB,
+                           swDownW: swDW, swDownS: swDS, swDownB: swDB, shGate: shGate, shUp: shUp, shDown: shDown, sharedGate: sharedGate)
+        let x = MLXRandom.normal([1, Hin]).asType(.float16)                 // [T=1, H]
+        let ref = blk(x); ref.eval()
+        // routing（MLX, MoEBlock と同一）
+        let gates = MLX.softmax(gate.apply(x), axis: -1, precise: true)     // [1, E]
+        let order = MLX.argPartition(gates, kth: E - topK, axis: -1)
+        let inds = order[0..., (E - topK)...].asType(.int32)                 // [1,8]
+        var scores = MLX.takeAlong(gates, inds, axis: -1)
+        scores = scores / scores.sum(axis: -1, keepDims: true)               // normTopk
+        let indsFlat = inds.reshaped([topK])
+        let x2 = x.reshaped([1, Hin])
+        // raw 4bit gather: g/u（共有 x）, d（per-expert h）
+        guard let g = gatherQmm(x2, swGW, scales: swGS, biases: swGB, inds: indsFlat, Ktop: topK, K: Hin, N: I),
+              let u = gatherQmm(x2, swUW, scales: swUS, biases: swUB, inds: indsFlat, Ktop: topK, K: Hin, N: I)
+        else { return "[raw-moe] gather g/u 失敗" }
+        let h = (g * MLX.sigmoid(g)) * u                                     // [8, I] swiglu(MLX glue)
+        guard let d = gatherQmm(h, swDW, scales: swDS, biases: swDB, inds: indsFlat, Ktop: topK, K: I, N: Hin, lhsPerExpert: true)
+        else { return "[raw-moe] gather d 失敗" }                           // [8, H] per-expert
+        let y = (d * scores.reshaped([topK, 1])).sum(axis: 0)               // combine(MLX glue) [H]
+        // shared expert（MLX glue, MoEBlock と同一）
+        let sg = shGate.apply(x), su = shUp.apply(x)
+        let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
+        let gateScale = MLX.sigmoid(sharedGate.apply(x))
+        let gotRaw = (y.reshaped([1, Hin]) + gateScale * sharedY)
+        gotRaw.eval()
+        let rel = relErr(gotRaw.reshaped([gotRaw.size]), ref.reshaped([ref.size]))
+        return String(format: "[raw-moe-test] MoE block raw gather(g/u共有 + d per-expert) vs MLX MoEBlock\n"
+            + "  E=%d topK=%d Hin=%d I=%d（routing/combine/shared は MLX glue, 4bit gather が raw）\n"
+            + "  MoE block 全体 rel=%.3e %@",
+            E, topK, Hin, I, rel, rel == 0 ? "✅ TRUE bit-exact（raw gather 組込可）" : (rel < 2e-3 ? "△ 近似" : "❌"))
     }
 
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
