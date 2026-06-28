@@ -2109,6 +2109,124 @@ extension Tell {
             + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, losslessTag)
     }
 
+    /// **[高速化] issue#3 lever-1 製品化: 16GB(C=128) を no-sync + miss-escalation で真 lossless 化**
+    /// C<256 では no-sync gather が cold routed を slot-0 alias=garbage 化するが、`countHotMiss` で
+    /// その token の cold route 数を層横断 GPU 累積し、**hotMiss=0 の token は no-sync 結果が bit-exact
+    /// ゆえ採用、hotMiss>0 の token だけ cache を巻戻して sync 再計算(exact, cold expert を ensure)**。
+    /// 検出は cold route の厳密 superset ゆえ出力は pure-sync と完全一致(真 lossless)。miss-check は token
+    /// 毎 1 scalar drain のみ(40 層 materialize より遥かに安い)。期待: 16GB を ~45-57 tok/s exact。
+    /// - env: QWISP_RUN=nosync-escalate / QWISP_CACHE_C(既定128) / QWISP_GEN(既定64) / QWISP_CALIB(既定48)
+    public static func runNoSyncEscalate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[NoSyncEscalate] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 128)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.hotMissAccum = nil
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        // 参照: pure-sync greedy
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            (_, lg) = try model.forwardHidden(u, caches: mc); MLX.eval([lg])     // warmup
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self))
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        // no-sync + escalation greedy
+        func greedyEscalate() throws -> (toks: [Int], tps: Double, escal: Int) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            // warmup（両 mode のグラフを確定、cache 巻戻し）
+            let s0 = mc.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil
+            let (_, w1) = try model.forwardHidden(u, caches: mc); MLX.eval([w1])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let (_, w2) = try model.forwardHidden(u, caches: mc); MLX.eval([w2])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; var escal = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let snaps = mc.map { $0.snapshot() }
+                StreamingMoEBlock.hotMissAccum = nil
+                StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true
+                let (_, lns) = try model.forwardHidden(u, caches: mc)
+                let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+                MLX.eval([lns, missArr] + mc.flatMap { $0.stateArrays })           // token 毎 1 sync(scalar+logits)
+                if missArr.item(Int32.self) == 0 {
+                    u = MLX.argMax(lns[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([u])   // 採用(cache exact)
+                } else {
+                    escal += 1
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                    StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+                    let (_, lex) = try model.forwardHidden(u, caches: mc)            // sync 再計算(exact, cold ensure)
+                    u = MLX.argMax(lex[0, 0], axis: -1).reshaped([1, 1])
+                    MLX.eval([u] + mc.flatMap { $0.stateArrays })
+                }
+                toks.append(u.item(Int.self))
+            }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), escal)
+        }
+        let ref = try greedySync()
+        let esc = try greedyEscalate()
+        let match = zip(ref.toks, esc.toks).filter { $0 == $1 }.count
+        let speedup = ref.tps > 0 ? esc.tps / ref.tps : 0
+        let escRate = Double(esc.escal) / Double(N) * 100
+        let tag = match == N ? "✅ 真 lossless(sync と完全一致)"
+            : "❌ \(N - match)/\(N) 不一致=escalation 検出漏れ(バグ)"
+        return "[NoSyncEscalate C=\(C), N=\(N), f32-full] issue#3 lever-1 16GB 安全化\n"
+            + String(format: "  pure-sync(exact)         : %.1f tok/s\n", ref.tps)
+            + String(format: "  no-sync+escalate         : %.1f tok/s  (escalation %d/%d=%.0f%%)\n",
+                     esc.tps, esc.escal, N, escRate)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, tag)
+    }
+
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
     /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
     /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。
