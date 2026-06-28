@@ -1259,6 +1259,85 @@ public enum RawMetalForward {
         return out
     }
 
+    /// MoE expert 計算の常駐 buffer（重み＋中間＝一度だけ確保）。routing(inds)/combine は外部(MLX)。
+    struct MoEBuffers {
+        let Hin, I, topK: Int
+        let bx, binds: MTLBuffer
+        let swGW, swGS, swGB, swUW, swUS, swUB, swDW, swDS, swDB: MTLBuffer
+        let shGW, shGS, shGB, shUW, shUS, shUB, shDW, shDS, shDB: MTLBuffer
+        let g, u, h, d, sg, su, shAct, sharedY: MTLBuffer
+    }
+    static func prepareMoEBuffers(swG: (MLXArray, MLXArray, MLXArray), swU: (MLXArray, MLXArray, MLXArray), swD: (MLXArray, MLXArray, MLXArray),
+                                  shG: (MLXArray, MLXArray, MLXArray), shU: (MLXArray, MLXArray, MLXArray), shD: (MLXArray, MLXArray, MLXArray),
+                                  Hin: Int, I: Int, topK: Int) -> MoEBuffers? {
+        guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
+        func wb(_ a: MLXArray) -> MTLBuffer? { a.asMTLBuffer(device: device, noCopy: false) }
+        func fb(_ a: MLXArray) -> MTLBuffer? { a.asType(.float16).asMTLBuffer(device: device, noCopy: false) }
+        func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        guard let swGW = wb(swG.0), let swGS = fb(swG.1), let swGB = fb(swG.2),
+              let swUW = wb(swU.0), let swUS = fb(swU.1), let swUB = fb(swU.2),
+              let swDW = wb(swD.0), let swDS = fb(swD.1), let swDB = fb(swD.2),
+              let shGW = wb(shG.0), let shGS = fb(shG.1), let shGB = fb(shG.2),
+              let shUW = wb(shU.0), let shUS = fb(shU.1), let shUB = fb(shU.2),
+              let shDW = wb(shD.0), let shDS = fb(shD.1), let shDB = fb(shD.2) else { return nil }
+        return MoEBuffers(Hin: Hin, I: I, topK: topK, bx: mk(Hin * 2), binds: mk(topK * 4),
+            swGW: swGW, swGS: swGS, swGB: swGB, swUW: swUW, swUS: swUS, swUB: swUB, swDW: swDW, swDS: swDS, swDB: swDB,
+            shGW: shGW, shGS: shGS, shGB: shGB, shUW: shUW, shUS: shUS, shUB: shUB, shDW: shDW, shDS: shDS, shDB: shDB,
+            g: mk(topK * I * 2), u: mk(topK * I * 2), h: mk(topK * I * 2), d: mk(topK * Hin * 2),
+            sg: mk(I * 2), su: mk(I * 2), shAct: mk(I * 2), sharedY: mk(Hin * 2))
+    }
+
+    /// ★ MoE expert+shared を **単一 encoder** で連結（gather g/u→swiglu→gather d(per-expert) / 並行 shared）。
+    ///   routing(inds, scores) は外部(MLX)、combine も外部。d[topK,Hin] と sharedY[Hin] を返す。
+    static func moeExpertSingleEncoder(_ x: MLXArray, _ inds: MLXArray, _ b: MoEBuffers) -> (MLXArray, MLXArray)? {
+        guard let (_, queue) = ensure() else { return nil }
+        guard let gqp = _gqmmPipeline, let qp = _qmmPipeline, let swp = _swigluPipeline else { return nil }
+        let Hin = b.Hin, I = b.I, K = b.topK
+        // x, inds を常駐 buffer に書込み
+        let xf = x.reshaped([Hin]).asType(.float16).asArray(Float16.self)
+        b.bx.contents().bindMemory(to: Float16.self, capacity: Hin).update(from: xf, count: Hin)
+        let indsI = inds.reshaped([K]).asType(.int32).asArray(Int32.self)
+        b.binds.contents().bindMemory(to: Int32.self, capacity: K).update(from: indsI, count: K)
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        func encGather(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
+            enc.setComputePipelineState(gqp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(b.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
+            var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0)
+            enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn / 8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encQmm(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int) {
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
+            var k = Int32(kk), n = Int32(nn); enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encSwiglu(_ gb: MTLBuffer, _ ub: MTLBuffer, _ hb: MTLBuffer, total: Int) {
+            enc.setComputePipelineState(swp)
+            enc.setBuffer(gb, offset: 0, index: 0); enc.setBuffer(ub, offset: 0, index: 1); enc.setBuffer(hb, offset: 0, index: 2)
+            var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(swp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+        // routed experts: g/u gather → swiglu → d gather(per-expert)
+        encGather(b.swGW, b.swGS, b.swGB, b.bx, b.g, K: Hin, N: I, lhs: false)
+        encGather(b.swUW, b.swUS, b.swUB, b.bx, b.u, K: Hin, N: I, lhs: false)
+        encSwiglu(b.g, b.u, b.h, total: K * I)
+        encGather(b.swDW, b.swDS, b.swDB, b.h, b.d, K: I, N: Hin, lhs: true)
+        // shared expert: sg/su qmm → swiglu → sharedY qmm
+        encQmm(b.shGW, b.shGS, b.shGB, b.bx, b.sg, K: Hin, N: I)
+        encQmm(b.shUW, b.shUS, b.shUB, b.bx, b.su, K: Hin, N: I)
+        encSwiglu(b.sg, b.su, b.shAct, total: I)
+        encQmm(b.shDW, b.shDS, b.shDB, b.shAct, b.sharedY, K: I, N: Hin)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let dp = b.d.contents().bindMemory(to: Float16.self, capacity: K * Hin)
+        let d = MLXArray(Array(UnsafeBufferPointer(start: dp, count: K * Hin)), [K, Hin])
+        let sp = b.sharedY.contents().bindMemory(to: Float16.self, capacity: Hin)
+        let sharedY = MLXArray(Array(UnsafeBufferPointer(start: sp, count: Hin)), [1, Hin])
+        return (d, sharedY)
+    }
+
     /// raw swiglu: h=(g*sigmoid(g))*u（全 f16）。round-trip(個別 cmd buffer)。
     static func swigluRaw(_ g: MLXArray, _ u: MLXArray) -> MLXArray? {
         guard let (device, queue) = ensure(), ensureAuxPipelines(), let p = _swigluPipeline else { return nil }
@@ -1353,6 +1432,31 @@ public enum RawMetalForward {
             let yMlx = (d * scores.reshaped([topK, 1])).sum(axis: 0)
             note = String(format: "\n  （raw combine 単体 rel=%.3e: MLX reduce_col の f16 sum 順序差。combine のみ MLX 推奨）",
                           relErr(yr, yMlx))
+        }
+        // ★ MoE expert single-encoder（task#7）: 常駐 buffer + 単一 encoder。bit-exact + 計測。
+        if let mb = prepareMoEBuffers(swG: (swGW, swGS, swGB), swU: (swUW, swUS, swUB), swD: (swDW, swDS, swDB),
+                                      shG: sgW, shU: suW, shD: sdW, Hin: Hin, I: I, topK: topK),
+           let (dSE, sharedYSE) = moeExpertSingleEncoder(x, indsFlat, mb) {
+            // combine + final add は MLX（routing/combine は外部 glue）
+            let ySE = (dSE * scores.reshaped([topK, 1])).sum(axis: 0)
+            let gotSE = (ySE.reshaped([1, Hin]) + gateScale * sharedYSE)
+            gotSE.eval()
+            let relSE = relErr(gotSE.reshaped([gotSE.size]), ref.reshaped([ref.size]))
+            func cpuNs() -> UInt64 { var r = rusage(); getrusage(RUSAGE_SELF, &r)
+                return UInt64(r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1_000_000_000 + UInt64(r.ru_utime.tv_usec+r.ru_stime.tv_usec)*1000 }
+            let reps = 200
+            for _ in 0..<10 { _ = moeExpertSingleEncoder(x, indsFlat, mb) }
+            var t0 = DispatchTime.now().uptimeNanoseconds; var c0 = cpuNs()
+            for _ in 0..<reps { _ = moeExpertSingleEncoder(x, indsFlat, mb) }
+            let seWall = Double(DispatchTime.now().uptimeNanoseconds-t0)/Double(reps)/1e6
+            let seCpu = Double(cpuNs()-c0)/Double(reps)/1e6
+            for _ in 0..<10 { let y = blk(x); y.eval() }
+            t0 = DispatchTime.now().uptimeNanoseconds; c0 = cpuNs()
+            for _ in 0..<reps { let y = blk(x); y.eval() }
+            let mlxWall = Double(DispatchTime.now().uptimeNanoseconds-t0)/Double(reps)/1e6
+            let mlxCpu = Double(cpuNs()-c0)/Double(reps)/1e6
+            note += String(format: "\n  ── MoE expert single-encoder（task#7, routing/combine=MLX）──\n   SE 全体 rel=%.3e %@\n   時間: SE expert-encoder wall=%.3fms cpu=%.3fms | MLX MoE全体 wall=%.3fms cpu=%.3fms",
+                           relSE, relSE == 0 ? "✅ bit-exact" : "△", seWall, seCpu, mlxWall, mlxCpu)
         }
         return String(format: "[raw-moe-test] MoE block raw（gather g/u/d・swiglu・shared expert=raw, routing/combine=MLX）vs MLX MoEBlock\n"
             + "  E=%d topK=%d Hin=%d I=%d。重い計算(gather 3種+swiglu+shared)は全 raw\n"
