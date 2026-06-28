@@ -1613,28 +1613,41 @@ extension Tell {
 
     /// **SuffixDecoding draft + clean exact verify（issue #2 軸B, 訓練不要）**
     /// - 機構: prompt+生成履歴の suffix を lookup し、過去に同 suffix の後に続いた token 列を K 個まで
-    ///   無料 draft → SpecK の clean exact verify(seqMT)で照合 → 一致 prefix を commit。draft cost ~0。
-    /// - lossless: **strict**（verify が exact）。token/step は反復性に依存。
+    ///   無料 draft → batched f32-full exact verify で照合 → 一致 prefix を commit。draft cost ~0。
+    /// - lossless: **strict**（batched f32-full verify が逐次 decode と bit-exact）。token/step は反復性に依存。
     /// - 速度: code/agentic の反復で高 accept→高 token/step。free-form(high-entropy)では accept 低下。
+    ///   実測 8GB C=64: mix 88 tok/s @maxK24 / 16GB C=128: mix 133 tok/s @maxK24-48（vs Swift-greedy 100%）。
     /// - 研究: SuffixDecoding (arXiv:2411.04975), Prompt-Lookup Decoding
-    /// - env: QWISP_RUN=suffix-spec / QWISP_CACHE_C / QWISP_DRAFT_K(最大draft長) / QWISP_SUFFIX_MIN(最小一致) / QWISP_SUFFIX_MATCH(最大一致) / QWISP_SWIFT_REF / QWISP_SPECK_PROF
+    /// - env: QWISP_RUN=suffix-spec / QWISP_CACHE_C / QWISP_DRAFT_K(最大draft長,既定16・C×3/8でクランプ) /
+    ///   QWISP_SUFFIX_MIN(最小一致) / QWISP_SUFFIX_MATCH(最大一致) / QWISP_SWIFT_REF / QWISP_SPECK_PROF /
+    ///   QWISP_F32_ATTN・QWISP_F32_CONV(既定1=f32-full, 0 で f16 batched) / QWISP_VERIFY_SEQ・QWISP_VERIFY_PQN(診断用逐次化)
     public static func runSuffixSpec(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SuffixSpec] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let calibN = Tell.envInt("QWISP_CALIB", 48)
-        // 安全 draft 長 ~4 の真因(計装で確定, issue #2): arena でない(|U|=47<64,slot衝突0)。
-        // multi-token verify が f16 で single-token と drift し、T↑で batched 寄りになって near-tie 反転
-        // ＝seqMT が直すのは attention のみで conv1d/GDN/MoE の f16 batched≠逐次 が残る(A1 同根)。
-        // hard(反復)は near-tie を越えず maxK=8 でも lossless ＝入力依存境界。安全側で maxK=4 固定。
-        // 長 draft 解放には multi-token forward 全体の bit-exact(f32/逐次)化=軸A2/A3 が要る。
-        let maxK = Swift.min(Tell.envInt("QWISP_DRAFT_K", 4), 16)   // A2 検証中は上限まで
+        // ★ batched f32-full verify が既定(investigate C + batched 再評価で確定):
+        //   verify forward の divergent op は attention SDPA(.causal/.none 経路差 ~7e-4)と GDN conv1d のみ。
+        //   両者を f32 化すると残り全 op(quantized matmul / GDN updateKernel / RoPE / rmsNorm / softmax)は
+        //   order-stable(rel=0)ゆえ verify forward 全体が逐次 decode と bit 一致(micro-test attn=1.08e-6 確認)。
+        //   → 逐次化(seqMT/perQueryNone)不要の単一 batched forward が provably lossless かつ最速。
+        //   f16 batched は ~7e-4 drift だが SuffixSpec は reject 自己訂正ゆえ実用 lossless(誤受理は near-tie のみ・保証なし)。
+        //   旧 maxK=4 上限は f16 運頼みを避ける保護だったが f32-full は bit-exact ゆえ撤廃。
+        // ★ 但し別の上限が残る: D+1 トークンの batched verify で 1 層が同時に要するユニーク expert 数が
+        //   per-layer cache 容量 C を超えると evict しきれず wrong-slot=silent garbage(クラッシュせず誤受理)。
+        //   実測安全境界 C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8。これで C 比例クランプ(精度でなく容量制約)。
+        let maxKReq = Tell.envInt("QWISP_DRAFT_K", 16)
+        let maxKSafe = Swift.max(4, C * 3 / 8)
+        let maxK = Swift.min(maxKReq, maxKSafe)
+        if maxK < maxKReq {
+            print("[SuffixSpec] maxK \(maxKReq)→\(maxK) にクランプ(C=\(C) の arena 容量制約 C×3/8, |U|>C 回避)")
+        }
         let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 2)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
-        // A2: divergent op(attention SDPA + conv1d)を f32 化＝seqMT 無しで batched verify を lossless に
-        GatedDeltaNetLayer.f32Conv = Tell.envFlag("QWISP_F32_CONV")
-        AttentionLayer.f32SDPA = Tell.envFlag("QWISP_F32_ATTN")
+        // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
+        GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
+        AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
         defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -1693,9 +1706,9 @@ extension Tell {
         var (_, lg) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
-        let vseq = Tell.envStr("QWISP_VERIFY_SEQ", "1") != "0"
-        // ★ per-query .none verify(investigate C 確定の軽量 bit-exact): 射影 batched(quantized=order-stable)を
-        //   1 回、SDPA だけ query 毎に exact prefix.none。seqMT(層丸ごと per-token 再実行)より軽い。
+        // verify 逐次化は既定 OFF(f32-full batched が代替)。診断用に明示時のみ有効化:
+        //   QWISP_VERIFY_SEQ=1 → seqMT(層丸ごと per-token), QWISP_VERIFY_PQN=1 → per-query .none(SDPA のみ)。
+        let vseq = Tell.envFlag("QWISP_VERIFY_SEQ")
         let vpqn = Tell.envFlag("QWISP_VERIFY_PQN")
         func setVerifyMode(_ on: Bool) {
             if vpqn { AttentionLayer.perQueryNone = on; AttentionLayer.seqMultiToken = false }
