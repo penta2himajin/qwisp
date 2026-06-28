@@ -51,6 +51,7 @@ if CommandLine.arguments.contains("stream") {
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("cost-model-validate",   { try Tell.runCostModelValidate(modelDir: $0, refPath: $1) }),
         ("device-config",         { _, _ in DeviceCalibration.describeAll() }),
+        ("device-calibrate",      { try Tell.runDeviceCalibrate(modelDir: $0, refPath: $1) }),
         ("pipeline-decode",       { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) }),
         ("predict-fixpoint",      { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) }),
         ("no-sync-gate-escalate", { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) }),

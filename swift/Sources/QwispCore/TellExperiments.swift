@@ -1985,6 +1985,59 @@ extension Tell {
             """, C, fcStr, cm.a, cm.b, rows.joined(separator: "\n"), cMed, rows2.joined(separator: "\n"))
     }
 
+    /// 起動時 calibration: device の RAM tier(mode/C/maxK) + cost-model(a,b,c)実測 を束ね DeviceConfig を完成。
+    /// 製品の起動時に 1 回実行し、以降の予測/判定に使う。QWISP_DEVICE_RAM で他 device 模擬可。
+    /// - env: QWISP_RUN=device-calibrate
+    public static func runDeviceCalibrate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[DeviceCalibrate] skip" }
+        var cfg = DeviceCalibration.recommend()
+        let C = cfg.C
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< 32 {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        // cost-model 実測
+        let cm = try DeviceCalibration.measureCostModel(model: model, ids: ids, isLin: isLin)
+        cfg.costModel = cm
+        // 予測: 高 accept(反復, p=maxK) と greedy 床(p=0)
+        let predHigh = cm.tokPerSec(draftLen: cfg.maxK, acceptedPerStep: Double(cfg.maxK))
+        let predFloor = cm.tokPerSec(draftLen: 0, acceptedPerStep: 0)
+        return String(format: """
+            [DeviceCalibrate] %@
+              cost-model 実測: a=%.1fms b=%.2fms/tok c=%.1fms (step=forward_ms(D+1)+c+io)
+              予測 tok/s: 反復(p=maxK=%d)→%.0f / greedy床(p=0)→%.0f
+              ※IO 項は 8GB streaming 実機の cold SSD BW で後埋め(現 dev 機は resident で io=0)
+            """, cfg.summary, cm.a, cm.b, cm.c, cfg.maxK, predHigh, predFloor)
+    }
+
     /// **buddy-draft speculative decode（8GB strict lossless ベースライン）**
     /// - 機構: buddy no-sync で K トークン draft → exact batched verify(seqMultiToken)で照合、draft==exact の prefix を採用、外れは exact 訂正
     /// - lossless: **strict**（long horizon でも vs Swift-exact 100%。唯一の真 lossless）

@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// device 別自動構成（calibration layer）。起動時に物理 RAM から mode/C/maxK を静的に決め、
 /// （オプションで）forward-cost / SSD probe を実測して cost-model 係数を埋める。
@@ -55,6 +56,49 @@ public enum DeviceCalibration {
 
     /// engine 既定 C（QWISP_CACHE_C 未指定時に使う）。実効 RAM(physicalRAMGB)から tier 決定。
     public static func defaultC() -> Int { tier(physicalRAMGB()).1 }
+
+    /// cost-model 係数 a,b,c をオンデバイス実測（要 model+hot-pin 済）。起動時 calibration で DeviceConfig に埋める。
+    /// a,b=forward-cost L-sweep の最小二乗、c=spec-step overhead(snapshot/restore/readback) - forward_ms(D+1)。
+    public static func measureCostModel(model: StreamingQwispModel, ids: MLXArray, isLin: [Bool]) throws -> CostModel {
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        // (a,b) forward-cost L-sweep（teacher-forced, restore で同一 prefill 反復）
+        var pts: [(L: Int, ms: Double)] = []
+        for L in [1, 2, 4, 8, 16] {
+            let bc = model.makeCaches(); _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            let snaps = bc.map { $0.snapshot() }
+            let seq = MLXArray(Array(repeating: Int32(100), count: L), [1, L])
+            let (hw, _) = try model.forwardHidden(seq, caches: bc); MLX.eval([hw] + bc.flatMap { $0.stateArrays })
+            for (i, cc) in bc.enumerated() { cc.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            var t: UInt64 = 0
+            for _ in 0 ..< 10 {
+                let s = now(); let (h, _) = try model.forwardHidden(seq, caches: bc)
+                MLX.eval([h] + bc.flatMap { $0.stateArrays }); t += now() - s
+                for (i, cc) in bc.enumerated() { cc.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            }
+            pts.append((L, Double(t) / 10 / 1e6))
+        }
+        let ab = CostModel.fit(pts)
+        // (c) spec-step overhead: snapshot + forward(D+1) + argmax readback(CPU) + restore - forward_ms(D+1)
+        let D = 4
+        let bc = model.makeCaches(); _ = try model.prefillChunked(ids, caches: bc)
+        MLX.eval(bc.flatMap { $0.stateArrays })
+        let seq = MLXArray(Array(repeating: Int32(100), count: D + 1), [1, D + 1])
+        var t: UInt64 = 0; let reps = 10
+        for _ in 0 ..< reps {
+            let s = now()
+            let snaps = bc.map { $0.snapshot() }
+            let (_, vlg) = try model.forwardHidden(seq, caches: bc)
+            let ev = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1)
+            MLX.eval([ev] + bc.flatMap { $0.stateArrays })
+            _ = ev.asArray(Int32.self)                                   // CPU readback(実 step と同じ)
+            for (i, cc) in bc.enumerated() { cc.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
+            t += now() - s
+        }
+        let stepMs = Double(t) / Double(reps) / 1e6
+        let c = Swift.max(0, stepMs - ab.forwardMs(D + 1))
+        return CostModel(a: ab.a, b: ab.b, c: c)
+    }
 
     /// device-config インスペクタ（モデル不要）。現機 + 各 RAM tier の構成を表示。
     public static func describeAll() -> String {

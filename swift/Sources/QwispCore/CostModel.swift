@@ -10,15 +10,17 @@ import Foundation
 public struct CostModel {
     public let a: Double   // forward 固定費 (ms/forward)
     public let b: Double   // forward marginal (ms/token)
+    public let c: Double   // per-step overhead (snapshot/restore/CPU readback/draft/sync, ms/step)
 
-    public init(a: Double, b: Double) { self.a = a; self.b = b }
+    public init(a: Double, b: Double, c: Double = 0) { self.a = a; self.b = b; self.c = c }
 
     /// forward_ms(L) = a + b·L
     public func forwardMs(_ L: Int) -> Double { a + b * Double(L) }
 
     /// 投機 decode の予測 tok/s。draftLen=D, acceptedPerStep=p（commit=1+p, verify は D+1 token forward）。
+    /// step_ms = forward_ms(D+1) + c + io。
     public func tokPerSec(draftLen D: Int, acceptedPerStep p: Double, ioMsPerStep: Double = 0) -> Double {
-        let stepMs = forwardMs(D + 1) + ioMsPerStep
+        let stepMs = forwardMs(D + 1) + c + ioMsPerStep
         return (1.0 + p) / stepMs * 1000.0
     }
 
