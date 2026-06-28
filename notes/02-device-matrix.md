@@ -62,17 +62,23 @@ regime ゆえ random≈sequential（単一 NAND は天井を ~50% 下げるが r
 
 ## 3. RAM tier → engine mode（静的 gate）
 
-model ~13-16GB resident(4-bit)が閾値。RAM は確実に query 可能ゆえ mode は静的決定:
+★**RSS 実測(2026-06-28, buddy-no-sync hot-pin top-C, dev 機 64GB=圧迫無の純 footprint)**:
+C=64→**6.9GB** / C=128→**11.4GB** / C=192→**15.9GB** / C=256(full-resident)→**20.5GB**。
+線形 +64C≈+4.5GB(=64 expert×40層×1.77MB)。base(非expert+overhead)≈2.4GB。**full model full-resident=20.5GB**。
+RAM tier は「RSS + macOS/他アプリ headroom(~4-8GB)」で決まる(C=256 を物理 RAM ぎりぎりに置くと memory pressure→
+expert ページ eviction/swap で実質 streaming に転落＝full-resident の利得消失):
 
-| RAM | mode | C(hot-pin) | 律速 | 代表機 |
-|---|---|---|---|---|
-| **8GB** | **streaming**(expert を SSD/mmap から demand-load) | C≈64 | SSD BW(Neo ~1.5/M1 Air ~2.7 GB/s)＋forward | Neo, M1–M3 Air, M1/M2 mini, base M3 MBP |
-| 16GB | partial-resident(大 C, miss 減) | C≈128 | forward(IO 二次) | M4 Air/mini/base MBP |
-| 24GB | partial-resident | C↑ | forward | M2/M3 Air 上位, M-Pro entry |
-| 32–36GB | ほぼ resident | C≈192 | forward | base/Pro |
-| 48–64GB+ | full-resident(streaming 無) | C=256 | forward のみ | Max |
-| 128–512GB | full-resident＋余裕 | C=256 | forward | Max/Ultra |
+| RAM | mode | C(hot-pin) | RSS | headroom | 代表機 |
+|---|---|---|---|---|---|
+| **8GB** | **streaming**(expert を pread demand-load) | C≈64 | 6.9GB | ~1GB(厳しい) | Neo, M1–M3 Air, M1/M2 mini, base M3 MBP |
+| 16GB | partial-resident | C≈128 | 11.4GB | ~4.6GB | M4 Air/mini/base MBP |
+| **24GB** | **near-full**(partial, miss 数%) | **C≈192–208** | 15.9–17GB | ~7-8GB | M2/M3 Air 上位, M-Pro entry |
+| 32–36GB | **full-resident** | **C=256** | 20.5GB | ~11GB(快適) | base M5, Pro |
+| 48–64GB+ | full-resident | C=256 | 20.5GB | 余裕大 | Max |
+| 128–512GB | full-resident | C=256 | 20.5GB | 余裕大 | Max/Ultra |
 
+★**24GB で C=256(20.5GB)は数値上可だが marginal**: 残り ~3.5GB のみ＝memory pressure リスク。**安全な
+full-resident tier は 32GB から**。24GB は near-full(C≈192-208)が現実解(全 expert の 75-81% 常駐、miss 数%)。
 maxK は全 mode で **C×3/8**（[[status-8gb-done-16gb-next]]）。8GB は SSD BW が下位の決定変数、16GB+ は
 forward 律速で C 非依存（[[greedy-wall-fixed-overhead]] の C=64↔128 で床不変と整合）。
 
