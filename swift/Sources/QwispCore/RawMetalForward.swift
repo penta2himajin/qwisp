@@ -364,34 +364,89 @@ public enum RawMetalForward {
 
     /// raw-Metal gather quantized matmul(MoE 核): x[K] を inds[Ktop] が選ぶ各 expert の量子化 weight で matmul。
     /// out[ki,n]=Σ_k x[k]·dequant(wq[e,n,k]), e=inds[ki]。expert オフセットで wq/scales/biases を index。
+    /// ★ MLX gather_qmv_fast 移植: expert offset(inds[ki])を ws/scales/biases に加えて同じ qmv_fast 内核を回す。
+    ///   → qmm と同一の数式・累積で rel 0.000e0。fast 条件 N%8==0 && K%512==0 && bits4/gs64。
+    ///   x[1,K] 共有, wq[E,N,K/8] uint32, out[Ktop,N]。grid=(M=1, N/8, Ktop), group=(32,2,1)。
     static func gatherQmm(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, inds: MLXArray,
                           Ktop: Int, K: Int, N: Int, gs: Int = 64) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0, gs == 64 else { print("[raw-gqmm] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil }
         if _gqmmPipeline == nil {
             let src = """
             #include <metal_stdlib>
             using namespace metal;
-            kernel void gqmm4(device const half* x [[buffer(0)]], device const uint* wq [[buffer(1)]],
-                              device const half* scales [[buffer(2)]], device const half* biases [[buffer(3)]],
-                              device const int* inds [[buffer(4)]], device half* out [[buffer(5)]],
-                              constant uint& K [[buffer(6)]], constant uint& N [[buffer(7)]], constant uint& GS [[buffer(8)]],
-                              uint gid [[thread_position_in_grid]]) {
-                uint ki = gid / N, n = gid % N;
-                uint e = (uint)inds[ki];
-                uint kp = K/8, kg = K/GS;
-                uint wbase = e*N*kp + n*kp;
-                uint sbase = e*N*kg + n*kg;
-                float acc = 0.0f;
-                for (uint k=0;k<K;++k){
-                    uint packed = wq[wbase + (k>>3)];
-                    uint nib = (packed >> (4u*(k&7u))) & 0xFu;
-                    uint gg = k/GS;
-                    acc += (float)x[k] * ((float)scales[sbase+gg]*(float)nib + (float)biases[sbase+gg]);
+            #define SIMD_SIZE 32
+            inline float ld16(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i] = x[i]; xt[i+1] = x[i+1]/16.0f; xt[i+2] = x[i+2]/256.0f; xt[i+3] = x[i+3]/4096.0f;
                 }
-                out[gid] = (half)acc;
+                return sum;
+            }
+            inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                const device uint16_t* ws = (const device uint16_t*)w;
+                for (int i = 0; i < 4; i++) {
+                    accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                              xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                              xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                              xt[4*i+3] * (float)(ws[i] & 0xf000));
+                }
+                return scale * accum + sum * bias;
+            }
+            // gather_qmv_fast: tid.z=ki(expert slot)。expert e=inds[ki] の weight 領域(N*行)へ offset。
+            kernel void gqmm4(device const uint32_t* w      [[buffer(0)]],   // [E, N, K/8]
+                              device const half*     scales [[buffer(1)]],   // [E, N, K/64]
+                              device const half*     biases [[buffer(2)]],
+                              device const half*     x      [[buffer(3)]],   // [1, K]
+                              device const int*      inds   [[buffer(4)]],   // [Ktop]
+                              device half*           y      [[buffer(5)]],   // [Ktop, N]
+                              constant int& in_vec_size  [[buffer(6)]],
+                              constant int& out_vec_size [[buffer(7)]],
+                              uint3 tid      [[threadgroup_position_in_grid]],
+                              uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                              uint  simd_lid [[thread_index_in_simdgroup]]) {
+                constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+                constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+                constexpr int block_size = 512, scale_step_per_thread = 4;
+                const device uint8_t* ws = (const device uint8_t*)w;
+                typedef float U;
+                thread U x_thread[16];
+                thread U result[4] = {0};
+                const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                const int in_vec_size_g = in_vec_size / 64;
+                uint ki = tid.z;
+                uint e = (uint)inds[ki];
+                // expert offset: 1 expert = N 行 ×(in_vec_size_w bytes / in_vec_size_g groups)
+                ws     += (size_t)e * out_vec_size * in_vec_size_w;
+                scales += (size_t)e * out_vec_size * in_vec_size_g;
+                biases += (size_t)e * out_vec_size * in_vec_size_g;
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+                scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                x += tid.x * in_vec_size + simd_lid * values_per_thread;     // tid.x=0(M=1)
+                y += ki * out_vec_size + out_row;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    U sum = ld16(x, x_thread);
+                    for (int row = 0; row < results_per_simdgroup; row++) {
+                        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                        const device half* sl = scales + row * in_vec_size_g;
+                        const device half* bl = biases + row * in_vec_size_g;
+                        U s = sl[0]; U b = bl[0];
+                        result[row] += qd4(wl, x_thread, s, b, sum);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;
+                    scales += block_size / 64; biases += block_size / 64; x += block_size;
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    result[row] = simd_sum(result[row]);
+                    if (simd_lid == 0) y[row] = (half)result[row];
+                }
             }
             """
-            do { let lib = try device.makeLibrary(source: src, options: nil)
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
                  _gqmmPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4")!)
             } catch { print("[raw-gqmm] compile: \(error)"); return nil }
         }
@@ -403,16 +458,16 @@ public enum RawMetalForward {
         let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_gqmmPipeline!)
-        enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
-        enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3)
+        enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+        enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
         enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
-        var kk = UInt32(K), nn = UInt32(N), g = UInt32(gs)
-        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&g, length: 4, index: 8)
-        let total = Ktop * N, tgw = min(_gqmmPipeline!.maxTotalThreadsPerThreadgroup, 256)
-        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        var kk = Int32(K), nn = Int32(N)
+        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
-        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [Ktop, N])
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: Ktop * N)), [Ktop, N])
     }
 
     /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
