@@ -116,8 +116,21 @@ materialize を消す＝[[pre-attention-predictor]]/[[selective-margin-prefetch]
   escalate が要る([[hotcold-hybrid-gate]]/[[nosync-approx-improve]] の near-lossless 路線)。
 - **含意: 「nl は forward 壁で resident でも頭打ち」(2-3)は sync forward 前提**。no-sync で forward 半減
   ＝resident/covered tier の greedy/nl は **~57 tok/s lossless**(従来 ~20-32 の ~1.7-2.9x)。
-- **未配線**: 本番 decode(`runSuffixSpec`)は C=256 でも sync のまま。resident/covered で no-sync に
-  切替えるのが lever-1 の製品化(次)。memory [[footprint-vs-budget]] の C=128 ~59 tok/s 予測と一致。
+- **本番配線済**: `runSuffixSpec` を **C>=nE(256) で auto pure no-sync**(QWISP_NOSYNC=1/0)。実測 C=256:
+  greedy 56.9 / spec 224(vs sync 196, +14%) 何れも 48/48 lossless。C<256 は従来 sync で無回帰。
+
+### 2-6. escalation(miss 検出→sync 再計算)は cold-start で net 効かず: 実用 no-sync は C=256 のみ
+C<256 で no-sync を安全(exact)化する `countHotMiss` escalation(`nosync-escalate` runner / `runSuffixSpec`
+の QWISP_NOSYNC_MIN opt-in)を検証。**出力は常に bit-exact**(hotMiss>0 token を sync 再計算)だが速度は:
+- **token 粒度 escalation は per-token all-hit≈0 の壁**: 1 token=40 層×top8=最大 320 routes、どれか 1 つ
+  cold で token 全体 sync 化。C=128 で escalation **98%→0.67x**(sync 以下)。[[footprint-vs-budget]] 再確認。
+- `nosync-escalate` runner で C=192 が 0% escalation・1.80x と出たのは **直前の sync-greedy が working set を
+  warm したアーティファクト**。実 decode の cold-start single-pass(`runSuffixSpec` 純 greedy)では C=192 でも
+  **escalation 100%**(frequency hot-pin が trajectory working set を覆えず、warming も収束せず)→ 移動窓+grace
+  の adaptive fallback で sync へ。多トークン verify は working set 過大ゆえ escalation 対象外(必ず損)。
+- ∴ **escalation の greedy 高速化は working set 事前常駐時のみ＝実質 C=256(全常駐)**。C=256 は ~21GB ゆえ
+  24GB+ 機で pure no-sync 可。**16GB(C=128)は exact lossless 高速化は壁**(approximate buddy/margin ~51-58
+  tok/s @ ~98% が別路線 [[nosync-approx-improve]])。production は band off 既定で C=256 pure / 以下 sync。
 
 ---
 
