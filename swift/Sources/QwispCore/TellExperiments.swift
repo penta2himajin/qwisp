@@ -2323,6 +2323,106 @@ extension Tell {
             + "低ければ per-layer fallback 頻発で sync 並みに縮退。"
     }
 
+    /// **[高速化試作] 8GB exact-pipeline: per-layer 予測 prefetch + miss escalation の bit-exact 検証**
+    /// `forwardHiddenPipeline` を実 greedy decode で回し、sync greedy と (1)token 完全一致(bit-exact)、
+    /// (2)tok/s、(3)実 per-layer escalation 率 を比較。直列版ゆえ速度は async 化前の go/no-go 指標
+    /// (escalation 率が低く bit-exact なら async overlap で round-trip 除去の勝算)。
+    /// - env: QWISP_RUN=pipeline-exact / QWISP_CACHE_C(既定64) / QWISP_GEN(既定64) / QWISP_PREDICT_W(既定48) / QWISP_CALIB(48)
+    public static func runPipelineExact(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[PipelineExact] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let predictW = Tell.envInt("QWISP_PREDICT_W", 48)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.captureGateInput = false; StreamingMoEBlock.captureInds = false
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C（warm start）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        // 参照: sync greedy（exact, 先に実行して true token 列を確定）
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            (_, lg) = try model.forwardHidden(u, caches: mc); MLX.eval([lg])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self))
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        // pipeline greedy（per-layer 予測 prefetch + miss escalation）
+        func greedyPipeline() throws -> (toks: [Int], tps: Double, escPerTok: Double) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            let (_, wlg, _) = try model.forwardHiddenPipeline(u, caches: mc, predictW: predictW, isLin: isLin)
+            MLX.eval([wlg])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; var escTot = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let (_, plg, esc) = try model.forwardHiddenPipeline(u, caches: mc, predictW: predictW, isLin: isLin)
+                u = MLX.argMax(plg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self)); escTot += esc
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), Double(escTot) / Double(N))
+        }
+        let sync = try greedySync()
+        let pipe = try greedyPipeline()
+        let match = zip(sync.toks, pipe.toks).filter { $0 == $1 }.count
+        var firstDiv = N; for i in 0 ..< N where sync.toks[i] != pipe.toks[i] { firstDiv = i; break }
+        let speedup = sync.tps > 0 ? pipe.tps / sync.tps : 0
+        let L = model.layerCount
+        let tag = match == N ? "✅ bit-exact(sync と完全一致)"
+            : "❌ \(N - match)/\(N) 不一致(先頭#\(firstDiv))=pipeline バグ(escalation 検出漏れ)"
+        return "[PipelineExact C=\(C), N=\(N), predictW=\(predictW), intra1 signal, 直列(overlap無)] 8GB exact-pipeline\n"
+            + String(format: "  sync     (exact)        : %.1f tok/s\n", sync.tps)
+            + String(format: "  pipeline (予測prefetch) : %.1f tok/s  (escalation %.1f/%d 層=%.0f%%/token)\n",
+                     pipe.tps, pipe.escPerTok, L, pipe.escPerTok / Double(L) * 100)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@\n", speedup, match, N, tag)
+            + "  ※直列版ゆえ予測+ensure コスト込み。escalation 率が低く bit-exact なら async overlap で勝算"
+    }
+
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
     /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
     /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。
