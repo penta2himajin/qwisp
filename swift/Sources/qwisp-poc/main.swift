@@ -42,6 +42,7 @@ if CommandLine.arguments.contains("stream") {
         ("cross-layer-cheap",     { try Tell.runCrossLayerCheap(modelDir: $0, refPath: $1) }),
         ("mtp-spec-verify",       { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) }),
         ("suffix-spec",           { try Tell.runSuffixSpec(modelDir: $0, refPath: $1) }),
+        ("forward-cost",          { try Tell.runForwardCost(modelDir: $0, refPath: $1) }),
         ("pipeline-decode",       { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) }),
         ("predict-fixpoint",      { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) }),
         ("no-sync-gate-escalate", { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) }),

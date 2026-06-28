@@ -1631,6 +1631,72 @@ extension Tell {
             """, depth, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
+    /// forward コストの L 依存ベンチ（streaming-bound vs compute/overhead-bound の切り分け）。
+    /// hot-pin top-C で IO を排除し、teacher-forced で L=1,2,4,8,16,24 の forwardHidden を計時。
+    /// cost(L)≈const(overhead 律速) なら multi-token 安く speculation 有利、cost(L)≈L·cost(1)(compute 律速)
+    /// なら per-token compute 削減(GDN kernel 等)が要。restore で同一 prefill 状態から反復。
+    /// - env: QWISP_RUN=forward-cost / QWISP_CACHE_C / QWISP_FC_REPS(反復,既定20)
+    public static func runForwardCost(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[ForwardCost] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let reps = Tell.envInt("QWISP_FC_REPS", 20)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C で IO 排除（pure compute を測る）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< 48 {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        var lines: [String] = []
+        for L in [1, 2, 4, 8, 16, 24] {
+            let bc = model.makeCaches()
+            _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            let snaps = bc.map { $0.snapshot() }
+            let seq = MLXArray(Array(repeating: Int32(100), count: L), [1, L])   // teacher-forced ダミー
+            // warmup（experts ensure 込み）
+            let (hw, _) = try model.forwardHidden(seq, caches: bc); MLX.eval([hw] + bc.flatMap { $0.stateArrays })
+            for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            var tAcc: UInt64 = 0
+            for _ in 0 ..< reps {
+                let t = now()
+                let (h, _) = try model.forwardHidden(seq, caches: bc)
+                MLX.eval([h] + bc.flatMap { $0.stateArrays })
+                tAcc += now() - t
+                for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }   // 非計時
+            }
+            let ms = Double(tAcc) / Double(reps) / 1e6
+            lines.append(String(format: "L=%2d: %6.2f ms  (%.2f ms/token)", L, ms, ms / Double(L)))
+        }
+        return "[ForwardCost C=\(C), f32-full, hot-pin top-C]\n  " + lines.joined(separator: "\n  ")
+    }
+
     /// **SuffixDecoding draft + clean exact verify（issue #2 軸B, 訓練不要）**
     /// - 機構: prompt+生成履歴の suffix を lookup し、過去に同 suffix の後に続いた token 列を K 個まで
     ///   無料 draft → batched f32-full exact verify で照合 → 一致 prefix を commit。draft cost ~0。
