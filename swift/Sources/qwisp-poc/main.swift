@@ -1,6 +1,12 @@
 import Foundation
 import QwispCore
 
+// issue#5: 1 command buffer に op を多く束ね commit/sync を削減（dispatch 律速の無料 ~4-5%, exact）。
+// 未設定時のみ既定 2000（ユーザ上書き可）。純スケジューリングゆえ数値不変。
+if ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] == nil {
+    setenv("MLX_MAX_OPS_PER_BUFFER", "2000", 1)
+}
+
 print("[qwisp-poc] starting ...")
 print(QwispCore.smoke())
 
