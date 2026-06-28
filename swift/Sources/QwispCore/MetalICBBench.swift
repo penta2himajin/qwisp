@@ -40,7 +40,10 @@ public enum MetalICBBench {
         let pipeline: MTLComputePipelineState
         do {
             let lib = try device.makeLibrary(source: src, options: nil)
-            pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "rmsk")!)
+            let pdesc = MTLComputePipelineDescriptor()
+            pdesc.computeFunction = lib.makeFunction(name: "rmsk")!
+            pdesc.supportIndirectCommandBuffers = true       // ICB に入れるため必須
+            pipeline = try device.makeComputePipelineState(descriptor: pdesc, options: [], reflection: nil)
         } catch { return "ERROR: kernel compile: \(error)" }
 
         // K 個の独立 buffer（各 dispatch が別 buffer を触る=実 forward の依存連鎖を粗く模擬）
@@ -86,27 +89,56 @@ public enum MetalICBBench {
         }
 
         _ = grid
-        // ★macOS では compute の ICB(replay) が unavailable（render ICB のみ）。
-        //   → 「encode once→replay で再 encode を省く」は不可。達成可能なのは「単一 cmd buffer+encoder で
-        //   K dispatch を効率 re-encode」まで。その per-dispatch encode CPU コストを測り MLX と比較する。
         let a = pathReencode()
-        // per-dispatch の encode+launch コスト見積（CPU 時間 / dispatch 数）
-        let cpuMsPerIter = a.ms * a.cpu                          // ≈ CPU 占有 ms/iter
-        let usPerDispatch = cpuMsPerIter * 1000.0 / Double(K)
-        // MLX no-sync forward 実測: ~16ms wall, CPU~1.0 cores, ~200 dispatch/forward(C=256) → ~80us/dispatch 相当
-        let verdict: String
-        if usPerDispatch < 30 {
-            verdict = String(format: "✅ raw-Metal の単一 encoder は %.1f us/dispatch＝MLX(~80us/dispatch 相当)より大幅安。"
-                + "自前 Metal forward に encode-efficiency の headroom あり（replay 無しでも価値）", usPerDispatch)
-        } else if usPerDispatch > 60 {
-            verdict = String(format: "❌ raw でも %.1f us/dispatch＝MLX と同等。encode は本質的に高く headroom 小", usPerDispatch)
-        } else {
-            verdict = String(format: "△ %.1f us/dispatch（MLX ~80 との中間）。実 kernel 規模で再評価", usPerDispatch)
+        // (B) compute ICB に K command を一度 encode → 以降 replay（再 encode 無し）。macOS 11+ で利用可
+        //     (Swift accessor は macOS14 で indirectComputeCommandAt に改名)。
+        let icbDesc = MTLIndirectCommandBufferDescriptor()
+        icbDesc.commandTypes = [.concurrentDispatch]
+        icbDesc.inheritBuffers = false
+        icbDesc.inheritPipelineState = false
+        icbDesc.maxKernelBufferBindCount = 2
+        var bResult: (ms: Double, cpu: Double)? = nil
+        if let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc, maxCommandCount: K, options: []) {
+            for k in 0 ..< K {
+                let c = icb.indirectComputeCommandAt(k)
+                c.setComputePipelineState(pipeline)
+                c.setKernelBuffer(inBufs[k], offset: 0, at: 0)
+                c.setKernelBuffer(outBufs[k], offset: 0, at: 1)
+                c.concurrentDispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            }
+            func replayOnce() -> UInt64 {
+                let t = now()
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                enc.useResources(inBufs, usage: .read)
+                enc.useResources(outBufs, usage: .write)
+                enc.executeCommandsInBuffer(icb, range: 0 ..< K)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                return now() - t
+            }
+            for _ in 0 ..< 3 { _ = replayOnce() }
+            var tAcc: UInt64 = 0; let c0 = cpuNs()
+            for _ in 0 ..< reps { tAcc += replayOnce() }
+            bResult = (Double(tAcc) / Double(reps) / 1e6, Double(cpuNs() - c0) / Double(tAcc))
         }
-        return "[ICB-bench K=\(K) dispatch, rows=\(rows), reps=\(reps)] capture/replay de-risk\n"
-            + "  ※ macOS は compute ICB(replay) 非対応＝literal replay 不可。測るのは単一 encoder の re-encode 効率\n"
-            + String(format: "  (A) 単一 cmd buffer+encoder で K dispatch re-encode: %.3f ms/iter  CPU-busy=%.2f cores\n", a.ms, a.cpu)
-            + String(format: "  → ~%.1f us/dispatch (encode+launch)\n  判定: %@", usPerDispatch, verdict)
+        let aCpuMs = a.ms * a.cpu, aUs = aCpuMs * 1000.0 / Double(K)
+        var out = "[ICB-bench K=\(K) dispatch, rows=\(rows), reps=\(reps)] capture/replay de-risk（macOS）\n"
+            + String(format: "  (A) 単一 encoder で K dispatch re-encode: %.3f ms wall, CPU %.3f ms/iter (~%.1f us/dispatch encode)\n", a.ms, aCpuMs, aUs)
+        if let b = bResult {
+            let bCpuMs = b.ms * b.cpu
+            // ★公平比較は CPU 絶対時間（encode コスト本体）。wall は独立 kernel の GPU 並列で混入するため非代表。
+            let cpuCut = aCpuMs > 0 ? (1 - bCpuMs / aCpuMs) * 100 : 0
+            out += String(format: "  (B) compute ICB replay (再 encode 無): %.3f ms wall, CPU %.3f ms/iter\n", b.ms, bCpuMs)
+            out += String(format: "  → ICB が CPU-encode を %.0f%% 削減（wall は独立 kernel の並列で混入ゆえ非代表）\n", cpuCut)
+            out += abs(cpuCut) < 25
+                ? "  判定: ICB replay は CPU-encode をほぼ削減せず（llama.cpp の null 結果と整合）。replay は本筋でない"
+                : "  判定: ICB が CPU-encode を削減（要追加検証）"
+        } else {
+            out += "  (B) ICB 生成失敗（family 非対応?）\n"
+        }
+        out += String(format: "\n  ★真の lever: raw-Metal encode ~%.1f us/dispatch vs MLX no-sync ~80 us/dispatch 相当(16ms/200) = ~%.0fx\n", aUs, 80.0 / Swift.max(0.1, aUs))
+            + "  → 機構は ICB replay でなく『MLX を迂回する raw-Metal forward(単一 encoder+pipeline cache+residency set)』"
+        return out
     }
 
     static func envInt(_ k: String, _ d: Int) -> Int {
