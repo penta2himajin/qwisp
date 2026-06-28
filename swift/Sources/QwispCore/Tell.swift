@@ -27,7 +27,12 @@ public enum Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[SuffixSpec] skip" }
-        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        // ★ C 既定は device 別自動選択(calibration layer): RAM tier 8→64/16→128/24→192/32+→256。
+        //   QWISP_CACHE_C で明示上書き可。選択構成をログ出力。
+        let C = Tell.envInt("QWISP_CACHE_C", DeviceCalibration.defaultC())
+        if ProcessInfo.processInfo.environment["QWISP_CACHE_C"] == nil {
+            print("[calibration] " + DeviceCalibration.recommend().summary)
+        }
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         // ★ batched f32-full verify が既定(investigate C + batched 再評価で確定):
         //   verify forward の divergent op は attention SDPA(.causal/.none 経路差 ~7e-4)と GDN conv1d のみ。

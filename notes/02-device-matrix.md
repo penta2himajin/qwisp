@@ -68,14 +68,15 @@ C=64→**6.9GB** / C=128→**11.4GB** / C=192→**15.9GB** / C=256(full-resident
 RAM tier は「RSS + macOS/他アプリ headroom(~4-8GB)」で決まる(C=256 を物理 RAM ぎりぎりに置くと memory pressure→
 expert ページ eviction/swap で実質 streaming に転落＝full-resident の利得消失):
 
-| RAM | mode | C(hot-pin) | RSS | headroom | 代表機 |
+★**確定 tier（2026-06-28, calibration layer 採用）: 8GB→C64 / 16GB→C128 / 24GB→C192 / 32GB+→C256(full)**。
+maxK=C×3/8（C64→24, C128→48, C192→72, C256→96）。
+
+| RAM | mode | **C(確定)** | RSS | headroom | 代表機 |
 |---|---|---|---|---|---|
-| **8GB** | **streaming**(expert を pread demand-load) | C≈64 | 6.9GB | ~1GB(厳しい) | Neo, M1–M3 Air, M1/M2 mini, base M3 MBP |
-| 16GB | partial-resident | C≈128 | 11.4GB | ~4.6GB | M4 Air/mini/base MBP |
-| **24GB** | **near-full**(partial, miss 数%) | **C≈192–208** | 15.9–17GB | ~7-8GB | M2/M3 Air 上位, M-Pro entry |
-| 32–36GB | **full-resident** | **C=256** | 20.5GB | ~11GB(快適) | base M5, Pro |
-| 48–64GB+ | full-resident | C=256 | 20.5GB | 余裕大 | Max |
-| 128–512GB | full-resident | C=256 | 20.5GB | 余裕大 | Max/Ultra |
+| **8GB** | **streaming**(expert を pread demand-load) | **64** | 6.9GB | ~1GB(厳しい) | Neo, M1–M3 Air, M1/M2 mini, base M3 MBP |
+| **16GB** | partial-resident | **128** | 11.4GB | ~4.6GB | M4 Air/mini/base MBP |
+| **24GB** | **near-full**(partial, miss 数%) | **192** | 15.9GB | ~8GB | M2/M3 Air 上位, M-Pro entry |
+| **32GB+** | **full-resident** | **256** | 20.5GB | ~11GB+ | base M5, Pro, Max, Ultra |
 
 ★**24GB で C=256(20.5GB)は数値上可だが marginal**: 残り ~3.5GB のみ＝memory pressure リスク。**安全な
 full-resident tier は 32GB から**。24GB は near-full(C≈192-208)が現実解(全 expert の 75-81% 常駐、miss 数%)。
