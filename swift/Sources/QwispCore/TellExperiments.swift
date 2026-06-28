@@ -1486,13 +1486,15 @@ extension Tell {
     }
 
     /// **depth-1 MTP head 投機 + clean exact verify（issue #1 準拠）**
-    /// - 機構: depth-1 MTP head で 1 token draft → SpecK と同じ clean batched `forwardHidden([u,d])`(seqMultiToken)で
-    ///   exact verify → draft==exact なら 2 token commit / 外れは exact 訂正。hot-pin top-C で verify expert を常駐化。
+    /// - 機構: depth-D MTP head で D token draft（EAGLE chain: head の hidden を次 h_prev へ連鎖）→
+    ///   batched f32-full exact verify([u,d0..d_{D-1}])で最長受理 prefix を commit / 外れは exact 訂正。hot-pin top-C。
+    /// - 動機: novel text でも head が model 自身の hidden から予測ゆえ accept が suffix lookup より高い
+    ///   (nl 0.69 vs suffix 0.23)＝high-entropy(自然文)で SuffixSpec が伸びない領域の lever。
     /// - lossless: **strict**（verify が exact ゆえ構成的。vs Swift-exact で確認）
-    /// - 速度: 8GB C=64 目標 ~35-38（draft を MTP head で無料化。律速は seqMT 逐次 verify ~54%）
-    /// - 研究: Speculative Decoding (Leviathan/Chen 2023) + Multi-Token Prediction (DeepSeek-V3; Gloeckle 2024)
-    /// - env: QWISP_RUN=mtp-spec-verify / QWISP_CACHE_C / QWISP_CALIB / QWISP_SWIFT_REF=1 / QWISP_SPECK_PROF
-    /// - 旧名: M4 / M2c。旧実装(MTP×tellForward, accept 0.855/20tok)を issue #1 準拠の clean 版へ置換(git bfa2651,382ccf7=旧)
+    /// - 研究: Speculative Decoding (Leviathan/Chen 2023) + Multi-Token Prediction (DeepSeek-V3; Gloeckle 2024) + EAGLE
+    /// - env: QWISP_RUN=mtp-spec-verify / QWISP_MTP_DEPTH(draft 段数,既定4) / QWISP_CACHE_C / QWISP_CALIB /
+    ///   QWISP_SWIFT_REF=1 / QWISP_SPECK_PROF / QWISP_F32_ATTN・QWISP_F32_CONV(既定1=f32-full verify)
+    /// - 旧名: M4 / M2c。旧 depth-1+seqMT を depth-D+f32-full batched verify へ一般化(2026-06-28)
     public static func runMTPSpecVerify(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
@@ -1551,7 +1553,13 @@ extension Tell {
                 .prefix(C).map { $0.offset }))
         }
 
-        // phase 3: depth-1 MTP draft + clean exact verify（Speculative.swift D1 を streaming に移植）
+        // phase 3: depth-D MTP draft（EAGLE chain: head の hidden x を次 draft の h_prev へ連鎖）
+        //   + batched f32-full exact verify（SuffixSpec と同根, divergent op=attention SDPA+GDN conv1d のみ）。
+        //   novel text でも head が model 自身の hidden から予測ゆえ accept が suffix より高い(nl 0.69 vs 0.23)。
+        let depth = Swift.max(1, Tell.envInt("QWISP_MTP_DEPTH", 4))
+        GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
+        AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
         let mc = model.makeCaches()
         let mtpKV = KVCache()
         let P = ids.dim(-1)
@@ -1561,7 +1569,6 @@ extension Tell {
         var lastH = Hf[0..., (P - 1)...]
         _ = head(Hf[0..., 0 ..< (P - 1)], ids[0..., 1...], cache: mtpKV)
         MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
-        if Tell.envStr("QWISP_BATCHED_VERIFY", "0") != "1" { AttentionLayer.seqMultiToken = true }
         let prof = Tell.envFlag("QWISP_SPECK_PROF")
         var tDraft: UInt64 = 0, tVerify: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -1570,29 +1577,42 @@ extension Tell {
         while out.count < N {
             steps += 1
             var ts = now()
-            let dl = head(lastH, uArr, cache: mtpKV)                       // depth-1 draft（安い）
-            let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
-            let ud = MLX.concatenated([uArr, dArr], axis: 1)              // [1,2]
-            if prof { MLX.eval([ud] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
-            let snaps = mc.map { $0.snapshot() }
-            let (H2, lg2) = try model.forwardHidden(ud, caches: mc)        // ★clean exact verify
-            let vw = MLX.argMax(lg2[0, 0 ..< 2], axis: -1)               // [v, w]
-            let vals = MLX.concatenated([dArr[0], vw]).asArray(Int32.self)
-            let d = Int(vals[0]), v = Int(vals[1])
-            out.append(uArr.item(Int.self))
-            if v == d {                                                   // accept → 2 token
-                acc += 1; out.append(d)
-                _ = head(H2[0..., 0 ..< 1], dArr, cache: mtpKV)           // catch-up
-                uArr = vw[1 ..< 2].reshaped([1, 1]); lastH = H2[0..., 1 ..< 2]
-            } else {                                                      // reject → [u] のみ再投入
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 2) }
-                let (H1, _) = try model.forwardHidden(uArr, caches: mc)
-                uArr = vw[0 ..< 1].reshaped([1, 1]); lastH = H1[0..., 0 ..< 1]
+            // depth-D draft: head を chain（dx を次 h_prev へ）。各 call が mtpKV に 1 entry 追加。
+            var drafts: [MLXArray] = []
+            var hPrev = lastH, tokIn = uArr
+            for _ in 0 ..< depth {
+                let (dl, dx) = head.callWithHidden(hPrev, tokIn, cache: mtpKV)
+                let dArr = MLX.argMax(dl[0..., 0...], axis: -1)            // [1,1]
+                drafts.append(dArr); hPrev = dx; tokIn = dArr
             }
+            let draftToks = MLX.concatenated(drafts, axis: 1)             // [1,depth]
+            let seq = MLX.concatenated([uArr, draftToks], axis: 1)        // [1,depth+1]
+            if prof { MLX.eval([seq] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
+            let snaps = mc.map { $0.snapshot() }
+            let (H, lg) = try model.forwardHidden(seq, caches: mc)        // ★batched f32-full exact verify
+            let evals = MLX.argMax(lg[0, 0 ..< (depth + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            let dArrI = draftToks.asArray(Int32.self).map { Int($0) }
+            var p = 0
+            while p < depth && dArrI[p] == evals[p] { p += 1 }            // 最長受理 prefix
+            out.append(uArr.item(Int.self))
+            for i in 0 ..< p { out.append(dArrI[i]) }
+            acc += p
+            let pCorr = MLXArray([Int32(evals[p])], [1, 1])              // 次トークン(correction or next)
+            if p < depth {                                               // reject: restore → committed 再forward
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: depth + 1) }
+                let commit = p > 0 ? MLX.concatenated([uArr, draftToks[0..., 0 ..< p]], axis: 1) : uArr
+                _ = try model.forwardHidden(commit, caches: mc)
+            }
+            // mtpKV を committed 状態へ: draft entries(depth 本)を trim → 真 hidden で committed(p+1 本)を catch-up
+            mtpKV.trim(depth)
+            let hPrevSeq = p > 0 ? MLX.concatenated([lastH, H[0..., 0 ..< p]], axis: 1) : lastH
+            let commitKV = p > 0 ? MLX.concatenated([uArr, draftToks[0..., 0 ..< p]], axis: 1) : uArr
+            _ = head(hPrevSeq, commitKV, cache: mtpKV)
+            uArr = pCorr; lastH = H[0..., p ..< (p + 1)]
             MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
             if prof { tVerify += now() - ts }
         }
-        StreamingMoEBlock.probeNoSync = false; AttentionLayer.seqMultiToken = false
+        StreamingMoEBlock.probeNoSync = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         let outN = Array(out.prefix(N))
@@ -1603,12 +1623,12 @@ extension Tell {
         if prof {
             let s = Double(steps)
             FileHandle.standardError.write(String(format:
-                "[MTPSpec-PROF/step] draft(MTP head)=%.1f verify(seqMT exact)=%.1f (ms)  steps=%d\n",
-                Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, steps).data(using: .utf8)!)
+                "[MTPSpec-PROF/step] draft(MTP head×%d)=%.1f verify(f32-full batched)=%.1f (ms)  steps=%d\n",
+                depth, Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, steps).data(using: .utf8)!)
         }
         return String(format: """
-            [MTPSpecVerify] depth-1 MTP draft + clean exact verify(C=%d): %.1f tok/s  accept=%.3f  品質(vs Python) %d/%d=%.0f%%%@
-            """, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
+            [MTPSpecVerify] depth-%d MTP draft + batched f32-full verify(C=%d): %.1f tok/s  accept/step=%.3f  品質(vs Python) %d/%d=%.0f%%%@
+            """, depth, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
     }
 
     /// **SuffixDecoding draft + clean exact verify（issue #2 軸B, 訓練不要）**
