@@ -134,12 +134,32 @@ m2(){ QWISP_RUN=cross-layer-predict ... ; }   # 同様
 ### ★ lossless ベースライン: SpecK → SuffixSpec に更新（2026-06-28, commit 658ae3d）
 
 **現在の lossless ベースラインは SuffixSpec（SuffixDecoding draft + clean exact verify, 訓練なし, `QWISP_RUN=suffix-spec`）**:
-- prompt+生成履歴の suffix lookup で draft を**無料生成(0.00ms)** → SpecK の clean exact verify(seqMT)で照合。draft が何でも verify が保証ゆえ lossless。
-- 実測 vs Swift-greedy **全て 100% lossless**: **8GB C=64 = 42-44 / 16GB C=128 = 58 tok/s**（accept/step 3.0-3.13）。SpecK の **1.6-2.1x**。high-entropy long でも greedy 反復を suffix が捕捉。
-- 制約: verify 単一 exact forward は ~5token(maxK=4)が安全上限（arena 容量でなく経路固有、SpecK K≥5 も破綻）。長 draft 解放(verify chunk化)が次の伸び代。
+- prompt+生成履歴の suffix lookup で draft を**無料生成(0.00ms)** → exact verify で照合。draft が何でも verify が保証ゆえ lossless。
 - 経緯: issue#1(depth-1 MTP draft=20tok, 律速は draft でなく verify)・issue#2 A1(batched-lossless f32 verify=順序安定 f32 でも 30%止まり)を反証し、issue#2 軸B(SuffixDecoding)で到達。GitHub issue #1/#2 参照。
 
-**SpecK（旧ベースライン, `QWISP_RUN=spec-verify`, ~27 / C=128 34-36）は SuffixSpec の verify 土台かつ比較基準として有効**。8GB で free-running long-horizon を真に lossless に保つ最小構成（M0/M2/margin/membership は near か低速）。
+**SpecK（旧ベースライン, `QWISP_RUN=spec-verify`, ~27 / C=128 34-36）は比較基準として有効**。
+
+### ★★ verify = batched f32-full に更新＋maxK 上限解放（2026-06-28, commit 677ef28, investigate C）
+
+**旧 maxK=4 上限の真因を解明し撤廃した。** 旧理解「verify forward 全体の bit-exact 化が要る」は半分正しく、**実際は divergent op は 2 つだけ**:
+1. **attention SDPA**: `.causal`(L>1) vs `.none`(L=1) の fused kernel 経路差で f16 ~7e-4 drift。**真因は matmul の L 依存でなく key 数差(verify は draft key も mask 越しに見る)**。micro-test で matmul/RoPE/rmsNorm/softmax/quantized matmul/GDN updateKernel は全て order-stable(rel=0)と確認。
+2. **GDN conv1d**: batched≠逐次の f16 drift。
+
+→ **この 2 op を f32 化(f32-attn + f32-conv = f32-full)するだけで verify forward 全体が逐次 decode と bit-exact**（micro-test: perQueryNone-quant rel=0.000 / ATTN-TTEST f32 1.08e-6）。逐次化(seqMT=層丸ごと per-token / perQueryNone=SDPA のみ per-query)は不要で、**単一 batched forward が provably lossless かつ最速**。既定 ON(`QWISP_F32_ATTN/CONV` 既定1)。
+
+**f16 batched は ~7e-4 drift だが SuffixSpec は reject 自己訂正ゆえ実用上 lossless**（誤受理は draft[i] と真 argmax の precise near-tie のみ・保証なし）。f32-full は near-tie でも bit-exact ゆえ**保証付き**。
+
+**maxK 上限の真因は精度でなく per-layer cache 容量**: D+1 トークン verify で 1 層が同時に要するユニーク expert 数が C 超で wrong-slot=silent garbage(クラッシュせず誤受理→品質崩壊)。実測安全境界 **C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8**。`maxK = min(QWISP_DRAFT_K, C×3/8)` でクランプ(超過時ログ)。
+
+実測 vs Swift-greedy **全て 100% lossless**（mix=反復code / nl=自然文）:
+
+| | 8GB C=64 | 16GB C=128 |
+|---|---|---|
+| mix @maxK16(既定) | 76 tok/s | 114 tok/s |
+| mix @maxK24/48(C 上限) | 88 | 132 |
+| nl(高entropy) | 24 | 29 |
+
+旧 SpecK ~27 比で **mix 最大 3.3-4.9x**。nl は draft が当たらず greedy 近傍(~24-29)＝SuffixDecoding の特性(反復で伸びる)。
 
 ### 読み取り
 
