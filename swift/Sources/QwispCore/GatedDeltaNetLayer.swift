@@ -64,6 +64,50 @@ public struct GatedDeltaNetLayer {
 
     nonisolated(unsafe) public static var fuseGDN = false   // 融合 in_proj 経路を使う
     nonisolated(unsafe) public static var f32Conv = false   // A2: conv1d を f32 で（batched≠逐次 f16 drift を消す）
+    nonisolated(unsafe) public static var fuseRMSGated = false  // issue#5: out-stage RMSNormGated を custom kernel 1 dispatch に融合
+
+    /// issue#5 融合カーネル: RMSNormGated。out-stage の rms_norm(coreOut,w)→silu(z)*normed を 1 dispatch に。
+    /// 行(=B·S·Hv)ごとに D=headVDim 要素を f32 で処理。numerics は元 MLX 経路を踏襲:
+    ///   normed = (coreOut/rms)*w を f16 丸め(元 rmsNorm は coreOut.dtype 出力)→ f32 で silu(z) と積。
+    /// eps/D はこのモデル固定(1e-6 / 128)ゆえカーネル内定数化。出力 dtype は template T。
+    nonisolated(unsafe) static var _rmsGatedKernel: MLXFast.MLXFastKernel?
+    static func rmsNormGatedFused(_ coreOut: MLXArray, _ z: MLXArray, _ weight: MLXArray,
+                                  D: Int, eps: Float, outType: DType) -> MLXArray {
+        let rows = coreOut.size / D
+        let co = coreOut.reshaped([rows, D]), zz = z.reshaped([rows, D])
+        if _rmsGatedKernel == nil {
+            // 行(=B·S·Hv)ごとに 1 threadgroup・D スレッド。各スレッドが 1 要素を担当し、
+            // sum(c^2) を threadgroup 内ツリー reduction → rms → gate。GPU 並列で 4 op を 1 dispatch 化。
+            _rmsGatedKernel = MLXFast.metalKernel(
+                name: "rms_norm_gated",
+                inputNames: ["co", "zz", "w"],
+                outputNames: ["out"],
+                source: """
+                    const uint D = co_shape[1];
+                    uint d = thread_position_in_threadgroup.x;
+                    uint row = thread_position_in_grid.y;
+                    threadgroup float sh[1024];
+                    float c = (float)co[row*D + d];
+                    sh[d] = c * c;
+                    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+                    for (uint s = D >> 1; s > 0; s >>= 1) {
+                        if (d < s) sh[d] += sh[d + s];
+                        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+                    }
+                    float rms = metal::rsqrt(sh[0] / (float)D + 1e-6f);
+                    T normed_t = (T)(c * rms * (float)w[d]);     // 元: rms_norm 出力は coreOut.dtype 丸め
+                    float zv = (float)zz[row*D + d];
+                    float sgate = zv / (1.0f + metal::exp(-zv));
+                    out[row*D + d] = (T)(sgate * (float)normed_t);
+                """)
+        }
+        let r = _rmsGatedKernel!(
+            [co, zz, weight],
+            template: [("T", outType)],
+            grid: (D, rows, 1), threadGroup: (D, 1, 1),
+            outputShapes: [[rows, D]], outputDTypes: [outType])
+        return r[0]
+    }
 
     public init(numKHeads: Int, numVHeads: Int, headKDim: Int, headVDim: Int,
                 convKernel: Int, eps: Float,
@@ -138,9 +182,16 @@ public struct GatedDeltaNetLayer {
         if prof { MLX.eval([coreOut, newState]); StreamingMoEBlock.tGdnKernel += now() - t; t = now() }
 
         // RMSNormGated(out, z): silu(z) * rms_norm(out, normWeight)
-        let normed = MLXFast.rmsNorm(coreOut, weight: normWeight, eps: eps)
-        let gated = silu(z.asType(.float32)) * normed.asType(.float32)
-        let outV = gated.asType(coreOut.dtype).reshaped([B, S, -1])  // [B,S,valueDim]
+        let outV: MLXArray
+        if GatedDeltaNetLayer.fuseRMSGated {                          // issue#5: 1 dispatch 融合カーネル
+            let g = GatedDeltaNetLayer.rmsNormGatedFused(coreOut, z, normWeight,
+                                                         D: headVDim, eps: eps, outType: coreOut.dtype)
+            outV = g.reshaped([B, S, -1])
+        } else {
+            let normed = MLXFast.rmsNorm(coreOut, weight: normWeight, eps: eps)
+            let gated = silu(z.asType(.float32)) * normed.asType(.float32)
+            outV = gated.asType(coreOut.dtype).reshaped([B, S, -1])  // [B,S,valueDim]
+        }
         let out = outProj.apply(outV)
         if prof { MLX.eval(out); StreamingMoEBlock.tGdnOut += now() - t }
         return out
@@ -161,13 +212,16 @@ public enum GatedDeltaNetLayerValidation {
             convKernel: 4, eps: 1e-6,
             inProjQKV: .plain(qkv), inProjZ: .plain(z), inProjB: .plain(pb), inProjA: .plain(pa),
             outProj: .plain(ow), conv1dW: cw, normWeight: nw, aLog: aLog, dtBias: dtBias)
+        let fuseRMS = ProcessInfo.processInfo.environment["QWISP_FUSE_RMS"] == "1"
+        GatedDeltaNetLayer.fuseRMSGated = fuseRMS
+        defer { GatedDeltaNetLayer.fuseRMSGated = false }
         let out = layer(x)
         out.eval()
         let d = MLX.max(MLX.abs(out - expOut)).item(Float.self)
             / (MLX.max(MLX.abs(expOut)).item(Float.self) + 1e-9)
         let ok = d < 1e-3
-        return String(format: "[M2b-1] GatedDeltaNet層 wrapping(qwen3_5): out_rel=%.2e  %@",
-                      d, ok ? "OK ✅ bit一致" : "MISMATCH ❌")
+        return String(format: "[M2b-1] GatedDeltaNet層 wrapping(qwen3_5)%@: out_rel=%.2e  %@",
+                      fuseRMS ? " [fuseRMSGated]" : "", d, ok ? "OK ✅ bit一致" : "MISMATCH ❌")
     }
 }
 

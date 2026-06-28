@@ -1864,7 +1864,8 @@ extension Tell {
             .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
         let tracePath = ProcessInfo.processInfo.environment["QWISP_GPUTRACE"]
         GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
-        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        GatedDeltaNetLayer.fuseRMSGated = Tell.envFlag("QWISP_FUSE_RMS")   // issue#5: RMSNormGated 融合
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; GatedDeltaNetLayer.fuseRMSGated = false }
         let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
         let arena = try ExpertArena(device: device, source: source, N: 64)
