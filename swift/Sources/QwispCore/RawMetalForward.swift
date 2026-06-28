@@ -557,21 +557,23 @@ public enum RawMetalForward {
     /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
     /// q[H,D], K/V[KV,S,D] → out[H,D]。head h は kv=h/(H/KV)。MLXFast.scaledDotProductAttention(f32,.none) と照合。
     static func sdpaDecode(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
-                           H: Int, KV: Int, D: Int, S: Int, scale: Float) -> MLXArray? {
+                           H: Int, KV: Int, D: Int, S: Int, scale: Float, inF32: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         guard D == 256 else { print("[raw-sdpa] D!=256 未対応 D=\(D)"); return nil }
         // ★ MLX sdpa_vector(sdpa_vector.h)逐語移植: BN=32 simdgroup が key を分担, BD=32 lane が head dim
         //   (qk_per_thread=8)。scale は q に適用, fast::exp, simd_sum/simd_max, cross-simdgroup combine。
         //   group=(1024,1,1)=32sg×32lane, grid=(H,1,1)。no mask/causal/sinks, query 非転置。decode L=1。
-        if _sdpaPipeline == nil {
+        //   inF32=true で q/k/v/out を f32（attention f32 cascade: qk-norm 後 f32, values も f32 昇格）。
+        let XT = inF32 ? "float" : "half"
+        if (inF32 ? _sdpaF32Pipeline : _sdpaPipeline) == nil {
             let src = """
             #include <metal_stdlib>
             #include <metal_simdgroup>
             using namespace metal;
-            kernel void sdpa(device const half* queries [[buffer(0)]],   // [H, D]
-                             device const half* keys    [[buffer(1)]],   // [KV, N, D]
-                             device const half* values  [[buffer(2)]],   // [KV, N, D]
-                             device half* out           [[buffer(3)]],   // [H, D]
+            kernel void sdpa(device const \(XT)* queries [[buffer(0)]],   // [H, D]
+                             device const \(XT)* keys    [[buffer(1)]],   // [KV, N, D]
+                             device const \(XT)* values  [[buffer(2)]],   // [KV, N, D]
+                             device \(XT)* out           [[buffer(3)]],   // [H, D]
                              constant int& gqa_factor   [[buffer(4)]],
                              constant int& N            [[buffer(5)]],
                              constant int& k_head_stride[[buffer(6)]],
@@ -633,22 +635,23 @@ public enum RawMetalForward {
                     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = (half)o[i]; }
+                if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = (\(XT))o[i]; }
             }
             """
             do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
-                 _sdpaPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa")!)
+                 let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa")!)
+                 if inF32 { _sdpaF32Pipeline = p } else { _sdpaPipeline = p }
             } catch { print("[raw-sdpa] compile: \(error)"); return nil }
         }
-        guard let bq = q.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bk = k.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bv = v.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
-        let outBuf = device.makeBuffer(length: H * D * 2, options: .storageModeShared)!
+        let dt: DType = inF32 ? .float32 : .float16, elem = inF32 ? 4 : 2
+        guard let bq = q.asType(dt).asMTLBuffer(device: device, noCopy: false),
+              let bk = k.asType(dt).asMTLBuffer(device: device, noCopy: false),
+              let bv = v.asType(dt).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: H * D * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_sdpaPipeline!)
+        enc.setComputePipelineState(inF32 ? _sdpaF32Pipeline! : _sdpaPipeline!)
         enc.setBuffer(bq, offset: 0, index: 0); enc.setBuffer(bk, offset: 0, index: 1)
         enc.setBuffer(bv, offset: 0, index: 2); enc.setBuffer(outBuf, offset: 0, index: 3)
-        // k/v は [KV, S, D] 連続: head_stride=S*D, seq_stride=D。gqa_factor=H/KV。
         var gqa = Int32(H / KV), nn = Int32(S), khs = Int32(S * D), kss = Int32(D), vhs = Int32(S * D), vss = Int32(D), sc = scale
         enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&nn, length: 4, index: 5)
         enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
@@ -656,6 +659,10 @@ public enum RawMetalForward {
         enc.setBytes(&sc, length: 4, index: 10)
         enc.dispatchThreadgroups(MTLSize(width: H, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        if inF32 {
+            let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: H * D)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H * D)), [H, D])
+        }
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: H * D)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H * D)), [H, D])
     }
@@ -705,13 +712,14 @@ public enum RawMetalForward {
 
     /// raw-Metal RoPE(非 traditional/NeoX, partial rotary)。x[rows, HD]、各行 position=offset(decode S=1)。
     /// rotary 部 rd dim を半分ペア(i, i+rd/2)で回転、rd..HD は passthrough。MLXFast.RoPE(traditional:false) 一致。
-    static func rope(_ x: MLXArray, headDim HD: Int, ropeDim rd: Int, base: Float, offset: Int) -> MLXArray? {
+    static func rope(_ x: MLXArray, headDim HD: Int, ropeDim rd: Int, base: Float, offset: Int, xF32: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
-        if _ropePipeline == nil {
+        let XT = xF32 ? "float" : "half"
+        if (xF32 ? _ropeF32Pipeline : _ropePipeline) == nil {
             let src = """
             #include <metal_stdlib>
             using namespace metal;
-            kernel void rope(device const half* x [[buffer(0)]], device half* out [[buffer(1)]],
+            kernel void rope(device const \(XT)* x [[buffer(0)]], device \(XT)* out [[buffer(1)]],
                              constant uint& HD [[buffer(2)]], constant uint& RD [[buffer(3)]],
                              constant float& base [[buffer(4)]], constant float& pos [[buffer(5)]],
                              uint gid [[thread_position_in_grid]]) {
@@ -723,25 +731,32 @@ public enum RawMetalForward {
                 float ang = pos * freq;
                 float c = cos(ang), s = sin(ang);
                 float x0 = (float)x[row*HD + i], x1 = (float)x[row*HD + i + hd2];
-                out[gid] = (half_t)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+                out[gid] = (\(XT))(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
             }
             """
-            do { let lib = try device.makeLibrary(source: src.replacingOccurrences(of: "half_t", with: "half"), options: nil)
-                 _ropePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "rope")!)
+            // ★ RoPE は MLX が fast-math transcendental(sin/cos/exp)＝既定 options(nil)で f16 rel 0(safe だと 2.9e-5)。
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "rope")!)
+                 if xF32 { _ropeF32Pipeline = p } else { _ropePipeline = p }
             } catch { print("[raw-rope] compile: \(error)"); return nil }
         }
         let rows = x.size / HD
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
-        let outBuf = device.makeBuffer(length: rows * HD * 2, options: .storageModeShared)!
+        let dt: DType = xF32 ? .float32 : .float16, elem = xF32 ? 4 : 2
+        guard let bx = x.asType(dt).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: rows * HD * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_ropePipeline!)
+        enc.setComputePipelineState(xF32 ? _ropeF32Pipeline! : _ropePipeline!)
         enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(outBuf, offset: 0, index: 1)
         var h = UInt32(HD), r = UInt32(rd), b = base, p = Float(offset)
         enc.setBytes(&h, length: 4, index: 2); enc.setBytes(&r, length: 4, index: 3)
         enc.setBytes(&b, length: 4, index: 4); enc.setBytes(&p, length: 4, index: 5)
-        let total = rows * HD, tgw = min(_ropePipeline!.maxTotalThreadsPerThreadgroup, 256)
+        let total = rows * HD, tgw = min((xF32 ? _ropeF32Pipeline! : _ropePipeline!).maxTotalThreadsPerThreadgroup, 256)
         enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        if xF32 {
+            let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: total)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [rows, HD])
+        }
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [rows, HD])
     }
@@ -1205,17 +1220,14 @@ public enum RawMetalForward {
         guard let qN = rmsNorm(queries, w.qNorm.asType(wT), eps: eps, D: headDim, promoteF32: promoteF32),
               let kN = rmsNorm(keys.reshaped([numKV, headDim]), w.kNorm.asType(wT), eps: eps, D: headDim, promoteF32: promoteF32)
         else { return nil }
-        // RoPE（offset 0）→ SDPA（S=1）。promoteF32 なら f32 経路（rope/sdpa は MLX で f32, それ以外 raw f16）。
+        // RoPE（offset 0）→ SDPA（S=1）。promoteF32 なら全 raw f32 variant（cascade）。
         let qRot: MLXArray, kRot: MLXArray, attnOut: MLXArray
         if promoteF32 {
-            // f32 cascade: RoPE/SDPA を MLX(f32)で（raw f16 kernel は不適）。raw 化は SE 段で f32 variant を追加予定。
-            let q4 = qN.reshaped([1, numHeads, 1, headDim]).asType(.float32)
-            let k4 = kN.reshaped([1, numKV, 1, headDim]).asType(.float32)
-            qRot = MLXFast.RoPE(q4, dimensions: ropeDim, traditional: false, base: ropeBase, scale: 1.0, offset: 0)
-            kRot = MLXFast.RoPE(k4, dimensions: ropeDim, traditional: false, base: ropeBase, scale: 1.0, offset: 0)
-            let v4 = values.reshaped([1, numKV, 1, headDim]).asType(.float32)
-            attnOut = MLXFast.scaledDotProductAttention(queries: qRot, keys: kRot, values: v4, scale: scale, mask: .none)
-                .reshaped([numHeads, headDim])
+            guard let qr = rope(qN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0, xF32: true),
+                  let kr = rope(kN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0, xF32: true),
+                  let ao = sdpaDecode(qr, kr.reshaped([numKV, 1, headDim]), values.reshaped([numKV, 1, headDim]),
+                                      H: numHeads, KV: numKV, D: headDim, S: 1, scale: scale, inF32: true) else { return nil }
+            qRot = qr; kRot = kr; attnOut = ao
         } else {
             guard let qr = rope(qN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0),
                   let kr = rope(kN, headDim: headDim, ropeDim: ropeDim, base: ropeBase, offset: 0),
