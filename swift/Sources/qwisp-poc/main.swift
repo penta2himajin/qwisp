@@ -48,6 +48,7 @@ if CommandLine.arguments.contains("stream") {
         ("suffix-spec",           { try Tell.runSuffixSpec(modelDir: $0, refPath: $1) }),
         ("forward-cost",          { try Tell.runForwardCost(modelDir: $0, refPath: $1) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
+        ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("pipeline-decode",       { try Tell.runPipelineDecode(modelDir: $0, refPath: $1) }),
         ("predict-fixpoint",      { try Tell.runPredictFixpoint(modelDir: $0, refPath: $1) }),
         ("no-sync-gate-escalate", { try Tell.runNoSyncGateEscalate(modelDir: $0, refPath: $1) }),

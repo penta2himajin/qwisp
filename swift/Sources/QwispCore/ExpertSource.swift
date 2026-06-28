@@ -109,6 +109,19 @@ public final class ExpertSource {
         return ExpertSource.dtype(t.dtype)
     }
 
+    /// expert e の (layer,proj,part) の絶対バイト範囲（shard パス, offset, length）。device probe 用。
+    public func expertByteRange(_ layer: Int, _ proj: String, _ part: String, _ e: Int)
+        throws -> (shardPath: String, offset: Int, length: Int) {
+        let name = key(layer, proj, part)
+        guard let shard = wm[name], let t = try header(shard).meta[name] else {
+            throw NSError(domain: "ExpertSource", code: 2)
+        }
+        let (_, dataStart) = try header(shard)
+        let stride = (t.end - t.begin) / t.shape[0]
+        let offset = dataStart + t.begin + e * stride
+        return (dir.appendingPathComponent(shard).path, offset, stride)
+    }
+
     /// expert e の (layer,proj,part) バイトを buf に直接 pread（arena slot へのゼロコピー書込）。
     public func preadInto(_ buf: UnsafeMutableRawPointer, _ layer: Int, _ proj: String,
                           _ part: String, _ e: Int) throws {
