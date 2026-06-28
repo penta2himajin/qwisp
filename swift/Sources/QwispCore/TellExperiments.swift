@@ -1958,6 +1958,40 @@ extension Tell {
                                 Double(LayerExpertCache.missTotal) / Double(reps) / Double(K),
                                 doTrace ? "  [gputrace→\(tracePath!)]" : ""))
         }
+        // (B) round-trip 除去の天井: sync(probeNoSync=false, 毎層 inds.asArray+ensure) vs
+        //     no-sync(GPU slot-table remap, 毎層 CPU materialize 無し)を同一 resident 状態で A/B。
+        //     hot-pin top-C に routed ⊂ なので no-sync gather は exact 経路と bit 一致のはず（lossless 確認込み）。
+        StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureK = 0
+        StreamingMoEBlock.marginK = 0; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.syncLayers = nil
+        func measureMode(_ noSync: Bool) throws -> (ms: Double, cores: Double, h: MLXArray) {
+            StreamingMoEBlock.probeNoSync = noSync
+            // warmup + 代表 hidden を1本確保（bit 比較用）
+            let (hw, _) = try model.forwardHidden(seq, caches: bcs[0]); MLX.eval([hw])
+            for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            var tAcc: UInt64 = 0
+            let cpu0 = cpuNs()
+            for _ in 0 ..< reps {
+                let t = now()
+                let (h, _) = try model.forwardHidden(seq, caches: bcs[0])
+                MLX.eval([h] + bcs[0].flatMap { $0.stateArrays })
+                tAcc += now() - t
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            }
+            let cores = Double(cpuNs() - cpu0) / Double(tAcc)
+            return (Double(tAcc) / Double(reps) / 1e6, cores, hw)
+        }
+        let mSync = try measureMode(false)
+        let mNo = try measureMode(true)
+        StreamingMoEBlock.probeNoSync = false
+        let maxAbs = MLX.abs(mSync.h - mNo.h).max().item(Float.self)         // lossless 確認(0=bit一致)
+        let speedup = mNo.ms > 0 ? mSync.ms / mNo.ms : 1.0
+        let abLines = String(format:
+            "  sync   (毎層 materialize+ensure): %6.2f ms/forward  CPU-busy=%.2f cores\n  "
+            + "no-sync(GPU slot-table remap)  : %6.2f ms/forward  CPU-busy=%.2f cores\n  "
+            + "→ round-trip 除去 speedup=%.2fx, max|Δhidden|=%.2e (%@)",
+            mSync.ms, mSync.cores, mNo.ms, mNo.cores, speedup, maxAbs,
+            maxAbs < 1e-3 ? "resident で bit一致=lossless" : "差あり(routed が hot-pin 外=要 resident 化)")
         // 二値判定(主=CPU-busy, 副=pipeline ratio):
         //   CPU-busy ≳1.0 → wall を CPU が占有=encode/routing-sync 律速(dispatch 系) → graph-capture/sync削減に価値
         //   CPU-busy ≲0.3 → CPU は GPU 待ちで block=GPU-exec 床 → 50ms は本物の compute 床、graph capture も無駄
@@ -1981,11 +2015,98 @@ extension Tell {
         return "[GpuBusy C=\(C), f32-full, hot-pin top-C, reps=\(reps)] issue#3 §5 dispatch vs exec\n"
             + String(format: "  build-only(eval せず forwardHidden のみ; lazy なら~0 のはず): %.2f ms/forward\n", buildMs)
             + "  (A) 独立 forward パイプライン (per-forward wall + CPU-busy cores):\n  " + lines.joined(separator: "\n  ")
+            + "\n  (B) sync vs no-sync round-trip 除去 A/B (同一 resident):\n" + abLines
             + "\n  判定: " + verdict
             + (tracePath == nil
                 ? "\n  ※ gputrace 裏取り: QWISP_GPUTRACE=/path/x.gputrace を渡す(要 mlx MLX_METAL_DEBUG ビルド)、"
                   + "または Instruments の Metal System Trace で本バイナリの GPU 占有率を直接読む"
                 : "")
+    }
+
+    /// **[高速化] issue#3 lever-1: round-trip 除去で resident greedy を ~2x lossless 化**
+    /// forward-gpu-busy の (B) A/B が「全 expert resident なら no-sync gather は exact 経路と bit 一致で 2x」
+    /// と forward 単位で示した。本 runner はそれを **エンドツーエンドの実 greedy decode** で確認する:
+    /// 同一プロンプトから N トークン greedy を sync / no-sync で各 1 回回し、(1)生成トークン完全一致(lossless)、
+    /// (2)tok/s を比較。C=256(全 expert 常駐)なら gpuSlotTable が全 expert を持ち alias 皆無＝無条件 exact。
+    /// C<256 では routed が cold に当たると slot-0 alias で発散(その divergent token 数も報告)。
+    /// - env: QWISP_RUN=nosync-resident / QWISP_CACHE_C(既定256) / QWISP_GEN(既定64) / QWISP_CALIB(既定48)
+    public static func runNoSyncResident(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[NoSyncResident] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 256)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; StreamingMoEBlock.probeNoSync = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C（C=256 なら全 expert を resident 化）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        var residentExperts = 0
+        for (mi, ec) in model.expertCaches.enumerated() {
+            let pin = Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset })
+            _ = ec.ensure(pin); residentExperts += pin.count
+        }
+        let avgResident = residentExperts / Swift.max(1, nMoE)
+        // greedy 1 run（probeNoSync 指定）。tokens と tok/s を返す。fresh cache（expert 常駐は model 側で持続）。
+        func greedy(_ noSync: Bool) throws -> (toks: [Int], tps: Double) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            // warmup 1（kernel/グラフ確定を計時外に）。snapshot を warmup 前に取り、cache を post-prefill へ巻戻す。
+            StreamingMoEBlock.probeNoSync = noSync
+            let snaps0 = mc.map { $0.snapshot() }
+            let (_, wlg) = try model.forwardHidden(u, caches: mc); MLX.eval([wlg])
+            for (i, c) in mc.enumerated() { c.restore(snaps0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays })
+                toks.append(u.item(Int.self))
+            }
+            StreamingMoEBlock.probeNoSync = false
+            let secs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            return (toks, Double(N) / secs)
+        }
+        let sync = try greedy(false)      // 参照=exact
+        let nosync = try greedy(true)
+        let match = zip(sync.toks, nosync.toks).filter { $0 == $1 }.count
+        // 先頭発散位置（lossless なら N、途中で alias 混入なら < N）
+        var firstDiv = N
+        for i in 0 ..< N where sync.toks[i] != nosync.toks[i] { firstDiv = i; break }
+        let speedup = sync.tps > 0 ? nosync.tps / sync.tps : 0
+        let losslessTag = match == N ? "✅ lossless(完全一致)"
+            : "⚠️ \(N - match)/\(N) 発散(先頭 token#\(firstDiv))=C<256 で routed が cold alias。要 full-resident or 予測"
+        return "[NoSyncResident C=\(C), avg resident=\(avgResident)/256 experts/層, N=\(N), f32-full]"
+            + " issue#3 lever-1 round-trip 除去\n"
+            + String(format: "  sync   (exact, 毎層 materialize+ensure): %.1f tok/s\n", sync.tps)
+            + String(format: "  no-sync(GPU slot-table remap)          : %.1f tok/s\n", nosync.tps)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, losslessTag)
     }
 
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、

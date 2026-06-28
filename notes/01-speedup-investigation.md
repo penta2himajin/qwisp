@@ -98,6 +98,27 @@ materialize を消す＝[[pre-attention-predictor]]/[[selective-margin-prefetch]
 再現: `forward-gpu-busy` probe + `xcrun xctrace record --template 'Metal System Trace'` →
 `tools/gpu_busy_from_trace.py`（手順は同スクリプト docstring）。
 
+### 2-5. lever-1 実証: round-trip 除去(no-sync)で resident greedy ~2x lossless
+2-4 の sync 床に対し、no-sync 経路(GPU slot-table remap, 毎層 CPU materialize/ensure 無し)を
+**全 expert resident で使うと exact 経路と bit 一致のまま 2x**。forward 単位(`forward-gpu-busy` (B)):
+**sync 31.9ms → no-sync 16.1ms = 1.99x, max|Δhidden|=0.0**。エンドツーエンドの実 greedy decode
+(`QWISP_RUN=nosync-resident`, sync/no-sync を各 1 回回し生成 token 比較):
+
+| C (tier) | sync tok/s | no-sync tok/s | speedup | lossless |
+|---|---|---|---|---|
+| 256 (32GB) | 32.7 | 56.7 | **1.73x** | ✅ **無条件**(全 expert 常駐＝alias 不可能) |
+| 128 (16GB) | 29.1 | 57.4 | **1.97x** | ✅ coverage 100% 前提 |
+| 64 (8GB)   | 20.6 | 59.1 | **2.87x** | ✅(本プロンプト, routed⊂hot-pin) |
+
+- no-sync tok/s は **~57-59 で C 非依存**(ensure/IO 消滅で純 compute)。sync は C 減で overhead 増。
+- **C=256 のみ無条件 bit-exact**(slot-table が全 expert を持ち alias 皆無)。C<256 の lossless は
+  coverage 依存(cold routed で slot-0 alias=garbage)→ 保証には miss 検出(`countHotMiss`)で sync
+  escalate が要る([[hotcold-hybrid-gate]]/[[nosync-approx-improve]] の near-lossless 路線)。
+- **含意: 「nl は forward 壁で resident でも頭打ち」(2-3)は sync forward 前提**。no-sync で forward 半減
+  ＝resident/covered tier の greedy/nl は **~57 tok/s lossless**(従来 ~20-32 の ~1.7-2.9x)。
+- **未配線**: 本番 decode(`runSuffixSpec`)は C=256 でも sync のまま。resident/covered で no-sync に
+  切替えるのが lever-1 の製品化(次)。memory [[footprint-vs-budget]] の C=128 ~59 tok/s 予測と一致。
+
 ---
 
 ## 3. 手法比較: SuffixSpec は Pareto 最適（task 別 dispatch 不要）
