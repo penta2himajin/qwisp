@@ -10,6 +10,7 @@ if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
     print(GatedDelta.tConsistencyTest())
     print(AttentionLayer.sConsistencyTest(dtype: .float16))
     print(AttentionLayer.sConsistencyTest(dtype: .float32))
+    // 注: float64 は Metal GPU 非対応（fatal: "float64 is not supported on the GPU"）。f32 が GPU 精度上限。
     exit(0)
 }
 
