@@ -210,6 +210,62 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _conv1dPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _gqmmPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _recurPipeline: MTLComputePipelineState?
+
+    /// raw-Metal GDN recurrent（GatedDelta.stepKernelSource を raw 化, decode T=1）。
+    /// q,k[B,T,Hk,Dk] v[B,T,Hv,Dv] g,beta[B,T,Hv] state[B,Hv,Dv,Dk] → y[B,T,Hv,Dv], state_out。
+    /// 既存の MLXFast.metalKernel 経路と同一 source を constants substitute で raw encoder に統合。
+    static func recurrent(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+                          B: Int, T: Int, Hk: Int, Dk: Int, Hv: Int, Dv: Int) -> (MLXArray, MLXArray)? {
+        guard let (device, queue) = ensure() else { return nil }
+        if _recurPipeline == nil {
+            let body = GatedDelta.stepKernelSource
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            #define InT half
+            #define StT float
+            #define Dk \(Dk)
+            #define Dv \(Dv)
+            #define Hk \(Hk)
+            #define Hv \(Hv)
+            kernel void gated_delta_step(
+                device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                device const half* v [[buffer(2)]], device const float* g [[buffer(3)]],
+                device const float* beta [[buffer(4)]], device const float* state_in [[buffer(5)]],
+                constant int& T [[buffer(6)]], device half* y [[buffer(7)]], device float* state_out [[buffer(8)]],
+                uint3 thread_position_in_grid [[thread_position_in_grid]],
+                uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+                uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
+            \(body)
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 _recurPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gated_delta_step")!)
+            } catch { print("[raw-recur] compile: \(error)"); return nil }
+        }
+        guard let bq = q.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bk = k.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bv = v.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bg = g.asType(.float32).asMTLBuffer(device: device, noCopy: false),
+              let bb = beta.asType(.float32).asMTLBuffer(device: device, noCopy: false),
+              let bs = state.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let yBuf = device.makeBuffer(length: B*T*Hv*Dv*2, options: .storageModeShared)!
+        let soBuf = device.makeBuffer(length: B*Hv*Dv*Dk*4, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_recurPipeline!)
+        enc.setBuffer(bq, offset: 0, index: 0); enc.setBuffer(bk, offset: 0, index: 1); enc.setBuffer(bv, offset: 0, index: 2)
+        enc.setBuffer(bg, offset: 0, index: 3); enc.setBuffer(bb, offset: 0, index: 4); enc.setBuffer(bs, offset: 0, index: 5)
+        var tt = Int32(T); enc.setBytes(&tt, length: 4, index: 6)
+        enc.setBuffer(yBuf, offset: 0, index: 7); enc.setBuffer(soBuf, offset: 0, index: 8)
+        enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: B*Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let yp = yBuf.contents().bindMemory(to: Float16.self, capacity: B*T*Hv*Dv)
+        let y = MLXArray(Array(UnsafeBufferPointer(start: yp, count: B*T*Hv*Dv)), [B, T, Hv, Dv])
+        let sp = soBuf.contents().bindMemory(to: Float.self, capacity: B*Hv*Dv*Dk)
+        let so = MLXArray(Array(UnsafeBufferPointer(start: sp, count: B*Hv*Dv*Dk)), [B, Hv, Dv, Dk])
+        return (y, so)
+    }
 
     /// raw-Metal gather quantized matmul(MoE 核): x[K] を inds[Ktop] が選ぶ各 expert の量子化 weight で matmul。
     /// out[ki,n]=Σ_k x[k]·dequant(wq[e,n,k]), e=inds[ki]。expert オフセットで wq/scales/biases を index。
@@ -571,6 +627,24 @@ public enum RawMetalForward {
                 out += String(format: "\n  gather_qmm:  rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
             } else { out += "\n  gather_qmm: kernel 失敗" }
         } else { out += "\n  gather_qmm: biases nil" }
+        // GDN recurrent(decode T=1): GatedDelta.updateKernel と照合
+        let Bg=1, Tg=1, Hkg=16, Dkg=128, Hvg=32, Dvg=128
+        let qg = MLXRandom.normal([Bg,Tg,Hkg,Dkg]).asType(.float16)
+        let kg = MLXRandom.normal([Bg,Tg,Hkg,Dkg]).asType(.float16)
+        let vg = MLXRandom.normal([Bg,Tg,Hvg,Dvg]).asType(.float16)
+        let ag = MLXRandom.normal([Bg,Tg,Hvg]).asType(.float16)
+        let bg2 = MLXRandom.normal([Bg,Tg,Hvg]).asType(.float16)
+        let aLog = MLXRandom.normal([Hvg]).asType(.float32)
+        let dtB = MLXRandom.normal([Hvg]).asType(.float32)
+        let stg = MLXRandom.normal([Bg,Hvg,Dvg,Dkg]).asType(.float32)
+        let (refY, _) = GatedDelta.updateKernel(qg, kg, vg, ag, bg2, aLog, dtB, state: stg); refY.eval()
+        let betaR = MLX.sigmoid(bg2), gR = GatedDelta.computeG(aLog, ag, dtB)
+        MLX.eval([betaR, gR])
+        if let (y, _) = recurrent(qg, kg, vg, g: gR, beta: betaR, state: stg, B: Bg, T: Tg, Hk: Hkg, Dk: Dkg, Hv: Hvg, Dv: Dvg) {
+            y.eval()
+            let rel = relErr(y, refY)
+            out += String(format: "\n  GDN recurrent:rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
+        } else { out += "\n  GDN recurrent: kernel 失敗" }
         return out
     }
 
