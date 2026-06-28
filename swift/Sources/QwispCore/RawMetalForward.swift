@@ -169,23 +169,28 @@ public enum RawMetalForward {
     }
 
     nonisolated(unsafe) static var _rmsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _rmsPipelineF32: MTLComputePipelineState?
     nonisolated(unsafe) static var _softmaxPipeline: MTLComputePipelineState?
 
     /// raw-Metal rmsNorm: ★ MLX rms_single_row(backend/metal/kernels/rms_norm.metal)を逐語移植し bit-exact。
     /// 要点: N_READS=4(thread が連続4要素), acc は f32 で xi*xi, simd_sum 二段, precise::rsqrt,
     /// 出力は w[i]*(half)(x[i]*inv_mean)（w 乗算は normed を half 化した後）。weight=nil は ones(no-weight 相当)。
     /// D≤4096 前提(RMS_LOOPED_LIMIT)。本モデルの D∈{128,2048} は全て single_row。
-    static func rmsNorm(_ x: MLXArray, _ weight: MLXArray?, eps: Float, D: Int) -> MLXArray? {
+    /// promoteF32: MLX の dtype promotion を再現。weight が f32 のとき MLX は out を f32 に昇格し
+    /// normed を f16 に丸めず f32 で計算する（RMSNormGated の normWeight=f32 経路）。false は全 f16(qk-norm)。
+    static func rmsNorm(_ x: MLXArray, _ weight: MLXArray?, eps: Float, D: Int, promoteF32: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         guard D <= 4096 else { print("[raw-rms] D>4096(looped)未対応 D=\(D)"); return nil }
-        if _rmsPipeline == nil {
+        let pipe = promoteF32 ? _rmsPipelineF32 : _rmsPipeline
+        if pipe == nil {
+            let WT = promoteF32 ? "float" : "half"   // weight/out 型（MLX promotion 再現）
             let src = """
             #include <metal_stdlib>
             #include <metal_simdgroup>
             using namespace metal;
             kernel void rmsnorm(device const half* x   [[buffer(0)]],
-                                device const half* w   [[buffer(1)]],
-                                device half* out       [[buffer(2)]],
+                                device const \(WT)* w  [[buffer(1)]],
+                                device \(WT)* out      [[buffer(2)]],
                                 constant float& eps    [[buffer(3)]],
                                 constant uint& axis_size [[buffer(4)]],
                                 constant uint& w_stride  [[buffer(5)]],
@@ -217,32 +222,39 @@ public enum RawMetalForward {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 out += gid * (size_t)axis_size + lid * N_READS;
                 if (lid * N_READS + N_READS <= axis_size) {
-                    for (int i = 0; i < N_READS; i++) out[i] = w[w_stride*i] * (half)(x[i] * local_inv_mean[0]);
+                    for (int i = 0; i < N_READS; i++) out[i] = w[w_stride*i] * (\(WT))(x[i] * local_inv_mean[0]);
                 } else {
-                    for (int i = 0; i < N_READS; i++) { if ((lid*N_READS+i) < axis_size) out[i] = w[w_stride*i] * (half)(x[i]*local_inv_mean[0]); }
+                    for (int i = 0; i < N_READS; i++) { if ((lid*N_READS+i) < axis_size) out[i] = w[w_stride*i] * (\(WT))(x[i]*local_inv_mean[0]); }
                 }
             }
             """
             do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
-                 _rmsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "rmsnorm")!)
+                 let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "rmsnorm")!)
+                 if promoteF32 { _rmsPipelineF32 = p } else { _rmsPipeline = p }
             } catch { print("[raw-rms] compile: \(error)"); return nil }
         }
         let rows = x.size / D
+        let wType: DType = promoteF32 ? .float32 : .float16
+        let elemSize = promoteF32 ? 4 : 2
         guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
         // weight=nil は ones[D](w_stride=1)。MLX も no-weight 時 ones を渡す挙動と一致。
-        let wArr = (weight?.asType(.float16) ?? MLXArray.ones([D], dtype: .float16))
+        let wArr = (weight?.asType(wType) ?? MLXArray.ones([D], dtype: wType))
         guard let bw = wArr.asMTLBuffer(device: device, noCopy: false) else { return nil }
-        let outBuf = device.makeBuffer(length: rows * D * 2, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: rows * D * elemSize, options: .storageModeShared)!
         // threadgroup_size = ceil(D/N_READS) を simd(32) 倍数に切上げ（MLX dispatch と一致）。
         let tgNeeded = (D + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_rmsPipeline!)
+        enc.setComputePipelineState(promoteF32 ? _rmsPipelineF32! : _rmsPipeline!)
         enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
         var ee = eps, asz = UInt32(D), ws = UInt32(1)
         enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        if promoteF32 {
+            let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: rows * D)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: rows * D)), [rows, D])
+        }
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: rows * D)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: rows * D)), [rows, D])
     }
@@ -683,9 +695,10 @@ public enum RawMetalForward {
         guard let (coreOut, _) = recurrent(qN, kN, v1, g: g, beta: beta, state: st,
                                            B: 1, T: 1, Hk: numKHeads, Dk: headKDim,
                                            Hv: numVHeads, Dv: headVDim) else { return nil }
-        // ⑥ RMSNormGated: silu(z) * rmsNorm(coreOut, normWeight)
+        // ⑥ RMSNormGated: silu(z) * rmsNorm(coreOut, normWeight)。
+        //   normWeight=f32 → MLX は out を f32 に昇格(normed を f16 に丸めない)。promoteF32 で再現。
         guard let normed = rmsNorm(coreOut.reshaped([numVHeads, headVDim]), w.normWeight,
-                                   eps: eps, D: headVDim) else { return nil }
+                                   eps: eps, D: headVDim, promoteF32: true) else { return nil }
         let zr = z.reshaped([numVHeads, headVDim])
         let gated = (silu(zr.asType(.float32)) * normed.asType(.float32)).asType(.float16)
         let outV = gated.reshaped([1, valueDim])
@@ -726,7 +739,7 @@ public enum RawMetalForward {
             bWq: bWq, bSc: bSc, bBi: bBi, aWq: aWq, aSc: aSc, aBi: aBi,
             outWq: outWq, outSc: outSc, outBi: outBi,
             conv1dW: cw.reshaped([convDim, 4]).asType(.float32),   // [convDim,K,1] → [convDim,K]、f32(MLX f32Conv 一致)
-            normWeight: nw.asType(.float16), aLog: aLog, dtBias: dtBias)
+            normWeight: nw.asType(.float32), aLog: aLog, dtBias: dtBias)   // f32(MLX promotion 再現)
         // MLX 参照（同一量子化重み, f32Conv=true で raw の f32 累積に一致, fuse=off）
         let prevF32 = GatedDeltaNetLayer.f32Conv
         GatedDeltaNetLayer.f32Conv = true
@@ -755,7 +768,7 @@ public enum RawMetalForward {
         }
         // per-stage 診断: 各段で raw 中間値 vs MLX 中間値の rel（誤差が compound か構造バグか）
         out += "\n  ── per-stage 診断（各段 raw vs MLX, 同入力・同重み）──"
-        let keyDim = 2048, nKH = 16, hKD = 128, cK = 4
+        let keyDim = 2048, nKH = 16, hKD = 128, cK = 4, nVH = 32, hVD = 128
         let x2 = x.reshaped([1, H])
         // ① in_proj qkv
         let mlxQkv = MLX.quantizedMatmul(x2, qkvWq, scales: qkvSc, biases: qkvBi, transpose: true,
@@ -788,6 +801,32 @@ public enum RawMetalForward {
         let rawQN = (invS * invS) * rmsNorm(rq1, nil, eps: 1e-6, D: hKD)!
         let rawKN = invS * rmsNorm(rk1, nil, eps: 1e-6, D: hKD)!
         out += String(format: "\n   ③ qN/kN:         rel=%.3e / %.3e", relErr(rawQN, mlxQN), relErr(rawKN, mlxKN))
+        // ④ recurrent（coreOut）。a/b 投影＋g/beta、state=zeros。両 path とも同じ qN/kN/v1。
+        let valueDim = 4096
+        let mlxV = mlxCo[(2*keyDim)...].reshaped([1, 1, nVH, hVD])
+        let rawV = rawCo[(2*keyDim)...].reshaped([1, 1, nVH, hVD])
+        let mlxA = MLX.quantizedMatmul(x2, aWq, scales: aSc, biases: aBi, transpose: true, groupSize: 64, bits: 4, mode: .affine).reshaped([1,1,nVH])
+        let mlxB = MLX.quantizedMatmul(x2, bWq, scales: bSc, biases: bBi, transpose: true, groupSize: 64, bits: 4, mode: .affine).reshaped([1,1,nVH])
+        let rawA = qmm(x2, aWq, scales: aSc, biases: aBi, M: 1, K: qkvW.dim(-1), N: nVH)!.reshaped([1,1,nVH])
+        let rawB = qmm(x2, bWq, scales: bSc, biases: bBi, M: 1, K: qkvW.dim(-1), N: nVH)!.reshaped([1,1,nVH])
+        let st0 = MLXArray.zeros([1, nVH, hVD, hKD], dtype: .float32)
+        let (mlxCore, _) = GatedDelta.updateKernel(mlxQN.reshaped([1,1,nKH,hKD]), mlxKN.reshaped([1,1,nKH,hKD]), mlxV, mlxA, mlxB, aLog, dtBias, state: st0)
+        let rg = GatedDelta.computeG(aLog, rawA, dtBias), rbeta = MLX.sigmoid(rawB)
+        let (rawCore, _) = recurrent(rawQN.reshaped([1,1,nKH,hKD]), rawKN.reshaped([1,1,nKH,hKD]), rawV, g: rg, beta: rbeta, state: st0, B: 1, T: 1, Hk: nKH, Dk: hKD, Hv: nVH, Dv: hVD)!
+        mlxCore.eval(); rawCore.eval()
+        out += String(format: "\n   ④ coreOut:       rel=%.3e", relErr(rawCore, mlxCore))
+        // ⑤ RMSNormGated（outV）。silu(z)*rmsNorm(core,normW)。
+        let mlxZ = MLX.quantizedMatmul(x2, zWq, scales: zSc, biases: zBi, transpose: true, groupSize: 64, bits: 4, mode: .affine).reshaped([nVH, hVD])
+        let rawZ = qmm(x2, zWq, scales: zSc, biases: zBi, M: 1, K: qkvW.dim(-1), N: valueDim)!.reshaped([nVH, hVD])
+        let mlxNormed = MLXFast.rmsNorm(mlxCore.reshaped([nVH,hVD]), weight: nw.asType(.float32), eps: 1e-6)  // refLayer 同様 f32 nw
+        let mlxOutV = (silu(mlxZ.asType(.float32)) * mlxNormed.asType(.float32)).asType(.float16).reshaped([1, valueDim])
+        let rawNormed = rmsNorm(rawCore.reshaped([nVH,hVD]), nw.asType(.float32), eps: 1e-6, D: hVD, promoteF32: true)!
+        let rawOutV = (silu(rawZ.asType(.float32)) * rawNormed.asType(.float32)).asType(.float16).reshaped([1, valueDim])
+        out += String(format: "\n   ⑤ outV(gated):   rel=%.3e", relErr(rawOutV, mlxOutV))
+        // ⑥ out_proj
+        let mlxOut = MLX.quantizedMatmul(mlxOutV, outWq, scales: outSc, biases: outBi, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+        let rawOut = qmm(rawOutV, outWq, scales: outSc, biases: outBi, M: 1, K: valueDim, N: qkvW.dim(-1))!
+        out += String(format: "\n   ⑥ out(out_proj): rel=%.3e", relErr(rawOut, mlxOut))
         return out
     }
 
