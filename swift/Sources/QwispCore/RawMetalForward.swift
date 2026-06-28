@@ -10,6 +10,9 @@ import MLXRandom
 /// 照合（最難関の format + MLX weight buffer 共有 を検証）。
 public enum RawMetalForward {
     nonisolated(unsafe) static var _qmmPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _qmmF32Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _ropeF32Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sdpaF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _device: MTLDevice?
     nonisolated(unsafe) static var _queue: MTLCommandQueue?
 
@@ -32,34 +35,32 @@ public enum RawMetalForward {
     /// dequant: w[n,k] = scales[n, k/gs]·nibble + biases[n, k/gs]、nibble=低位から 8 個/uint32。
     /// MLX weight buffer(wq/scales/biases)を asMTLBuffer(noCopy)で共有して読む。
     static func qmm(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray,
-                    M: Int, K: Int, N: Int, bits: Int = 4, gs: Int = 64) -> MLXArray? {
+                    M: Int, K: Int, N: Int, bits: Int = 4, gs: Int = 64, xF32: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         // ★ MLX の quantizedMatmul(qmv_fast) を数式・累積順・simd_sum まで完全一致で移植（rel 0.000e0 が目標）。
-        //   raw-Metal forward の目的は MLX の per-dispatch C++ overhead 回避であり、GPU kernel 自体は MLX と
-        //   同一にする（= bit-exact かつ同速）。bits=4/gs=64/half に特化。fast 条件 N%8==0 && K%512==0。
-        //   MLX: backend/metal/kernels/quantized.h qmv_fast_impl/qdot/load_vector を逐語移植。
+        //   bits=4/gs=64。fast 条件 N%8==0 && K%512==0。xF32=true で x/scales/biases/out を f32（attention f32 cascade,
+        //   o_proj の入力が f32 になる経路。MLX も x f32 時は scales を f32 にして qmv_fast<float> を回す）。
         let fast = (N % 8 == 0) && (K % 512 == 0) && bits == 4 && gs == 64
         guard fast else { print("[raw-qmm] 非fast (N=\(N) K=\(K) bits=\(bits) gs=\(gs)) 未対応"); return nil }
-        if _qmmPipeline == nil {
+        let XT = xF32 ? "float" : "half"
+        let needCompile = xF32 ? (_qmmF32Pipeline == nil) : (_qmmPipeline == nil)
+        if needCompile {
             let src = """
             #include <metal_stdlib>
             using namespace metal;
             #define SIMD_SIZE 32
-            // MLX load_vector<bits=4>: x を 16^j で事前除算（qdot で packed nibble の bit-shift と相殺）。sum=Σx。
-            // ★ MLX 厳密一致の要点: sum の 4 要素加算は half 演算（x は half）→ float の sum に昇格。
-            //   各要素を先に float 化して足すと丸めが変わり非 bit-exact になる（ここが残差源だった）。
-            inline float ld16(const device half* x, thread float* xt) {
+            // MLX load_vector<bits=4>: x を 16^j で事前除算。sum の 4 要素加算は T 演算（XT, MLX と一致）→ float 昇格。
+            inline float ld16(const device \(XT)* x, thread float* xt) {
                 float sum = 0.0f;
                 for (int i = 0; i < 16; i += 4) {
-                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];   // half 加算 → float（MLX と一致）
-                    xt[i]   = x[i];                            // half→float 厳密変換
-                    xt[i+1] = x[i+1] / 16.0f;                  // half/float → float
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i]   = x[i];
+                    xt[i+1] = x[i+1] / 16.0f;
                     xt[i+2] = x[i+2] / 256.0f;
                     xt[i+3] = x[i+3] / 4096.0f;
                 }
                 return sum;
             }
-            // MLX qdot<bits=4>: ws を uint16 として 4 nibble 同時、accum=Σ xt·(nibble<<4j)。返り scale*accum+sum*bias。
             inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
                 float accum = 0.0f;
                 const device uint16_t* ws = (const device uint16_t*)w;
@@ -71,12 +72,11 @@ public enum RawMetalForward {
                 }
                 return scale * accum + sum * bias;
             }
-            // MLX qmv_fast_impl<half, gs=64, bits=4>: packs_per_thread=2 vpt=16 block=512 2sg×4row。
             kernel void qmm4(device const uint32_t* w      [[buffer(0)]],
-                             device const half*     scales [[buffer(1)]],
-                             device const half*     biases [[buffer(2)]],
-                             device const half*     x      [[buffer(3)]],
-                             device half*           y      [[buffer(4)]],
+                             device const \(XT)*    scales [[buffer(1)]],
+                             device const \(XT)*    biases [[buffer(2)]],
+                             device const \(XT)*    x      [[buffer(3)]],
+                             device \(XT)*          y      [[buffer(4)]],
                              constant int&          in_vec_size  [[buffer(5)]],   // K
                              constant int&          out_vec_size [[buffer(6)]],   // N
                              uint3 tid      [[threadgroup_position_in_grid]],
@@ -106,8 +106,8 @@ public enum RawMetalForward {
                     U sum = ld16(x, x_thread);
                     for (int row = 0; row < results_per_simdgroup; row++) {
                         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                        const device half* sl = scales + row * in_vec_size_g;
-                        const device half* bl = biases + row * in_vec_size_g;
+                        const device \(XT)* sl = scales + row * in_vec_size_g;
+                        const device \(XT)* bl = biases + row * in_vec_size_g;
                         U s = sl[0]; U b = bl[0];
                         result[row] += qd4(wl, x_thread, s, b, sum);
                     }
@@ -118,7 +118,7 @@ public enum RawMetalForward {
                 }
                 for (int row = 0; row < results_per_simdgroup; row++) {
                     result[row] = simd_sum(result[row]);
-                    if (simd_lid == 0) y[row] = (half)result[row];
+                    if (simd_lid == 0) y[row] = (\(XT))result[row];
                 }
             }
             """
@@ -137,19 +137,21 @@ public enum RawMetalForward {
                     opts.fastMathEnabled = (mathSel == "fast")
                 }
                 let lib = try device.makeLibrary(source: src, options: opts)
-                _qmmPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4")!)
+                let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4")!)
+                if xF32 { _qmmF32Pipeline = p } else { _qmmPipeline = p }
             } catch { print("[raw-qmm] compile error: \(error)"); return nil }
         }
-        // MLX weight を MTLBuffer 共有（noCopy）。x も同様。out は新規。バッファ順は MLX kernel に合わせ w,scales,biases,x,y。
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+        let dt: DType = xF32 ? .float32 : .float16
+        let elem = xF32 ? 4 : 2
+        guard let bx = x.asType(dt).asMTLBuffer(device: device, noCopy: false),
               let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+              let bsc = scales.asType(dt).asMTLBuffer(device: device, noCopy: false),
+              let bbi = biases.asType(dt).asMTLBuffer(device: device, noCopy: false)
         else { return nil }
-        let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: M * N * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_qmmPipeline!)
+        enc.setComputePipelineState(xF32 ? _qmmF32Pipeline! : _qmmPipeline!)
         enc.setBuffer(bwq, offset: 0, index: 0)
         enc.setBuffer(bsc, offset: 0, index: 1)
         enc.setBuffer(bbi, offset: 0, index: 2)
@@ -158,14 +160,15 @@ public enum RawMetalForward {
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5)
         enc.setBytes(&nn, length: 4, index: 6)
-        // grid=(M, N/8, 1), group=(32,2,1) ＝ MLX qmv の dispatch と一致。
         enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        // MTLBuffer → MLXArray（f16, [M,N]）
+        if xF32 {
+            let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: M * N)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+        }
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
-        let arr = Array(UnsafeBufferPointer(start: ptr, count: M * N))
-        return MLXArray(arr, [M, N])
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
     }
 
     nonisolated(unsafe) static var _rmsPipeline: MTLComputePipelineState?
@@ -1220,9 +1223,16 @@ public enum RawMetalForward {
                                       H: numHeads, KV: numKV, D: headDim, S: 1, scale: scale) else { return nil }
             qRot = qr; kRot = kr; attnOut = ao
         }
-        let outR = attnOut.reshaped([1, numHeads * headDim]).asType(.float16)
-        let gated = (outR.asType(.float32) * MLX.sigmoid(gate.asType(.float32))).asType(.float16)  // out*sigmoid(gate)
-        return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H)
+        // gated = output * sigmoid(gate)。promoteF32 では output f32・sigmoid(gate) は f16(MLX 一致)→ gated f32、o_proj は f32 qmm。
+        if promoteF32 {
+            let outR = attnOut.reshaped([1, numHeads * headDim])                       // f32（SDPA f32 出力）
+            let gated = outR.asType(.float32) * MLX.sigmoid(gate)                       // f32 * sigmoid(gate_f16) → f32
+            return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H, xF32: true)
+        } else {
+            let outR = attnOut.reshaped([1, numHeads * headDim]).asType(.float16)
+            let gated = (outR.asType(.float32) * MLX.sigmoid(gate.asType(.float32))).asType(.float16)
+            return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H)
+        }
     }
 
     /// 検証: attention 1 層 raw assembly vs MLX AttentionLayer（同量子化, decode S=1）。
