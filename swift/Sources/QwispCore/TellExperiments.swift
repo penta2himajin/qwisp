@@ -1557,6 +1557,7 @@ extension Tell {
         //   + batched f32-full exact verify（SuffixSpec と同根, divergent op=attention SDPA+GDN conv1d のみ）。
         //   novel text でも head が model 自身の hidden から予測ゆえ accept が suffix より高い(nl 0.69 vs 0.23)。
         let depth = Swift.max(1, Tell.envInt("QWISP_MTP_DEPTH", 4))
+        let gate = Tell.envFloat("QWISP_MTP_GATE", 0)   // >0: head top1prob<gate で draft 打ち切り(AdaEDL 式)
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
         AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
         defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
@@ -1578,33 +1579,49 @@ extension Tell {
             steps += 1
             var ts = now()
             // depth-D draft: head を chain（dx を次 h_prev へ）。各 call が mtpKV に 1 entry 追加。
+            // gate>0: head top1prob<gate で打ち切り（hard token で無駄 draft node を払わない）。
             var drafts: [MLXArray] = []
             var hPrev = lastH, tokIn = uArr
             for _ in 0 ..< depth {
                 let (dl, dx) = head.callWithHidden(hPrev, tokIn, cache: mtpKV)
+                if gate > 0 {
+                    let pc = MLX.max(MLX.softmax(dl[0, 0].asType(.float32), axis: -1)).item(Float.self)
+                    if pc < gate { mtpKV.trim(1); break }                 // 低信頼 → この draft を捨て打ち切り
+                }
                 let dArr = MLX.argMax(dl[0..., 0...], axis: -1)            // [1,1]
                 drafts.append(dArr); hPrev = dx; tokIn = dArr
             }
-            let draftToks = MLX.concatenated(drafts, axis: 1)             // [1,depth]
-            let seq = MLX.concatenated([uArr, draftToks], axis: 1)        // [1,depth+1]
+            let D = drafts.count
+            if D == 0 {                                                   // draft 無し → 通常 greedy 1 step
+                let (H1, lg1) = try model.forwardHidden(uArr, caches: mc)
+                let nxt = MLX.argMax(lg1[0, 0], axis: -1).item(Int.self)
+                out.append(uArr.item(Int.self))
+                _ = head(lastH, uArr, cache: mtpKV)                       // mtpKV catch-up（uArr entry）
+                uArr = MLXArray([Int32(nxt)], [1, 1]); lastH = H1[0..., 0 ..< 1]
+                MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
+                if prof { tVerify += now() - ts }
+                continue
+            }
+            let draftToks = MLX.concatenated(drafts, axis: 1)             // [1,D]
+            let seq = MLX.concatenated([uArr, draftToks], axis: 1)        // [1,D+1]
             if prof { MLX.eval([seq] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
             let snaps = mc.map { $0.snapshot() }
             let (H, lg) = try model.forwardHidden(seq, caches: mc)        // ★batched f32-full exact verify
-            let evals = MLX.argMax(lg[0, 0 ..< (depth + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            let evals = MLX.argMax(lg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             let dArrI = draftToks.asArray(Int32.self).map { Int($0) }
             var p = 0
-            while p < depth && dArrI[p] == evals[p] { p += 1 }            // 最長受理 prefix
+            while p < D && dArrI[p] == evals[p] { p += 1 }                // 最長受理 prefix
             out.append(uArr.item(Int.self))
             for i in 0 ..< p { out.append(dArrI[i]) }
             acc += p
             let pCorr = MLXArray([Int32(evals[p])], [1, 1])              // 次トークン(correction or next)
-            if p < depth {                                               // reject: restore → committed 再forward
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: depth + 1) }
+            if p < D {                                                   // reject: restore → committed 再forward
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
                 let commit = p > 0 ? MLX.concatenated([uArr, draftToks[0..., 0 ..< p]], axis: 1) : uArr
                 _ = try model.forwardHidden(commit, caches: mc)
             }
-            // mtpKV を committed 状態へ: draft entries(depth 本)を trim → 真 hidden で committed(p+1 本)を catch-up
-            mtpKV.trim(depth)
+            // mtpKV を committed 状態へ: draft entries(D 本)を trim → 真 hidden で committed(p+1 本)を catch-up
+            mtpKV.trim(D)
             let hPrevSeq = p > 0 ? MLX.concatenated([lastH, H[0..., 0 ..< p]], axis: 1) : lastH
             let commitKV = p > 0 ? MLX.concatenated([uArr, draftToks[0..., 0 ..< p]], axis: 1) : uArr
             _ = head(hPrevSeq, commitKV, cache: mtpKV)
@@ -1629,6 +1646,104 @@ extension Tell {
         return String(format: """
             [MTPSpecVerify] depth-%d MTP draft + batched f32-full verify(C=%d): %.1f tok/s  accept/step=%.3f  品質(vs Python) %d/%d=%.0f%%%@
             """, depth, C, Double(N) / secs, Double(acc) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag)
+    }
+
+    /// pre-flight: MTP head draft 品質計測（narrow tree draft 着手判断, EAGLE-2 前提検証）。
+    /// true greedy 列を teacher-force し各 position で head の top-K を取り:
+    ///  (a) top-1..K coverage(=true next が top-k に入る率=width-k tree の accept 天井)
+    ///  (b) confidence(top-1 prob)と accept@1 の相関(EAGLE-2 tree-value 機構=confidence で expand の前提)。
+    /// top-K が top-1 を大きく超えれば narrow tree が効く / confidence が accept と単調なら tree-value 可。
+    /// - env: QWISP_RUN=mtp-draft-calib / QWISP_CACHE_C / QWISP_CALIB / QWISP_GEN
+    public static func runMTPDraftCalib(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MTPDraftCalib] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let head = try MTPHead(modelDir: modelDir, store: store)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 64), gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        let K = 4
+
+        // calib + hot-pin
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+
+        // teacher-forced greedy + head top-K 計測
+        let mc = model.makeCaches()
+        let mtpKV = KVCache()
+        let P = ids.dim(-1)
+        let (Hf, lgf) = try model.prefillChunked(ids, caches: mc)
+        var uArr = MLX.argMax(lgf[0..., (lgf.dim(1) - 1)...], axis: -1)
+        var lastH = Hf[0..., (P - 1)...]
+        _ = head(Hf[0..., 0 ..< (P - 1)], ids[0..., 1...], cache: mtpKV)
+        MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
+
+        var covK = [Int](repeating: 0, count: K)
+        let edges: [Float] = [0.0, 0.5, 0.7, 0.85, 0.95, 1.01]
+        var binTot = [Int](repeating: 0, count: edges.count - 1)
+        var binAcc = [Int](repeating: 0, count: edges.count - 1)
+        var steps = 0
+        for _ in 0 ..< N {
+            let dl = head(lastH, uArr, cache: mtpKV)                       // [1,1,V]
+            let logitsArr = dl[0, 0].asType(.float32).asArray(Float.self)  // [V] CPU
+            // top-K（K 小ゆえ K パス選択）
+            var topk: [Int] = []; var used = Set<Int>()
+            for _ in 0 ..< K {
+                var best = -1; var bestV = -Float.greatestFiniteMagnitude
+                for i in 0 ..< logitsArr.count where !used.contains(i) {
+                    if logitsArr[i] > bestV { bestV = logitsArr[i]; best = i }
+                }
+                topk.append(best); used.insert(best)
+            }
+            let mx = logitsArr.max()!
+            var z: Float = 0; for v in logitsArr { z += exp(v - mx) }
+            let top1Prob = exp(logitsArr[topk[0]] - mx) / z
+            // true next token
+            let (H2, lg2) = try model.forwardHidden(uArr, caches: mc)
+            let trueNext = MLX.argMax(lg2[0, 0], axis: -1).item(Int.self)
+            for j in 0 ..< K where topk[0 ... j].contains(trueNext) { covK[j] += 1 }
+            let acc1 = (topk[0] == trueNext) ? 1 : 0
+            for b in 0 ..< (edges.count - 1) where top1Prob >= edges[b] && top1Prob < edges[b + 1] {
+                binTot[b] += 1; binAcc[b] += acc1; break
+            }
+            steps += 1
+            uArr = MLXArray([Int32(trueNext)], [1, 1]); lastH = H2[0..., 0 ..< 1]
+            MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
+        }
+        let s = Double(steps)
+        var cov = "top-K coverage(=width-k tree accept 天井): "
+        for j in 0 ..< K { cov += String(format: "≤top%d=%.1f%%  ", j + 1, Double(covK[j]) / s * 100) }
+        var corr = "confidence(top1prob)→accept@1: "
+        for b in 0 ..< (edges.count - 1) where binTot[b] > 0 {
+            corr += String(format: "[%.2f-%.2f]:%.0f%%(n%d)  ", edges[b], edges[b + 1] > 1 ? 1.0 : edges[b + 1],
+                           Double(binAcc[b]) / Double(binTot[b]) * 100, binTot[b])
+        }
+        return "[MTPDraftCalib C=\(C), N=\(steps)]\n  \(cov)\n  \(corr)"
     }
 
     /// forward コストの L 依存ベンチ（streaming-bound vs compute/overhead-bound の切り分け）。
