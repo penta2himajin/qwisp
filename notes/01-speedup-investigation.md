@@ -72,8 +72,65 @@ nl で accept が伸びない（suffix 0.23）。その先を speculation 以外
 **50ms = 40 層 × mx.fast-optimal な matmul/gather/recurrent kernel の batch=1 latency-bound 実行**。
 各 matmul は weight 全体を読むのに 1 行しか計算せず GPU を underutilize するが、kernel 自体は既に最適。
 これは融合・compile・量子化で動かない。**唯一 latency-bound matmul を効率化する道 = batching(=speculation)**で、
-それは accept を要し反復 content でしか効かない。∴ **nl(novel)は batch=1 床で原理的に ~20 tok/s 頭打ち**
-（MLX/Apple Silicon の物理であり実装不足でない）。
+それは accept を要し反復 content でしか効かない。∴ **nl(novel)は batch=1 床で ~20 tok/s 頭打ち**。
+
+### 2-4. 床の機構 = dispatch/sync 律速（GPU ~35% busy・実測, issue#3 §5・commit このブランチ）
+2-3 の「batch=1 latency-bound」を **GPU 占有率の実測で確定**した（issue#3 への裏取り）。
+`QWISP_RUN=forward-gpu-busy`（forward-cost と同じ hot-pin 経路）で:
+- **CPU-busy ≈ 0.51 cores**（`getrusage` の process CPU 時間 / wall）＝ wall の約半分は CPU が
+  encode/per-layer routing 同期でビジー、残り半分は GPU 待ちで block。
+- **build-only(eval せず forwardHidden のみ) ≈ 37ms ≈ K=1 eval 35ms** ＝ forward は lazy でなく
+  **内部で per-layer routing 同期を強制**（router logits を materialize して expert gather する round-trip）。
+- 独立 forward を K 本まとめて 1 eval する pipeline 法は **flat(0.94x)** ＝ 同期が forward 内で逐次化し、
+  末尾 eval をまとめても GPU idle を埋められない（層を interleave しない限り回収不可）。
+- **Metal System Trace（`metal-gpu-intervals`）実測（M1 Max）: GPU-busy ≈ 34.6%**
+  （steady median 33.8% / p90 51%）＝ **GPU は wall の ~65% アイドル**。`tools/gpu_busy_from_trace.py`。
+
+→ **床は GPU-exec(帯域/compute)でなく dispatch/sync-latency 律速**。理論帯域床 ~260 tok/s に対し 20 が出る
+真因は per-layer の CPU↔GPU routing round-trip（GPU 65% idle）。issue#3 の指摘どおり「fundamental
+physics」は **言い過ぎ**で、実体は **tooling/sync 床**。
+**ただし idle の正体が MoE 動的 routing の round-trip** ゆえ、標準治療の command-graph capture は
+per-token の expert 選択を capture できず native には効かない（issue#3 §3 と整合）。効く lever は
+intra-kernel fusion でなく **sync/round-trip 除去**（routing 予測で expert 選択を先回りし層跨ぎの
+materialize を消す＝[[pre-attention-predictor]]/[[selective-margin-prefetch]] 系の延長）。これは別途
+高難度（予測精度 ~82-84% 頭打ち実績）で、弱機（M1/Neo 帯域床 ~40-45 tok/s）では旨味 ~2x に縮む。
+∴ **「nl は今追わない」判断は妥当だが framing は「MLX/Metal の sync-tooling 限界」に修正**。
+再現: `forward-gpu-busy` probe + `xcrun xctrace record --template 'Metal System Trace'` →
+`tools/gpu_busy_from_trace.py`（手順は同スクリプト docstring）。
+
+### 2-5. lever-1 実証: round-trip 除去(no-sync)で resident greedy ~2x lossless
+2-4 の sync 床に対し、no-sync 経路(GPU slot-table remap, 毎層 CPU materialize/ensure 無し)を
+**全 expert resident で使うと exact 経路と bit 一致のまま 2x**。forward 単位(`forward-gpu-busy` (B)):
+**sync 31.9ms → no-sync 16.1ms = 1.99x, max|Δhidden|=0.0**。エンドツーエンドの実 greedy decode
+(`QWISP_RUN=nosync-resident`, sync/no-sync を各 1 回回し生成 token 比較):
+
+| C (tier) | sync tok/s | no-sync tok/s | speedup | lossless |
+|---|---|---|---|---|
+| 256 (32GB) | 32.7 | 56.7 | **1.73x** | ✅ **無条件**(全 expert 常駐＝alias 不可能) |
+| 128 (16GB) | 29.1 | 57.4 | **1.97x** | ✅ coverage 100% 前提 |
+| 64 (8GB)   | 20.6 | 59.1 | **2.87x** | ✅(本プロンプト, routed⊂hot-pin) |
+
+- no-sync tok/s は **~57-59 で C 非依存**(ensure/IO 消滅で純 compute)。sync は C 減で overhead 増。
+- **C=256 のみ無条件 bit-exact**(slot-table が全 expert を持ち alias 皆無)。C<256 の lossless は
+  coverage 依存(cold routed で slot-0 alias=garbage)→ 保証には miss 検出(`countHotMiss`)で sync
+  escalate が要る([[hotcold-hybrid-gate]]/[[nosync-approx-improve]] の near-lossless 路線)。
+- **含意: 「nl は forward 壁で resident でも頭打ち」(2-3)は sync forward 前提**。no-sync で forward 半減
+  ＝resident/covered tier の greedy/nl は **~57 tok/s lossless**(従来 ~20-32 の ~1.7-2.9x)。
+- **本番配線済**: `runSuffixSpec` を **C>=nE(256) で auto pure no-sync**(QWISP_NOSYNC=1/0)。実測 C=256:
+  greedy 56.9 / spec 224(vs sync 196, +14%) 何れも 48/48 lossless。C<256 は従来 sync で無回帰。
+
+### 2-6. escalation(miss 検出→sync 再計算)は cold-start で net 効かず: 実用 no-sync は C=256 のみ
+C<256 で no-sync を安全(exact)化する `countHotMiss` escalation(`nosync-escalate` runner / `runSuffixSpec`
+の QWISP_NOSYNC_MIN opt-in)を検証。**出力は常に bit-exact**(hotMiss>0 token を sync 再計算)だが速度は:
+- **token 粒度 escalation は per-token all-hit≈0 の壁**: 1 token=40 層×top8=最大 320 routes、どれか 1 つ
+  cold で token 全体 sync 化。C=128 で escalation **98%→0.67x**(sync 以下)。[[footprint-vs-budget]] 再確認。
+- `nosync-escalate` runner で C=192 が 0% escalation・1.80x と出たのは **直前の sync-greedy が working set を
+  warm したアーティファクト**。実 decode の cold-start single-pass(`runSuffixSpec` 純 greedy)では C=192 でも
+  **escalation 100%**(frequency hot-pin が trajectory working set を覆えず、warming も収束せず)→ 移動窓+grace
+  の adaptive fallback で sync へ。多トークン verify は working set 過大ゆえ escalation 対象外(必ず損)。
+- ∴ **escalation の greedy 高速化は working set 事前常駐時のみ＝実質 C=256(全常駐)**。C=256 は ~21GB ゆえ
+  24GB+ 機で pure no-sync 可。**16GB(C=128)は exact lossless 高速化は壁**(approximate buddy/margin ~51-58
+  tok/s @ ~98% が別路線 [[nosync-approx-improve]])。production は band off 既定で C=256 pure / 以下 sync。
 
 ---
 

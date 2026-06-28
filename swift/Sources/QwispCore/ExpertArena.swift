@@ -263,6 +263,14 @@ public final class StreamingMoEBlock {
         return order[0..., (numExperts - topK)...].asType(.int32)
     }
 
+    /// predictInds の幅可変版: 任意 hidden から top-k(k>=topK)を返す（exact-pipeline の prefetch 幅振り用）。
+    public func predictIndsK(_ h: MLXArray, _ k: Int) -> MLXArray {
+        let kk = Swift.min(Swift.max(k, topK), numExperts)
+        let gates = MLX.softmax(gate.apply(h), axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: numExperts - kk, axis: -1)
+        return order[0..., (numExperts - kk)...].asType(.int32)
+    }
+
     private func gatherQmm(_ x: MLXArray, _ store: ExpertArena, _ proj: String, _ remap: MLXArray) -> MLXArray {
         gatherQuantizedMatmul(x, store.arr(proj, "weight"), scales: store.arr(proj, "scales"),
                               biases: store.arr(proj, "biases"), rhsIndices: remap,

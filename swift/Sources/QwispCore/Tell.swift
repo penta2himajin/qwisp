@@ -56,7 +56,10 @@ public enum Tell {
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
         AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
-        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false }
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -108,9 +111,21 @@ public enum Tell {
         }
 
         // phase 3: suffix-lookup draft + clean exact verify
+        // ★ lever-1(issue#3): per-layer routing round-trip 除去で ~1.7-1.8x lossless（dispatch/sync 律速）。
+        //   C>=nE(256): 全 expert resident=no-sync gather(GPU slot-table remap)が無条件 bit-exact → pure no-sync。
+        //   C < nE: 既定 sync(cold-start の greedy working set は frequency-pin に収まらず escalation が
+        //     net 損＝warming 浪費。escalation の greedy 高速化は working set 事前常駐時のみ＝実質 C=256)。
+        //   研究用に QWISP_NOSYNC_MIN=<C> を明示すると [その値, nE) で no-sync+escalation(率監視 fallback)を有効化。
+        //   QWISP_NOSYNC=1 強制 pure / =0 無効。出力は常に exact(pure は residency 保証, escalation は sync 再計算)。
+        let nosyncEnv = Tell.envStr("QWISP_NOSYNC", "auto")
+        let escalMin = Tell.envInt("QWISP_NOSYNC_MIN", nE)   // 既定 nE=band 空=production は pure/sync のみ
+        let pureNoSync = nosyncEnv == "1" || (nosyncEnv != "0" && C >= nE)
+        var escalateActive = nosyncEnv != "0" && !pureNoSync && C >= escalMin
+        if pureNoSync { print("[SuffixSpec] no-sync pure ON (C=\(C)>=\(nE) 全 resident, 無条件 lossless ~1.7x)") }
+        else if escalateActive { print("[SuffixSpec] no-sync+escalation ON (C=\(C) in [\(escalMin),\(nE)), exact, 率監視 fallback)") }
         var hist = ids.asArray(Int32.self).map { Int($0) }     // 履歴（prompt + commit token）
         let mc = model.makeCaches()
-        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.probeNoSync = pureNoSync
         var (_, lg) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
@@ -125,6 +140,50 @@ public enum Tell {
         let prof = Tell.envFlag("QWISP_SPECK_PROF")
         var tDraft: UInt64 = 0, tVerify: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        // adaptive escalation: escalateActive 時、input を no-sync で forward→cold routed があれば cache を
+        //   巻戻して sync 再計算(exact)。escalation 率が高ければ escalateActive を落とし以降 sync(footprint 壁で無回帰)。
+        //   非 escalation 時は global probeNoSync(pure か false)のまま素通し。返す logits は常に exact。
+        //   escalate=false(verify 多トークン)では escalation 無効: working set が大きく必ず miss→2x 損。
+        //   pure no-sync(C>=256)は global probeNoSync で verify も安全に no-sync 化される。
+        //   fallback 判定は移動窓 + grace: escalate は cache を warm する(sync 再計算が cold expert を ensure)ので
+        //   cold start は高 escalation でも収束しうる。grace 後の recent rate が break-even(no-sync 0.5x +
+        //   escalate 2x ゆえ rate>~0.5 で sync より損)を超えたら footprint 壁と判断し sync へ自動 fallback。
+        var escSeen = 0
+        var escRecent: [Bool] = []
+        let escWindow = Tell.envInt("QWISP_ESC_WINDOW", 16)
+        let escGrace = Tell.envInt("QWISP_ESC_GRACE", 24)
+        let escMaxRate = 0.45
+        func decodeForward(_ input: MLXArray, rows: Int, escalate: Bool) throws -> MLXArray {
+            if !escalateActive || !escalate {
+                let (_, l) = try model.forwardHidden(input, caches: mc)
+                return l
+            }
+            let snaps = mc.map { $0.snapshot() }
+            StreamingMoEBlock.hotMissAccum = nil
+            StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true
+            let (_, l) = try model.forwardHidden(input, caches: mc)
+            let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+            MLX.eval([l, missArr] + mc.flatMap { $0.stateArrays })
+            StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.probeNoSync = false
+            escSeen += 1
+            var result = l
+            let escalated = missArr.item(Int32.self) != 0
+            if escalated {                                           // cold routed あり → sync 再計算(exact, cold ensure)
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: rows) }
+                let (_, l2) = try model.forwardHidden(input, caches: mc)
+                result = l2
+            }
+            escRecent.append(escalated); if escRecent.count > escWindow { escRecent.removeFirst() }
+            if escSeen >= escGrace && escRecent.count == escWindow {  // warming 後に移動窓で判定
+                let rate = Double(escRecent.filter { $0 }.count) / Double(escWindow)
+                if rate > escMaxRate {
+                    escalateActive = false
+                    print(String(format: "[SuffixSpec] recent escalation率 %.0f%% > %.0f%% → sync へ fallback(footprint 壁, 無回帰)",
+                                 rate * 100, escMaxRate * 100))
+                }
+            }
+            return result
+        }
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0
         let t0 = DispatchTime.now()
         while out.count < N {
@@ -136,7 +195,7 @@ public enum Tell {
             draftTot += D
             if prof { tDraft += now() - ts; ts = now() }
             if D == 0 {                                          // 一致なし → 通常 greedy 1 step
-                let (_, glg) = try model.forwardHidden(uArr, caches: mc)
+                let glg = try decodeForward(uArr, rows: 1, escalate: true)
                 out.append(u); hist.append(u)
                 uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
@@ -146,7 +205,7 @@ public enum Tell {
             setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
             let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1, D+1]
-            let (_, vlg) = try model.forwardHidden(seq, caches: mc)
+            let vlg = try decodeForward(seq, rows: D + 1, escalate: false)
             let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }

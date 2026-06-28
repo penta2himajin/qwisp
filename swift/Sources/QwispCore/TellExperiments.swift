@@ -1842,6 +1842,587 @@ extension Tell {
             + "\n  (B) 有効層数依存(L=1, 末尾skip):\n  " + lines2.joined(separator: "\n  ")
     }
 
+    /// **[計測] issue#3 §5: forward 50ms 床は dispatch-latency 律速か GPU-exec 床か（二値判定）**
+    /// 機構 = 独立 forward パイプライン法。K 個の **データ依存の無い** L=1 forward を 1 回の eval に
+    /// まとめて投入し、per-forward wall が K で下がるかを測る。単 forward が dispatch 律速（40 層の
+    /// 逐次カーネル投入の間 GPU がアイドル）なら、独立 forward を束ねるとその idle 隙間が埋まり
+    /// per-forward wall が **下がる**＝CPU submit が GPU を待たせている証拠。GPU が既に飽和（exec 床）
+    /// なら K を増やしても **flat**＝50ms は本物の GPU-exec 床で graph-capture も無駄。GPU counter 不要・
+    /// mlx 再ビルド不要でクリーンな二値数値が出る（RNN-T「GPU 80% idle」測定の型）。
+    /// build-only(lazy 構築) vs eval(submit+exec) も分離して CPU-record 寄与も見る。
+    /// hot-pin top-C で IO 排除。QWISP_GPUTRACE=path を渡すと K=1 区間を .gputrace capture（要 mlx
+    /// MLX_METAL_DEBUG ビルド + MTL_CAPTURE_ENABLED=1。無ければ Instruments の Metal System Trace で代替可）。
+    /// - env: QWISP_RUN=forward-gpu-busy / QWISP_CACHE_C / QWISP_FC_REPS(既定20) /
+    ///        QWISP_GPUBUSY_K(既定"1,2,4,8") / QWISP_GPUTRACE(任意, capture 出力パス)
+    public static func runForwardGpuBusy(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[GpuBusy] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let reps = Tell.envInt("QWISP_FC_REPS", 20)
+        let Ks = (ProcessInfo.processInfo.environment["QWISP_GPUBUSY_K"] ?? "1,2,4,8")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let tracePath = ProcessInfo.processInfo.environment["QWISP_GPUTRACE"]
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C で IO 排除（pure compute を測る）— runForwardCost と同型
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< 48 {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        // プロセス全体の累積 CPU 時間(user+sys, 全スレッド合算)。wall と比べて cores-busy 比を出す。
+        // cores-busy ≈ 1+ なら CPU が wall を占有(=encode/sync 律速=dispatch 系)、≈0 なら CPU は GPU 待ちで block(=GPU-exec 床)。
+        func cpuNs() -> UInt64 {
+            var ru = rusage()
+            getrusage(RUSAGE_SELF, &ru)
+            let u = UInt64(ru.ru_utime.tv_sec) * 1_000_000_000 + UInt64(ru.ru_utime.tv_usec) * 1000
+            let s = UInt64(ru.ru_stime.tv_sec) * 1_000_000_000 + UInt64(ru.ru_stime.tv_usec) * 1000
+            return u + s
+        }
+        let seq = MLXArray([Int32(100)], [1, 1])                                  // L=1 ダミー decode
+        // 各 K 用に独立した cache 群（データ依存なし）を prefill しておく
+        let maxK = Ks.max() ?? 1
+        var bcs: [[LayerCache]] = []
+        var snapss: [[LayerCache.Snapshot]] = []
+        for _ in 0 ..< maxK {
+            let bc = model.makeCaches()
+            _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            bcs.append(bc); snapss.append(bc.map { $0.snapshot() })
+        }
+        // build-only(lazy 構築のみ, eval せず) の CPU-record 寄与を 1 forward で測る
+        var buildAcc: UInt64 = 0
+        for _ in 0 ..< reps {
+            let t = now()
+            let (h, _) = try model.forwardHidden(seq, caches: bcs[0])     // lazy: ops 記録のみ
+            _ = h
+            buildAcc += now() - t
+            for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+        }
+        let buildMs = Double(buildAcc) / Double(reps) / 1e6
+        // (A) パイプライン法: K 独立 forward を 1 eval、per-forward wall を測る
+        var lines: [String] = []
+        var perK: [(K: Int, ms: Double, cores: Double)] = []
+        for K in Ks {
+            // warmup
+            do {
+                var hs: [MLXArray] = []
+                for k in 0 ..< K { let (h, _) = try model.forwardHidden(seq, caches: bcs[k]); hs.append(h) }
+                MLX.eval(hs + (0 ..< K).flatMap { bcs[$0].flatMap { $0.stateArrays } })
+                for k in 0 ..< K { for (i, c) in bcs[k].enumerated() { c.restore(snapss[k][i], isLinear: isLin[i], trim: 1) } }
+            }
+            LayerExpertCache.missTotal = 0
+            var tAcc: UInt64 = 0
+            let doTrace = tracePath != nil && K == 1
+            if doTrace, let tp = tracePath { MLX.GPU.startCapture(url: URL(fileURLWithPath: tp)) }
+            let cpu0 = cpuNs()
+            for _ in 0 ..< reps {
+                let t = now()
+                var hs: [MLXArray] = []
+                for k in 0 ..< K { let (h, _) = try model.forwardHidden(seq, caches: bcs[k]); hs.append(h) }
+                MLX.eval(hs + (0 ..< K).flatMap { bcs[$0].flatMap { $0.stateArrays } })   // K 本まとめて submit
+                tAcc += now() - t
+                for k in 0 ..< K { for (i, c) in bcs[k].enumerated() { c.restore(snapss[k][i], isLinear: isLin[i], trim: 1) } }   // 非計時(CPU はここも含むが小)
+            }
+            let cpuDelta = cpuNs() - cpu0
+            if doTrace, let tp = tracePath { MLX.GPU.stopCapture(url: URL(fileURLWithPath: tp)) }
+            let perFwd = Double(tAcc) / Double(reps) / Double(K) / 1e6
+            let cores = Double(cpuDelta) / Double(tAcc)                       // CPU時間 / 計時 wall = 平均ビジー core 数
+            perK.append((K, perFwd, cores))
+            lines.append(String(format: "K=%d: %6.2f ms/forward  (batch wall %6.2f ms, CPU-busy=%.2f cores, misses/fwd=%.1f)%@",
+                                K, perFwd, perFwd * Double(K), cores,
+                                Double(LayerExpertCache.missTotal) / Double(reps) / Double(K),
+                                doTrace ? "  [gputrace→\(tracePath!)]" : ""))
+        }
+        // (B) round-trip 除去の天井: sync(probeNoSync=false, 毎層 inds.asArray+ensure) vs
+        //     no-sync(GPU slot-table remap, 毎層 CPU materialize 無し)を同一 resident 状態で A/B。
+        //     hot-pin top-C に routed ⊂ なので no-sync gather は exact 経路と bit 一致のはず（lossless 確認込み）。
+        StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureK = 0
+        StreamingMoEBlock.marginK = 0; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.syncLayers = nil
+        func measureMode(_ noSync: Bool) throws -> (ms: Double, cores: Double, h: MLXArray) {
+            StreamingMoEBlock.probeNoSync = noSync
+            // warmup + 代表 hidden を1本確保（bit 比較用）
+            let (hw, _) = try model.forwardHidden(seq, caches: bcs[0]); MLX.eval([hw])
+            for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            var tAcc: UInt64 = 0
+            let cpu0 = cpuNs()
+            for _ in 0 ..< reps {
+                let t = now()
+                let (h, _) = try model.forwardHidden(seq, caches: bcs[0])
+                MLX.eval([h] + bcs[0].flatMap { $0.stateArrays })
+                tAcc += now() - t
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            }
+            let cores = Double(cpuNs() - cpu0) / Double(tAcc)
+            return (Double(tAcc) / Double(reps) / 1e6, cores, hw)
+        }
+        let mSync = try measureMode(false)
+        let mNo = try measureMode(true)
+        StreamingMoEBlock.probeNoSync = false
+        let maxAbs = MLX.abs(mSync.h - mNo.h).max().item(Float.self)         // lossless 確認(0=bit一致)
+        let speedup = mNo.ms > 0 ? mSync.ms / mNo.ms : 1.0
+        let abLines = String(format:
+            "  sync   (毎層 materialize+ensure): %6.2f ms/forward  CPU-busy=%.2f cores\n  "
+            + "no-sync(GPU slot-table remap)  : %6.2f ms/forward  CPU-busy=%.2f cores\n  "
+            + "→ round-trip 除去 speedup=%.2fx, max|Δhidden|=%.2e (%@)",
+            mSync.ms, mSync.cores, mNo.ms, mNo.cores, speedup, maxAbs,
+            maxAbs < 1e-3 ? "resident で bit一致=lossless" : "差あり(routed が hot-pin 外=要 resident 化)")
+        // 二値判定(主=CPU-busy, 副=pipeline ratio):
+        //   CPU-busy ≳1.0 → wall を CPU が占有=encode/routing-sync 律速(dispatch 系) → graph-capture/sync削減に価値
+        //   CPU-busy ≲0.3 → CPU は GPU 待ちで block=GPU-exec 床 → 50ms は本物の compute 床、graph capture も無駄
+        let base = perK.first?.ms ?? 0
+        let best = perK.map { $0.ms }.min() ?? base
+        let ratio = base > 0 ? best / base : 1.0
+        let cores = perK.first?.cores ?? 0
+        let verdict: String
+        if cores >= 0.8 {
+            verdict = String(format: "DISPATCH/SYNC 律速 (CPU-busy=%.2f cores≒wall占有, pipeline %.2fx). "
+                + "wall は GPU exec でなく CPU の encode/per-layer routing 同期律速。"
+                + "→ MoE routing を含むため native graph-capture は困難だが、sync 削減(routing 予測でround-trip除去)に価値。"
+                + "「fundamental physics」でなく tooling/sync 床=issue#3 §4 の framing 修正が正しい", cores, ratio)
+        } else if cores <= 0.3 {
+            verdict = String(format: "GPU-EXEC 床 (CPU-busy=%.2f cores=GPU待ちで block, pipeline %.2fx flat). "
+                + "→ 50ms は本物の GPU compute 床、graph capture も無駄。penta の「床」が正しい", cores, ratio)
+        } else {
+            verdict = String(format: "混在 (CPU-busy=%.2f cores, pipeline %.2fx). CPU sync と GPU exec が拮抗。"
+                + "gputrace で GPU 占有率を裏取りして確定", cores, ratio)
+        }
+        return "[GpuBusy C=\(C), f32-full, hot-pin top-C, reps=\(reps)] issue#3 §5 dispatch vs exec\n"
+            + String(format: "  build-only(eval せず forwardHidden のみ; lazy なら~0 のはず): %.2f ms/forward\n", buildMs)
+            + "  (A) 独立 forward パイプライン (per-forward wall + CPU-busy cores):\n  " + lines.joined(separator: "\n  ")
+            + "\n  (B) sync vs no-sync round-trip 除去 A/B (同一 resident):\n" + abLines
+            + "\n  判定: " + verdict
+            + (tracePath == nil
+                ? "\n  ※ gputrace 裏取り: QWISP_GPUTRACE=/path/x.gputrace を渡す(要 mlx MLX_METAL_DEBUG ビルド)、"
+                  + "または Instruments の Metal System Trace で本バイナリの GPU 占有率を直接読む"
+                : "")
+    }
+
+    /// **[高速化] issue#3 lever-1: round-trip 除去で resident greedy を ~2x lossless 化**
+    /// forward-gpu-busy の (B) A/B が「全 expert resident なら no-sync gather は exact 経路と bit 一致で 2x」
+    /// と forward 単位で示した。本 runner はそれを **エンドツーエンドの実 greedy decode** で確認する:
+    /// 同一プロンプトから N トークン greedy を sync / no-sync で各 1 回回し、(1)生成トークン完全一致(lossless)、
+    /// (2)tok/s を比較。C=256(全 expert 常駐)なら gpuSlotTable が全 expert を持ち alias 皆無＝無条件 exact。
+    /// C<256 では routed が cold に当たると slot-0 alias で発散(その divergent token 数も報告)。
+    /// - env: QWISP_RUN=nosync-resident / QWISP_CACHE_C(既定256) / QWISP_GEN(既定64) / QWISP_CALIB(既定48)
+    public static func runNoSyncResident(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[NoSyncResident] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 256)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; StreamingMoEBlock.probeNoSync = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C（C=256 なら全 expert を resident 化）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        var residentExperts = 0
+        for (mi, ec) in model.expertCaches.enumerated() {
+            let pin = Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset })
+            _ = ec.ensure(pin); residentExperts += pin.count
+        }
+        let avgResident = residentExperts / Swift.max(1, nMoE)
+        // greedy 1 run（probeNoSync 指定）。tokens と tok/s を返す。fresh cache（expert 常駐は model 側で持続）。
+        func greedy(_ noSync: Bool) throws -> (toks: [Int], tps: Double) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            // warmup 1（kernel/グラフ確定を計時外に）。snapshot を warmup 前に取り、cache を post-prefill へ巻戻す。
+            StreamingMoEBlock.probeNoSync = noSync
+            let snaps0 = mc.map { $0.snapshot() }
+            let (_, wlg) = try model.forwardHidden(u, caches: mc); MLX.eval([wlg])
+            for (i, c) in mc.enumerated() { c.restore(snaps0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays })
+                toks.append(u.item(Int.self))
+            }
+            StreamingMoEBlock.probeNoSync = false
+            let secs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            return (toks, Double(N) / secs)
+        }
+        let sync = try greedy(false)      // 参照=exact
+        let nosync = try greedy(true)
+        let match = zip(sync.toks, nosync.toks).filter { $0 == $1 }.count
+        // 先頭発散位置（lossless なら N、途中で alias 混入なら < N）
+        var firstDiv = N
+        for i in 0 ..< N where sync.toks[i] != nosync.toks[i] { firstDiv = i; break }
+        let speedup = sync.tps > 0 ? nosync.tps / sync.tps : 0
+        let losslessTag = match == N ? "✅ lossless(完全一致)"
+            : "⚠️ \(N - match)/\(N) 発散(先頭 token#\(firstDiv))=C<256 で routed が cold alias。要 full-resident or 予測"
+        return "[NoSyncResident C=\(C), avg resident=\(avgResident)/256 experts/層, N=\(N), f32-full]"
+            + " issue#3 lever-1 round-trip 除去\n"
+            + String(format: "  sync   (exact, 毎層 materialize+ensure): %.1f tok/s\n", sync.tps)
+            + String(format: "  no-sync(GPU slot-table remap)          : %.1f tok/s\n", nosync.tps)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, losslessTag)
+    }
+
+    /// **[高速化] issue#3 lever-1 製品化: 16GB(C=128) を no-sync + miss-escalation で真 lossless 化**
+    /// C<256 では no-sync gather が cold routed を slot-0 alias=garbage 化するが、`countHotMiss` で
+    /// その token の cold route 数を層横断 GPU 累積し、**hotMiss=0 の token は no-sync 結果が bit-exact
+    /// ゆえ採用、hotMiss>0 の token だけ cache を巻戻して sync 再計算(exact, cold expert を ensure)**。
+    /// 検出は cold route の厳密 superset ゆえ出力は pure-sync と完全一致(真 lossless)。miss-check は token
+    /// 毎 1 scalar drain のみ(40 層 materialize より遥かに安い)。期待: 16GB を ~45-57 tok/s exact。
+    /// - env: QWISP_RUN=nosync-escalate / QWISP_CACHE_C(既定128) / QWISP_GEN(既定64) / QWISP_CALIB(既定48)
+    public static func runNoSyncEscalate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[NoSyncEscalate] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 128)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.hotMissAccum = nil
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        // 参照: pure-sync greedy
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            (_, lg) = try model.forwardHidden(u, caches: mc); MLX.eval([lg])     // warmup
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self))
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        // no-sync + escalation greedy
+        func greedyEscalate() throws -> (toks: [Int], tps: Double, escal: Int) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            // warmup（両 mode のグラフを確定、cache 巻戻し）
+            let s0 = mc.map { $0.snapshot() }
+            StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil
+            let (_, w1) = try model.forwardHidden(u, caches: mc); MLX.eval([w1])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let (_, w2) = try model.forwardHidden(u, caches: mc); MLX.eval([w2])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; var escal = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let snaps = mc.map { $0.snapshot() }
+                StreamingMoEBlock.hotMissAccum = nil
+                StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true
+                let (_, lns) = try model.forwardHidden(u, caches: mc)
+                let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+                MLX.eval([lns, missArr] + mc.flatMap { $0.stateArrays })           // token 毎 1 sync(scalar+logits)
+                if missArr.item(Int32.self) == 0 {
+                    u = MLX.argMax(lns[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([u])   // 採用(cache exact)
+                } else {
+                    escal += 1
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: 1) }
+                    StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+                    let (_, lex) = try model.forwardHidden(u, caches: mc)            // sync 再計算(exact, cold ensure)
+                    u = MLX.argMax(lex[0, 0], axis: -1).reshaped([1, 1])
+                    MLX.eval([u] + mc.flatMap { $0.stateArrays })
+                }
+                toks.append(u.item(Int.self))
+            }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), escal)
+        }
+        let ref = try greedySync()
+        let esc = try greedyEscalate()
+        let match = zip(ref.toks, esc.toks).filter { $0 == $1 }.count
+        let speedup = ref.tps > 0 ? esc.tps / ref.tps : 0
+        let escRate = Double(esc.escal) / Double(N) * 100
+        let tag = match == N ? "✅ 真 lossless(sync と完全一致)"
+            : "❌ \(N - match)/\(N) 不一致=escalation 検出漏れ(バグ)"
+        return "[NoSyncEscalate C=\(C), N=\(N), f32-full] issue#3 lever-1 16GB 安全化\n"
+            + String(format: "  pure-sync(exact)         : %.1f tok/s\n", ref.tps)
+            + String(format: "  no-sync+escalate         : %.1f tok/s  (escalation %d/%d=%.0f%%)\n",
+                     esc.tps, esc.escal, N, escRate)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@", speedup, match, N, tag)
+    }
+
+    /// **[計測] 8GB exact-pipeline go/no-go: cross-layer 予測の per-layer/per-token hit 率**
+    /// 「層跨ぎ予測 prefetch で routing round-trip を除去（bit-exact）」が成立するかの決め手を測る。
+    /// 機構: 各 token を exact greedy で回し、各層の **真の top-8** を、前 token 同層 gate 入力(temporal, M2 signal)
+    /// から予測した **top-w 集合**が覆うか判定。報告:
+    ///   - per-expert recall(w=8): 真 top-8 のうち予測 top-8 に入る割合（memory の 82-84% と比較）。
+    ///   - **per-layer all-8-hit 率**: その層の真 top-8 が全部 予測 top-w に入る確率（= その層が no-sync で exact に
+    ///     回せる＝round-trip 不要な割合）。
+    ///   - **per-token all-layers-hit 率**: 全層が hit する token の割合（= その token は全層 no-sync＝round-trip 完全ゼロ）。
+    /// 高い w で per-token all-hit が高く、w<=C(=64) に収まれば exact-pipeline が成立（残り層だけ sync fallback）。
+    /// - env: QWISP_RUN=cross-layer-hitrate / QWISP_CACHE_C(既定64) / QWISP_GEN(既定64)
+    public static func runCrossLayerHitrate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[CrossLayerHitrate] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let widths = [8, 16, 32, 48]
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.captureGateInput = false; StreamingMoEBlock.captureInds = false
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let L = model.layerCount
+        let caches = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.captureGateInput = true; StreamingMoEBlock.captureInds = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([cur] + caches.flatMap { $0.stateArrays }
+            + model.expertCaches.compactMap { $0.lastGateInput })
+        func capGate() -> [MLXArray] { (0 ..< L).map { model.expertCaches[$0].lastGateInput! } }
+        var prevGate = capGate()
+        // 集計
+        var layerHit = [Int: Int](); var tokAllHit = [Int: Int]()
+        for w in widths { layerHit[w] = 0; tokAllHit[w] = 0 }
+        // 信号選択: temporal(前 token 同層 gate入力, full-token lead) / intra1(同 token 前層 gate入力, ~1層 lead)
+        let sig = Tell.envStr("QWISP_SIGNAL", "temporal")
+        var recallSum = 0.0; var lt = 0; var toks = 0
+        for _ in 1 ..< N {
+            // exact forward（真の routing + 各層 gate 入力を捕捉）
+            let (_, lgt) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lgt] + caches.flatMap { $0.stateArrays }
+                + model.expertCaches.compactMap { $0.lastInds }
+                + model.expertCaches.compactMap { $0.lastGateInput })
+            let true8 = (0 ..< L).map { Set(model.expertCaches[$0].lastInds!.asArray(Int32.self).map { Int($0) }) }
+            let thisGate = capGate()
+            // 予測元 signal（層毎）: forward 後に確定した入力で各幅予測（accuracy 計測）
+            let srcGate: [MLXArray] = (0 ..< L).map { i in
+                switch sig {
+                case "intra1": return i > 0 ? thisGate[i - 1] : prevGate[i]   // 同 token 前層
+                default:       return prevGate[i]                              // temporal
+                }
+            }
+            var predByW = [Int: [Set<Int>]]()
+            for w in widths {
+                let preds = (0 ..< L).map { model.predictLayerIndsK($0, srcGate[$0], w) }
+                MLX.eval(preds)
+                predByW[w] = preds.map { Set($0.asArray(Int32.self).map { Int($0) }) }
+            }
+            // per-expert recall（w=8）
+            for i in 0 ..< L {
+                let inter = true8[i].intersection(predByW[8]![i]).count
+                recallSum += Double(inter) / Double(Swift.max(1, true8[i].count))
+            }
+            // per-layer all-8-hit & per-token all-layers-hit（各幅）
+            for w in widths {
+                var allHit = true
+                for i in 0 ..< L {
+                    if true8[i].isSubset(of: predByW[w]![i]) { layerHit[w]! += 1 } else { allHit = false }
+                }
+                if allHit { tokAllHit[w]! += 1 }
+            }
+            lt += L; toks += 1
+            prevGate = thisGate
+            cur = MLX.argMax(lgt[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        let recall = recallSum / Double(Swift.max(1, lt)) * 100
+        var lines: [String] = []
+        for w in widths {
+            lines.append(String(format: "  w=%2d: per-layer all-8-hit=%5.1f%%  per-token all-layers-hit=%5.1f%%  (prefetch %d≤C=%d %@)",
+                                w, Double(layerHit[w]!) / Double(Swift.max(1, lt)) * 100,
+                                Double(tokAllHit[w]!) / Double(Swift.max(1, toks)) * 100,
+                                w, C, w <= C ? "✓fit" : "✗"))
+        }
+        return "[CrossLayerHitrate C=\(C), N=\(N), signal=\(sig)] 8GB exact-pipeline go/no-go\n"
+            + String(format: "  per-expert recall(w=8)=%.1f%% (memory 82-84% と比較), L=%d 層\n", recall, L)
+            + lines.joined(separator: "\n")
+            + "\n  判定: per-token all-layers-hit が高い w で exact-pipeline 有望(全層 no-sync=round-trip 0)。"
+            + "低ければ per-layer fallback 頻発で sync 並みに縮退。"
+    }
+
+    /// **[高速化試作] 8GB exact-pipeline: per-layer 予測 prefetch + miss escalation の bit-exact 検証**
+    /// `forwardHiddenPipeline` を実 greedy decode で回し、sync greedy と (1)token 完全一致(bit-exact)、
+    /// (2)tok/s、(3)実 per-layer escalation 率 を比較。直列版ゆえ速度は async 化前の go/no-go 指標
+    /// (escalation 率が低く bit-exact なら async overlap で round-trip 除去の勝算)。
+    /// - env: QWISP_RUN=pipeline-exact / QWISP_CACHE_C(既定64) / QWISP_GEN(既定64) / QWISP_PREDICT_W(既定48) / QWISP_CALIB(48)
+    public static func runPipelineExact(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[PipelineExact] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let N = Tell.envInt("QWISP_GEN", 64)
+        let predictW = Tell.envInt("QWISP_PREDICT_W", 48)
+        let calibN = Tell.envInt("QWISP_CALIB", 48)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.captureGateInput = false; StreamingMoEBlock.captureInds = false
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C（warm start）
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< calibN {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        // 参照: sync greedy（exact, 先に実行して true token 列を確定）
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            (_, lg) = try model.forwardHidden(u, caches: mc); MLX.eval([lg])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self))
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        // pipeline greedy（per-layer 予測 prefetch + miss escalation）
+        func greedyPipeline() throws -> (toks: [Int], tps: Double, escPerTok: Double) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            let s0 = mc.map { $0.snapshot() }
+            let (_, wlg, _) = try model.forwardHiddenPipeline(u, caches: mc, predictW: predictW, isLin: isLin)
+            MLX.eval([wlg])
+            for (i, c) in mc.enumerated() { c.restore(s0[i], isLinear: isLin[i], trim: 1) }
+            var toks: [Int] = []; var escTot = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let (_, plg, esc) = try model.forwardHiddenPipeline(u, caches: mc, predictW: predictW, isLin: isLin)
+                u = MLX.argMax(plg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self)); escTot += esc
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), Double(escTot) / Double(N))
+        }
+        let sync = try greedySync()
+        let pipe = try greedyPipeline()
+        let match = zip(sync.toks, pipe.toks).filter { $0 == $1 }.count
+        var firstDiv = N; for i in 0 ..< N where sync.toks[i] != pipe.toks[i] { firstDiv = i; break }
+        let speedup = sync.tps > 0 ? pipe.tps / sync.tps : 0
+        let L = model.layerCount
+        let tag = match == N ? "✅ bit-exact(sync と完全一致)"
+            : "❌ \(N - match)/\(N) 不一致(先頭#\(firstDiv))=pipeline バグ(escalation 検出漏れ)"
+        return "[PipelineExact C=\(C), N=\(N), predictW=\(predictW), intra1 signal, 直列(overlap無)] 8GB exact-pipeline\n"
+            + String(format: "  sync     (exact)        : %.1f tok/s\n", sync.tps)
+            + String(format: "  pipeline (予測prefetch) : %.1f tok/s  (escalation %.1f/%d 層=%.0f%%/token)\n",
+                     pipe.tps, pipe.escPerTok, L, pipe.escPerTok / Double(L) * 100)
+            + String(format: "  → speedup=%.2fx, token一致=%d/%d  %@\n", speedup, match, N, tag)
+            + "  ※直列版ゆえ予測+ensure コスト込み。escalation 率が低く bit-exact なら async overlap で勝算"
+    }
+
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
     /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
     /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。

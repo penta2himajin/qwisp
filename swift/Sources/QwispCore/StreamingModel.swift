@@ -122,6 +122,8 @@ public final class StreamingQwispModel {
     public var layerCount: Int { numLayers }
     /// Tell M1: 層 i の expert を任意 hidden h から予測（cross-layer）。
     public func predictLayerInds(_ i: Int, _ h: MLXArray) -> MLXArray { layers[i].mlp.predictInds(h) }
+    /// 幅可変版: 層 i の top-k 予測（exact-pipeline prefetch 幅振り用）。
+    public func predictLayerIndsK(_ i: Int, _ h: MLXArray, _ k: Int) -> MLXArray { layers[i].mlp.predictIndsK(h, k) }
 
     func headProj() -> Proj {
         .quantized(store.req("language_model.lm_head.weight"),
@@ -131,6 +133,47 @@ public final class StreamingQwispModel {
 
     public func callAsFunction(_ ids: MLXArray, caches: [LayerCache]) throws -> MLXArray {
         try forwardHidden(ids, caches: caches).logits
+    }
+
+    /// **[8GB exact-pipeline] per-layer 予測 prefetch + miss escalation の exact forward（L=1 専用）**
+    /// 各層 i: intra1(前層 gate入力)で top-w 予測→ensure(resident 化)→no-sync gather→1int miss drain。
+    /// true top-8 ⊂ predicted-resident(miss=0)なら no-sync exact、miss>0 ならその層だけ snapshot 巻戻し
+    /// sync 再計算(exact)。出力は exact 経路と bit 一致。escLayers=sync 再計算した層数。
+    /// ※直列版(予測+ensure は同期)。overlap 無しゆえ予測コストを含む＝速度は async 化前提の go/no-go 計測用。
+    public func forwardHiddenPipeline(_ ids: MLXArray, caches: [LayerCache], predictW: Int, isLin: [Bool])
+        throws -> (hidden: MLXArray, logits: MLXArray, escLayers: Int) {
+        var h = embed(ids)
+        var esc = 0
+        let trim = ids.dim(1)
+        StreamingMoEBlock.captureGateInput = true
+        for i in 0 ..< numLayers {
+            if i > 0, let src = expertCaches[i - 1].lastGateInput {        // intra1 予測 → prefetch
+                let pred = layers[i].mlp.predictIndsK(src, predictW)
+                var seen = Set<Int>(); var u: [Int] = []
+                for e in pred.asArray(Int32.self) { let v = Int(e); if seen.insert(v).inserted { u.append(v) } }
+                _ = expertCaches[i].ensure(u)
+            }
+            let snap = caches[i].snapshot()
+            StreamingMoEBlock.hotMissAccum = nil
+            StreamingMoEBlock.probeNoSync = (i > 0)                        // 層0は予測元無し→sync
+            StreamingMoEBlock.countHotMiss = (i > 0)
+            var hn = try layers[i](h, cache: caches[i])
+            if i > 0 {
+                let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
+                MLX.eval([hn, missArr] + caches[i].stateArrays)            // per-layer 1int drain（+ 出力確定）
+                if missArr.item(Int32.self) != 0 {                        // cold routed → その層だけ sync 再計算
+                    esc += 1
+                    caches[i].restore(snap, isLinear: isLin[i], trim: trim)
+                    StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+                    hn = try layers[i](h, cache: caches[i])
+                }
+            }
+            h = hn
+        }
+        StreamingMoEBlock.captureGateInput = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+        let hidden = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return (hidden, headProj().apply(hidden), esc)
     }
 
     /// cached forward で (post-norm hidden, logits)（MTP 投機用）。
