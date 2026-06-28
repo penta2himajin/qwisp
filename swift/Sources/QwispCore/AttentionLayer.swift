@@ -32,7 +32,13 @@ public struct AttentionLayer {
     /// ★解(調査で確定): SDPA に boolean causal mask 配列を渡す。MLX SDPA は L=1/L>1 とも mask=.array なら
     /// 同じ bool_mask vector kernel 経路(f32 累積・同 key 順序)を通り batched verify=single decode が bit 一致。
     /// .causal/.none enum は do_causal トグルで経路が分岐し ~7e-4 drift。mlx-lm spec decode も bool 配列方式。
+    /// ※実測で不発(7.299e-4 残)。key 数差(S)が残るため。代わりに perQueryNone を使う。
     nonisolated(unsafe) public static var boolMaskSDPA: Bool = false
+    /// ★★真の解(investigate C 確定): 射影は batched(quantized=order-stable)で 1 回、SDPA だけを
+    /// query ごとに分け、各 query の exact causal prefix を .none で SDPA する。各 SDPA は L=1・.none で
+    /// decode 経路と完全同一(同 key 集合・同 mask モード)ゆえ batched verify = 逐次 decode が bit 一致。
+    /// seqMultiToken と違い射影/conv/MoE を再実行しない軽量版（per-query は SDPA のみ）。
+    nonisolated(unsafe) public static var perQueryNone: Bool = false
 
     public init(numHeads: Int, numKVHeads: Int, headDim: Int, ropeDim: Int, ropeBase: Float,
                 eps: Float, qProj: Proj, kProj: Proj, vProj: Proj, oProj: Proj,
@@ -111,6 +117,20 @@ public struct AttentionLayer {
             let m = (kIdx .<= qIdx).reshaped([1, 1, L, S])              // [1,1,L,S] bool, query i は key 0..offset+i
             output = MLXFast.scaledDotProductAttention(queries: queries, keys: allKeys, values: allValues,
                                                        scale: scale, mask: .array(m))
+        } else if AttentionLayer.perQueryNone && L > 1 {
+            // ★★ per-query .none: query t を exact causal prefix(key 0..<offset+t+1)だけ L=1・.none で SDPA。
+            // decode(L=1,.none,全履歴)と同一経路ゆえ batched verify が逐次 decode と bit 一致。SDPA のみ per-query。
+            var outs: [MLXArray] = []
+            outs.reserveCapacity(L)
+            for t in 0 ..< L {
+                let qt = queries[0..., 0..., t ..< (t + 1), 0...]            // [B,H,1,D]
+                let pre = offset + t + 1                                     // causal prefix 長
+                let kt = allKeys[0..., 0..., 0 ..< pre, 0...]                // [B,kv,pre,D]
+                let vt = allValues[0..., 0..., 0 ..< pre, 0...]
+                outs.append(MLXFast.scaledDotProductAttention(
+                    queries: qt, keys: kt, values: vt, scale: scale, mask: .none))
+            }
+            output = MLX.concatenated(outs, axis: 2)                         // [B,H,L,D]
         } else {
             // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
@@ -174,6 +194,39 @@ extension AttentionLayer {
 }
 
 extension AttentionLayer {
+    /// ★★ perQueryNone を量子化射影(実モデル相当)で検証。射影が order-stable な量子化なら rel=0 が期待値。
+    /// plain f16(sConsistencyTest)は射影の L=1 境界 7e-7 が残るが、量子化は完全 bit 一致するはず。
+    public static func perQueryNoneQuantTest() -> String {
+        let H = 2048, P = 16
+        MLXRandom.seed(0)
+        func qp(_ outd: Int, _ ind: Int = H) -> Proj {
+            let w = (MLXRandom.normal([outd, ind]) * 0.02).asType(.float16)
+            let (wq, sq, bq) = MLX.quantized(w, groupSize: 64, bits: 4)
+            return .quantized(wq, sq, bq!, 4)
+        }
+        let attn = AttentionLayer(
+            numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
+            qProj: qp(16 * 256 * 2), kProj: qp(2 * 256), vProj: qp(2 * 256), oProj: qp(H, 16 * 256),
+            qNorm: MLXArray.ones([256]).asType(.float16), kNorm: MLXArray.ones([256]).asType(.float16))
+        let xPrefix = (MLXRandom.normal([1, P, H]) * 0.5).asType(.float16)
+        let u = (MLXRandom.normal([1, 1, H]) * 0.5).asType(.float16)
+        let v = (MLXRandom.normal([1, 1, H]) * 0.5).asType(.float16)
+        let uv = MLX.concatenated([u, v], axis: 1)
+        func cache() -> KVCache { let c = KVCache(); _ = attn(xPrefix, cache: c); return c }
+        func rel(_ a: MLXArray, _ b: MLXArray) -> Float {
+            MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
+                / (MLX.max(MLX.abs(b.asType(.float32))).item(Float.self) + 1e-9)
+        }
+        // perQueryNone は呼び出し側で true 設定済の前提。batched [u,v] vs 逐次 u→v(decode 経路)
+        let cB = cache(); let yB = attn(uv, cache: cB); yB.eval()
+        let cS = cache(); let yu = attn(u, cache: cS); let yv = attn(v, cache: cS)
+        yu.eval(); yv.eval()
+        let relU = rel(yB[0..., 0 ..< 1], yu), relV = rel(yB[0..., 1 ..< 2], yv)
+        let ok = relU < 1e-6 && relV < 1e-6
+        return String(format: "検証[u,v] vs 逐次 u→v(量子化射影): u rel=%.3e v rel=%.3e -> %@",
+                      relU, relV, ok ? "bit一致 ✅(strict lossless verify 可)" : "乖離 ❌")
+    }
+
     /// (C) 順序安定性検証: MLX の sum-based naive attention が batched(L>1) と single(L=1) で
     /// 同 query につき bit 一致するか。一致なら matmul の L 依存を回避でき custom kernel 不要。
     public static func reductionStableTest() -> String {

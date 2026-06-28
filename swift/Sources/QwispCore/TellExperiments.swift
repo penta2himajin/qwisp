@@ -1635,7 +1635,7 @@ extension Tell {
         // A2: divergent op(attention SDPA + conv1d)を f32 化＝seqMT 無しで batched verify を lossless に
         GatedDeltaNetLayer.f32Conv = Tell.envFlag("QWISP_F32_CONV")
         AttentionLayer.f32SDPA = Tell.envFlag("QWISP_F32_ATTN")
-        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1694,6 +1694,13 @@ extension Tell {
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
         let vseq = Tell.envStr("QWISP_VERIFY_SEQ", "1") != "0"
+        // ★ per-query .none verify(investigate C 確定の軽量 bit-exact): 射影 batched(quantized=order-stable)を
+        //   1 回、SDPA だけ query 毎に exact prefix.none。seqMT(層丸ごと per-token 再実行)より軽い。
+        let vpqn = Tell.envFlag("QWISP_VERIFY_PQN")
+        func setVerifyMode(_ on: Bool) {
+            if vpqn { AttentionLayer.perQueryNone = on; AttentionLayer.seqMultiToken = false }
+            else { AttentionLayer.seqMultiToken = on && vseq }
+        }
         let prof = Tell.envFlag("QWISP_SPECK_PROF")
         var tDraft: UInt64 = 0, tVerify: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -1715,7 +1722,7 @@ extension Tell {
                 if prof { tVerify += now() - ts }
                 continue
             }
-            AttentionLayer.seqMultiToken = vseq
+            setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
             let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1, D+1]
             let (_, vlg) = try model.forwardHidden(seq, caches: mc)
@@ -1727,19 +1734,19 @@ extension Tell {
             accTok += p
             if p == D {
                 uArr = MLXArray([Int32(evals[D])], [1, 1])
-                AttentionLayer.seqMultiToken = false
+                setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             } else {
                 for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
                 let acc = [u] + Array(drafts.prefix(p))
                 _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
-                AttentionLayer.seqMultiToken = false
+                setVerifyMode(false)
                 uArr = MLXArray([Int32(evals[p])], [1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             }
             if prof { tVerify += now() - ts }
         }
-        AttentionLayer.seqMultiToken = false
+        AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         let outN = Array(out.prefix(N))

@@ -18,6 +18,10 @@ if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
     AttentionLayer.boolMaskSDPA = true            // ★ bool mask 統一で batched=single bit一致するか
     print("[boolMask] " + AttentionLayer.sConsistencyTest(dtype: .float16))
     AttentionLayer.boolMaskSDPA = false
+    AttentionLayer.perQueryNone = true            // ★★ per-query .none で batched verify=逐次 decode bit一致か
+    print("[perQueryNone f16] " + AttentionLayer.sConsistencyTest(dtype: .float16))
+    print("[perQueryNone-quant] " + AttentionLayer.perQueryNoneQuantTest())
+    AttentionLayer.perQueryNone = false
     exit(0)
 }
 
