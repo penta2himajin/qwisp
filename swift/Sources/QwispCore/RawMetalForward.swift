@@ -20,6 +20,14 @@ public enum RawMetalForward {
         return (d, q)
     }
 
+    /// ★ MLX metallib との bit 一致に必須のコンパイル設定。MLX は safe-math(FMA contraction 無効)ビルド
+    ///   ＝厳密 IEEE。fast-math だと FMA で last-bit がずれ非 bit-exact になる（qmm で実証: safe=rel0 / fast=2e-7）。
+    static func mlxMatchCompileOpts() -> MTLCompileOptions {
+        let opts = MTLCompileOptions()
+        if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
+        return opts
+    }
+
     /// 4-bit affine quantized matmul（decode gemv 一般: x[M,K] · Wq[N,K] → out[M,N], transpose=true）。
     /// dequant: w[n,k] = scales[n, k/gs]·nibble + biases[n, k/gs]、nibble=低位から 8 個/uint32。
     /// MLX weight buffer(wq/scales/biases)を asMTLBuffer(noCopy)で共有して読む。
@@ -163,52 +171,77 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _rmsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _softmaxPipeline: MTLComputePipelineState?
 
-    /// raw-Metal rmsNorm: out[r,d] = x[r,d]·rsqrt(mean_d(x^2)+eps)·w[d]。行ごと TG スレッドで stride reduction
-    /// (D>1024 でも可)。MLXFast.rmsNorm と一致。weight=nil で no-weight(ones 相当)。
+    /// raw-Metal rmsNorm: ★ MLX rms_single_row(backend/metal/kernels/rms_norm.metal)を逐語移植し bit-exact。
+    /// 要点: N_READS=4(thread が連続4要素), acc は f32 で xi*xi, simd_sum 二段, precise::rsqrt,
+    /// 出力は w[i]*(half)(x[i]*inv_mean)（w 乗算は normed を half 化した後）。weight=nil は ones(no-weight 相当)。
+    /// D≤4096 前提(RMS_LOOPED_LIMIT)。本モデルの D∈{128,2048} は全て single_row。
     static func rmsNorm(_ x: MLXArray, _ weight: MLXArray?, eps: Float, D: Int) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
+        guard D <= 4096 else { print("[raw-rms] D>4096(looped)未対応 D=\(D)"); return nil }
         if _rmsPipeline == nil {
             let src = """
             #include <metal_stdlib>
+            #include <metal_simdgroup>
             using namespace metal;
-            kernel void rmsnorm(device const half* x [[buffer(0)]],
-                                device const half* w [[buffer(1)]],
-                                device half* out     [[buffer(2)]],
-                                constant uint& D     [[buffer(3)]],
-                                constant float& eps  [[buffer(4)]],
-                                constant uint& hasW  [[buffer(5)]],
-                                uint t  [[thread_position_in_threadgroup]],
-                                uint TG [[threads_per_threadgroup]],
-                                uint row [[threadgroup_position_in_grid]]) {
-                threadgroup float sh[1024];
-                float local = 0.0f;
-                for (uint d = t; d < D; d += TG) { float c = (float)x[row*D+d]; local += c*c; }
-                sh[t] = local;
+            kernel void rmsnorm(device const half* x   [[buffer(0)]],
+                                device const half* w   [[buffer(1)]],
+                                device half* out       [[buffer(2)]],
+                                constant float& eps    [[buffer(3)]],
+                                constant uint& axis_size [[buffer(4)]],
+                                constant uint& w_stride  [[buffer(5)]],
+                                uint gid [[threadgroup_position_in_grid]],
+                                uint lid [[thread_position_in_threadgroup]],
+                                uint simd_lane_id  [[thread_index_in_simdgroup]],
+                                uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+                constexpr int N_READS = 4;
+                constexpr int SIMD_SIZE = 32;
+                threadgroup float local_inv_mean[1];
+                threadgroup float local_sums[SIMD_SIZE];
+                float acc = 0;
+                x += gid * (size_t)axis_size + lid * N_READS;
+                w += (size_t)w_stride * lid * N_READS;
+                if (lid * N_READS + N_READS <= axis_size) {
+                    for (int i = 0; i < N_READS; i++) { float xi = x[i]; acc += xi * xi; }
+                } else {
+                    for (int i = 0; i < N_READS; i++) { if ((lid*N_READS+i) < axis_size) { float xi = x[i]; acc += xi*xi; } }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint s = TG>>1; s>0; s>>=1) { if (t<s) sh[t]+=sh[t+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-                float r = rsqrt(sh[0]/(float)D + eps);
-                for (uint d = t; d < D; d += TG) {
-                    float wv = hasW ? (float)w[d] : 1.0f;
-                    out[row*D+d] = (half)((float)x[row*D+d] * r * wv);
+                if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / axis_size + eps);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                out += gid * (size_t)axis_size + lid * N_READS;
+                if (lid * N_READS + N_READS <= axis_size) {
+                    for (int i = 0; i < N_READS; i++) out[i] = w[w_stride*i] * (half)(x[i] * local_inv_mean[0]);
+                } else {
+                    for (int i = 0; i < N_READS; i++) { if ((lid*N_READS+i) < axis_size) out[i] = w[w_stride*i] * (half)(x[i]*local_inv_mean[0]); }
                 }
             }
             """
-            do { let lib = try device.makeLibrary(source: src, options: nil)
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
                  _rmsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "rmsnorm")!)
             } catch { print("[raw-rms] compile: \(error)"); return nil }
         }
         let rows = x.size / D
         guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
-        let wArr = weight?.asType(.float16) ?? MLXArray.ones([1], dtype: .float16)
+        // weight=nil は ones[D](w_stride=1)。MLX も no-weight 時 ones を渡す挙動と一致。
+        let wArr = (weight?.asType(.float16) ?? MLXArray.ones([D], dtype: .float16))
         guard let bw = wArr.asMTLBuffer(device: device, noCopy: false) else { return nil }
         let outBuf = device.makeBuffer(length: rows * D * 2, options: .storageModeShared)!
+        // threadgroup_size = ceil(D/N_READS) を simd(32) 倍数に切上げ（MLX dispatch と一致）。
+        let tgNeeded = (D + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_rmsPipeline!)
         enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
-        var dd = UInt32(D), ee = eps, hw = UInt32(weight == nil ? 0 : 1)
-        enc.setBytes(&dd, length: 4, index: 3); enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hw, length: 4, index: 5)
-        let TG = min(D, 1024)
-        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: TG, height: 1, depth: 1))
+        var ee = eps, asz = UInt32(D), ws = UInt32(1)
+        enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: rows * D)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: rows * D)), [rows, D])
@@ -438,23 +471,29 @@ public enum RawMetalForward {
             let src = """
             #include <metal_stdlib>
             using namespace metal;
-            kernel void conv1d_silu(device const half* x [[buffer(0)]],   // [K, C]
-                                    device const half* w [[buffer(1)]],   // [C, K]
-                                    device half* out     [[buffer(2)]],   // [C]
+            kernel void conv1d_silu(device const half*  x [[buffer(0)]],   // [K, C]
+                                    device const float* w [[buffer(1)]],   // [C, K] f32(MLX f32Conv 一致)
+                                    device half* out      [[buffer(2)]],   // [C]
                                     constant uint& K [[buffer(3)]], constant uint& C [[buffer(4)]],
                                     uint c [[thread_position_in_grid]]) {
                 if (c >= C) return;
                 float acc = 0.0f;
-                for (uint k = 0; k < K; ++k) acc += (float)x[k*C + c] * (float)w[c*K + k];
-                out[c] = (half)(acc / (1.0f + exp(-acc)));     // silu
+                // ★ MLX depthwise_conv_1d は acc += (float)in * w（plain +=, fma 無し, safe-math）。w は f32。
+                for (uint k = 0; k < K; ++k) acc += (float)x[k*C + c] * w[c*K + k];
+                // ★ silu = x*sigmoid(x)、sigmoid は MLX の数値安定版(unary_ops.h Sigmoid):
+                //   y=1/(1+exp(|x|)); s = x<0 ? y : 1-y。直接 acc/(1+exp(-acc)) は last-bit がずれる。
+                float ax = metal::abs(acc);
+                float y = 1.0f / (1.0f + precise::exp(ax));
+                float s = (acc < 0.0f) ? y : (1.0f - y);
+                out[c] = (half)(acc * s);
             }
             """
-            do { let lib = try device.makeLibrary(source: src, options: nil)
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
                  _conv1dPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv1d_silu")!)
             } catch { print("[raw-conv1d] compile: \(error)"); return nil }
         }
         guard let bx = input.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bw = w.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+              let bw = w.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }   // w は f32(MLX f32Conv 一致)
         let outBuf = device.makeBuffer(length: C * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_conv1dPipeline!)
@@ -686,7 +725,7 @@ public enum RawMetalForward {
             qkvWq: qkvWq, qkvSc: qkvSc, qkvBi: qkvBi, zWq: zWq, zSc: zSc, zBi: zBi,
             bWq: bWq, bSc: bSc, bBi: bBi, aWq: aWq, aSc: aSc, aBi: aBi,
             outWq: outWq, outSc: outSc, outBi: outBi,
-            conv1dW: cw.reshaped([convDim, 4]).asType(.float16),   // [convDim,K,1] → [convDim,K]
+            conv1dW: cw.reshaped([convDim, 4]).asType(.float32),   // [convDim,K,1] → [convDim,K]、f32(MLX f32Conv 一致)
             normWeight: nw.asType(.float16), aLog: aLog, dtBias: dtBias)
         // MLX 参照（同一量子化重み, f32Conv=true で raw の f32 累積に一致, fuse=off）
         let prevF32 = GatedDeltaNetLayer.f32Conv
@@ -734,7 +773,7 @@ public enum RawMetalForward {
         let mlxCo = mlxConv(mlxQkv)
         let csR = MLXArray.zeros([cK - 1, convDim], dtype: .float16)
         let rawCo = conv1dSilu(MLX.concatenated([csR, rawQkv.asType(.float16)], axis: 0),
-                               cw.reshaped([convDim, cK]).asType(.float16), K: cK, C: convDim)!.reshaped([convDim])
+                               cw.reshaped([convDim, cK]).asType(.float32), K: cK, C: convDim)!.reshaped([convDim])
         out += String(format: "\n   ② convOut:       rel=%.3e", relErr(rawCo, mlxCo))
         // ③ qk-norm（各 path 自分の convOut）
         let invS = Float(pow(Double(hKD), -0.5))
