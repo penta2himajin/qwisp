@@ -29,6 +29,10 @@ public struct AttentionLayer {
     /// (C) 順序安定 attention: fused SDPA(L 依存)でなく broadcast+sum で計算。sum は L 非依存ゆえ
     /// batched(L>1) と single(L=1) が bit 一致(rel=0)＝seqMT 無しで verify が strict lossless。f32 累積。
     nonisolated(unsafe) public static var orderStable: Bool = false
+    /// ★解(調査で確定): SDPA に boolean causal mask 配列を渡す。MLX SDPA は L=1/L>1 とも mask=.array なら
+    /// 同じ bool_mask vector kernel 経路(f32 累積・同 key 順序)を通り batched verify=single decode が bit 一致。
+    /// .causal/.none enum は do_causal トグルで経路が分岐し ~7e-4 drift。mlx-lm spec decode も bool 配列方式。
+    nonisolated(unsafe) public static var boolMaskSDPA: Bool = false
 
     public init(numHeads: Int, numKVHeads: Int, headDim: Int, ropeDim: Int, ropeBase: Float,
                 eps: Float, qProj: Proj, kProj: Proj, vProj: Proj, oProj: Proj,
@@ -100,6 +104,13 @@ public struct AttentionLayer {
             let o = (p.expandedDimensions(axis: -1) * vg.expandedDimensions(axis: 3))
                 .sum(axis: -2)                                                            // [B,kv,g,L,D]
             output = o.reshaped([B, numHeads, L, headDim]).asType(inDtype)
+        } else if AttentionLayer.boolMaskSDPA {
+            // ★ boolean causal mask 配列で L=1/L>1 の SDPA 経路を統一 → batched verify=single decode bit一致
+            let qIdx = MLXArray((0 ..< L).map { Int32(offset + $0) }).reshaped([L, 1])
+            let kIdx = MLXArray((0 ..< S).map { Int32($0) }).reshaped([1, S])
+            let m = (kIdx .<= qIdx).reshaped([1, 1, L, S])              // [1,1,L,S] bool, query i は key 0..offset+i
+            output = MLXFast.scaledDotProductAttention(queries: queries, keys: allKeys, values: allValues,
+                                                       scale: scale, mask: .array(m))
         } else {
             // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
@@ -233,6 +244,76 @@ extension AttentionLayer {
                                 (2)正しさ orderStable vs fused: rel=%.3e -> %@
             """, relStableU, relStableV, (relStableU < 1e-6 && relStableV < 1e-6) ? "✅ bit一致" : "❌乖離",
             relVsFused, relVsFused < 5e-3 ? "✅ 同等" : "❌異なる")
+    }
+}
+
+extension AttentionLayer {
+    /// matmul の L 依存が「L=1(GEMV) vs L≥2(GEMM) 境界のみ」か「全 L」かを切り分ける。
+    /// 前者なら decode を L=2 padding で順序統一でき strict batched verify が可能。
+    public static func matmulLDependenceTest() -> String {
+        MLXRandom.seed(0)
+        let H = 2048, O = 512
+        let Wp = (MLXRandom.normal([H, O]) * 0.02).asType(.float16)
+        let x = (MLXRandom.normal([16, H]) * 0.5).asType(.float16)
+        func mm(_ rows: Int) -> MLXArray { MLX.matmul(x[0 ..< rows, 0...], Wp) }   // [rows,H]@[H,O]=[rows,O]
+        func rel(_ a: MLXArray, _ b: MLXArray) -> Float {
+            MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
+                / (MLX.max(MLX.abs(b.asType(.float32))).item(Float.self) + 1e-9)
+        }
+        // quantized 版（実モデルの射影は量子化）
+        let (wq, sq, bq) = MLX.quantized(Wp.transposed(), groupSize: 64, bits: 4)
+        func qmm(_ rows: Int) -> MLXArray {
+            MLX.quantizedMatmul(x[0 ..< rows, 0...], wq, scales: sq, biases: bq, transpose: true, groupSize: 64, bits: 4)
+        }
+        let r1 = mm(1), r2 = mm(2), r4 = mm(4), r8 = mm(8)
+        let q1 = qmm(1), q2 = qmm(2), q8 = qmm(8)
+        for a in [r1, r2, r4, r8, q1, q2, q8] { a.eval() }
+        return String(format: """
+            [MATMUL-LDEP] plain f16 row0: L1vs2=%.2e  L2vs4=%.2e  L4vs8=%.2e
+                          quant 4bit row0: L1vs2=%.2e  L2vs8=%.2e
+              -> %@
+            """,
+            rel(r1[0 ..< 1, 0...], r2[0 ..< 1, 0...]), rel(r2[0 ..< 1, 0...], r4[0 ..< 1, 0...]),
+            rel(r4[0 ..< 1, 0...], r8[0 ..< 1, 0...]),
+            rel(q1[0 ..< 1, 0...], q2[0 ..< 1, 0...]), rel(q2[0 ..< 1, 0...], q8[0 ..< 1, 0...]),
+            "L=1境界のみ非0なら decode を L=2 padding で順序統一可")
+    }
+}
+
+extension AttentionLayer {
+    /// 各 fused op(RoPE/rmsNorm/SDPA)が L=1 vs L=2(row0)で L 依存か。explicit 版が順序安定なら置換で解決。
+    public static func fusedOpLDepTest() -> String {
+        MLXRandom.seed(0)
+        let D = 256, S = 20
+        let x = (MLXRandom.normal([1, 4, 8, D]) * 0.5).asType(.float16)   // [B,heads,L=4,D]
+        func rel(_ a: MLXArray, _ b: MLXArray) -> Float {
+            MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
+                / (MLX.max(MLX.abs(b.asType(.float32))).item(Float.self) + 1e-9)
+        }
+        // RoPE: fused（L 依存か）
+        func ropeF(_ rows: Int) -> MLXArray {
+            MLXFast.RoPE(x[0..., 0..., 0 ..< rows, 0...], dimensions: 64, traditional: false, base: 1e7, scale: 1.0, offset: 0)
+        }
+        let rp2 = ropeF(2), rp4 = ropeF(4); rp2.eval(); rp4.eval()
+        let relRope = rel(rp2[0..., 0..., 0 ..< 1, 0...], rp4[0..., 0..., 0 ..< 1, 0...])
+        // rmsNorm: fused
+        let w = MLXArray.ones([D]).asType(.float16)
+        func rmsF(_ rows: Int) -> MLXArray { MLXFast.rmsNorm(x[0..., 0..., 0 ..< rows, 0...], weight: w, eps: 1e-6) }
+        let rm2 = rmsF(2), rm4 = rmsF(4); rm2.eval(); rm4.eval()
+        let relRms = rel(rm2[0..., 0..., 0 ..< 1, 0...], rm4[0..., 0..., 0 ..< 1, 0...])
+        // fused SDPA: L=1 vs L=2（causal, KV 共通）
+        let q = (MLXRandom.normal([1, 2, 8, D]) * 0.5).asType(.float16)
+        let k = (MLXRandom.normal([1, 2, S, D]) * 0.5).asType(.float16)
+        let v = (MLXRandom.normal([1, 2, S, D]) * 0.5).asType(.float16)
+        let sc = Float(pow(Double(D), -0.5))
+        let s1 = MLXFast.scaledDotProductAttention(queries: q[0..., 0..., 0 ..< 1, 0...], keys: k, values: v, scale: sc, mask: .none)
+        let s2 = MLXFast.scaledDotProductAttention(queries: q[0..., 0..., 0 ..< 2, 0...], keys: k, values: v, scale: sc, mask: .none)
+        s1.eval(); s2.eval()
+        let relSdpa = rel(s1, s2[0..., 0..., 0 ..< 1, 0...])
+        return String(format: """
+            [FUSED-OP-LDEP] L=1 vs L≥2 (row0):  RoPE=%.2e  rmsNorm=%.2e  fused-SDPA=%.2e
+              -> 非0 の op が drift 源。explicit/sum 版で順序安定化できるか確認
+            """, relRope, relRms, relSdpa)
     }
 }
 
