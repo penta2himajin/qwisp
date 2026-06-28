@@ -1842,6 +1842,149 @@ extension Tell {
             + "\n  (B) 有効層数依存(L=1, 末尾skip):\n  " + lines2.joined(separator: "\n  ")
     }
 
+    /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
+    /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
+    /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。
+    /// - env: QWISP_RUN=cost-model-validate / QWISP_CACHE_C(既定128) / QWISP_GEN
+    public static func runCostModelValidate(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[CostModelValidate] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 128)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        let isLin = model.isLinearFlags
+        let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+        // calib + hot-pin top-C
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< 48 {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+
+        // (A) forward-cost L-sweep → a,b
+        var fcPts: [(L: Int, ms: Double)] = []
+        for L in [1, 2, 4, 8, 16, 24] {
+            let bc = model.makeCaches(); _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            let snaps = bc.map { $0.snapshot() }
+            let seq = MLXArray(Array(repeating: Int32(100), count: L), [1, L])
+            let (hw, _) = try model.forwardHidden(seq, caches: bc); MLX.eval([hw] + bc.flatMap { $0.stateArrays })
+            for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            var tAcc: UInt64 = 0
+            for _ in 0 ..< 20 {
+                let t = now(); let (h, _) = try model.forwardHidden(seq, caches: bc)
+                MLX.eval([h] + bc.flatMap { $0.stateArrays }); tAcc += now() - t
+                for (i, c) in bc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: L) }
+            }
+            fcPts.append((L, Double(tAcc) / 20 / 1e6))
+        }
+        let cm = CostModel.fit(fcPts)
+
+        // (B) maxK-sweep SuffixSpec 実測（mix ref 前提=高 accept）
+        func suffixRun(_ maxK: Int) throws -> (tokPerSec: Double, accept: Double, draftLen: Double) {
+            var hist = ids.asArray(Int32.self).map { Int($0) }
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+            var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0
+            let t0 = now()
+            while out.count < N {
+                steps += 1
+                let u = uArr.item(Int.self)
+                let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 2)
+                let D = drafts.count; draftTot += D
+                if D == 0 {
+                    let (_, glg) = try model.forwardHidden(uArr, caches: mc)
+                    out.append(u); hist.append(u)
+                    uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                    continue
+                }
+                let snaps = mc.map { $0.snapshot() }
+                let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)
+                let (_, vlg) = try model.forwardHidden(seq, caches: mc)
+                let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+                var p = 0; while p < D && drafts[p] == evals[p] { p += 1 }
+                out.append(u); hist.append(u)
+                for i in 0 ..< p { out.append(drafts[i]); hist.append(drafts[i]) }
+                accTok += p
+                if p == D {
+                    uArr = MLXArray([Int32(evals[D])], [1, 1]); MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                } else {
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
+                    let acc = [u] + Array(drafts.prefix(p))
+                    _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
+                    uArr = MLXArray([Int32(evals[p])], [1, 1]); MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                }
+            }
+            let secs = Double(now() - t0) / 1e9
+            return (Double(out.prefix(N).count) / secs, Double(accTok) / Double(steps), Double(draftTot) / Double(steps))
+        }
+
+        var rows: [String] = []
+        var cVals: [Double] = []
+        for maxK in [4, 8, 16, 24, 32] {
+            // 3 回測って中央値（サーマルノイズ低減）
+            var runs: [(Double, Double, Double)] = []
+            for _ in 0 ..< 3 { runs.append(try suffixRun(maxK)) }
+            let med = runs.sorted { $0.0 < $1.0 }[1]
+            let (tps, accept, draftLen) = med
+            let predNoC = cm.tokPerSec(draftLen: Int(draftLen.rounded()), acceptedPerStep: accept)
+            let stepMs = (1.0 + accept) / tps * 1000.0                  // 実 step 時間
+            let cImplied = stepMs - cm.forwardMs(Int(draftLen.rounded()) + 1)  // forward 超過分=per-step overhead
+            cVals.append(cImplied)
+            rows.append(String(format: "  maxK=%2d: 実測中央値 %.1f / 予測(c無) %.1f tok/s (誤差%+.0f%%)  accept=%.1f  step=%.0fms 内 forward=%.0f → 含意 c=%.0fms",
+                               maxK, tps, predNoC, (tps - predNoC) / predNoC * 100, accept,
+                               stepMs, cm.forwardMs(Int(draftLen.rounded()) + 1), cImplied))
+        }
+        // c を中央値で固定して再予測（c 項込みの当てはまり）
+        let cMed = cVals.sorted()[cVals.count / 2]
+        var rows2: [String] = []
+        for (i, maxK) in [4, 8, 16, 24, 32].enumerated() {
+            let parts = rows[i].split(separator: " ")
+            _ = parts
+            // 実測中央値は rows から再計算せず、c 込み予測のみ表示
+            let dl = maxK   // mix 全受理ゆえ draftLen≈maxK
+            let predC = (1.0 + Double(maxK)) / (cm.forwardMs(dl + 1) + cMed) * 1000.0
+            rows2.append(String(format: "  maxK=%2d: 予測(c=%.0fms込) %.1f tok/s", maxK, cMed, predC))
+        }
+        let fcStr = fcPts.map { String(format: "L%d=%.1f", $0.L, $0.ms) }.joined(separator: " ")
+        return String(format: """
+            [CostModelValidate C=%d, 各maxK 3回中央値] forward-cost: %@
+              fit: a=%.1fms b=%.2fms/tok  (forward_ms(L)=a+b·L)
+            (1) 素の予測=(1+accept)/(a+b·(draftLen+1)) と含意 per-step overhead c:
+            %@
+            (2) c=中央値%.0fms を固定した c 項込み予測:
+            %@
+              → c が ~一定なら cost-model+c で予測選択 OK。c がバラつく/実測が非単調なら起動時実sweep か feedback が要
+            """, C, fcStr, cm.a, cm.b, rows.joined(separator: "\n"), cMed, rows2.joined(separator: "\n"))
+    }
+
     /// **buddy-draft speculative decode（8GB strict lossless ベースライン）**
     /// - 機構: buddy no-sync で K トークン draft → exact batched verify(seqMultiToken)で照合、draft==exact の prefix を採用、外れは exact 訂正
     /// - lossless: **strict**（long horizon でも vs Swift-exact 100%。唯一の真 lossless）
