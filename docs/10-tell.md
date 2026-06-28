@@ -1,5 +1,13 @@
 # 10 — Tell：Qwisp コアランタイム
 
+> **⚠️ 2026-06-28 更新（最新の正典は `notes/01-speedup-investigation.md`）**：
+> - **標準手法 = `suffix-spec`(SuffixSpec, Tell.swift)**。SuffixDecoding draft + **batched f32-full exact verify**(lossless)。
+>   既定実行(QWISP_RUN 無指定)はこれ。全領域で SpecK/Fast 以上の **Pareto 最適**（nl 18.8/mix 76+ vs SpecK 16.6/21）。
+>   既定 maxK=C×3/8(最速安全上限)。実測 8GB C=64 mix 88 / 16GB C=128 mix 132 tok/s(@maxK24-48)。
+> - 旧 `spec-verify`(SpecK)・`buddy-no-sync`(Fast) は **TellExperiments.swift へ移管**(QWISP_RUN で利用可、比較基準)。
+> - **lossless 単流高速化の探索は出尽くし**: compile/MoE 3bit/A3 融合/tree draft は全て実証否定、nl は batch=1 床(~20 tok/s)。詳細 notes/01。
+> - 以下 2026-06-27 の記述(SpecK 基準)は履歴として残置。
+
 > **⚠️ 2026-06-27 後半 大幅更新**：strict-vs-near の決着・命名統一・MLX 基準化により本書の一部結論を訂正。
 > - **8GB lossless ベースライン = `spec-verify`(SpecK)**。**「M2 strict / M0 near が天井」は誤り**で、M0/M2 は long horizon で発散＝near-lossless（真 lossless は SpecK のみ）。
 > - runner は記述名へ統一（`runHotCold*`/`M0-M6` 廃止）、dispatch は **`QWISP_RUN=<name>`** に集約。
@@ -100,7 +108,7 @@
 
 ## 7. env フラグ早見
 
-**dispatch（どの runner を回すか）**: `QWISP_RUN=<name>`（無指定＝既定で spec-verify + buddy-no-sync を実行）。`<name>` 一覧は §2、または不正値で起動すると候補が表示される。`main.swift` の `runners` テーブルが実体。
+**dispatch（どの runner を回すか）**: `QWISP_RUN=<name>`（**無指定＝既定で標準手法 suffix-spec を実行**。旧 spec-verify/buddy-no-sync は明示名で利用可）。`<name>` 一覧は §2、または不正値で起動すると候補が表示される。`main.swift` の `runners` テーブルが実体。
 
 **パラメータ（挙動制御, dispatch とは独立）**: `QWISP_CACHE_C`(cache slot 数) / `QWISP_GEN`(生成長) / `QWISP_DRAFT_K`(投機 draft 長) / `QWISP_CALIB`(calib token 数) / `QWISP_SKIPMODE`（1=skip, 2=skip+renorm, 3=**buddy**）/ `QWISP_MARGIN`（gate しきい, 0=membership）/ `QWISP_PIN`(pin 数) / `QWISP_MTP_REF`(ref パス) / `QWISP_SWIFT_REF=1`（**vs Swift-exact** 評価; long の vs-Python は f16 で無意味）/ `QWISP_M0_SELK`・`QWISP_M0_TAU`（predict-prefetch 選択的 margin）/ `QWISP_M0_TOPK`(neg) / `QWISP_VERIFY_SEQ`・`QWISP_VERIFY_NOSYNC`（verify 制御）/ `QWISP_PARTIAL`・`QWISP_PREFETCH`（gate-escalate の variant）/ `QWISP_MULTI`(cross-layer multi-source) / `QWISP_*_PROF`（profiling）/ `QWISP_BUDDY_OUTSIM`・`QWISP_FUSE_GDN`(neg)。
 
