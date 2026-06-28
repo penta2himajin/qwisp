@@ -311,6 +311,8 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _cgbPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _gatePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _scalePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _swigluPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _combinePipeline: MTLComputePipelineState?
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -352,6 +354,26 @@ public enum RawMetalForward {
             if (i >= total) return;
             x[i] = (half)s * x[i];
         }
+        // swiglu: h = (g*sigmoid(g))*u（MoE/shared expert, 全 f16）。sigmoid は MLX stable(half, metal::exp)
+        kernel void swiglu(device const half* g [[buffer(0)]], device const half* u [[buffer(1)]],
+                           device half* h [[buffer(2)]], constant uint& total [[buffer(3)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            half gv = g[i];
+            half y = (half)1 / ((half)1 + exp(metal::abs(gv)));
+            half s = (gv < (half)0) ? y : ((half)1 - y);
+            h[i] = (gv * s) * u[i];
+        }
+        // combine: y[n] = Σ_k (d[k,n]*scores[k])。★MLX は f16 sum(remap_reduce_types: float は {in,in}=f16 累積)。
+        //   scores も f16(precise softmax でも出力 f16)。積も累積も f16、sequential k で MLX reduce と一致。
+        kernel void combine(device const half* d [[buffer(0)]], device const half* scores [[buffer(1)]],
+                            device half* y [[buffer(2)]], constant uint& K [[buffer(3)]],
+                            constant uint& N [[buffer(4)]], uint n [[thread_position_in_grid]]) {
+            if (n >= N) return;
+            half acc = (half)0;
+            for (uint k = 0; k < K; ++k) acc += d[k*N + n] * scores[k];
+            y[n] = acc;
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -359,6 +381,8 @@ public enum RawMetalForward {
             _cgbPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_g_beta")!)
             _gatePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gate")!)
             _scalePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "scale_mul")!)
+            _swigluPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "swiglu")!)
+            _combinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -1235,6 +1259,38 @@ public enum RawMetalForward {
         return out
     }
 
+    /// raw swiglu: h=(g*sigmoid(g))*u（全 f16）。round-trip(個別 cmd buffer)。
+    static func swigluRaw(_ g: MLXArray, _ u: MLXArray) -> MLXArray? {
+        guard let (device, queue) = ensure(), ensureAuxPipelines(), let p = _swigluPipeline else { return nil }
+        let total = g.size
+        guard let bg = g.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bu = u.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bg, offset: 0, index: 0); enc.setBuffer(bu, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
+        var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), g.shape)
+    }
+    /// raw combine: y[n]=Σ_k (d[k,n]*scores[k])（全 f16, MLX の f16 sum と一致）。
+    static func combineRaw(_ d: MLXArray, _ scores: MLXArray, K: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = ensure(), ensureAuxPipelines(), let p = _combinePipeline else { return nil }
+        guard let bd = d.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bs = scores.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bd, offset: 0, index: 0); enc.setBuffer(bs, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
+        var kk = UInt32(K), nn = UInt32(N); enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&nn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: N)), [N])
+    }
+
     /// 検証: MoE block の raw gather 経路（routing/combine/shared は MLX glue, 4bit gather g/u/d は raw）vs MLX MoEBlock。
     /// down gather は per-expert 入力(h[ki])。bit-exact なら raw gather が full MoE に組み込み可能。
     /// - env: QWISP_RUN=raw-moe-test / QWISP_DEC0_REF(既定 /tmp/qwisp_dec0_ref.safetensors)
@@ -1252,6 +1308,9 @@ public enum RawMetalForward {
               let swUW = r["switch_mlp.up_proj.weight"], let swUS = r["switch_mlp.up_proj.scales"], let swUB = r["switch_mlp.up_proj.biases"],
               let swDW = r["switch_mlp.down_proj.weight"], let swDS = r["switch_mlp.down_proj.scales"], let swDB = r["switch_mlp.down_proj.biases"]
         else { return "[raw-moe] ref キー不足（gate/switch_mlp/shared_expert）" }
+        // shared expert の raw 量子化タプル（4bit, my qmm 用）
+        func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!) }
+        let sgW = tup("shared_expert.gate_proj"), suW = tup("shared_expert.up_proj"), sdW = tup("shared_expert.down_proj")
         let Hin = swGS.dim(-1) * 64                                          // K = groups*gs = 2048
         let topK = 8, E = 256, I = swGW.dim(-2)                              // I=intermediate=512
         let blk = MoEBlock(topK: topK, numExperts: E, normTopk: true, expertBits: 4, gate: gate,
@@ -1271,21 +1330,34 @@ public enum RawMetalForward {
         guard let g = gatherQmm(x2, swGW, scales: swGS, biases: swGB, inds: indsFlat, Ktop: topK, K: Hin, N: I),
               let u = gatherQmm(x2, swUW, scales: swUS, biases: swUB, inds: indsFlat, Ktop: topK, K: Hin, N: I)
         else { return "[raw-moe] gather g/u 失敗" }
-        let h = (g * MLX.sigmoid(g)) * u                                     // [8, I] swiglu(MLX glue)
+        guard let h = swigluRaw(g, u) else { return "[raw-moe] swiglu 失敗" }  // [8, I] raw swiglu
         guard let d = gatherQmm(h, swDW, scales: swDS, biases: swDB, inds: indsFlat, Ktop: topK, K: I, N: Hin, lhsPerExpert: true)
         else { return "[raw-moe] gather d 失敗" }                           // [8, H] per-expert
-        let y = (d * scores.reshaped([topK, 1])).sum(axis: 0)               // combine(MLX glue) [H]
-        // shared expert（MLX glue, MoEBlock と同一）
-        let sg = shGate.apply(x), su = shUp.apply(x)
-        let sharedY = shDown.apply((sg * MLX.sigmoid(sg)) * su)
-        let gateScale = MLX.sigmoid(sharedGate.apply(x))
+        let useRawCombine = ProcessInfo.processInfo.environment["QWISP_RAW_COMBINE"] == "1"
+        let y: MLXArray
+        if useRawCombine { guard let yc = combineRaw(d, scores.reshaped([topK]), K: topK, N: Hin) else { return "[raw-moe] combine 失敗" }; y = yc }
+        else { y = (d * scores.reshaped([topK, 1])).sum(axis: 0) }            // MLX combine（切り分け用）
+        // shared expert（shGate/shUp/shDown は raw 4bit qmm + raw swiglu, sharedGate 8bit は MLX）
+        guard let sg = qmm(x, sgW.0, scales: sgW.1, biases: sgW.2, M: 1, K: Hin, N: I),
+              let su = qmm(x, suW.0, scales: suW.1, biases: suW.2, M: 1, K: Hin, N: I),
+              let shAct = swigluRaw(sg, su),
+              let sharedY = qmm(shAct, sdW.0, scales: sdW.1, biases: sdW.2, M: 1, K: I, N: Hin)
+        else { return "[raw-moe] shared expert 失敗" }
+        let gateScale = MLX.sigmoid(sharedGate.apply(x))                     // 8bit gate は MLX
         let gotRaw = (y.reshaped([1, Hin]) + gateScale * sharedY)
         gotRaw.eval()
         let rel = relErr(gotRaw.reshaped([gotRaw.size]), ref.reshaped([ref.size]))
-        return String(format: "[raw-moe-test] MoE block raw gather(g/u共有 + d per-expert) vs MLX MoEBlock\n"
-            + "  E=%d topK=%d Hin=%d I=%d（routing/combine/shared は MLX glue, 4bit gather が raw）\n"
-            + "  MoE block 全体 rel=%.3e %@",
-            E, topK, Hin, I, rel, rel == 0 ? "✅ TRUE bit-exact（raw gather 組込可）" : (rel < 2e-3 ? "△ 近似" : "❌"))
+        // raw combine の単体 rel も併記（MLX reduce_col の sum 順序差で near, 重い計算は全 raw で bit-exact）
+        var note = ""
+        if !useRawCombine, let yr = combineRaw(d, scores.reshaped([topK]), K: topK, N: Hin) {
+            let yMlx = (d * scores.reshaped([topK, 1])).sum(axis: 0)
+            note = String(format: "\n  （raw combine 単体 rel=%.3e: MLX reduce_col の f16 sum 順序差。combine のみ MLX 推奨）",
+                          relErr(yr, yMlx))
+        }
+        return String(format: "[raw-moe-test] MoE block raw（gather g/u/d・swiglu・shared expert=raw, routing/combine=MLX）vs MLX MoEBlock\n"
+            + "  E=%d topK=%d Hin=%d I=%d。重い計算(gather 3種+swiglu+shared)は全 raw\n"
+            + "  MoE block 全体 rel=%.3e %@%@",
+            E, topK, Hin, I, rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ 近似(raw combine)" : "❌"), note)
     }
 
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
