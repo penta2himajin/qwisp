@@ -109,6 +109,42 @@ public struct GatedDeltaNetLayer {
         return r[0]
     }
 
+    /// issue#5 融合カーネル: rmsNormNoWeight(x)*scale を 1 dispatch に（conv-stage の qN/kN 用）。
+    /// 元: scale * rms_norm(x, ones)。normed を x.dtype 丸め → scale 積（元の scalar mul 経路）。
+    nonisolated(unsafe) static var _rmsScaledKernel: MLXFast.MLXFastKernel?
+    static func rmsNormScaledFused(_ x: MLXArray, scale: Float, D: Int, outType: DType) -> MLXArray {
+        let rows = x.size / D
+        let xr = x.reshaped([rows, D])
+        if _rmsScaledKernel == nil {
+            _rmsScaledKernel = MLXFast.metalKernel(
+                name: "rms_norm_scaled",
+                inputNames: ["x", "sc"],
+                outputNames: ["out"],
+                source: """
+                    const uint D = x_shape[1];
+                    uint d = thread_position_in_threadgroup.x;
+                    uint row = thread_position_in_grid.y;
+                    threadgroup float sh[1024];
+                    float c = (float)x[row*D + d];
+                    sh[d] = c * c;
+                    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+                    for (uint s = D >> 1; s > 0; s >>= 1) {
+                        if (d < s) sh[d] += sh[d + s];
+                        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+                    }
+                    float rms = metal::rsqrt(sh[0] / (float)D + 1e-6f);
+                    T normed_t = (T)(c * rms);              // 元: rms_norm(ones) 出力は x.dtype 丸め
+                    out[row*D + d] = (T)((float)normed_t * sc[0]);
+                """)
+        }
+        let r = _rmsScaledKernel!(
+            [xr, MLXArray([scale], [1])],
+            template: [("T", outType)],
+            grid: (D, rows, 1), threadGroup: (D, 1, 1),
+            outputShapes: [[rows, D]], outputDTypes: [outType])
+        return r[0]
+    }
+
     public init(numKHeads: Int, numVHeads: Int, headKDim: Int, headVDim: Int,
                 convKernel: Int, eps: Float,
                 inProjQKV: Proj, inProjZ: Proj, inProjB: Proj, inProjA: Proj, outProj: Proj,
@@ -172,8 +208,16 @@ public struct GatedDeltaNetLayer {
         let v1 = convOut[0..., 0..., (2 * keyDim)...].reshaped([B, S, numVHeads, headVDim])
 
         let invScale = Float(pow(Double(headKDim), -0.5))
-        let qN = (invScale * invScale) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
-        let kN = invScale * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
+        let qN: MLXArray, kN: MLXArray
+        if GatedDeltaNetLayer.fuseRMSGated {                          // issue#5: qk-norm を融合カーネルに
+            qN = GatedDeltaNetLayer.rmsNormScaledFused(q1, scale: invScale * invScale, D: headKDim, outType: q1.dtype)
+                .reshaped([B, S, numKHeads, headKDim])
+            kN = GatedDeltaNetLayer.rmsNormScaledFused(k1, scale: invScale, D: headKDim, outType: k1.dtype)
+                .reshaped([B, S, numKHeads, headKDim])
+        } else {
+            qN = (invScale * invScale) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
+            kN = invScale * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
+        }
         if prof { MLX.eval([qN, kN, v1] + ((cache?.convState).map { [$0] } ?? [])); StreamingMoEBlock.tGdnConv += now() - t; t = now() }
 
         let (coreOut, newState) = GatedDelta.updateKernel(qN, kN, v1, a, b, aLog, dtBias,
