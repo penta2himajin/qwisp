@@ -185,6 +185,67 @@ public enum RawMetalForward {
 
     nonisolated(unsafe) static var _ropePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _conv1dPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sdpaPipeline: MTLComputePipelineState?
+
+    /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
+    /// q[H,D], K/V[KV,S,D] → out[H,D]。head h は kv=h/(H/KV)。MLXFast.scaledDotProductAttention(f32,.none) と照合。
+    static func sdpaDecode(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+                           H: Int, KV: Int, D: Int, S: Int, scale: Float) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        if _sdpaPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void sdpa(device const half* q [[buffer(0)]],   // [H,D]
+                             device const half* k [[buffer(1)]],   // [KV,S,D]
+                             device const half* v [[buffer(2)]],   // [KV,S,D]
+                             device half* out      [[buffer(3)]],  // [H,D]
+                             constant uint& H [[buffer(4)]], constant uint& KV [[buffer(5)]],
+                             constant uint& D [[buffer(6)]], constant uint& S [[buffer(7)]],
+                             constant float& scale [[buffer(8)]],
+                             uint d [[thread_position_in_threadgroup]],
+                             uint h [[threadgroup_position_in_grid]]) {
+                threadgroup float sh[256];
+                uint g = H / KV;          // q-heads per kv
+                uint kv = h / g;
+                float qd = (float)q[h*D + d];
+                float accd = 0.0f, m = -INFINITY, l = 0.0f;
+                for (uint s = 0; s < S; ++s) {
+                    sh[d] = qd * (float)k[(kv*S + s)*D + d];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint t = D>>1; t>0; t>>=1) { if (d<t) sh[d]+=sh[d+t]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                    float score = scale * sh[0];
+                    float m_new = max(m, score);
+                    float corr = exp(m - m_new);
+                    float p = exp(score - m_new);
+                    l = l*corr + p;
+                    accd = accd*corr + p * (float)v[(kv*S + s)*D + d];
+                    m = m_new;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                out[h*D + d] = (half)(accd / l);
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 _sdpaPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa")!)
+            } catch { print("[raw-sdpa] compile: \(error)"); return nil }
+        }
+        guard let bq = q.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bk = k.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bv = v.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: H * D * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_sdpaPipeline!)
+        enc.setBuffer(bq, offset: 0, index: 0); enc.setBuffer(bk, offset: 0, index: 1)
+        enc.setBuffer(bv, offset: 0, index: 2); enc.setBuffer(outBuf, offset: 0, index: 3)
+        var hh = UInt32(H), kk = UInt32(KV), dd = UInt32(D), ss = UInt32(S), sc = scale
+        enc.setBytes(&hh, length: 4, index: 4); enc.setBytes(&kk, length: 4, index: 5)
+        enc.setBytes(&dd, length: 4, index: 6); enc.setBytes(&ss, length: 4, index: 7); enc.setBytes(&sc, length: 4, index: 8)
+        enc.dispatchThreadgroups(MTLSize(width: H, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: H * D)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H * D)), [H, D])
+    }
 
     /// raw-Metal grouped causal conv1d + silu（GDN, decode S=1）。input[K,C](K=conv窓), w[C,K] → out[C]。
     /// out[c]=silu(Σ_k input[k,c]·w[c,k])、f32 累積（f32Conv 経路一致）。MLX conv1d(groups=C)+silu と照合。
@@ -314,6 +375,20 @@ public enum RawMetalForward {
             let rel = relErr(g.reshaped([1, 1, Cc]), refC)
             out += String(format: "\n  conv1d+silu: rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
         } else { out += "\n  conv1d: kernel 失敗" }
+        // SDPA(decode L=1, GQA 16q/2kv, head_dim 256, S=10, f32)
+        let Hh = 16, KVk = 2, Dd = 256, Ss = 10
+        let scaleA = Float(pow(256.0, -0.5))
+        let q = MLXRandom.normal([1, Hh, 1, Dd]).asType(.float16)
+        let kk2 = MLXRandom.normal([1, KVk, Ss, Dd]).asType(.float16)
+        let vv = MLXRandom.normal([1, KVk, Ss, Dd]).asType(.float16)
+        let refA = MLXFast.scaledDotProductAttention(queries: q.asType(.float32), keys: kk2.asType(.float32),
+                       values: vv.asType(.float32), scale: scaleA, mask: .none).asType(.float16); refA.eval()
+        if let g = sdpaDecode(q.reshaped([Hh, Dd]), kk2.reshaped([KVk, Ss, Dd]), vv.reshaped([KVk, Ss, Dd]),
+                              H: Hh, KV: KVk, D: Dd, S: Ss, scale: scaleA) {
+            g.eval()
+            let rel = relErr(g.reshaped([1, Hh, 1, Dd]), refA)
+            out += String(format: "\n  SDPA(decode):rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
+        } else { out += "\n  SDPA: kernel 失敗" }
         return out
     }
 
