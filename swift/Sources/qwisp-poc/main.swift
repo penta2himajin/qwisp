@@ -22,6 +22,7 @@ if ProcessInfo.processInfo.environment["QWISP_GDN_TTEST"] == "1" {
     print("[perQueryNone f16] " + AttentionLayer.sConsistencyTest(dtype: .float16))
     print("[perQueryNone-quant] " + AttentionLayer.perQueryNoneQuantTest())
     AttentionLayer.perQueryNone = false
+    print(CompileBench.run())                      // mx.compile が per-layer launch overhead を削るか
     exit(0)
 }
 
