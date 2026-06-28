@@ -63,6 +63,7 @@ public struct GatedDeltaNetLayer {
     let fusedIn: Proj?    // qkv+z+b+a を 1 本に融合（4→1 matmul）
 
     nonisolated(unsafe) public static var fuseGDN = false   // 融合 in_proj 経路を使う
+    nonisolated(unsafe) public static var f32Conv = false   // A2: conv1d を f32 で（batched≠逐次 f16 drift を消す）
 
     public init(numKHeads: Int, numVHeads: Int, headKDim: Int, headVDim: Int,
                 convKernel: Int, eps: Float,
@@ -111,8 +112,15 @@ public struct GatedDeltaNetLayer {
         if let c = cache {
             c.convState = MLX.contiguous(convInput[0..., (convInput.dim(1) - (convKernel - 1))...])
         }
-        let convOut = silu(MLX.conv1d(convInput, conv1dW, stride: 1, padding: 0,
+        let convOut: MLXArray
+        if GatedDeltaNetLayer.f32Conv {
+            let co = MLX.conv1d(convInput.asType(.float32), conv1dW.asType(.float32), stride: 1,
+                                padding: 0, dilation: 1, groups: convDim)
+            convOut = silu(co).asType(x.dtype)
+        } else {
+            convOut = silu(MLX.conv1d(convInput, conv1dW, stride: 1, padding: 0,
                                       dilation: 1, groups: convDim))   // [B,S,convDim]
+        }
 
         // split conv_out → q,k,v
         let q1 = convOut[0..., 0..., 0 ..< keyDim].reshaped([B, S, numKHeads, headKDim])

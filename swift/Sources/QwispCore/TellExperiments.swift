@@ -1629,9 +1629,13 @@ extension Tell {
         // ＝seqMT が直すのは attention のみで conv1d/GDN/MoE の f16 batched≠逐次 が残る(A1 同根)。
         // hard(反復)は near-tie を越えず maxK=8 でも lossless ＝入力依存境界。安全側で maxK=4 固定。
         // 長 draft 解放には multi-token forward 全体の bit-exact(f32/逐次)化=軸A2/A3 が要る。
-        let maxK = Swift.min(Tell.envInt("QWISP_DRAFT_K", 4), 4)
+        let maxK = Swift.min(Tell.envInt("QWISP_DRAFT_K", 4), 16)   // A2 検証中は上限まで
         let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 2)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
+        // A2: divergent op(attention SDPA + conv1d)を f32 化＝seqMT 無しで batched verify を lossless に
+        GatedDeltaNetLayer.f32Conv = Tell.envFlag("QWISP_F32_CONV")
+        AttentionLayer.f32SDPA = Tell.envFlag("QWISP_F32_ATTN")
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
