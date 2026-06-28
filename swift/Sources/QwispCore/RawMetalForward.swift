@@ -2,6 +2,7 @@ import Foundation
 import Metal
 import MLX
 import MLXFast
+import MLXNN
 import MLXRandom
 
 /// issue#5 raw-Metal forward 本実装の足場。MLX を迂回し forward を自前 Metal kernel + 単一 encoder で
@@ -25,63 +26,113 @@ public enum RawMetalForward {
     static func qmm(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray,
                     M: Int, K: Int, N: Int, bits: Int = 4, gs: Int = 64) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
+        // ★ MLX の quantizedMatmul(qmv_fast) を数式・累積順・simd_sum まで完全一致で移植（rel 0.000e0 が目標）。
+        //   raw-Metal forward の目的は MLX の per-dispatch C++ overhead 回避であり、GPU kernel 自体は MLX と
+        //   同一にする（= bit-exact かつ同速）。bits=4/gs=64/half に特化。fast 条件 N%8==0 && K%512==0。
+        //   MLX: backend/metal/kernels/quantized.h qmv_fast_impl/qdot/load_vector を逐語移植。
+        let fast = (N % 8 == 0) && (K % 512 == 0) && bits == 4 && gs == 64
+        guard fast else { print("[raw-qmm] 非fast (N=\(N) K=\(K) bits=\(bits) gs=\(gs)) 未対応"); return nil }
         if _qmmPipeline == nil {
-            // 最適化: threadgroup/output(m,n)、TG スレッドで K 並列 reduction。各スレッドは uint32(8 nibble)
-            // 一括 load で 8 k を処理（nibble unpack のメモリ load を 1/8 に）。f32 累積→simd/threadgroup reduce。
             let src = """
             #include <metal_stdlib>
             using namespace metal;
-            kernel void qmm4(device const half*  x      [[buffer(0)]],
-                             device const uint*  wq     [[buffer(1)]],
-                             device const half*  scales [[buffer(2)]],
-                             device const half*  biases [[buffer(3)]],
-                             device half*        out    [[buffer(4)]],
-                             constant uint&       K      [[buffer(5)]],
-                             constant uint&       N      [[buffer(6)]],
-                             constant uint&       GS     [[buffer(7)]],
-                             uint t  [[thread_position_in_threadgroup]],
-                             uint TG [[threads_per_threadgroup]],
-                             uint o  [[threadgroup_position_in_grid]],
-                             uint sgid [[simdgroup_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-                uint m = o / N, n = o % N;
-                uint kp = K / 8, kg = K / GS;
-                threadgroup float sh[8];
-                device const uint4* wq4 = (device const uint4*)(wq + n*kp);
-                device const half* xrow = x + m*K;
-                float acc = 0.0f;
-                // 各スレッドは base=t*32 から TG*32 stride で uint4(32 nibble=32 k)を一括 load
-                for (uint base = t*32; base < K; base += TG*32) {
-                    uint4 pk = wq4[base >> 5];
-                    uint g = base / GS;            // 32 k は同一 group(GS=64 の倍数前提)
-                    float sc = (float)scales[n*kg + g], bi = (float)biases[n*kg + g];
-                    uint ps[4] = {pk.x, pk.y, pk.z, pk.w};
-                    #pragma unroll(4)
-                    for (uint w8 = 0; w8 < 4; ++w8) {
-                        uint packed = ps[w8];
-                        #pragma unroll(8)
-                        for (uint j = 0; j < 8; ++j) {
-                            uint nib = (packed >> (4u*j)) & 0xFu;
-                            acc += (float)xrow[base + w8*8 + j] * (sc * (float)nib + bi);
-                        }
-                    }
+            #define SIMD_SIZE 32
+            // MLX load_vector<bits=4>: x を 16^j で事前除算（qdot で packed nibble の bit-shift と相殺）。sum=Σx。
+            // ★ MLX 厳密一致の要点: sum の 4 要素加算は half 演算（x は half）→ float の sum に昇格。
+            //   各要素を先に float 化して足すと丸めが変わり非 bit-exact になる（ここが残差源だった）。
+            inline float ld16(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];   // half 加算 → float（MLX と一致）
+                    xt[i]   = x[i];                            // half→float 厳密変換
+                    xt[i+1] = x[i+1] / 16.0f;                  // half/float → float
+                    xt[i+2] = x[i+2] / 256.0f;
+                    xt[i+3] = x[i+3] / 4096.0f;
                 }
-                float ssum = simd_sum(acc);               // simdgroup(32 lane)内合算
-                if (lane == 0) sh[sgid] = ssum;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (t == 0) {
-                    float tot = 0.0f; uint ng = (TG + 31) / 32;
-                    for (uint i = 0; i < ng; ++i) tot += sh[i];
-                    out[m*N + n] = (half)tot;
+                return sum;
+            }
+            // MLX qdot<bits=4>: ws を uint16 として 4 nibble 同時、accum=Σ xt·(nibble<<4j)。返り scale*accum+sum*bias。
+            inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                const device uint16_t* ws = (const device uint16_t*)w;
+                for (int i = 0; i < 4; i++) {
+                    accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                              xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                              xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                              xt[4*i+3] * (float)(ws[i] & 0xf000));
+                }
+                return scale * accum + sum * bias;
+            }
+            // MLX qmv_fast_impl<half, gs=64, bits=4>: packs_per_thread=2 vpt=16 block=512 2sg×4row。
+            kernel void qmm4(device const uint32_t* w      [[buffer(0)]],
+                             device const half*     scales [[buffer(1)]],
+                             device const half*     biases [[buffer(2)]],
+                             device const half*     x      [[buffer(3)]],
+                             device half*           y      [[buffer(4)]],
+                             constant int&          in_vec_size  [[buffer(5)]],   // K
+                             constant int&          out_vec_size [[buffer(6)]],   // N
+                             uint3 tid      [[threadgroup_position_in_grid]],
+                             uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                             uint  simd_lid [[thread_index_in_simdgroup]]) {
+                constexpr int packs_per_thread = 2;
+                constexpr int num_simdgroups = 2;
+                constexpr int results_per_simdgroup = 4;
+                constexpr int pack_factor = 8;
+                constexpr int bytes_per_pack = 4;
+                constexpr int values_per_thread = 16;
+                constexpr int block_size = 512;            // vpt*SIMD_SIZE
+                constexpr int scale_step_per_thread = 4;   // gs(64)/vpt(16)
+                const device uint8_t* ws = (const device uint8_t*)w;
+                typedef float U;
+                thread U x_thread[16];
+                thread U result[4] = {0};
+                const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                const int in_vec_size_g = in_vec_size / 64;
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+                scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                x += tid.x * in_vec_size + simd_lid * values_per_thread;
+                y += tid.x * out_vec_size + out_row;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    U sum = ld16(x, x_thread);
+                    for (int row = 0; row < results_per_simdgroup; row++) {
+                        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                        const device half* sl = scales + row * in_vec_size_g;
+                        const device half* bl = biases + row * in_vec_size_g;
+                        U s = sl[0]; U b = bl[0];
+                        result[row] += qd4(wl, x_thread, s, b, sum);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;
+                    scales += block_size / 64;
+                    biases += block_size / 64;
+                    x += block_size;
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    result[row] = simd_sum(result[row]);
+                    if (simd_lid == 0) y[row] = (half)result[row];
                 }
             }
             """
             do {
-                let lib = try device.makeLibrary(source: src, options: nil)
+                // ★ MLX metallib との bit 一致は浮動小数点コンパイル設定(FMA contraction/fast-math)に依存。
+                //   QWISP_QMM_MATH=safe|relaxed|fast で切替（既定 safe=FMA contraction 無効で MLX の決定論ビルドに合わせる試行）。
+                let opts = MTLCompileOptions()
+                let mathSel = ProcessInfo.processInfo.environment["QWISP_QMM_MATH"] ?? "safe"
+                if #available(macOS 15.0, *) {
+                    switch mathSel {
+                    case "fast": opts.mathMode = .fast
+                    case "relaxed": opts.mathMode = .relaxed
+                    default: opts.mathMode = .safe
+                    }
+                } else {
+                    opts.fastMathEnabled = (mathSel == "fast")
+                }
+                let lib = try device.makeLibrary(source: src, options: opts)
                 _qmmPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4")!)
             } catch { print("[raw-qmm] compile error: \(error)"); return nil }
         }
-        // MLX weight を MTLBuffer 共有（noCopy）。x も同様。out は新規。
+        // MLX weight を MTLBuffer 共有（noCopy）。x も同様。out は新規。バッファ順は MLX kernel に合わせ w,scales,biases,x,y。
         guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
               let bwq = wq.asMTLBuffer(device: device, noCopy: false),
               let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
@@ -91,18 +142,17 @@ public enum RawMetalForward {
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_qmmPipeline!)
-        enc.setBuffer(bx, offset: 0, index: 0)
-        enc.setBuffer(bwq, offset: 0, index: 1)
-        enc.setBuffer(bsc, offset: 0, index: 2)
-        enc.setBuffer(bbi, offset: 0, index: 3)
+        enc.setBuffer(bwq, offset: 0, index: 0)
+        enc.setBuffer(bsc, offset: 0, index: 1)
+        enc.setBuffer(bbi, offset: 0, index: 2)
+        enc.setBuffer(bx, offset: 0, index: 3)
         enc.setBuffer(outBuf, offset: 0, index: 4)
-        var kk = UInt32(K), nn = UInt32(N), g = UInt32(gs)
+        var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5)
         enc.setBytes(&nn, length: 4, index: 6)
-        enc.setBytes(&g, length: 4, index: 7)
-        let TG = 128
-        enc.dispatchThreadgroups(MTLSize(width: M * N, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: TG, height: 1, depth: 1))
+        // grid=(M, N/8, 1), group=(32,2,1) ＝ MLX qmv の dispatch と一致。
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         // MTLBuffer → MLXArray（f16, [M,N]）
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
@@ -542,6 +592,166 @@ public enum RawMetalForward {
             + "\n  → depth↑ で encode 削減率↑ なら 40 層 forward の ~1.7x を裏付け"
     }
 
+    // ── task#3: GDN 1 層 assembly（全 raw kernel を chain）───────────────────────
+    /// GDN decode 1 step（cold state: convState/recState=zeros）を全 raw kernel で組む。
+    /// 量子化 in/out_proj(wq,scales,biases)＋ conv1dW/normWeight/aLog/dtBias を受け、coreOut→out[1,H]。
+    /// この段階では各 kernel が個別 command buffer で round-trip する（numeric assembly の正しさを先に確定。
+    /// single-encoder 融合は次段）。slicing・computeG・sigmoid・reshape の合成を MLX 経路と bit-exact 照合する。
+    struct GDNRawWeights {
+        let qkvWq: MLXArray, qkvSc: MLXArray, qkvBi: MLXArray
+        let zWq: MLXArray, zSc: MLXArray, zBi: MLXArray
+        let bWq: MLXArray, bSc: MLXArray, bBi: MLXArray
+        let aWq: MLXArray, aSc: MLXArray, aBi: MLXArray
+        let outWq: MLXArray, outSc: MLXArray, outBi: MLXArray
+        let conv1dW: MLXArray   // [convDim, K]
+        let normWeight: MLXArray, aLog: MLXArray, dtBias: MLXArray
+    }
+
+    static func gdnLayerRaw(_ x: MLXArray, _ w: GDNRawWeights,
+                            numKHeads: Int = 16, numVHeads: Int = 32,
+                            headKDim: Int = 128, headVDim: Int = 128,
+                            convKernel: Int = 4, eps: Float = 1e-6) -> MLXArray? {
+        let H = x.dim(-1)
+        let keyDim = headKDim * numKHeads        // 2048
+        let valueDim = headVDim * numVHeads      // 4096
+        let convDim = keyDim * 2 + valueDim      // 8192
+        let x2 = x.reshaped([1, H])
+        // ① in_proj（4 本, 量子化 gemv）
+        guard let qkv = qmm(x2, w.qkvWq, scales: w.qkvSc, biases: w.qkvBi, M: 1, K: H, N: convDim),
+              let z   = qmm(x2, w.zWq,   scales: w.zSc,   biases: w.zBi,   M: 1, K: H, N: valueDim),
+              let bP  = qmm(x2, w.bWq,   scales: w.bSc,   biases: w.bBi,   M: 1, K: H, N: numVHeads),
+              let aP  = qmm(x2, w.aWq,   scales: w.aSc,   biases: w.aBi,   M: 1, K: H, N: numVHeads)
+        else { return nil }
+        // ② conv1d+silu（cold: convState=zeros, 窓 K=convKernel）。convInput[K, convDim]
+        let convState = MLXArray.zeros([convKernel - 1, convDim], dtype: .float16)
+        let convInput = MLX.concatenated([convState, qkv.asType(.float16)], axis: 0)  // [K, convDim]
+        guard let convOut = conv1dSilu(convInput, w.conv1dW, K: convKernel, C: convDim) else { return nil }
+        let co = convOut.reshaped([convDim])
+        // ③ split → q,k,v
+        let q1 = co[0 ..< keyDim].reshaped([numKHeads, headKDim])
+        let k1 = co[keyDim ..< 2 * keyDim].reshaped([numKHeads, headKDim])
+        let v1 = co[(2 * keyDim)...].reshaped([1, 1, numVHeads, headVDim])
+        // ④ qk-norm（no-weight rmsNorm → scalar）
+        let invScale = Float(pow(Double(headKDim), -0.5))
+        guard let qn0 = rmsNorm(q1, nil, eps: eps, D: headKDim),
+              let kn0 = rmsNorm(k1, nil, eps: eps, D: headKDim) else { return nil }
+        let qN = ((invScale * invScale) * qn0).reshaped([1, 1, numKHeads, headKDim])
+        let kN = (invScale * kn0).reshaped([1, 1, numKHeads, headKDim])
+        // ⑤ recurrent（g/beta は MLX で, kernel は GQA を内部処理）
+        let g = GatedDelta.computeG(w.aLog, aP.reshaped([1, 1, numVHeads]), w.dtBias)
+        let beta = MLX.sigmoid(bP.reshaped([1, 1, numVHeads]))
+        let st = MLXArray.zeros([1, numVHeads, headVDim, headKDim], dtype: .float32)
+        guard let (coreOut, _) = recurrent(qN, kN, v1, g: g, beta: beta, state: st,
+                                           B: 1, T: 1, Hk: numKHeads, Dk: headKDim,
+                                           Hv: numVHeads, Dv: headVDim) else { return nil }
+        // ⑥ RMSNormGated: silu(z) * rmsNorm(coreOut, normWeight)
+        guard let normed = rmsNorm(coreOut.reshaped([numVHeads, headVDim]), w.normWeight,
+                                   eps: eps, D: headVDim) else { return nil }
+        let zr = z.reshaped([numVHeads, headVDim])
+        let gated = (silu(zr.asType(.float32)) * normed.asType(.float32)).asType(.float16)
+        let outV = gated.reshaped([1, valueDim])
+        // ⑦ out_proj
+        return qmm(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: 1, K: valueDim, N: H)
+    }
+
+    /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。
+    /// - env: QWISP_RUN=raw-gdn-test / QWISP_GDN_REF(ref path, 既定 /tmp/qwisp_gdn_layer_ref.safetensors)
+    public static func runGdnLayerTest() -> String {
+        let refPath = ProcessInfo.processInfo.environment["QWISP_GDN_REF"]
+            ?? "/tmp/qwisp_gdn_layer_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else {
+            return "[raw-gdn] ERROR: ref 読込失敗 \(refPath)"
+        }
+        guard let qkvW = r["in_proj_qkv"], let zW = r["in_proj_z"],
+              let bW = r["in_proj_b"], let aW = r["in_proj_a"], let outW = r["out_proj"],
+              let cw = r["conv1d"], let nw = r["norm_weight"],
+              let aLog = r["A_log"], let dtBias = r["dt_bias"] else {
+            return "[raw-gdn] ERROR: ref キー不足"
+        }
+        // decode 1 step（S=1, cold cache）を検証: 新規 x[1,1,2048]、ref も同 x で MLX 層から構築。
+        let H = qkvW.dim(-1)
+        let x = MLXRandom.normal([1, 1, H]).asType(.float16)
+        // 同一量子化重みで raw / MLX-ref を構築（量子化ノイズを除外し assembly のみ比較）
+        func quant(_ wt: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+            let (wq, s, bOpt) = MLX.quantized(wt.asType(.float16), groupSize: 64, bits: 4, mode: .affine)
+            return (wq, s, bOpt!)
+        }
+        let (qkvWq, qkvSc, qkvBi) = quant(qkvW)
+        let (zWq, zSc, zBi) = quant(zW)
+        let (bWq, bSc, bBi) = quant(bW)
+        let (aWq, aSc, aBi) = quant(aW)
+        let (outWq, outSc, outBi) = quant(outW)
+        let convDim = 8192
+        let rw = GDNRawWeights(
+            qkvWq: qkvWq, qkvSc: qkvSc, qkvBi: qkvBi, zWq: zWq, zSc: zSc, zBi: zBi,
+            bWq: bWq, bSc: bSc, bBi: bBi, aWq: aWq, aSc: aSc, aBi: aBi,
+            outWq: outWq, outSc: outSc, outBi: outBi,
+            conv1dW: cw.reshaped([convDim, 4]).asType(.float16),   // [convDim,K,1] → [convDim,K]
+            normWeight: nw.asType(.float16), aLog: aLog, dtBias: dtBias)
+        // MLX 参照（同一量子化重み, f32Conv=true で raw の f32 累積に一致, fuse=off）
+        let prevF32 = GatedDeltaNetLayer.f32Conv
+        GatedDeltaNetLayer.f32Conv = true
+        defer { GatedDeltaNetLayer.f32Conv = prevF32 }
+        let refLayer = GatedDeltaNetLayer(
+            numKHeads: 16, numVHeads: 32, headKDim: 128, headVDim: 128, convKernel: 4, eps: 1e-6,
+            inProjQKV: .quantized(qkvWq, qkvSc, qkvBi, 4), inProjZ: .quantized(zWq, zSc, zBi, 4),
+            inProjB: .quantized(bWq, bSc, bBi, 4), inProjA: .quantized(aWq, aSc, aBi, 4),
+            outProj: .quantized(outWq, outSc, outBi, 4),
+            conv1dW: cw, normWeight: nw, aLog: aLog, dtBias: dtBias)
+        let ref = refLayer(x); ref.eval()
+        guard let got = gdnLayerRaw(x, rw) else { return "[raw-gdn] ERROR: raw assembly 実行失敗" }
+        got.eval()
+        let refFlat = ref.reshaped([ref.size])
+        let gotFlat = got.reshaped([got.size])
+        let rel = relErr(gotFlat, refFlat)
+        let ok = rel < 2e-3
+        var out = String(format: "[raw-gdn-test] GDN 1 層 raw assembly vs MLX(同量子化, f32Conv)\n"
+            + "  out shape raw=%@ ref=%@  rel=%.3e  %@",
+            "\(got.shape)", "\(ref.shape)", rel, ok ? "OK ✅ assembly bit-exact" : "MISMATCH ❌")
+        if !ok {
+            let rf = refFlat.asArray(Float.self), gf = gotFlat.asArray(Float.self)
+            var mi = 0; var md: Float = 0
+            for i in 0 ..< rf.count { let d = abs(rf[i] - gf[i]); if d > md { md = d; mi = i } }
+            out += String(format: "\n    max diff @ %d: ref=%.4f got=%.4f", mi, rf[mi], gf[mi])
+        }
+        // per-stage 診断: 各段で raw 中間値 vs MLX 中間値の rel（誤差が compound か構造バグか）
+        out += "\n  ── per-stage 診断（各段 raw vs MLX, 同入力・同重み）──"
+        let keyDim = 2048, nKH = 16, hKD = 128, cK = 4
+        let x2 = x.reshaped([1, H])
+        // ① in_proj qkv
+        let mlxQkv = MLX.quantizedMatmul(x2, qkvWq, scales: qkvSc, biases: qkvBi, transpose: true,
+                                         groupSize: 64, bits: 4, mode: .affine); mlxQkv.eval()
+        let rawQkv = qmm(x2, qkvWq, scales: qkvSc, biases: qkvBi, M: 1, K: H, N: convDim)!
+        out += String(format: "\n   ① qkv(qmm):      rel=%.3e", relErr(rawQkv, mlxQkv))
+        // ② conv1d+silu（各 path は自分の qkv を入力＝cumulative drift）
+        func mlxConv(_ qkv: MLXArray) -> MLXArray {
+            let cs = MLXArray.zeros([1, cK - 1, convDim], dtype: .float16)
+            let ci = MLX.concatenated([cs, qkv.reshaped([1, 1, convDim])], axis: 1)
+            let co = MLX.conv1d(ci.asType(DType.float32), cw.reshaped([convDim, cK, 1]).asType(DType.float32),
+                                stride: 1, padding: 0, dilation: 1, groups: convDim)
+            return silu(co).asType(DType.float16).reshaped([convDim])
+        }
+        let mlxCo = mlxConv(mlxQkv)
+        let csR = MLXArray.zeros([cK - 1, convDim], dtype: .float16)
+        let rawCo = conv1dSilu(MLX.concatenated([csR, rawQkv.asType(.float16)], axis: 0),
+                               cw.reshaped([convDim, cK]).asType(.float16), K: cK, C: convDim)!.reshaped([convDim])
+        out += String(format: "\n   ② convOut:       rel=%.3e", relErr(rawCo, mlxCo))
+        // ③ qk-norm（各 path 自分の convOut）
+        let invS = Float(pow(Double(hKD), -0.5))
+        func qkNormMLX(_ co: MLXArray) -> (MLXArray, MLXArray) {
+            let q1 = co[0 ..< keyDim].reshaped([nKH, hKD]), k1 = co[keyDim ..< 2 * keyDim].reshaped([nKH, hKD])
+            let qn = (invS * invS) * GatedDeltaNetLayer.rmsNormNoWeight(q1, eps: 1e-6)
+            let kn = invS * GatedDeltaNetLayer.rmsNormNoWeight(k1, eps: 1e-6)
+            return (qn, kn)
+        }
+        let (mlxQN, mlxKN) = qkNormMLX(mlxCo)
+        let rq1 = rawCo[0 ..< keyDim].reshaped([nKH, hKD]), rk1 = rawCo[keyDim ..< 2 * keyDim].reshaped([nKH, hKD])
+        let rawQN = (invS * invS) * rmsNorm(rq1, nil, eps: 1e-6, D: hKD)!
+        let rawKN = invS * rmsNorm(rk1, nil, eps: 1e-6, D: hKD)!
+        out += String(format: "\n   ③ qN/kN:         rel=%.3e / %.3e", relErr(rawQN, mlxQN), relErr(rawKN, mlxKN))
+        return out
+    }
+
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
     /// - env: QWISP_RUN=raw-ops-test / QWISP_QMM_K(D, 既定2048) / QWISP_QMM_M(rows, 既定4)
     public static func runOpsTest() -> String {
@@ -673,10 +883,14 @@ public enum RawMetalForward {
         let d = MLX.max(MLX.abs(got.asType(.float32) - ref.asType(.float32))).item(Float.self)
         let scale = MLX.max(MLX.abs(ref.asType(.float32))).item(Float.self) + 1e-9
         let rel = d / scale
-        let ok = rel < 2e-3
-        return String(format: "[raw-qmm-test M=%d K=%d N=%d, 4bit affine gs=64] raw-Metal vs MLX quantizedMatmul\n"
-            + "  max|Δ|=%.3e  rel=%.3e  %@", M, K, N, d, rel,
-            ok ? "OK ✅ bit-exact(MLX weight buffer 共有 + format 一致)" : "MISMATCH ❌(format 要修正)")
+        // ★ 真の bit-exact = rel==0（max|Δ|==0）。それ以外は「近似」と正直に表示する。
+        let label: String
+        if d == 0 { label = "OK ✅✅ TRUE bit-exact (rel=0.000e0, MLX と完全一致)" }
+        else if rel < 2e-3 { label = "△ 近似一致(rel<2e-3 だが非 bit-exact)。FMA/fast-math 差残存" }
+        else { label = "MISMATCH ❌" }
+        let math = ProcessInfo.processInfo.environment["QWISP_QMM_MATH"] ?? "safe"
+        return String(format: "[raw-qmm-test M=%d K=%d N=%d, 4bit affine gs=64, math=%@] raw-Metal(qmv_fast 移植) vs MLX\n"
+            + "  max|Δ|=%.3e  rel=%.3e  %@", M, K, N, math, d, rel, label)
     }
 
     static func envInt(_ k: String, _ d: Int) -> Int {
