@@ -1914,6 +1914,24 @@ extension Tell {
             MLX.eval(bc.flatMap { $0.stateArrays })
             bcs.append(bc); snapss.append(bc.map { $0.snapshot() })
         }
+        // issue#5 trace 専用: no-sync forward を reps 回だけ tight loop（build-only/B-section を飛ばし
+        //   Metal trace を短く清浄に保つ）。QWISP_GPUBUSY_TRACEONLY=1 + C=256(全常駐 exact)で使う。
+        if Tell.envFlag("QWISP_GPUBUSY_TRACEONLY") {
+            StreamingMoEBlock.probeNoSync = true
+            var tAcc: UInt64 = 0; let cpu0 = cpuNs()
+            for _ in 0 ..< reps {
+                let t = now()
+                let (h, _) = try model.forwardHidden(seq, caches: bcs[0])
+                MLX.eval([h] + bcs[0].flatMap { $0.stateArrays })
+                tAcc += now() - t
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            }
+            StreamingMoEBlock.probeNoSync = false
+            let ms = Double(tAcc) / Double(reps) / 1e6
+            let cores = Double(cpuNs() - cpu0) / Double(tAcc)
+            return String(format: "[GpuBusy TRACEONLY no-sync C=\(C)] %.2f ms/forward, CPU-busy=%.2f cores (reps=\(reps))\n"
+                + "  → Metal trace 記録対象。GPU-busy%% は tools/gpu_busy_from_trace.py で算出", ms, cores)
+        }
         // build-only(lazy 構築のみ, eval せず) の CPU-record 寄与を 1 forward で測る
         var buildAcc: UInt64 = 0
         for _ in 0 ..< reps {
@@ -1925,6 +1943,11 @@ extension Tell {
         }
         let buildMs = Double(buildAcc) / Double(reps) / 1e6
         // (A) パイプライン法: K 独立 forward を 1 eval、per-forward wall を測る
+        //   issue#5: QWISP_GPUBUSY_NOSYNC=1 で K-loop を no-sync 化（要 C=256 全常駐で exact）。
+        //   この loop を Metal System Trace で記録すると no-sync forward の GPU-busy% が取れる（capture 回収天井の go/no-go）。
+        let traceNoSync = Tell.envFlag("QWISP_GPUBUSY_NOSYNC")
+        if traceNoSync { StreamingMoEBlock.probeNoSync = true }
+        defer { StreamingMoEBlock.probeNoSync = false }
         var lines: [String] = []
         var perK: [(K: Int, ms: Double, cores: Double)] = []
         for K in Ks {
