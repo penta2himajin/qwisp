@@ -19,31 +19,30 @@ public enum MetalICBBench {
             return "ERROR: ICB/Metal3 非対応 device"
         }
 
-        // 代表 kernel: 行ごと(D スレッド) sum(x^2)→rsqrt→正規化 出力（実 forward の小カーネルを模擬）
+        let bufs = envInt("QWISP_ICB_BUFS", 5)       // /dispatch の buffer 束縛数（quantized matmul 相当=5）
+        // 実層相当の profile を encode するため 3 種 pipeline を用意（op 多様性=pipeline 切替コスト込み）。
+        // 中身は同型(rmsnorm 風)だが encode コストは dispatch 数×buffer 数×pipeline 切替で決まり数学に依らない。
         let src = """
         #include <metal_stdlib>
         using namespace metal;
-        kernel void rmsk(device const float* x [[buffer(0)]],
-                         device float* out      [[buffer(1)]],
-                         uint d [[thread_position_in_threadgroup]],
-                         uint row [[threadgroup_position_in_grid]]) {
-            const uint D = 128;
-            threadgroup float sh[128];
-            float c = x[row*D + d];
-            sh[d] = c*c;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = D>>1; s>0; s>>=1) { if (d<s) sh[d]+=sh[d+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-            float r = rsqrt(sh[0]/(float)D + 1e-6f);
-            out[row*D + d] = c * r;
-        }
+        #define KDEF(NM) kernel void NM(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], \
+            device const float* b2 [[buffer(2)]], device const float* b3 [[buffer(3)]], device const float* b4 [[buffer(4)]], \
+            uint d [[thread_position_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) { \
+            const uint D = 128; threadgroup float sh[128]; float c = x[row*D + d]; sh[d] = c*c; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = D>>1; s>0; s>>=1) { if (d<s) sh[d]+=sh[d+s]; threadgroup_barrier(mem_flags::mem_threadgroup); } \
+            out[row*D + d] = c * rsqrt(sh[0]/(float)D + 1e-6f); }
+        KDEF(k0) KDEF(k1) KDEF(k2)
         """
-        let pipeline: MTLComputePipelineState
+        var pipelines: [MTLComputePipelineState] = []
         do {
             let lib = try device.makeLibrary(source: src, options: nil)
-            let pdesc = MTLComputePipelineDescriptor()
-            pdesc.computeFunction = lib.makeFunction(name: "rmsk")!
-            pdesc.supportIndirectCommandBuffers = true       // ICB に入れるため必須
-            pipeline = try device.makeComputePipelineState(descriptor: pdesc, options: [], reflection: nil)
+            for nm in ["k0", "k1", "k2"] {
+                let pdesc = MTLComputePipelineDescriptor()
+                pdesc.computeFunction = lib.makeFunction(name: nm)!
+                pdesc.supportIndirectCommandBuffers = true
+                pipelines.append(try device.makeComputePipelineState(descriptor: pdesc, options: [], reflection: nil))
+            }
         } catch { return "ERROR: kernel compile: \(error)" }
 
         // K 個の独立 buffer（各 dispatch が別 buffer を触る=実 forward の依存連鎖を粗く模擬）
@@ -55,6 +54,7 @@ public enum MetalICBBench {
             return b
         }
         let outBufs = (0 ..< K).map { _ in device.makeBuffer(length: n * 4, options: .storageModeShared)! }
+        let extra = (0 ..< 3).map { _ in device.makeBuffer(length: n * 4, options: .storageModeShared)! }  // b2,b3,b4 共有
         let tg = MTLSize(width: D, height: 1, depth: 1)
         let grid = MTLSize(width: D, height: rows, depth: 1)
 
@@ -79,9 +79,10 @@ public enum MetalICBBench {
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             for k in 0 ..< K {
-                enc.setComputePipelineState(pipeline)
+                enc.setComputePipelineState(pipelines[k % pipelines.count])   // pipeline 切替コスト込み
                 enc.setBuffer(inBufs[k], offset: 0, index: 0)
                 enc.setBuffer(outBufs[k], offset: 0, index: 1)
+                for bi in 2 ..< bufs { enc.setBuffer(extra[(bi - 2) % 3], offset: 0, index: bi) }
                 enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: tg)
             }
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -96,14 +97,15 @@ public enum MetalICBBench {
         icbDesc.commandTypes = [.concurrentDispatch]
         icbDesc.inheritBuffers = false
         icbDesc.inheritPipelineState = false
-        icbDesc.maxKernelBufferBindCount = 2
+        icbDesc.maxKernelBufferBindCount = bufs
         var bResult: (ms: Double, cpu: Double)? = nil
         if let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc, maxCommandCount: K, options: []) {
             for k in 0 ..< K {
                 let c = icb.indirectComputeCommandAt(k)
-                c.setComputePipelineState(pipeline)
+                c.setComputePipelineState(pipelines[k % pipelines.count])
                 c.setKernelBuffer(inBufs[k], offset: 0, at: 0)
                 c.setKernelBuffer(outBufs[k], offset: 0, at: 1)
+                for bi in 2 ..< bufs { c.setKernelBuffer(extra[(bi - 2) % 3], offset: 0, at: bi) }
                 c.concurrentDispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: tg)
             }
             func replayOnce() -> UInt64 {
@@ -136,8 +138,20 @@ public enum MetalICBBench {
         } else {
             out += "  (B) ICB 生成失敗（family 非対応?）\n"
         }
-        out += String(format: "\n  ★真の lever: raw-Metal encode ~%.1f us/dispatch vs MLX no-sync ~80 us/dispatch 相当(16ms/200) = ~%.0fx\n", aUs, 80.0 / Swift.max(0.1, aUs))
-            + "  → 機構は ICB replay でなく『MLX を迂回する raw-Metal forward(単一 encoder+pipeline cache+residency set)』"
+        // ★ forward 外挿（実層 ~25 dispatch×40 層 ≈ K_total）。raw encode CPU を 40 層へスケール。
+        let layersEq = Double(K) / 25.0                              // この run が相当する「層数」
+        let rawFwdEncodeMs = layersEq > 0 ? aCpuMs / layersEq * 40.0 : aCpuMs   // 40 層 forward の raw encode CPU
+        let mlxFwdMs = 16.0, gpuFloorMs = 9.0                        // 実測: MLX no-sync forward 16ms, GPU-exec ~9ms
+        let rawFwdWall = Swift.max(gpuFloorMs, rawFwdEncodeMs)       // raw は GPU-bound 化（encode<exec なら exec 床）
+        let speedup = mlxFwdMs / rawFwdWall
+        out += String(format: "\n  ★raw-Metal encode ~%.1f us/dispatch（実層相当 %.0f dispatch/層・%d buffer・3 pipeline）= MLX ~80us の ~%.0fx 安\n",
+                      aUs, 25.0, bufs, 80.0 / Swift.max(0.1, aUs))
+            + String(format: "  forward 外挿: raw encode %.1fms(40層) %@ GPU-exec %.0fms → wall ~%.1fms vs MLX %.0fms = ~%.2fx\n",
+                     rawFwdEncodeMs, rawFwdEncodeMs < gpuFloorMs ? "<" : "≥", gpuFloorMs, rawFwdWall, mlxFwdMs, speedup)
+            + (speedup >= 1.4
+               ? "  判定: ✅ GREEN — raw-Metal forward で encode が GPU 床を下回り ~1.5-1.7x。rewrite の ROI 確認"
+               : "  判定: △ encode 削減効くが GPU 床近く、ROI 限定。実 kernel で再評価")
+            + "\n  機構: ICB replay でなく『MLX 迂回 raw-Metal forward(単一 encoder + pipeline cache + MTLResidencySet)』"
         return out
     }
 
