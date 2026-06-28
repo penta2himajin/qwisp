@@ -26,6 +26,8 @@ public enum RawMetalForward {
                     M: Int, K: Int, N: Int, bits: Int = 4, gs: Int = 64) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         if _qmmPipeline == nil {
+            // 最適化: threadgroup/output(m,n)、TG スレッドで K 並列 reduction。各スレッドは uint32(8 nibble)
+            // 一括 load で 8 k を処理（nibble unpack のメモリ load を 1/8 に）。f32 累積→simd/threadgroup reduce。
             let src = """
             #include <metal_stdlib>
             using namespace metal;
@@ -37,19 +39,28 @@ public enum RawMetalForward {
                              constant uint&       K      [[buffer(5)]],
                              constant uint&       N      [[buffer(6)]],
                              constant uint&       GS     [[buffer(7)]],
-                             uint gid [[thread_position_in_grid]]) {
-                uint m = gid / N, n = gid % N;
-                uint kp = K / 8;          // uint32 / row（4bit×8）
-                uint kg = K / GS;         // group / row
+                             uint t  [[thread_position_in_threadgroup]],
+                             uint TG [[threads_per_threadgroup]],
+                             uint o  [[threadgroup_position_in_grid]]) {
+                uint m = o / N, n = o % N;
+                uint kp = K / 8, kg = K / GS;
+                threadgroup float sh[256];
                 float acc = 0.0f;
-                for (uint k = 0; k < K; ++k) {
-                    uint packed = wq[n*kp + (k >> 3)];
-                    uint nib = (packed >> (4u * (k & 7u))) & 0xFu;
-                    uint g = k / GS;
-                    float w = (float)scales[n*kg + g] * (float)nib + (float)biases[n*kg + g];
-                    acc += (float)x[m*K + k] * w;
+                // 各スレッドは base=t*8 から TG*8 stride で uint32 を 1 つずつ処理（8 k/load）
+                for (uint base = t*8; base < K; base += TG*8) {
+                    uint packed = wq[n*kp + (base >> 3)];
+                    uint g = base / GS;
+                    float sc = (float)scales[n*kg + g], bi = (float)biases[n*kg + g];
+                    #pragma unroll(8)
+                    for (uint j = 0; j < 8; ++j) {
+                        uint nib = (packed >> (4u*j)) & 0xFu;
+                        acc += (float)x[m*K + base + j] * (sc * (float)nib + bi);
+                    }
                 }
-                out[m*N + n] = (half)acc;
+                sh[t] = acc;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = TG>>1; s>0; s>>=1) { if (t<s) sh[t]+=sh[t+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (t == 0) out[m*N + n] = (half)sh[0];
             }
             """
             do {
@@ -76,14 +87,13 @@ public enum RawMetalForward {
         enc.setBytes(&kk, length: 4, index: 5)
         enc.setBytes(&nn, length: 4, index: 6)
         enc.setBytes(&g, length: 4, index: 7)
-        let total = M * N
-        let tgw = min(_qmmPipeline!.maxTotalThreadsPerThreadgroup, 256)
-        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        let TG = 128
+        enc.dispatchThreadgroups(MTLSize(width: M * N, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: TG, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         // MTLBuffer → MLXArray（f16, [M,N]）
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
-        let arr = Array(UnsafeBufferPointer(start: ptr, count: total))
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
+        let arr = Array(UnsafeBufferPointer(start: ptr, count: M * N))
         return MLXArray(arr, [M, N])
     }
 
@@ -417,7 +427,7 @@ public enum RawMetalForward {
             enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3); enc.setBuffer(mid, offset: 0, index: 4)
             var kk = UInt32(K), nn = UInt32(N), g = UInt32(64)
             enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&g, length: 4, index: 7)
-            enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             // op2: rmsNorm(mid) → out （同 encoder, 中間 buffer をそのまま読む）
             enc.setComputePipelineState(_rmsPipeline!)
             enc.setBuffer(mid, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
