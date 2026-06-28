@@ -1932,6 +1932,71 @@ extension Tell {
             return String(format: "[GpuBusy TRACEONLY no-sync C=\(C)] %.2f ms/forward, CPU-busy=%.2f cores (reps=\(reps))\n"
                 + "  → Metal trace 記録対象。GPU-busy%% は tools/gpu_busy_from_trace.py で算出", ms, cores)
         }
+        // issue#5 de-risk: 有効層数スイープ(forwardHiddenSkip)で no-sync forward の wall/CPU-busy が
+        //   dispatch 数(≈層数)に比例するか測る。比例＆CPU-busy≈1 一定なら「dispatch を減らす=CPU-encode を
+        //   減らす」が成立し mega-kernel fusion の ROI 天井が見積れる。QWISP_GPUBUSY_SCALING=1 + C=256。
+        if Tell.envFlag("QWISP_GPUBUSY_SCALING") {
+            StreamingMoEBlock.probeNoSync = true
+            let L0 = model.isLinearFlags.count
+            var rows: [String] = []
+            var pts: [(a: Int, ms: Double)] = []
+            for active in [8, 16, 24, 32, L0] {
+                let skip = Set((active) ..< L0)
+                // warmup
+                let (hw, _) = try model.forwardHiddenSkip(seq, caches: bcs[0], skip: skip); MLX.eval([hw])
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+                var tAcc: UInt64 = 0; let cpu0 = cpuNs()
+                for _ in 0 ..< reps {
+                    let t = now()
+                    let (h, _) = try model.forwardHiddenSkip(seq, caches: bcs[0], skip: skip)
+                    MLX.eval([h] + bcs[0].flatMap { $0.stateArrays })
+                    tAcc += now() - t
+                    for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+                }
+                let ms = Double(tAcc) / Double(reps) / 1e6
+                let cores = Double(cpuNs() - cpu0) / Double(tAcc)
+                pts.append((active, ms))
+                rows.append(String(format: "  active=%2d 層: %6.2f ms  (%.3f ms/層, CPU-busy=%.2f cores)", active, ms, ms / Double(active), cores))
+            }
+            StreamingMoEBlock.probeNoSync = false
+            // 線形 fit ms = a + b·active（a=層非依存 embed+norm+head, b=per-layer encode+exec）
+            let n = Double(pts.count)
+            let sx = pts.reduce(0.0) { $0 + Double($1.a) }, sy = pts.reduce(0.0) { $0 + $1.ms }
+            let sxx = pts.reduce(0.0) { $0 + Double($1.a * $1.a) }, sxy = pts.reduce(0.0) { $0 + Double($1.a) * $1.ms }
+            let b = (n * sxy - sx * sy) / (n * sxx - sx * sx), a = (sy - b * sx) / n
+            return "[GpuBusy SCALING no-sync C=\(C)] issue#5 mega-fusion ROI de-risk\n"
+                + rows.joined(separator: "\n")
+                + String(format: "\n  線形fit: ms ≈ %.2f(層非依存) + %.3f·活性層数。per-layer = %.3f ms。", a, b, b)
+                + "\n  → CPU-busy≈1.0 一定かつ ms が層数に比例なら、dispatch 削減=encode 削減が成立"
+                + "（mega-fusion で per-layer op 数を 1/k に → b の encode 寄与が ~1/k に縮む見込み）"
+        }
+        // issue#5: サブレイヤ別内訳（融合ターゲット特定）。profileLayers の barrier 計時ゆえ絶対値は
+        //   inflate するが相対 share は op-cost/encode 比率の目安。QWISP_GPUBUSY_SUBPROF=1 + C=256。
+        if Tell.envFlag("QWISP_GPUBUSY_SUBPROF") {
+            StreamingMoEBlock.probeNoSync = true
+            StreamingMoEBlock.profileLayers = true
+            let S = StreamingMoEBlock.self
+            S.tNorm = 0; S.tGDN = 0; S.tAttn = 0; S.tMoEgather = 0; S.tMoEshared = 0
+            S.tGdnInproj = 0; S.tGdnConv = 0; S.tGdnKernel = 0; S.tGdnOut = 0
+            for _ in 0 ..< reps {
+                let (h, _) = try model.forwardHidden(seq, caches: bcs[0]); MLX.eval([h])
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+            }
+            StreamingMoEBlock.profileLayers = false; StreamingMoEBlock.probeNoSync = false
+            let parts: [(String, UInt64)] = [
+                ("GDN(linear層)", S.tGDN), ("attention(full層)", S.tAttn),
+                ("MoE-gather", S.tMoEgather), ("MoE-shared", S.tMoEshared), ("norm×2", S.tNorm)]
+            let tot = Double(parts.reduce(0) { $0 + $1.1 })
+            let plines = parts.map { String(format: "  %-16@ %5.1f%%  (%.1f ms/forward)", $0.0,
+                                            Double($0.1) / Swift.max(1, tot) * 100, Double($0.1) / Double(reps) / 1e6) }
+            let gdnTot = Double(S.tGdnInproj + S.tGdnConv + S.tGdnKernel + S.tGdnOut)
+            let gline = String(format: "  └GDN内訳: in_proj %.0f%% / conv %.0f%% / recurrent-kernel %.0f%% / out %.0f%%",
+                               Double(S.tGdnInproj) / Swift.max(1, gdnTot) * 100, Double(S.tGdnConv) / Swift.max(1, gdnTot) * 100,
+                               Double(S.tGdnKernel) / Swift.max(1, gdnTot) * 100, Double(S.tGdnOut) / Swift.max(1, gdnTot) * 100)
+            return "[GpuBusy SUBPROF no-sync C=\(C), barrier計時=相対share用] issue#5 融合ターゲット\n"
+                + plines.joined(separator: "\n") + "\n" + gline
+                + "\n  → share 最大のサブレイヤが mega-fusion の第一候補（op 数多＝encode 寄与大）"
+        }
         // build-only(lazy 構築のみ, eval せず) の CPU-record 寄与を 1 forward で測る
         var buildAcc: UInt64 = 0
         for _ in 0 ..< reps {
