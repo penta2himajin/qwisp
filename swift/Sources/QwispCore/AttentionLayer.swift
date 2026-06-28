@@ -49,7 +49,13 @@ public struct AttentionLayer {
     public func callAsFunction(_ x: MLXArray, cache: KVCache? = nil) -> MLXArray {
         let B = x.dim(0), L = x.dim(1)
 
-        // 射影は per-position（逐次でも同結果）ゆえ常に batched で計算（seqMT でも再実行しない＝軽い）
+        // 逐次モード: L>1 を 1 token ずつ再帰呼び（cache が順に u→v を取り込む＝greedy 等価）
+        if AttentionLayer.seqMultiToken && L > 1 {
+            var outs: [MLXArray] = []
+            for t in 0 ..< L { outs.append(callAsFunction(x[0..., t ..< (t + 1)], cache: cache)) }
+            return MLX.concatenated(outs, axis: 1)
+        }
+
         let qOut = qProj.apply(x).reshaped([B, L, numHeads, 2 * headDim])
         var queries = qOut[0..., 0..., 0..., 0 ..< headDim]            // [B,L,H,headDim]
         let gate = qOut[0..., 0..., 0..., headDim...].reshaped([B, L, -1])  // [B,L,H*headDim]
@@ -68,31 +74,17 @@ public struct AttentionLayer {
 
         var allKeys = keys, allValues = values
         if let c = cache { (allKeys, allValues) = c.update(keys, values) }
-        let inDtype = queries.dtype
 
-        var output: MLXArray
-        if AttentionLayer.seqMultiToken && L > 1 {
-            // 順序安定(partial-seqMT): SDPA だけ per-token。query t は causal prefix(0..offset+t)に
-            // .none で attend ＝single-token decode と bit 一致(robust, f32 不要)。射影は上で batched 済。
-            var outs: [MLXArray] = []
-            for t in 0 ..< L {
-                let s = offset + t + 1
-                let qt = queries[0..., 0..., t ..< (t + 1), 0...]      // [B,heads,1,d]
-                let kt = allKeys[0..., 0..., 0 ..< s, 0...]
-                let vt = allValues[0..., 0..., 0 ..< s, 0...]
-                outs.append(MLXFast.scaledDotProductAttention(queries: qt, keys: kt, values: vt,
-                                                              scale: scale, mask: .none))
-            }
-            output = MLX.concatenated(outs, axis: 2)                   // [B,heads,L,headDim]
-        } else {
-            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
-            var (q2, k2, v2) = (queries, allKeys, allValues)
-            if AttentionLayer.f32SDPA {
-                q2 = queries.asType(.float32); k2 = allKeys.asType(.float32); v2 = allValues.asType(.float32)
-            }
-            output = MLXFast.scaledDotProductAttention(queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
-            if AttentionLayer.f32SDPA { output = output.asType(inDtype) }
+        // prefill(L>1) は causal、decode(L==1, 全履歴に attend) は mask 無し
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
+        let inDtype = queries.dtype
+        var (q2, k2, v2) = (queries, allKeys, allValues)
+        if AttentionLayer.f32SDPA {
+            q2 = queries.asType(.float32); k2 = allKeys.asType(.float32); v2 = allValues.asType(.float32)
         }
+        var output = MLXFast.scaledDotProductAttention(
+            queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
+        if AttentionLayer.f32SDPA { output = output.asType(inDtype) }
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]
 
         return oProj.apply(output * MLX.sigmoid(gate))
