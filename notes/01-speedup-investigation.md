@@ -72,8 +72,31 @@ nl で accept が伸びない（suffix 0.23）。その先を speculation 以外
 **50ms = 40 層 × mx.fast-optimal な matmul/gather/recurrent kernel の batch=1 latency-bound 実行**。
 各 matmul は weight 全体を読むのに 1 行しか計算せず GPU を underutilize するが、kernel 自体は既に最適。
 これは融合・compile・量子化で動かない。**唯一 latency-bound matmul を効率化する道 = batching(=speculation)**で、
-それは accept を要し反復 content でしか効かない。∴ **nl(novel)は batch=1 床で原理的に ~20 tok/s 頭打ち**
-（MLX/Apple Silicon の物理であり実装不足でない）。
+それは accept を要し反復 content でしか効かない。∴ **nl(novel)は batch=1 床で ~20 tok/s 頭打ち**。
+
+### 2-4. 床の機構 = dispatch/sync 律速（GPU ~35% busy・実測, issue#3 §5・commit このブランチ）
+2-3 の「batch=1 latency-bound」を **GPU 占有率の実測で確定**した（issue#3 への裏取り）。
+`QWISP_RUN=forward-gpu-busy`（forward-cost と同じ hot-pin 経路）で:
+- **CPU-busy ≈ 0.51 cores**（`getrusage` の process CPU 時間 / wall）＝ wall の約半分は CPU が
+  encode/per-layer routing 同期でビジー、残り半分は GPU 待ちで block。
+- **build-only(eval せず forwardHidden のみ) ≈ 37ms ≈ K=1 eval 35ms** ＝ forward は lazy でなく
+  **内部で per-layer routing 同期を強制**（router logits を materialize して expert gather する round-trip）。
+- 独立 forward を K 本まとめて 1 eval する pipeline 法は **flat(0.94x)** ＝ 同期が forward 内で逐次化し、
+  末尾 eval をまとめても GPU idle を埋められない（層を interleave しない限り回収不可）。
+- **Metal System Trace（`metal-gpu-intervals`）実測（M1 Max）: GPU-busy ≈ 34.6%**
+  （steady median 33.8% / p90 51%）＝ **GPU は wall の ~65% アイドル**。`tools/gpu_busy_from_trace.py`。
+
+→ **床は GPU-exec(帯域/compute)でなく dispatch/sync-latency 律速**。理論帯域床 ~260 tok/s に対し 20 が出る
+真因は per-layer の CPU↔GPU routing round-trip（GPU 65% idle）。issue#3 の指摘どおり「fundamental
+physics」は **言い過ぎ**で、実体は **tooling/sync 床**。
+**ただし idle の正体が MoE 動的 routing の round-trip** ゆえ、標準治療の command-graph capture は
+per-token の expert 選択を capture できず native には効かない（issue#3 §3 と整合）。効く lever は
+intra-kernel fusion でなく **sync/round-trip 除去**（routing 予測で expert 選択を先回りし層跨ぎの
+materialize を消す＝[[pre-attention-predictor]]/[[selective-margin-prefetch]] 系の延長）。これは別途
+高難度（予測精度 ~82-84% 頭打ち実績）で、弱機（M1/Neo 帯域床 ~40-45 tok/s）では旨味 ~2x に縮む。
+∴ **「nl は今追わない」判断は妥当だが framing は「MLX/Metal の sync-tooling 限界」に修正**。
+再現: `forward-gpu-busy` probe + `xcrun xctrace record --template 'Metal System Trace'` →
+`tools/gpu_busy_from_trace.py`（手順は同スクリプト docstring）。
 
 ---
 

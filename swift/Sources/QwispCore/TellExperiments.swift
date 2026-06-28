@@ -1842,6 +1842,152 @@ extension Tell {
             + "\n  (B) 有効層数依存(L=1, 末尾skip):\n  " + lines2.joined(separator: "\n  ")
     }
 
+    /// **[計測] issue#3 §5: forward 50ms 床は dispatch-latency 律速か GPU-exec 床か（二値判定）**
+    /// 機構 = 独立 forward パイプライン法。K 個の **データ依存の無い** L=1 forward を 1 回の eval に
+    /// まとめて投入し、per-forward wall が K で下がるかを測る。単 forward が dispatch 律速（40 層の
+    /// 逐次カーネル投入の間 GPU がアイドル）なら、独立 forward を束ねるとその idle 隙間が埋まり
+    /// per-forward wall が **下がる**＝CPU submit が GPU を待たせている証拠。GPU が既に飽和（exec 床）
+    /// なら K を増やしても **flat**＝50ms は本物の GPU-exec 床で graph-capture も無駄。GPU counter 不要・
+    /// mlx 再ビルド不要でクリーンな二値数値が出る（RNN-T「GPU 80% idle」測定の型）。
+    /// build-only(lazy 構築) vs eval(submit+exec) も分離して CPU-record 寄与も見る。
+    /// hot-pin top-C で IO 排除。QWISP_GPUTRACE=path を渡すと K=1 区間を .gputrace capture（要 mlx
+    /// MLX_METAL_DEBUG ビルド + MTL_CAPTURE_ENABLED=1。無ければ Instruments の Metal System Trace で代替可）。
+    /// - env: QWISP_RUN=forward-gpu-busy / QWISP_CACHE_C / QWISP_FC_REPS(既定20) /
+    ///        QWISP_GPUBUSY_K(既定"1,2,4,8") / QWISP_GPUTRACE(任意, capture 出力パス)
+    public static func runForwardGpuBusy(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+        guard let promptArr = r["spec_prompt"] else { return "[GpuBusy] skip" }
+        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let reps = Tell.envInt("QWISP_FC_REPS", 20)
+        let Ks = (ProcessInfo.processInfo.environment["QWISP_GPUBUSY_K"] ?? "1,2,4,8")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let tracePath = ProcessInfo.processInfo.environment["QWISP_GPUTRACE"]
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer { GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let nE = 256, nMoE = model.expertCaches.count
+        // calib + hot-pin top-C で IO 排除（pure compute を測る）— runForwardCost と同型
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+        let cc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true
+        var (_, clg) = try model.prefillChunked(ids, caches: cc)
+        var ccur = MLX.argMax(clg[0, clg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([ccur] + cc.flatMap { $0.stateArrays })
+        for _ in 0 ..< 48 {
+            (_, clg) = try model.forwardHidden(ccur, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            for (mi, ec) in model.expertCaches.enumerated() {
+                if let li = ec.lastInds { for e in li.asArray(Int32.self) { counts[mi][Int(e)] += 1 } }
+            }
+            ccur = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([ccur])
+        }
+        StreamingMoEBlock.captureInds = false
+        for (mi, ec) in model.expertCaches.enumerated() {
+            _ = ec.ensure(Array(counts[mi].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .prefix(C).map { $0.offset }))
+        }
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        // プロセス全体の累積 CPU 時間(user+sys, 全スレッド合算)。wall と比べて cores-busy 比を出す。
+        // cores-busy ≈ 1+ なら CPU が wall を占有(=encode/sync 律速=dispatch 系)、≈0 なら CPU は GPU 待ちで block(=GPU-exec 床)。
+        func cpuNs() -> UInt64 {
+            var ru = rusage()
+            getrusage(RUSAGE_SELF, &ru)
+            let u = UInt64(ru.ru_utime.tv_sec) * 1_000_000_000 + UInt64(ru.ru_utime.tv_usec) * 1000
+            let s = UInt64(ru.ru_stime.tv_sec) * 1_000_000_000 + UInt64(ru.ru_stime.tv_usec) * 1000
+            return u + s
+        }
+        let seq = MLXArray([Int32(100)], [1, 1])                                  // L=1 ダミー decode
+        // 各 K 用に独立した cache 群（データ依存なし）を prefill しておく
+        let maxK = Ks.max() ?? 1
+        var bcs: [[LayerCache]] = []
+        var snapss: [[LayerCache.Snapshot]] = []
+        for _ in 0 ..< maxK {
+            let bc = model.makeCaches()
+            _ = try model.prefillChunked(ids, caches: bc)
+            MLX.eval(bc.flatMap { $0.stateArrays })
+            bcs.append(bc); snapss.append(bc.map { $0.snapshot() })
+        }
+        // build-only(lazy 構築のみ, eval せず) の CPU-record 寄与を 1 forward で測る
+        var buildAcc: UInt64 = 0
+        for _ in 0 ..< reps {
+            let t = now()
+            let (h, _) = try model.forwardHidden(seq, caches: bcs[0])     // lazy: ops 記録のみ
+            _ = h
+            buildAcc += now() - t
+            for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+        }
+        let buildMs = Double(buildAcc) / Double(reps) / 1e6
+        // (A) パイプライン法: K 独立 forward を 1 eval、per-forward wall を測る
+        var lines: [String] = []
+        var perK: [(K: Int, ms: Double, cores: Double)] = []
+        for K in Ks {
+            // warmup
+            do {
+                var hs: [MLXArray] = []
+                for k in 0 ..< K { let (h, _) = try model.forwardHidden(seq, caches: bcs[k]); hs.append(h) }
+                MLX.eval(hs + (0 ..< K).flatMap { bcs[$0].flatMap { $0.stateArrays } })
+                for k in 0 ..< K { for (i, c) in bcs[k].enumerated() { c.restore(snapss[k][i], isLinear: isLin[i], trim: 1) } }
+            }
+            LayerExpertCache.missTotal = 0
+            var tAcc: UInt64 = 0
+            let doTrace = tracePath != nil && K == 1
+            if doTrace, let tp = tracePath { MLX.GPU.startCapture(url: URL(fileURLWithPath: tp)) }
+            let cpu0 = cpuNs()
+            for _ in 0 ..< reps {
+                let t = now()
+                var hs: [MLXArray] = []
+                for k in 0 ..< K { let (h, _) = try model.forwardHidden(seq, caches: bcs[k]); hs.append(h) }
+                MLX.eval(hs + (0 ..< K).flatMap { bcs[$0].flatMap { $0.stateArrays } })   // K 本まとめて submit
+                tAcc += now() - t
+                for k in 0 ..< K { for (i, c) in bcs[k].enumerated() { c.restore(snapss[k][i], isLinear: isLin[i], trim: 1) } }   // 非計時(CPU はここも含むが小)
+            }
+            let cpuDelta = cpuNs() - cpu0
+            if doTrace, let tp = tracePath { MLX.GPU.stopCapture(url: URL(fileURLWithPath: tp)) }
+            let perFwd = Double(tAcc) / Double(reps) / Double(K) / 1e6
+            let cores = Double(cpuDelta) / Double(tAcc)                       // CPU時間 / 計時 wall = 平均ビジー core 数
+            perK.append((K, perFwd, cores))
+            lines.append(String(format: "K=%d: %6.2f ms/forward  (batch wall %6.2f ms, CPU-busy=%.2f cores, misses/fwd=%.1f)%@",
+                                K, perFwd, perFwd * Double(K), cores,
+                                Double(LayerExpertCache.missTotal) / Double(reps) / Double(K),
+                                doTrace ? "  [gputrace→\(tracePath!)]" : ""))
+        }
+        // 二値判定(主=CPU-busy, 副=pipeline ratio):
+        //   CPU-busy ≳1.0 → wall を CPU が占有=encode/routing-sync 律速(dispatch 系) → graph-capture/sync削減に価値
+        //   CPU-busy ≲0.3 → CPU は GPU 待ちで block=GPU-exec 床 → 50ms は本物の compute 床、graph capture も無駄
+        let base = perK.first?.ms ?? 0
+        let best = perK.map { $0.ms }.min() ?? base
+        let ratio = base > 0 ? best / base : 1.0
+        let cores = perK.first?.cores ?? 0
+        let verdict: String
+        if cores >= 0.8 {
+            verdict = String(format: "DISPATCH/SYNC 律速 (CPU-busy=%.2f cores≒wall占有, pipeline %.2fx). "
+                + "wall は GPU exec でなく CPU の encode/per-layer routing 同期律速。"
+                + "→ MoE routing を含むため native graph-capture は困難だが、sync 削減(routing 予測でround-trip除去)に価値。"
+                + "「fundamental physics」でなく tooling/sync 床=issue#3 §4 の framing 修正が正しい", cores, ratio)
+        } else if cores <= 0.3 {
+            verdict = String(format: "GPU-EXEC 床 (CPU-busy=%.2f cores=GPU待ちで block, pipeline %.2fx flat). "
+                + "→ 50ms は本物の GPU compute 床、graph capture も無駄。penta の「床」が正しい", cores, ratio)
+        } else {
+            verdict = String(format: "混在 (CPU-busy=%.2f cores, pipeline %.2fx). CPU sync と GPU exec が拮抗。"
+                + "gputrace で GPU 占有率を裏取りして確定", cores, ratio)
+        }
+        return "[GpuBusy C=\(C), f32-full, hot-pin top-C, reps=\(reps)] issue#3 §5 dispatch vs exec\n"
+            + String(format: "  build-only(eval せず forwardHidden のみ; lazy なら~0 のはず): %.2f ms/forward\n", buildMs)
+            + "  (A) 独立 forward パイプライン (per-forward wall + CPU-busy cores):\n  " + lines.joined(separator: "\n  ")
+            + "\n  判定: " + verdict
+            + (tracePath == nil
+                ? "\n  ※ gputrace 裏取り: QWISP_GPUTRACE=/path/x.gputrace を渡す(要 mlx MLX_METAL_DEBUG ビルド)、"
+                  + "または Instruments の Metal System Trace で本バイナリの GPU 占有率を直接読む"
+                : "")
+    }
+
     /// cost-model 検証: 同一プロセスで (A)forward-cost→a,b fit (B)maxK-sweep の SuffixSpec 実測 を行い、
     /// 予測 tok/s=(1+p)/(a+b(D+1)) が実測と一致するか確認。dev 機は IO≈0 ゆえ forward+accept 項を検証。
     /// 一致なら cost-model で C/maxK/mode を予測選択して良い。ズレれば feedback/起動時実 sweep が要ると判る。

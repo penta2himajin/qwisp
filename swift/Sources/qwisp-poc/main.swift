@@ -47,6 +47,7 @@ if CommandLine.arguments.contains("stream") {
         ("mtp-spec-verify",       { try Tell.runMTPSpecVerify(modelDir: $0, refPath: $1) }),
         ("suffix-spec",           { try Tell.runSuffixSpec(modelDir: $0, refPath: $1) }),
         ("forward-cost",          { try Tell.runForwardCost(modelDir: $0, refPath: $1) }),
+        ("forward-gpu-busy",      { try Tell.runForwardGpuBusy(modelDir: $0, refPath: $1) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("cost-model-validate",   { try Tell.runCostModelValidate(modelDir: $0, refPath: $1) }),
