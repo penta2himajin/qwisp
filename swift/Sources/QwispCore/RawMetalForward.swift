@@ -186,6 +186,60 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _ropePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _conv1dPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _sdpaPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _gqmmPipeline: MTLComputePipelineState?
+
+    /// raw-Metal gather quantized matmul(MoE 核): x[K] を inds[Ktop] が選ぶ各 expert の量子化 weight で matmul。
+    /// out[ki,n]=Σ_k x[k]·dequant(wq[e,n,k]), e=inds[ki]。expert オフセットで wq/scales/biases を index。
+    static func gatherQmm(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, inds: MLXArray,
+                          Ktop: Int, K: Int, N: Int, gs: Int = 64) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        if _gqmmPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void gqmm4(device const half* x [[buffer(0)]], device const uint* wq [[buffer(1)]],
+                              device const half* scales [[buffer(2)]], device const half* biases [[buffer(3)]],
+                              device const int* inds [[buffer(4)]], device half* out [[buffer(5)]],
+                              constant uint& K [[buffer(6)]], constant uint& N [[buffer(7)]], constant uint& GS [[buffer(8)]],
+                              uint gid [[thread_position_in_grid]]) {
+                uint ki = gid / N, n = gid % N;
+                uint e = (uint)inds[ki];
+                uint kp = K/8, kg = K/GS;
+                uint wbase = e*N*kp + n*kp;
+                uint sbase = e*N*kg + n*kg;
+                float acc = 0.0f;
+                for (uint k=0;k<K;++k){
+                    uint packed = wq[wbase + (k>>3)];
+                    uint nib = (packed >> (4u*(k&7u))) & 0xFu;
+                    uint gg = k/GS;
+                    acc += (float)x[k] * ((float)scales[sbase+gg]*(float)nib + (float)biases[sbase+gg]);
+                }
+                out[gid] = (half)acc;
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 _gqmmPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4")!)
+            } catch { print("[raw-gqmm] compile: \(error)"); return nil }
+        }
+        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bin = inds.asType(.int32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_gqmmPipeline!)
+        enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
+        enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3)
+        enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
+        var kk = UInt32(K), nn = UInt32(N), g = UInt32(gs)
+        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&g, length: 4, index: 8)
+        let total = Ktop * N, tgw = min(_gqmmPipeline!.maxTotalThreadsPerThreadgroup, 256)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [Ktop, N])
+    }
 
     /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
     /// q[H,D], K/V[KV,S,D] → out[H,D]。head h は kv=h/(H/KV)。MLXFast.scaledDotProductAttention(f32,.none) と照合。
@@ -389,6 +443,29 @@ public enum RawMetalForward {
             let rel = relErr(g.reshaped([1, Hh, 1, Dd]), refA)
             out += String(format: "\n  SDPA(decode):rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
         } else { out += "\n  SDPA: kernel 失敗" }
+        // gather_qmm(MoE 核): expert ごとの MLX.quantizedMatmul と照合
+        let E = 64, Nn = 512, Kk2 = 2048, Ktop = 4
+        let wf = MLXRandom.normal([E, Nn, Kk2]).asType(.float16)
+        let (gwq, gsc, gbiOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+        let xg = MLXRandom.normal([1, Kk2]).asType(.float16)
+        let indsArr = [3, 17, 40, 62].map { Int32($0) }
+        let inds = MLXArray(indsArr, [Ktop])
+        MLX.eval([gwq, gsc, xg, inds] + (gbiOpt.map { [$0] } ?? []))
+        if let gbi = gbiOpt {
+            var refRows: [MLXArray] = []
+            for ki in 0 ..< Ktop {
+                let e = Int(indsArr[ki])
+                let r = MLX.quantizedMatmul(xg, gwq[e], scales: gsc[e], biases: gbi[e],
+                                            transpose: true, groupSize: 64, bits: 4, mode: .affine)
+                refRows.append(r)
+            }
+            let refG = MLX.concatenated(refRows, axis: 0); refG.eval()   // [Ktop, N]
+            if let g = gatherQmm(xg, gwq, scales: gsc, biases: gbi, inds: inds, Ktop: Ktop, K: Kk2, N: Nn) {
+                g.eval()
+                let rel = relErr(g, refG)
+                out += String(format: "\n  gather_qmm:  rel=%.3e  %@", rel, rel < 2e-3 ? "OK ✅" : "MISMATCH ❌")
+            } else { out += "\n  gather_qmm: kernel 失敗" }
+        } else { out += "\n  gather_qmm: biases nil" }
         return out
     }
 
