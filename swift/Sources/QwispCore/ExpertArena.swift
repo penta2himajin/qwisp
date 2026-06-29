@@ -960,7 +960,8 @@ public enum StreamingMoEValidation {
         for i in 0 ..< nLayers { refreshLayer(i) }   // 初期(cold)
         // ★ A5b: cross-layer 予測 prefetch。layer i の routing を hidden h から gate_i(h) top-(8+margin) で予測。
         //   resume の再 seed(prevStart 深化)で予測距離が縮み精度向上=自己補正。env QWISP_PREDICT=0 で無効、QWISP_MARGIN。
-        let doPredict = (ProcessInfo.processInfo.environment["QWISP_PREDICT"] ?? "1") != "0"
+        let doPredict = (ProcessInfo.processInfo.environment["QWISP_PREDICT"] ?? "0") == "1"   // 既定 off(MLX gate+IO で wash)
+        let predictEveryPass = (ProcessInfo.processInfo.environment["QWISP_PREDICT_EVERYPASS"] ?? "0") == "1"
         let predictK = 8 + (Int(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "16") ?? 16)
         func predictLayer(_ i: Int, _ h: MLXArray) -> MLXArray {
             let p = "language_model.model.layers.\(i).mlp.gate"
@@ -980,8 +981,9 @@ public enum StreamingMoEValidation {
             var prevStart = 0, passes = 0
             while passes < maxPasses {
                 passes += 1
-                // 予測 prefetch: suffix [prevStart..39] を ckptH[prevStart](正しい hidden)から予測しキャッシュ確保。
-                if doPredict {
+                // 予測 prefetch: token 先頭(pass1)に全層を embed から予測しキャッシュ確保(1回/token=CPU 最小)。
+                // QWISP_PREDICT_EVERYPASS=1 で旧来の per-pass 再予測(高精度・高 CPU)。
+                if doPredict && (prevStart == 0 || predictEveryPass) {
                     let seedH = prevStart == 0 ? embedX.reshaped([1, H]) : RawMetalForward.readBuffer(ckptH[prevStart], H)
                     var preds: [MLXArray] = []
                     for L in prevStart ..< nLayers { preds.append(predictLayer(L, seedH)) }
