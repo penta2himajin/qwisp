@@ -45,6 +45,28 @@ public struct MoEBlock {
 
     /// x: [T, H] → [T, H]
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let inds: MLXArray, scores: MLXArray
+        if RawMetalForward.metalRoute {
+            // ★ task#8 検証: routing(選択+normalize)を Metal(route_top8)で。gate logits は MLX(qmm8 と bit-exact)。
+            //   argPartition→route_top8 だけを差し替え＝選択法の near-tie 差を実 decode で検証。T 行をループ。
+            let logits = gate.apply(x)                                    // [T, E] f16（softmax 前）
+            let T = x.dim(0)
+            var iRows: [MLXArray] = [], sRows: [MLXArray] = []
+            for t in 0 ..< T {
+                guard let (ri, rs) = RawMetalForward.routeTop8(logits[t].reshaped([numExperts]), N: numExperts, K: topK) else {
+                    return callAsFunctionMLX(x)   // 失敗時は MLX 経路にフォールバック
+                }
+                iRows.append(ri.reshaped([1, topK])); sRows.append(rs.reshaped([1, topK]))
+            }
+            inds = MLX.concatenated(iRows, axis: 0).asType(.uint32)        // [T, K]
+            scores = MLX.concatenated(sRows, axis: 0).asType(.float16)     // [T, K] f16（route_top8 で normalize 済）
+            return moeExperts(x, inds: inds, scores: scores)
+        }
+        return callAsFunctionMLX(x)
+    }
+
+    /// MLX routing 経路（既存）。
+    private func callAsFunctionMLX(_ x: MLXArray) -> MLXArray {
         let gates = MLX.softmax(gate.apply(x), axis: -1, precise: true)  // [T, E]
         // top-k（kth=E-K で分割、後半 K 個が上位）。順序非依存（最後に sum）
         let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
@@ -53,6 +75,11 @@ public struct MoEBlock {
         if normTopk {
             scores = scores / scores.sum(axis: -1, keepDims: true)
         }
+        return moeExperts(x, inds: inds, scores: scores)
+    }
+
+    /// expert 計算（gather swiglu + shared）。routing(inds/scores)は呼び元で決定。
+    private func moeExperts(_ x: MLXArray, inds: MLXArray, scores: MLXArray) -> MLXArray {
 
         // switch_mlp: xe [T,1,1,H]
         let xe = x.expandedDimensions(axes: [-2, -3])

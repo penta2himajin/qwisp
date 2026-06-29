@@ -558,6 +558,60 @@ public final class QwispModel {
         return out
     }
 
+    /// ★ task#8 本筋検証: **teacher-forced 多トークン decode で Metal routing の lossless 性を rank 判定**。
+    /// 参照=MLX-routing greedy（エンジン自身）, テスト=Metal-routing teacher-forced。measureMLXFidelity と同方法。
+    /// 不一致を refRank で分類（≤2=near-tie=許容, >2=真の乖離）。これが本プロジェクト基準の lossless 判定。
+    /// env QWISP_RUN=route-decode-lossless / QWISP_GEN(decode 数, 既定 64), refPath=spec_prompt 入り(qwisp_long_ref 等)。
+    public static func runRouteDecodeLossless(modelDir: String, refPath: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        let model = QwispModel(store: store)
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)), let pa = r["spec_prompt"] else {
+            return "[route-decode-lossless] skip: spec_prompt 無し \(refPath)（QWISP_MTP_REF に qwisp_long_ref.safetensors 等を指定）"
+        }
+        let promptIds = pa.asType(.int32).reshaped([1, pa.dim(0)]); let T = promptIds.dim(1)
+        // 参照 = mlx_lm greedy（spec_greedy）。両 routing を**同一外部参照**に teacher-force し fidelity を公平比較。
+        guard let gRefArr = r["spec_greedy"] else { return "[route-decode-lossless] spec_greedy 無し" }
+        let gR = gRefArr.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(ProcessInfo.processInfo.environment["QWISP_GEN"].flatMap { Int($0) } ?? 96, gR.count)
+        defer { RawMetalForward.metalRoute = false }
+        // 各 routing mode を mlx_lm 参照に teacher-force（measureMLXFidelity と同方法）。
+        func fidelity(_ metal: Bool) -> (match: Int, near: Int, tru: Int, ex: [String]) {
+            RawMetalForward.metalRoute = metal
+            let c = model.makeCaches()
+            var match = 0, near = 0, tru = 0; var ex: [String] = []
+            func record(_ i: Int, _ v: MLXArray) {
+                let pred = MLX.argMax(v, axis: -1).item(Int.self)
+                if pred == gR[i] { match += 1; return }
+                let refLogit = v[gR[i]].item(Float.self), top1 = MLX.max(v).item(Float.self)
+                let rank = MLX.sum(v .> refLogit).item(Int.self)        // 0-indexed: 参照 token が test 内で何位
+                if rank <= 2 { near += 1 } else { tru += 1 }
+                if ex.count < 8 { ex.append(String(format: "p%d:pred=%d ref=%d(rank%d,gap%.2f)", i, pred, gR[i], rank, top1 - refLogit)) }
+            }
+            var lg = model(promptIds, caches: c)
+            var v = lg[0, T - 1]; record(0, v); MLX.eval([v] + c.flatMap { $0.stateArrays })
+            for i in 0 ..< (N - 1) {
+                lg = model(MLXArray([Int32(gR[i])], [1, 1]), caches: c)
+                v = lg[0, 0]; record(i + 1, v); MLX.eval([v] + c.flatMap { $0.stateArrays })
+            }
+            return (match, near, tru, ex)
+        }
+        let mlx = fidelity(false)   // MLX routing（既存エンジンの基準 fidelity）
+        let met = fidelity(true)    // Metal routing
+        RawMetalForward.metalRoute = false
+        func line(_ lbl: String, _ f: (match: Int, near: Int, tru: Int, ex: [String])) -> String {
+            String(format: "  [%@] %d/%d=%.1f%%  不一致%d（near-tie %d, 真の乖離 %d）%@", lbl, f.match, N,
+                   Double(f.match)/Double(N)*100, N - f.match, f.near, f.tru,
+                   f.ex.isEmpty ? "" : "\n      " + f.ex.joined(separator: " | "))
+        }
+        return """
+            [route-decode-lossless] teacher-forced vs mlx_lm(spec_greedy), prompt T=\(T), decode \(N)
+              プロジェクト基準（measureMLXFidelity 同方法, near-tie refRank≤2 許容）。両 routing を同一参照に比較:
+            \(line("routing=MLX  ", mlx))
+            \(line("routing=Metal", met))
+              → Metal の『真の乖離』が MLX と同数なら、routing 差は fidelity を悪化させず＝プロジェクト基準で lossless 同等（多層融合 GO）。
+            """
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
