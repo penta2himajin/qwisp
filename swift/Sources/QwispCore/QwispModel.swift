@@ -971,6 +971,77 @@ public final class QwispModel {
         return out
     }
 
+    /// ★ continuous batching forward: GDN 層は batched gdnCaches[i]、attn 層は per-slot attnKV[i][B]+positions。
+    public func forwardContinuous(_ tokens: MLXArray, positions: [Int],
+                                  gdnCaches: [LayerCache], attnKV: [[KVCache]]) -> MLXArray {
+        var h = embed(tokens)   // [B,1,H]
+        for (i, layer) in layers.enumerated() {
+            h = layer.callContinuous(h, gdnCache: isLinear(i) ? gdnCaches[i].gdn : nil,
+                                     slotKV: isLinear(i) ? [] : attnKV[i], positions: positions)
+        }
+        h = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        return headProj().apply(h)
+    }
+
+    /// ★ issue#6 #1: continuous batching の end-to-end 検証 + throughput。B 本の異 position stream を 1 batch で
+    /// decode し、各 stream の予測を standalone と比較（per-stream correct）+ tok/s。env QWISP_RUN=continuous-batch。
+    public static func runContinuousBatch(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store)
+        let L = model.numLayers
+        let B = 8
+        // 各 stream に異なる長さの prompt（position を散らす）。standalone で prefill → caches を取得。
+        let plens = (0 ..< B).map { 4 + $0 * 3 }   // 4,7,10,...,25
+        var soloCaches: [[LayerCache]] = []; var firstTok: [Int32] = []
+        for b in 0 ..< B {
+            let pid = MLXArray((0 ..< plens[b]).map { Int32(($0 * 53 + b * 17 + 1) % 100000) }, [1, plens[b]])
+            let c = model.makeCaches()
+            let lg = model(pid, caches: c); lg.eval()
+            firstTok.append(Int32(MLX.argMax(lg[0, plens[b]-1], axis: -1).item(Int.self)))
+            MLX.eval(c.flatMap { $0.stateArrays })
+            soloCaches.append(c)
+        }
+        // continuous state: GDN は per-stream state を [B,...] に stack、attn は per-slot KVCache 配列。
+        var gdnCaches: [LayerCache] = (0 ..< L).map { _ in LayerCache() }
+        var attnKV: [[KVCache]] = (0 ..< L).map { _ in [] }
+        for i in 0 ..< L {
+            if model.isLinear(i) {
+                let recs = soloCaches.map { $0[i].gdn.recState! }
+                let convs = soloCaches.map { $0[i].gdn.convState }
+                gdnCaches[i].gdn.recState = MLX.concatenated(recs, axis: 0)
+                if convs.allSatisfy({ $0 != nil }) { gdnCaches[i].gdn.convState = MLX.concatenated(convs.map { $0! }, axis: 0) }
+            } else {
+                attnKV[i] = soloCaches.map { $0[i].kv }   // per-slot 独立 KVCache をそのまま流用
+            }
+        }
+        var positions = plens
+        // 1 step continuous decode + per-stream correctness（standalone と比較）
+        let tokB = MLXArray(firstTok, [B, 1])
+        let lgC = model.forwardContinuous(tokB, positions: positions, gdnCaches: gdnCaches, attnKV: attnKV); lgC.eval()
+        var match = 0, near = 0, tru = 0
+        for b in 0 ..< B {
+            let soloLg = model(MLXArray([firstTok[b]], [1,1]), caches: soloCaches[b]); soloLg.eval()
+            let sv = soloLg.reshaped([soloLg.size]); let amS = MLX.argMax(sv).item(Int.self)
+            let amC = MLX.argMax(lgC[b].reshaped([lgC.dim(-1)])).item(Int.self)
+            if amC == amS { match += 1 } else { let rank = MLX.sum(sv .> sv[amC]).item(Int.self); if rank <= 2 { near += 1 } else { tru += 1 } }
+        }
+        // throughput: 続けて 16 step continuous decode（positions/state を進める）
+        var cur = MLX.argMax(lgC[0..., 0], axis: -1).reshaped([B, 1])
+        for b in 0 ..< B { positions[b] += 1 }
+        MLX.eval([cur] + gdnCaches.flatMap { $0.stateArrays } + attnKV.flatMap { $0 }.compactMap { $0.keys })
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        for _ in 0..<3 { let lg = model.forwardContinuous(cur, positions: positions, gdnCaches: gdnCaches, attnKV: attnKV); cur = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); for b in 0..<B { positions[b] += 1 }; MLX.eval([cur] + gdnCaches.flatMap { $0.stateArrays }) }
+        let steps = 16; let t0 = now()
+        for _ in 0..<steps { let lg = model.forwardContinuous(cur, positions: positions, gdnCaches: gdnCaches, attnKV: attnKV); cur = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); for b in 0..<B { positions[b] += 1 }; MLX.eval([cur] + gdnCaches.flatMap { $0.stateArrays }) }
+        let ms = (now()-t0)/Double(steps)
+        return String(format: """
+            [continuous-batch] B=%d 異 position stream を 1 batch で continuous decode（per-slot KV + per-stream RoPE, GDN batched）
+              per-stream correctness（step1 vs standalone）: 一致 %d/%d, 不一致=%d（near-tie %d, 真の乖離 %d）
+              throughput: %.1f ms/step, %.1f tok/s aggregate
+              → 一致/near-tie のみなら continuous batching が end-to-end で correct。
+            """, B, match, B, B-match, near, tru, ms, Double(B)/ms*1000)
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {

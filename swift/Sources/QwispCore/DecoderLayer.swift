@@ -34,6 +34,18 @@ public struct DecoderLayer {
         let mlpOut = mlp(flat).reshaped([B, S, H])
         return h + mlpOut
     }
+
+    /// ★ continuous batching: attn 層は per-slot KV+position(callContinuous), GDN 層は batched gdnCache。
+    /// MoE/norm/residual は batched(amortize)。x[B,1,H]。
+    public func callContinuous(_ x: MLXArray, gdnCache: GDNCache?, slotKV: [KVCache], positions: [Int]) -> MLXArray {
+        let normed = MLXFast.rmsNorm(x, weight: inputLayernorm, eps: eps)
+        let r = isLinear ? gdn!(normed, cache: gdnCache) : attn!.callContinuous(normed, slotKV: slotKV, positions: positions)
+        let h = x + r
+        let postNorm = MLXFast.rmsNorm(h, weight: postAttentionLayernorm, eps: eps)
+        let B = h.dim(0), S = h.dim(1), H = h.dim(2)
+        let mlpOut = mlp(postNorm.reshaped([B * S, H])).reshaped([B, S, H])
+        return h + mlpOut
+    }
 }
 
 public enum DecoderLayerValidation {
