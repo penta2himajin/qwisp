@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXFast
 
@@ -248,6 +249,94 @@ public final class QwispModel {
         return h2 + (y + gateScale * sharedY)
     }
 
+    // ── 層全体融合 full forward（task#4）: residual stream を resident GPU buffer に保持 ──
+    nonisolated(unsafe) var normWeightCache: [Int: RawMetalForward.NormWeightBuffers] = [:]
+    nonisolated(unsafe) var hBuf: MTLBuffer?          // residual stream（H f16, 全40層常駐）
+    nonisolated(unsafe) var postNormBuf: MTLBuffer?   // post_norm 出力（routing 用 readback）
+    nonisolated(unsafe) var combinedBuf: MTLBuffer?   // MoE residual scratch
+
+    /// GDN/attn mixer buffer を lazy 確保し、norm 重みも cache。戻り値: GDN なら true。
+    func ensureFusedBuffers(_ i: Int, H: Int) -> Bool {
+        let p = "language_model.model.layers.\(i)"
+        if normWeightCache[i] == nil {
+            normWeightCache[i] = RawMetalForward.prepareNormWeights(
+                input: store.req("\(p).input_layernorm.weight"), post: store.req("\(p).post_attention_layernorm.weight"))
+        }
+        if isLinear(i) {
+            if gdnBufCache[i] == nil {
+                let la = "\(p).linear_attn"
+                let rw = RawMetalForward.GDNRawWeights(
+                    qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
+                    zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
+                    bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
+                    aWq: store.req("\(la).in_proj_a.weight"), aSc: store.req("\(la).in_proj_a.scales"), aBi: store.req("\(la).in_proj_a.biases"),
+                    outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
+                    conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
+                    aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
+                gdnBufCache[i] = RawMetalForward.prepareGDNBuffers(rw, H: H)
+            }
+            return true
+        } else {
+            if attnBufCache[i] == nil {
+                let sa = "\(p).self_attn"
+                let aw = RawMetalForward.AttnRawWeights(
+                    qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
+                    kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
+                    vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
+                    oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
+                    qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
+                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H)
+            }
+            return false
+        }
+    }
+
+    /// 層融合 1 層: mixer-half（input_norm+mixer+residual+post_norm を 1 encoder, hBuf 直更新）→
+    /// routing(MLX) → expert SE → combine(MLX) → MoE residual(kernel)。hBuf は GPU 常駐のまま。
+    func fusedDecoderLayer(_ i: Int, H: Int) -> Bool {
+        let isGDN = ensureFusedBuffers(i, H: H)
+        guard let nw = normWeightCache[i], let hb = hBuf, let pnb = postNormBuf, let cb = combinedBuf else { return false }
+        guard let postNorm = RawMetalForward.fusedMixerHalf(
+            hBuf: hb, nw: nw, postNormBuf: pnb,
+            gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i], H: H, eps: eps) else { return false }
+        // MoE: routing(MLX) + expert SE + combine(MLX) + residual(kernel)
+        let p = "language_model.model.layers.\(i)", mp = "\(p).mlp"
+        let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: 256 - 8, axis: -1)
+        let inds = order[0..., (256 - 8)...].asType(.int32)
+        var scores = MLX.takeAlong(gates, inds, axis: -1)
+        scores = scores / scores.sum(axis: -1, keepDims: true)
+        if moeBufCache[i] == nil {
+            func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
+            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+                swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
+                shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
+                Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
+        }
+        guard let moeBuf = moeBufCache[i],
+              let (d, sharedY) = RawMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return false }
+        let y = (d * scores.reshaped([8, 1])).sum(axis: 0).reshaped([1, H])
+        let gateScale = MLX.sigmoid(q("\(mp).shared_expert_gate", 8).apply(postNorm))
+        let combined = y + gateScale * sharedY
+        combined.eval()
+        RawMetalForward.fusedMoEResidual(hBuf: hb, combined: combined, combinedBuf: cb, H: H)
+        return true
+    }
+
+    /// ★ 層融合 full forward: residual stream を hBuf に常駐し全40層で MLXArray 往復を排除。decode T=1。
+    public func fusedRawForward(_ ids: MLXArray) -> MLXArray? {
+        let e = embed(ids); let H = e.dim(-1)
+        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        if postNormBuf == nil { postNormBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        if combinedBuf == nil { combinedBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        guard let hb = hBuf else { return nil }
+        RawMetalForward.writeBuffer(hb, e, H)                      // embed → hBuf
+        for i in 0 ..< numLayers { if !fusedDecoderLayer(i, H: H) { return nil } }
+        let h = RawMetalForward.readBuffer(hb, H)                  // hBuf → MLXArray（最後だけ readback）
+        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        return headProj().apply(fn.reshaped([1, 1, H]))
+    }
+
     /// SE full forward（GDN/MoE は single-encoder, attn は round-trip）。decode T=1。
     public func seRawForward(_ ids: MLXArray) -> MLXArray? {
         let e = embed(ids); let H = e.dim(-1)
@@ -317,6 +406,18 @@ public final class QwispModel {
             t0 = now(); for _ in 0..<reps { _ = model.seRawForward(ids)?.eval() }; let seMs = (now()-t0)/Double(reps)
             out += String(format: "\n  ── SE full forward（GDN/attn/MoE=single-encoder）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
                           srel, amS, amR, amS == amR ? "✅" : "❌", seMs, 1000/seMs, mlxMs/Swift.max(0.01, seMs))
+        }
+        // ★★ 層融合 full forward（residual stream を hBuf 常駐, input_norm+mixer+residual+post_norm を 1 encoder）
+        if let fu = model.fusedRawForward(ids) {
+            fu.eval()
+            let ff = fu.reshaped([fu.size])
+            let fd = MLX.max(MLX.abs(ff.asType(.float32) - rf.asType(.float32))).item(Float.self)
+            let frel = fd / (MLX.max(MLX.abs(rf.asType(.float32))).item(Float.self) + 1e-9)
+            let amF = MLX.argMax(ff).item(Int.self)
+            for _ in 0..<3 { _ = model.fusedRawForward(ids)?.eval() }
+            t0 = now(); for _ in 0..<reps { _ = model.fusedRawForward(ids)?.eval() }; let fuMs = (now()-t0)/Double(reps)
+            out += String(format: "\n  ── 層融合 full forward（hBuf 常駐, norm/residual も kernel）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
+                          frel, amF, amR, amF == amR ? "✅" : "❌", fuMs, 1000/fuMs, mlxMs/Swift.max(0.01, fuMs))
         }
         // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
         if ProcessInfo.processInfo.environment["QWISP_FULL_DIAG"] == "1" {

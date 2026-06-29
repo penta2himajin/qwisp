@@ -1006,28 +1006,39 @@ public enum RawMetalForward {
     ///   round-trip 版 gdnLayerRaw と bit-exact。pipeline は事前 warm 前提。cold cache(decode 1 step)。
     static func gdnLayerSingleEncoder(_ x: MLXArray, _ b: GDNBuffers, eps: Float = 1e-6) -> MLXArray? {
         guard let (_, queue) = ensure() else { return nil }
-        guard let qp = _qmmPipeline, let rp = _rmsPipeline,
-              let cp = _conv1dPipeline, let rcp = _recurPipeline,
-              let cgb = _cgbPipeline, let gp = _gatePipeline, let scp = _scalePipeline else {
-            print("[raw-gdn-se] pipeline 未 warm（先に gdnLayerRaw を呼ぶ）"); return nil
-        }
-        if b.normF32 && _rmsPipelineF32 == nil { print("[raw-gdn-se] rmsF32 未 warm"); return nil }
-        let H = b.H, keyDim = b.keyDim, valueDim = b.valueDim, convDim = b.convDim
-        let Dk = b.Dk, Dv = b.Dv, Hv = b.Hv, Hk = b.Hk, convKernel = b.convKernel, invScale = b.invScale
+        guard checkGDNPipelines(b) else { return nil }
+        let H = b.H
         // x を常駐 buffer に書込み（per-call、H*2 bytes のみ）
         let xf = x.reshaped([H]).asType(.float16).asArray(Float16.self)
         b.bx.contents().bindMemory(to: Float16.self, capacity: H).update(from: xf, count: H)
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGDNBody(enc, b, eps: eps)                  // b.bx → b.outBuf
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = b.outBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H)), [1, H])
+    }
+
+    static func checkGDNPipelines(_ b: GDNBuffers) -> Bool {
+        guard _qmmPipeline != nil, _rmsPipeline != nil, _conv1dPipeline != nil, _recurPipeline != nil,
+              _cgbPipeline != nil, _gatePipeline != nil, _scalePipeline != nil else {
+            print("[raw-gdn-se] pipeline 未 warm（先に gdnLayerRaw を呼ぶ）"); return false
+        }
+        if b.normF32 && _rmsPipelineF32 == nil { print("[raw-gdn-se] rmsF32 未 warm"); return false }
+        return true
+    }
+
+    /// GDN 1 層の kernel chain を既存 encoder に encode（b.bx → b.outBuf）。input_norm/residual/post_norm は含まない。
+    /// gdnLayerSingleEncoder（単体）と fusedDecoderLayer（層融合）で共有する単一ソース。
+    static func encodeGDNBody(_ enc: MTLComputeCommandEncoder, _ b: GDNBuffers, eps: Float) {
+        let qp = _qmmPipeline!, rp = _rmsPipeline!, cp = _conv1dPipeline!, rcp = _recurPipeline!
+        let cgb = _cgbPipeline!, gp = _gatePipeline!, scp = _scalePipeline!
+        let H = b.H, keyDim = b.keyDim, valueDim = b.valueDim, convDim = b.convDim
+        let Dk = b.Dk, Dv = b.Dv, Hv = b.Hv, Hk = b.Hk, convKernel = b.convKernel, invScale = b.invScale
         let bx = b.bx
-        let bQkvW = b.bQkvW, bQkvS = b.bQkvS, bQkvB = b.bQkvB, bZW = b.bZW, bZS = b.bZS, bZB = b.bZB
-        let bAW = b.bAW, bAS = b.bAS, bAB = b.bAB, bBW = b.bBW, bBS = b.bBS, bBB = b.bBB
-        let bOW = b.bOW, bOS = b.bOS, bOB = b.bOB
         let bConvW = b.bConvW, bNormW = b.bNormW, bALog = b.bALog, bDt = b.bDt, bOnes = b.bOnes
         let convInput = b.convInput, zBuf = b.zBuf, aBuf = b.aBuf, bBuf = b.bBuf, gBuf = b.gBuf, betaBuf = b.betaBuf
         let convOut = b.convOut, qN = b.qN, kN = b.kN, stateBuf = b.stateBuf, stateOut = b.stateOut
         let coreOut = b.coreOut, normed = b.normed, outV = b.outV, outBuf = b.outBuf
-
-        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        // qmm helper（grid=(M,N/8,1), group=(32,2,1)）。y は offset 指定可。
         func encQmm(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, xoff: Int,
                     _ y: MTLBuffer, yoff: Int, K: Int, N: Int) {
             enc.setComputePipelineState(qp)
@@ -1037,7 +1048,6 @@ public enum RawMetalForward {
             var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
-        // rmsNorm helper（D≤4096, tg=ceil(D/4)→32倍数）。promote=true で f32 weight/out。
         func encRms(_ xb: MTLBuffer, xoff: Int, _ wb: MTLBuffer, _ ob: MTLBuffer, rows: Int, D: Int, promote: Bool) {
             enc.setComputePipelineState(promote ? _rmsPipelineF32! : rp)
             enc.setBuffer(xb, offset: xoff, index: 0); enc.setBuffer(wb, offset: 0, index: 1); enc.setBuffer(ob, offset: 0, index: 2)
@@ -1053,10 +1063,10 @@ public enum RawMetalForward {
             enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(scp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
         // ① in_proj 4 本。qkv は convInput の row(K-1) に直接書く（zero-pad は memset 済）。
-        encQmm(bQkvW, bQkvS, bQkvB, bx, xoff: 0, convInput, yoff: (convKernel - 1) * convDim * 2, K: H, N: convDim)
-        encQmm(bZW, bZS, bZB, bx, xoff: 0, zBuf, yoff: 0, K: H, N: valueDim)
-        encQmm(bAW, bAS, bAB, bx, xoff: 0, aBuf, yoff: 0, K: H, N: Hv)
-        encQmm(bBW, bBS, bBB, bx, xoff: 0, bBuf, yoff: 0, K: H, N: Hv)
+        encQmm(b.bQkvW, b.bQkvS, b.bQkvB, bx, xoff: 0, convInput, yoff: (convKernel - 1) * convDim * 2, K: H, N: convDim)
+        encQmm(b.bZW, b.bZS, b.bZB, bx, xoff: 0, zBuf, yoff: 0, K: H, N: valueDim)
+        encQmm(b.bAW, b.bAS, b.bAB, bx, xoff: 0, aBuf, yoff: 0, K: H, N: Hv)
+        encQmm(b.bBW, b.bBS, b.bBB, bx, xoff: 0, bBuf, yoff: 0, K: H, N: Hv)
         // ② g/beta
         enc.setComputePipelineState(cgb)
         enc.setBuffer(aBuf, offset: 0, index: 0); enc.setBuffer(bBuf, offset: 0, index: 1)
@@ -1088,10 +1098,87 @@ public enum RawMetalForward {
         var vt = UInt32(valueDim); enc.setBytes(&vt, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: valueDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(gp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         // ⑦ out_proj
-        encQmm(bOW, bOS, bOB, outV, xoff: 0, outBuf, yoff: 0, K: valueDim, N: H)
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        encQmm(b.bOW, b.bOS, b.bOB, outV, xoff: 0, outBuf, yoff: 0, K: valueDim, N: H)
+    }
+
+    // ══════════ 層全体融合（task#4）: residual stream を resident GPU buffer に保持 ══════════
+    // 各層の input_norm + mixer + residual + post_norm を **単一 command buffer** で連結し、
+    // MLXArray 往復（standalone rmsNorm CB ×2/層・mixer の x-copy/readback・residual の MLX add）を排除。
+    // MoE routing(argPartition) のみ MLX 必須＝層に 1 sync 不可避（postNorm readback → routing → expert SE）。
+
+    /// 層融合用の norm 重み常駐 buffer（per layer: input/post layernorm の f16 重み）。
+    struct NormWeightBuffers { let inputNormW, postNormW: MTLBuffer }
+    static func prepareNormWeights(input: MLXArray, post: MLXArray) -> NormWeightBuffers? {
+        guard let (device, _) = ensure() else { return nil }
+        guard let iw = input.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let pw = post.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        return NormWeightBuffers(inputNormW: iw, postNormW: pw)
+    }
+
+    /// 共有 residual stream buffer（H f16）を確保。
+    static func makeResidentBuffer(_ bytes: Int) -> MTLBuffer? {
+        guard let (device, _) = ensure() else { return nil }
+        return device.makeBuffer(length: bytes, options: .storageModeShared)
+    }
+    /// MLXArray[*,H] → hBuf（f16）書込み。
+    static func writeBuffer(_ buf: MTLBuffer, _ a: MLXArray, _ H: Int) {
+        let f = a.reshaped([H]).asType(.float16).asArray(Float16.self)
+        buf.contents().bindMemory(to: Float16.self, capacity: H).update(from: f, count: H)
+    }
+    /// hBuf（f16）→ MLXArray[1,H]。
+    static func readBuffer(_ buf: MTLBuffer, _ H: Int) -> MLXArray {
+        let ptr = buf.contents().bindMemory(to: Float16.self, capacity: H)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H)), [1, H])
+    }
+
+    /// encoder に rmsNorm を encode（src→out, weight=f16 non-promote）。層融合の input/post norm 用。
+    private static func encodeRms(_ enc: MTLComputeCommandEncoder, src: MTLBuffer, w: MTLBuffer, out: MTLBuffer,
+                                  D: Int, eps: Float) {
+        enc.setComputePipelineState(_rmsPipeline!)
+        enc.setBuffer(src, offset: 0, index: 0); enc.setBuffer(w, offset: 0, index: 1); enc.setBuffer(out, offset: 0, index: 2)
+        var ee = eps, asz = UInt32(D), ws = UInt32(1)
+        enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+        let tg = ((((D + 3) / 4) + 31) / 32) * 32
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
+    }
+    /// encoder に resid_add を encode（h[i] += r[i], in-place）。
+    private static func encodeResidAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, r: MTLBuffer, total: Int) {
+        enc.setComputePipelineState(_residAddPipeline!)
+        enc.setBuffer(h, offset: 0, index: 0); enc.setBuffer(r, offset: 0, index: 1)
+        var tt = UInt32(total); enc.setBytes(&tt, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_residAddPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// ★ 層融合 mixer-half: input_norm + mixer(GDN/attn) + residual + post_norm を **単一 encoder** で連結。
+    /// hBuf(residual stream, in/out, f16) を直読/直更新。postNorm を返す（MoE routing 用, MLXArray）。
+    /// gdn か attn のどちらか一方を渡す。mixer の入力 buffer(b.bx) に input_norm 結果を書く。
+    static func fusedMixerHalf(hBuf: MTLBuffer, nw: NormWeightBuffers, postNormBuf: MTLBuffer,
+                               gdn: GDNBuffers?, attn: AttnBuffers?, H: Int, eps: Float) -> MLXArray? {
+        guard let (_, queue) = ensure(), _rmsPipeline != nil, _residAddPipeline != nil else { return nil }
+        let mixerBx: MTLBuffer, mixerOut: MTLBuffer
+        if let g = gdn { guard checkGDNPipelines(g) else { return nil }; mixerBx = g.bx; mixerOut = g.outBuf }
+        else if let a = attn { guard checkAttnPipelines() else { return nil }; mixerBx = a.bx; mixerOut = a.outBuf }
+        else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        // ① input_norm: hBuf → mixer.bx（f16, non-promote）
+        encodeRms(enc, src: hBuf, w: nw.inputNormW, out: mixerBx, D: H, eps: eps)
+        // ② mixer: mixer.bx → mixer.outBuf
+        if let g = gdn { encodeGDNBody(enc, g, eps: eps) } else { encodeAttnBody(enc, attn!) }
+        // ③ residual: hBuf += mixer.outBuf
+        encodeResidAdd(enc, h: hBuf, r: mixerOut, total: H)
+        // ④ post_norm: hBuf → postNormBuf（f16）
+        encodeRms(enc, src: hBuf, w: nw.postNormW, out: postNormBuf, D: H, eps: eps)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        return readBuffer(postNormBuf, H)
+    }
+
+    /// 層融合 MoE residual: hBuf += combined（MLXArray[1,H]）。combinedBuf に書込み後 resid_add 1 dispatch。
+    static func fusedMoEResidual(hBuf: MTLBuffer, combined: MLXArray, combinedBuf: MTLBuffer, H: Int) {
+        guard let (_, queue) = ensure(), _residAddPipeline != nil else { return }
+        writeBuffer(combinedBuf, combined, H)
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeResidAdd(enc, h: hBuf, r: combinedBuf, total: H)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
     }
 
     /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。
@@ -1338,19 +1425,33 @@ public enum RawMetalForward {
     /// ★ attention 1 層を **単一 command buffer + 単一 encoder** で連結（GDN SE 同型）。decode S=1, cold cache, f16。
     ///   q/k/v proj→extract_q→qk-norm→RoPE→SDPA→sigmoid_mul→o_proj。round-trip attnLayerRaw(pf=false) と bit-exact。
     ///   pipeline(qmm/rms/rope/sdpa)は事前 warm 前提（rawForward の attnLayerRaw が warm する）。
-    static func attnLayerSingleEncoder(_ x: MLXArray, _ b: AttnBuffers) -> MLXArray? {
-        guard let (_, queue) = ensure() else { return nil }
-        guard let qp = _qmmPipeline, let rp = _rmsPipeline, let rope = _ropePipeline, let sdpa = _sdpaPipeline,
-              let exq = _extractQPipeline, let sgm = _sigmoidMulPipeline else {
-            print("[raw-attn-se] pipeline 未 warm（先に attnLayerRaw を呼ぶ）"); return nil
+    static func checkAttnPipelines() -> Bool {
+        guard _qmmPipeline != nil, _rmsPipeline != nil, _ropePipeline != nil, _sdpaPipeline != nil,
+              _extractQPipeline != nil, _sigmoidMulPipeline != nil else {
+            print("[raw-attn-se] pipeline 未 warm（先に attnLayerRaw を呼ぶ）"); return false
         }
-        let H = b.H, numHeads = b.numHeads, numKV = b.numKV, headDim = b.headDim, qd2 = b.qd2
-        let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
+        return true
+    }
+
+    static func attnLayerSingleEncoder(_ x: MLXArray, _ b: AttnBuffers) -> MLXArray? {
+        guard let (_, queue) = ensure(), checkAttnPipelines() else { return nil }
+        let H = b.H
         // x を常駐 buffer に書込み（per-call, H*2 bytes）
         let xf = x.reshaped([H]).asType(.float16).asArray(Float16.self)
         b.bx.contents().bindMemory(to: Float16.self, capacity: H).update(from: xf, count: H)
-
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeAttnBody(enc, b)                            // b.bx → b.outBuf
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = b.outBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H)), [1, H])
+    }
+
+    /// attention 1 層の kernel chain を既存 encoder に encode（b.bx → b.outBuf）。input_norm/residual/post_norm 非含。
+    static func encodeAttnBody(_ enc: MTLComputeCommandEncoder, _ b: AttnBuffers) {
+        let qp = _qmmPipeline!, rp = _rmsPipeline!, rope = _ropePipeline!, sdpa = _sdpaPipeline!
+        let exq = _extractQPipeline!, sgm = _sigmoidMulPipeline!
+        let H = b.H, numHeads = b.numHeads, numKV = b.numKV, headDim = b.headDim, qd2 = b.qd2
+        let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
         func encQmm(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K: Int, N: Int) {
             enc.setComputePipelineState(qp)
             enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1)
@@ -1411,9 +1512,6 @@ public enum RawMetalForward {
             enc.setBytes(&hd, length: 4, index: 3); enc.setBytes(&q2, length: 4, index: 4); enc.setBytes(&tot, length: 4, index: 5)
         }
         encQmm(b.oW, b.oS, b.oB, b.gated, b.outBuf, K: vDim, N: H)
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let ptr = b.outBuf.contents().bindMemory(to: Float16.self, capacity: H)
-        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H)), [1, H])
     }
 
     /// 検証: attention 1 層 raw assembly vs MLX AttentionLayer（同量子化, decode S=1）。
