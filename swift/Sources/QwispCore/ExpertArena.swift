@@ -937,12 +937,12 @@ public enum StreamingMoEValidation {
                 memcpy(gdnConvBak[i]!.contents(), g.convInput.contents(), g.convKernel * g.convDim * 2)
             }
         }
+        // ★ stop flag が miss 後層の state(recur/shiftConv)を凍結するので、resume 層 m **のみ** restore で足りる
+        //   (m+1.. は token 開始のまま=frozen、0..m-1 は正しく前進済で保持)。per-pass の suffix memcpy を排除。
         func restoreGDN(from m: Int) {
-            for i in m ..< nLayers {
-                guard let g = residentLayers[i].gdn else { continue }
-                memcpy(g.stateBuf.contents(), gdnStateBak[i]!.contents(), g.Hv * g.Dv * g.Dk * 4)
-                memcpy(g.convInput.contents(), gdnConvBak[i]!.contents(), g.convKernel * g.convDim * 2)
-            }
+            guard let g = residentLayers[m].gdn else { return }
+            memcpy(g.stateBuf.contents(), gdnStateBak[m]!.contents(), g.Hv * g.Dv * g.Dk * 4)
+            memcpy(g.convInput.contents(), gdnConvBak[m]!.contents(), g.convKernel * g.convDim * 2)
         }
         // ★ bookkeeping 最適化(2): slotTable/hotMask を **永続 buffer** にし、cache 変更層のみ in-place 更新
         //   (旧: 毎 pass 全40層 asMTLBuffer 再構築=80 alloc×passes)。

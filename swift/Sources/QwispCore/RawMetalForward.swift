@@ -882,7 +882,9 @@ public enum RawMetalForward {
         // shift_conv（GDN decode）: conv cache を 1 行上シフト（最古を捨て新トークン分を空ける）。
         //   thread=列 c（race-free: 各 thread 自分の列の K 行を昇順 read/write）。その後 qkv が row(K-1)を書く。
         kernel void shift_conv(device half* conv [[buffer(0)]], constant uint& K [[buffer(1)]],
-                               constant uint& C [[buffer(2)]], uint c [[thread_position_in_grid]]) {
+                               constant uint& C [[buffer(2)]], device const int* stopFlag [[buffer(16)]],
+                               uint c [[thread_position_in_grid]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4: stop で convInput 凍結(restore を miss 層のみに)
             if (c >= C) return;
             for (uint j = 0; j + 1 < K; j++) conv[j*C + c] = conv[(j+1)*C + c];
         }
@@ -1625,6 +1627,7 @@ public enum RawMetalForward {
             enc.setComputePipelineState(_shiftConvPipeline!)
             enc.setBuffer(convInput, offset: 0, index: 0)
             var kk = UInt32(convKernel), cc = UInt32(convDim); enc.setBytes(&kk, length: 4, index: 1); enc.setBytes(&cc, length: 4, index: 2)
+            bindStop(enc, 16)
             enc.dispatchThreads(MTLSize(width: convDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_shiftConvPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
         // ① in_proj 4 本。qkv は convInput の row(K-1) に直接書く（zero-pad は memset 済）。
