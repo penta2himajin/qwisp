@@ -1406,6 +1406,11 @@ public enum RawMetalForward {
         guard let (device, _) = ensure() else { return nil }
         return device.makeBuffer(length: bytes, options: .storageModeShared)
     }
+    /// MLXArray を f16 MTLBuffer 化（重み常駐用）。
+    static func f16Buffer(_ a: MLXArray) -> MTLBuffer? {
+        guard let (device, _) = ensure() else { return nil }
+        return a.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+    }
     /// MLXArray[*,H] → hBuf（f16）書込み。
     static func writeBuffer(_ buf: MTLBuffer, _ a: MLXArray, _ H: Int) {
         let f = a.reshaped([H]).asType(.float16).asArray(Float16.self)
@@ -1483,12 +1488,12 @@ public enum RawMetalForward {
         return Gate8Buffers(wq: wq, sc: sc, bi: bi, N: w.dim(0))
     }
 
-    /// all-GPU 層融合の共有中間 buffer（全層で再利用＝serial 実行ゆえ安全）。
-    struct GPUScratch { let postNorm, gateLogits, scores, y, gateScale, combined: MTLBuffer }
+    /// all-GPU 層融合の共有中間 buffer（全層で再利用＝serial 実行ゆえ安全）。normed=final norm 出力(同一 CB 内)。
+    struct GPUScratch { let postNorm, gateLogits, scores, y, gateScale, combined, normed: MTLBuffer }
     static func makeGPUScratch(H: Int, E: Int, K: Int) -> GPUScratch? {
         guard let (device, _) = ensure() else { return nil }
         func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
-        return GPUScratch(postNorm: mk(H*2), gateLogits: mk(E*2), scores: mk(K*2), y: mk(H*2), gateScale: mk(2), combined: mk(H*2))
+        return GPUScratch(postNorm: mk(H*2), gateLogits: mk(E*2), scores: mk(K*2), y: mk(H*2), gateScale: mk(2), combined: mk(H*2), normed: mk(H*2))
     }
 
     /// mixer-half を encoder に encode（CB/commit 無し, postNorm は postNormBuf に残る）。多層 1-CB 用。
@@ -1586,7 +1591,8 @@ public enum RawMetalForward {
     ///   per-layer waitUntilCompleted を排除（GPU が層間 pipeline）。embed→hBuf 書込み済前提、hBuf に結果。
     ///   各層 MoE residual は次層 mixer 先頭で hBuf に畳む（pendingResid=scratch.combined）。最終層は末尾 flush。
     static func fusedForwardGPU(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
-                                H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0) {
+                                H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0,
+                                finalNormW: MTLBuffer? = nil) {
         guard let (_, queue) = ensure() else { return }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         for (i, L) in layers.enumerated() {
@@ -1597,7 +1603,8 @@ public enum RawMetalForward {
                          sharedGateW: L.sharedGate, H: H, E: E, K: K)
         }
         encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)    // 最終層 MoE residual
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()        // ★全40層で sync 1 回のみ
+        if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }  // final norm 同梱
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()        // ★全40層+final norm で sync 1 回のみ
         lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0     // GPU-exec（CPU-encode と分離）
     }
 

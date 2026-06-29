@@ -367,6 +367,14 @@ public final class QwispModel {
     nonisolated(unsafe) var gpuWarmed = false
     nonisolated(unsafe) var gpuLayers: [RawMetalForward.GPULayer]?
     nonisolated(unsafe) var gpuMaxLen = 2048      // decode KV cache 最大長（prompt+生成）
+    nonisolated(unsafe) var finalNormBuf: MTLBuffer?   // final norm weight（GPU CB 同梱用）
+
+    func ensureFinalNorm() -> MTLBuffer? {
+        if finalNormBuf == nil {
+            finalNormBuf = RawMetalForward.f16Buffer(store.req("language_model.model.norm.weight"))
+        }
+        return finalNormBuf
+    }
 
     /// 全層 GPU buffer を ensure し [GPULayer] を構築（初回のみ, cache）。
     func buildGPULayers(_ ids: MLXArray, _ H: Int) -> [RawMetalForward.GPULayer]? {
@@ -409,9 +417,9 @@ public final class QwispModel {
         if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         RawMetalForward.writeBuffer(hb, e, H)
-        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps)
-        let h = RawMetalForward.readBuffer(hb, H)
-        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
+                                        finalNormW: ensureFinalNorm())
+        let fn = RawMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
@@ -424,9 +432,9 @@ public final class QwispModel {
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         let e = embed(MLXArray([tokenId], [1, 1]))
         RawMetalForward.writeBuffer(hb, e, H)
-        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps, decode: true, pos: pos)
-        let h = RawMetalForward.readBuffer(hb, H)
-        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
+                                        decode: true, pos: pos, finalNormW: ensureFinalNorm())
+        let fn = RawMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
