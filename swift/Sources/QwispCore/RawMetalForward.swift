@@ -1242,8 +1242,9 @@ public enum RawMetalForward {
             let gated = outR.asType(.float32) * MLX.sigmoid(gate)                       // f32 * sigmoid(gate_f16) → f32
             return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H, xF32: true)
         } else {
+            // f16 経路: MLX は output_f16 * sigmoid(gate_f16) を f16 で計算（f32 にしない）。
             let outR = attnOut.reshaped([1, numHeads * headDim]).asType(.float16)
-            let gated = (outR.asType(.float32) * MLX.sigmoid(gate.asType(.float32))).asType(.float16)
+            let gated = outR * MLX.sigmoid(gate)
             return qmm(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: 1, K: numHeads * headDim, N: H)
         }
     }
@@ -1518,36 +1519,58 @@ public enum RawMetalForward {
     /// input_norm(raw rmsNorm)→GDN raw→residual→post_norm→MoE raw→residual。40 層 tile の単位。
     /// - env: QWISP_RUN=raw-declayer-test / QWISP_DEC0_REF
     public static func runDecoderLayerTest() -> String {
-        let refPath = ProcessInfo.processInfo.environment["QWISP_DEC0_REF"] ?? "/tmp/qwisp_dec0_ref.safetensors"
-        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else { return "[raw-declayer] ref 読込失敗" }
-        guard r["conv1d"] != nil else { return "[raw-declayer] dec0 は GDN 層でない(conv1d 無)" }
+        // QWISP_DEC_REF で ref 切替（既定 dec0=GDN, dec3=attn も可）。conv1d 有=GDN / 無=attn を自動判定。
+        let refPath = ProcessInfo.processInfo.environment["QWISP_DEC_REF"]
+            ?? ProcessInfo.processInfo.environment["QWISP_DEC0_REF"] ?? "/tmp/qwisp_dec0_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else { return "[raw-declayer] ref 読込失敗 \(refPath)" }
         func q4(_ n: String) -> Proj { .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 4) }
         func q8(_ n: String) -> Proj { .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 8) }
         func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!) }
         guard let iln = r["input_layernorm_weight"], let pln = r["post_attention_layernorm_weight"] else { return "[raw-declayer] layernorm 無" }
         let H = iln.dim(-1)
-        // MLX 参照 DecoderLayer（f32Conv=true で raw 一致）
-        let gdn = GatedDeltaNetLayer(numKHeads: 16, numVHeads: 32, headKDim: 128, headVDim: 128, convKernel: 4, eps: 1e-6,
-            inProjQKV: q4("in_proj_qkv"), inProjZ: q4("in_proj_z"), inProjB: q4("in_proj_b"), inProjA: q4("in_proj_a"),
-            outProj: q4("out_proj"), conv1dW: r["conv1d"]!, normWeight: r["la_norm_weight"]!, aLog: r["A_log"]!, dtBias: r["dt_bias"]!)
-        let layer = DecoderLayer(isLinear: true, eps: 1e-6, inputLayernorm: iln, postAttentionLayernorm: pln,
-                                 gdn: gdn, attn: nil, mlp: DecoderLayerValidation.mlpFrom(r))
+        let isLinear = r["conv1d"] != nil
+        // MLX 参照 DecoderLayer
+        var gdn: GatedDeltaNetLayer? = nil; var attn: AttentionLayer? = nil
+        if isLinear {
+            gdn = GatedDeltaNetLayer(numKHeads: 16, numVHeads: 32, headKDim: 128, headVDim: 128, convKernel: 4, eps: 1e-6,
+                inProjQKV: q4("in_proj_qkv"), inProjZ: q4("in_proj_z"), inProjB: q4("in_proj_b"), inProjA: q4("in_proj_a"),
+                outProj: q4("out_proj"), conv1dW: r["conv1d"]!, normWeight: r["la_norm_weight"]!, aLog: r["A_log"]!, dtBias: r["dt_bias"]!)
+        } else {
+            attn = AttentionLayer(numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
+                qProj: q4("q_proj"), kProj: q4("k_proj"), vProj: q4("v_proj"), oProj: q4("o_proj"),
+                qNorm: r["q_norm_weight"]!, kNorm: r["k_norm_weight"]!)
+        }
+        let layer = DecoderLayer(isLinear: isLinear, eps: 1e-6, inputLayernorm: iln, postAttentionLayernorm: pln,
+                                 gdn: gdn, attn: attn, mlp: DecoderLayerValidation.mlpFrom(r))
         let prevF32 = GatedDeltaNetLayer.f32Conv; GatedDeltaNetLayer.f32Conv = true
         defer { GatedDeltaNetLayer.f32Conv = prevF32 }
         let x = MLXRandom.normal([1, 1, H]).asType(.float16)
         let ref = layer(x); ref.eval()
-        // GDN raw weights
-        let rw = GDNRawWeights(
-            qkvWq: r["in_proj_qkv.weight"]!, qkvSc: r["in_proj_qkv.scales"]!, qkvBi: r["in_proj_qkv.biases"]!,
-            zWq: r["in_proj_z.weight"]!, zSc: r["in_proj_z.scales"]!, zBi: r["in_proj_z.biases"]!,
-            bWq: r["in_proj_b.weight"]!, bSc: r["in_proj_b.scales"]!, bBi: r["in_proj_b.biases"]!,
-            aWq: r["in_proj_a.weight"]!, aSc: r["in_proj_a.scales"]!, aBi: r["in_proj_a.biases"]!,
-            outWq: r["out_proj.weight"]!, outSc: r["out_proj.scales"]!, outBi: r["out_proj.biases"]!,
-            conv1dW: r["conv1d"]!.reshaped([8192, 4]).asType(.float32), normWeight: r["la_norm_weight"]!,  // native(F16)＝MLX 一致
-            aLog: r["A_log"]!, dtBias: r["dt_bias"]!)
-        // raw decoder forward
+        // raw mixer
         guard let normed = rmsNorm(x.reshaped([1, H]), iln, eps: 1e-6, D: H) else { return "[raw-declayer] input_norm 失敗" }
-        guard let rOut = gdnLayerRaw(normed.reshaped([1, 1, H]), rw) else { return "[raw-declayer] GDN 失敗" }
+        let rOut: MLXArray
+        if isLinear {
+            let rw = GDNRawWeights(
+                qkvWq: r["in_proj_qkv.weight"]!, qkvSc: r["in_proj_qkv.scales"]!, qkvBi: r["in_proj_qkv.biases"]!,
+                zWq: r["in_proj_z.weight"]!, zSc: r["in_proj_z.scales"]!, zBi: r["in_proj_z.biases"]!,
+                bWq: r["in_proj_b.weight"]!, bSc: r["in_proj_b.scales"]!, bBi: r["in_proj_b.biases"]!,
+                aWq: r["in_proj_a.weight"]!, aSc: r["in_proj_a.scales"]!, aBi: r["in_proj_a.biases"]!,
+                outWq: r["out_proj.weight"]!, outSc: r["out_proj.scales"]!, outBi: r["out_proj.biases"]!,
+                conv1dW: r["conv1d"]!.reshaped([8192, 4]).asType(.float32), normWeight: r["la_norm_weight"]!,
+                aLog: r["A_log"]!, dtBias: r["dt_bias"]!)
+            guard let ro = gdnLayerRaw(normed.reshaped([1, 1, H]), rw) else { return "[raw-declayer] GDN 失敗" }
+            rOut = ro
+        } else {
+            let aw = AttnRawWeights(
+                qWq: r["q_proj.weight"]!, qSc: r["q_proj.scales"]!, qBi: r["q_proj.biases"]!,
+                kWq: r["k_proj.weight"]!, kSc: r["k_proj.scales"]!, kBi: r["k_proj.biases"]!,
+                vWq: r["v_proj.weight"]!, vSc: r["v_proj.scales"]!, vBi: r["v_proj.biases"]!,
+                oWq: r["o_proj.weight"]!, oSc: r["o_proj.scales"]!, oBi: r["o_proj.biases"]!,
+                qNorm: r["q_norm_weight"]!, kNorm: r["k_norm_weight"]!)
+            let pf = (r["q_norm_weight"]!.dtype == .float32)              // dec3 は F16→f16 経路
+            guard let ro = attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: pf) else { return "[raw-declayer] attn 失敗" }
+            rOut = ro.asType(x.dtype)                                      // attn 出力を residual dtype(f16)へ
+        }
         let h = x.reshaped([1, H]) + rOut                                   // residual
         guard let postNorm = rmsNorm(h, pln, eps: 1e-6, D: H) else { return "[raw-declayer] post_norm 失敗" }
         guard let mlpOut = moeRawForward(postNorm, gate: q8("gate"), sharedGate: q8("shared_expert_gate"),
@@ -1557,8 +1580,8 @@ public enum RawMetalForward {
         let got = h + mlpOut
         got.eval()
         let rel = relErr(got.reshaped([got.size]), ref.reshaped([ref.size]))
-        return String(format: "[raw-declayer-test] GDN decoder layer 1層 raw(input_norm→GDN→res→post_norm→MoE→res) vs MLX\n"
-            + "  H=%d  rel=%.3e %@", H, rel, rel == 0 ? "✅ TRUE bit-exact（40層 tile の単位）" : (rel < 2e-3 ? "△ 近似" : "❌"))
+        return String(format: "[raw-declayer-test] %@ decoder layer 1層 raw(input_norm→mixer→res→post_norm→MoE→res) vs MLX\n"
+            + "  H=%d  rel=%.3e %@", isLinear ? "GDN" : "attn", H, rel, rel == 0 ? "✅ TRUE bit-exact（40層 tile の単位）" : (rel < 2e-3 ? "△ 近似" : "❌"))
     }
 
     /// 検証: rmsNorm / softmax を MLX と bit-exact 照合。
