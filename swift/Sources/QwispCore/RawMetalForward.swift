@@ -173,9 +173,11 @@ public enum RawMetalForward {
                              device \(XT)*          y      [[buffer(4)]],
                              constant int&          in_vec_size  [[buffer(5)]],   // K
                              constant int&          out_vec_size [[buffer(6)]],   // N
+                             device const int*      stopFlag [[buffer(16)]],   // ★ A4: 非0 で no-op(未使用 index=衝突回避)
                              uint3 tid      [[threadgroup_position_in_grid]],
                              uint  simd_gid [[simdgroup_index_in_threadgroup]],
                              uint  simd_lid [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;                            // ★ A4 stop flag guard
                 constexpr int packs_per_thread = 2;
                 constexpr int num_simdgroups = 2;
                 constexpr int results_per_simdgroup = 4;
@@ -254,6 +256,7 @@ public enum RawMetalForward {
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5)
         enc.setBytes(&nn, length: 4, index: 6)
+        bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -294,9 +297,11 @@ public enum RawMetalForward {
                          device half*           y      [[buffer(4)]],
                          constant int&          in_vec_size  [[buffer(5)]],   // K
                          constant int&          out_vec_size [[buffer(6)]],   // N
+                         device const int*      stopFlag [[buffer(16)]],   // ★ A4
                          uint3 tid      [[threadgroup_position_in_grid]],
                          uint  simd_gid [[simdgroup_index_in_threadgroup]],
                          uint  simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4 stop flag guard
             constexpr int packs_per_thread = 2;
             constexpr int num_simdgroups = 2;
             constexpr int results_per_simdgroup = 4;
@@ -357,6 +362,7 @@ public enum RawMetalForward {
         enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
         enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3); enc.setBuffer(outBuf, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
@@ -379,7 +385,9 @@ public enum RawMetalForward {
         kernel void route_top8(device const half* logits [[buffer(0)]],
                                device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
                                constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                               device const int* stopFlag [[buffer(16)]],
                                uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4 stop flag guard
             threadgroup float red[256]; threadgroup int redi[256];
             threadgroup float gates[256]; threadgroup float work[256];
             threadgroup float bcast[1];
@@ -529,6 +537,7 @@ public enum RawMetalForward {
         enc.setComputePipelineState(_routePipeline!)
         enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1); enc.setBuffer(bScores, offset: 0, index: 2)
         var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ip = bInds.contents().bindMemory(to: Int32.self, capacity: K)
@@ -847,7 +856,9 @@ public enum RawMetalForward {
         kernel void shared_gate8(device const uint8_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
                                  device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
                                  device half* out [[buffer(4)]], constant uint& K [[buffer(5)]],
+                                 device const int* stopFlag [[buffer(16)]],
                                  uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4 stop flag guard
             threadgroup float part[256];
             uint G = K / 64;
             float acc = 0.0f;
@@ -927,9 +938,11 @@ public enum RawMetalForward {
                 device const half* v [[buffer(2)]], device const float* g [[buffer(3)]],
                 device const float* beta [[buffer(4)]], device const float* state_in [[buffer(5)]],
                 constant int& T [[buffer(6)]], device half* y [[buffer(7)]], device float* state_out [[buffer(8)]],
+                device const int* stopFlag [[buffer(16)]],
                 uint3 thread_position_in_grid [[thread_position_in_grid]],
                 uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
                 uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;          // ★ A4 stop flag guard
             \(body)
             }
             """
@@ -951,6 +964,7 @@ public enum RawMetalForward {
         enc.setBuffer(bg, offset: 0, index: 3); enc.setBuffer(bb, offset: 0, index: 4); enc.setBuffer(bs, offset: 0, index: 5)
         var tt = Int32(T); enc.setBytes(&tt, length: 4, index: 6)
         enc.setBuffer(yBuf, offset: 0, index: 7); enc.setBuffer(soBuf, offset: 0, index: 8)
+        bindStop(enc, 16)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: B*Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let yp = yBuf.contents().bindMemory(to: Float16.self, capacity: B*T*Hv*Dv)
@@ -1389,6 +1403,7 @@ public enum RawMetalForward {
                 enc.setBuffer(src, offset: 0, index: 0); enc.setBuffer(bwq, offset: 0, index: 1)
                 enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3); enc.setBuffer(a, offset: 0, index: 4)
                 enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&g, length: 4, index: 7)
+                bindStop(enc, 16)
                 enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
                 enc.setComputePipelineState(_rmsPipeline!)
                 enc.setBuffer(a, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(b, offset: 0, index: 2)
@@ -1588,6 +1603,7 @@ public enum RawMetalForward {
             enc.setBuffer(bi, offset: 0, index: 2); enc.setBuffer(xb, offset: xoff, index: 3)
             enc.setBuffer(y, offset: yoff, index: 4)
             var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encRms(_ xb: MTLBuffer, xoff: Int, _ wb: MTLBuffer, _ ob: MTLBuffer, rows: Int, D: Int, promote: Bool) {
@@ -1644,6 +1660,7 @@ public enum RawMetalForward {
         // decode は state を in-place 更新（stateBuf を out にも＝次トークンへ feedback。recurrent は register に
         // state を読んでから書くので in-place 安全）。cold は別 stateOut（毎回独立）。
         enc.setBuffer(coreOut, offset: 0, index: 7); enc.setBuffer(decode ? stateBuf : stateOut, offset: 0, index: 8)
+        bindStop(enc, 16)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         }
         // ⑥ RMSNormGated: rmsNorm(promote=normF32) → gate(normF32 で f32/f16 版)
@@ -1794,12 +1811,14 @@ public enum RawMetalForward {
         enc.setBuffer(gate.wq, offset: 0, index: 0); enc.setBuffer(gate.sc, offset: 0, index: 1); enc.setBuffer(gate.bi, offset: 0, index: 2)
         enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateLogits, offset: 0, index: 4)
         var kk = Int32(H), nn = Int32(E); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: E/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         // ② route_top8: gateLogits → moe.binds(inds), scores（single-thread; profile で skip 可）
         if !profSkipSingleThread {
             enc.setComputePipelineState(_routePipeline!)
             enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
             var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             // ★ A3a: slot_remap 前に hotMask で miss(cache 未収容 routed expert)を GPU 検出・emit。
             if let hm = hotMask, let mc = missCount, let me = missExperts, let rcp = _residencyCheckPipeline {
@@ -1834,6 +1853,7 @@ public enum RawMetalForward {
             enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
             enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
             var k = Int32(kk), n = Int32(nn); enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encSwiglu(_ g: MTLBuffer, _ u: MTLBuffer, _ h: MTLBuffer, _ total: Int) {
@@ -1877,6 +1897,7 @@ public enum RawMetalForward {
             enc.setBuffer(sharedGateW.wq, offset: 0, index: 0); enc.setBuffer(sharedGateW.sc, offset: 0, index: 1); enc.setBuffer(sharedGateW.bi, offset: 0, index: 2)
             enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateScale, offset: 0, index: 4)
             var sk = UInt32(H); enc.setBytes(&sk, length: 4, index: 5)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
         enc.setComputePipelineState(_finalCombinePipeline!)
@@ -2265,6 +2286,7 @@ public enum RawMetalForward {
             enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1)
             enc.setBuffer(bi, offset: 0, index: 2); enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
             var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encRms(_ xb: MTLBuffer, _ wb: MTLBuffer, _ ob: MTLBuffer, rows: Int, D: Int) {
@@ -2455,6 +2477,7 @@ public enum RawMetalForward {
             enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
             enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
             var k = Int32(kk), n = Int32(nn); enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6)
+            bindStop(enc, 16)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: nn / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encSwiglu(_ gb: MTLBuffer, _ ub: MTLBuffer, _ hb: MTLBuffer, total: Int) {
