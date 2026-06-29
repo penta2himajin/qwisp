@@ -213,6 +213,16 @@ public final class QwispModel {
             + "  logits rel=%.3e  argmax raw=%d ref=%d %@  %@",
             rel, amG, amR, amG == amR ? "一致✅" : "不一致❌",
             rel == 0 ? "TRUE bit-exact ✅✅" : (rel < 1e-3 ? "△ near" : "❌ f16累積"))
+        // 時間計測: round-trip raw forward vs MLX full forward
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        let reps = 20
+        for _ in 0..<3 { _ = model.rawForward(ids)?.eval() }
+        var t0 = now(); for _ in 0..<reps { _ = model.rawForward(ids)?.eval() }; let rawMs = (now()-t0)/Double(reps)
+        for _ in 0..<3 { model(ids).eval() }
+        t0 = now(); for _ in 0..<reps { model(ids).eval() }; let mlxMs = (now()-t0)/Double(reps)
+        out += String(format: "\n  時間/forward: round-trip raw=%.1fms(%.1f tok/s) | MLX=%.1fms(%.1f tok/s) → %.2fx",
+                      rawMs, 1000/rawMs, mlxMs, 1000/mlxMs, mlxMs/Swift.max(0.01, rawMs))
+        out += "\n  ※ round-trip(kernel毎 cmd buffer)は遅い。SE 化(GDN SE 2.64x/MoE expert SE)で高速化が本筋"
         // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
         if ProcessInfo.processInfo.environment["QWISP_FULL_DIAG"] == "1" {
             var hM = model.embed(ids); let H = hM.dim(-1)
