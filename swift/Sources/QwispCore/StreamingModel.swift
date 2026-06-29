@@ -240,6 +240,56 @@ public final class StreamingQwispModel {
         return (hid, lg, L - firstMiss)
     }
 
+    /// ★ issue#7 layer-batch: chunk(K 層)単位の cross-layer 予測 prefetch + no-sync + chunk内 escalate。
+    /// 各 chunk: 入力 h を materialize→K 層を一括予測(gate_{j+d}(h))→prefetch→chunk no-sync lazy→単一 eval
+    /// →chunk 内 first-miss から sync 再計算。drain=2/chunk(40/K に削減)、escalate は chunk 内に bounded。
+    /// 短距離予測ゆえ高 cover(marginK=32,d≤3 で 54-83%)。bit-exact。
+    public func forwardHiddenChunked(_ ids: MLXArray, caches: [LayerCache], K: Int, marginK: Int, isLin: [Bool])
+        throws -> (hidden: MLXArray, logits: MLXArray, esc: Int) {
+        let L = numLayers, trim = ids.dim(1)
+        func distinct(_ a: MLXArray) -> [Int] { var s = Set<Int>(); var u: [Int] = []; for e in a.asArray(Int32.self) { let v = Int(e); if s.insert(v).inserted { u.append(v) } }; return u }
+        var h = embed(ids); var esc = 0
+        StreamingMoEBlock.captureInds = true
+        var j = 0
+        while j < L {
+            let end = Swift.min(j + K, L)
+            h.eval()                                            // chunk 入力 materialize（drain 1/chunk）
+            let h2 = h.reshaped([1, h.dim(-1)])
+            // K 層を一括予測（gate_{layer}(h)）→ eval 1 回 → prefetch
+            var preds: [MLXArray] = []
+            for layer in j ..< end { preds.append(predictLayerIndsK(layer, h2, marginK)) }
+            MLX.eval(preds)
+            for (idx, layer) in (j ..< end).enumerated() { _ = expertCaches[layer].ensure(distinct(preds[idx])) }
+            // chunk を no-sync lazy 実行 + per-layer miss
+            let snaps = (j ..< end).map { caches[$0].snapshot() }
+            var hIn: [MLXArray] = []; var miss: [MLXArray] = []
+            for layer in j ..< end {
+                hIn.append(h)
+                StreamingMoEBlock.hotMissAccum = nil
+                StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true
+                h = try layers[layer](h, cache: caches[layer])
+                miss.append(StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0)))
+            }
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            MLX.eval([h] + miss + (j ..< end).flatMap { caches[$0].stateArrays })   // chunk 末尾 eval（drain 1/chunk）
+            // chunk 内 first-miss から sync 再計算
+            var fm = -1
+            for (idx, layer) in (j ..< end).enumerated() where miss[idx].item(Int32.self) != 0 { fm = layer; break }
+            if fm >= 0 {
+                for layer in fm ..< end { caches[layer].restore(snaps[layer - j], isLinear: isLin[layer], trim: trim) }
+                var hh = hIn[fm - j]
+                for layer in fm ..< end { hh = try layers[layer](hh, cache: caches[layer]) }   // sync(ensure)
+                MLX.eval([hh] + (fm ..< end).flatMap { caches[$0].stateArrays })
+                h = hh; esc += end - fm
+            }
+            j = end
+        }
+        StreamingMoEBlock.captureInds = false
+        let hid = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        let lg = headProj().apply(hid); MLX.eval([lg])
+        return (hid, lg, esc)
+    }
+
     /// layer-skip draft 用: skip に含まれる層は identity(計算ごと省略)。draft を計算ごと安くする。
     /// 注意: skip 層は cache を更新しないので draft state は近似（throwaway 前提）。
     public func forwardHiddenSkip(_ ids: MLXArray, caches: [LayerCache], skip: Set<Int>)
@@ -390,6 +440,130 @@ public enum StreamingDecode {
         return "[step0-resident] cold-start single-pass nl decode（\(ref), gen=\(N)）の per-layer 全常駐率"
             + "\n  #7 機構: per-layer 粒度で resident 層 no-sync / miss 層のみ sync。下の per-layer 率に比例して sync 削減。"
             + blocks
+    }
+
+    /// ★ issue#7: drain-free 層入力予測の上限を実測。各層 i の routing を **embedding h_0**（token 開始時に
+    /// 利用可・drain-free）から gate_i(h_0) で予測し、actual top-8 への recall / full-coverage を per-layer 計測。
+    /// 残差類似で早期層が h_0 から予測でき、中間層の次元ピークで壁が来るか（情報幾何の予言）を検証。
+    /// env QWISP_RUN=predict-h0 / QWISP_RESID_REF(既定 long) / QWISP_GEN / QWISP_MARGIN_K(既定 "8,16,32")。
+    public static func runPredictH0(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let ref = ProcessInfo.processInfo.environment["QWISP_RESID_REF"] ?? "/tmp/qwisp_long_ref.safetensors"
+        let r = try loadArrays(url: URL(fileURLWithPath: ref))
+        guard let promptArr = r["spec_prompt"] else { return "[predict-h0] spec_prompt 無し(\(ref))" }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: 256)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let L = model.numLayers, topK = 8
+        let genCap = (r["spec_greedy"]?.dim(0)) ?? 128
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, genCap)
+        let mks = (ProcessInfo.processInfo.environment["QWISP_MARGIN_K"] ?? "8,16,32").split(separator: ",").compactMap { Int($0) }
+        func setS(_ a: MLXArray) -> Set<Int> { a.eval(); return Set(a.asArray(Int32.self).map { Int($0) }) }
+        let ds = [1, 2, 3, 5, 8]    // 予測距離（chunk K の候補）
+        let caches = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.captureInds = true; StreamingMoEBlock.captureGateInput = true
+        var (_, lg) = try model.prefillChunked(ids, caches: caches)
+        var cur = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1]); MLX.eval([cur] + caches.flatMap { $0.stateArrays })
+        // mk → d → (recall 累計, fullcover 累計, ペア数)
+        var recall = mks.map { _ in ds.map { _ in 0.0 } }
+        var fullc  = mks.map { _ in ds.map { _ in 0 } }
+        var pairs  = ds.map { _ in 0 }
+        for _ in 0 ..< N {
+            // gating input(post-attn-norm)を全層 capture する 1 forward
+            (_, lg) = try model.forwardHidden(cur, caches: caches)
+            MLX.eval([lg] + caches.flatMap { $0.stateArrays }
+                     + model.expertCaches.compactMap { $0.lastInds } + model.expertCaches.compactMap { $0.lastGateInput })
+            let gin: [MLXArray?] = (0..<L).map { model.expertCaches[$0].lastGateInput }
+            let act: [Set<Int>?] = (0..<L).map { model.expertCaches[$0].lastInds.map { setS($0) } }
+            for (di, d) in ds.enumerated() {
+                for j in 0 ..< (L - d) {
+                    guard let g = gin[j], let actual = act[j+d] else { continue }   // gate_{j+d}(gatingInput_j)
+                    if di == 0 { pairs[di] += 0 }   // count below
+                    for (mi, mk) in mks.enumerated() {
+                        let pred = setS(model.predictLayerIndsK(j+d, g.reshaped([1, g.dim(-1)]), mk))
+                        let inter = actual.intersection(pred).count
+                        recall[mi][di] += Double(inter) / Double(topK)
+                        if inter == actual.count { fullc[mi][di] += 1 }
+                    }
+                }
+                pairs[di] += (L - d)
+            }
+            cur = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([cur])
+        }
+        StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureGateInput = false
+        var blocks = ""
+        for (mi, mk) in mks.enumerated() {
+            var row = String(format: "\n── marginK=%d（gate_{j+d}(gatingInput_j) top-%d で d 層先を予測）──\n  距離d:", mk, mk)
+            for (di, d) in ds.enumerated() {
+                let rc = recall[mi][di] / Double(max(1, pairs[di])) * 100
+                let fc = Double(fullc[mi][di]) / Double(max(1, pairs[di])) * 100
+                row += String(format: "  d=%d→recall %.0f%%/cover %.0f%% |", d, rc, fc)
+            }
+            blocks += row
+        }
+        return "[predict-h0] cross-layer 予測の距離減衰（gatingInput_j → d 層先 gate, \(ref) gen=\(N)）"
+            + "\n  layer-batch K の決定材料: cover(actual⊂予測=no-sync exact 可)が高い d まで chunk 化可。drain は 40/K に。"
+            + blocks
+    }
+
+    /// ★ issue#7 layer-batch: forwardHiddenChunked の実 greedy decode 速度+bit-exact+escalation を sync と比較。
+    /// env QWISP_RUN=chunked / QWISP_RESID_REF / QWISP_CACHE_C(128) / QWISP_CHUNK_K(4) / QWISP_MARGIN_K(32) / QWISP_GEN。
+    public static func runChunked(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let ref = ProcessInfo.processInfo.environment["QWISP_RESID_REF"] ?? "/tmp/qwisp_long_ref.safetensors"
+        let r = try loadArrays(url: URL(fileURLWithPath: ref))
+        guard let promptArr = r["spec_prompt"] else { return "[chunked] spec_prompt 無し(\(ref))" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "128") ?? 128
+        let K = Int(ProcessInfo.processInfo.environment["QWISP_CHUNK_K"] ?? "4") ?? 4
+        let mK = Int(ProcessInfo.processInfo.environment["QWISP_MARGIN_K"] ?? "32") ?? 32
+        let genCap = (r["spec_greedy"]?.dim(0)) ?? 128
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, genCap)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.captureInds = false
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags; let L = model.numLayers
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            let mc = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.captureInds = false
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1]); MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N { (_, lg) = try model.forwardHidden(u, caches: mc); u = MLX.argMax(lg[0,0],axis: -1).reshaped([1,1]); MLX.eval([u]+mc.flatMap{$0.stateArrays}); toks.append(u.item(Int.self)) }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        func greedyChunked() throws -> (toks: [Int], tps: Double, esc: Double) {
+            let mc = model.makeCaches()
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1]); MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            var toks: [Int] = []; var escTot = 0; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let (_, clg, esc) = try model.forwardHiddenChunked(u, caches: mc, K: K, marginK: mK, isLin: isLin)
+                u = MLX.argMax(clg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([u]); toks.append(u.item(Int.self)); escTot += esc
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), Double(escTot)/Double(N))
+        }
+        let sync = try greedySync(); let ck = try greedyChunked()
+        let match = zip(sync.toks, ck.toks).filter { $0 == $1 }.count
+        var fd = N; for i in 0 ..< N where sync.toks[i] != ck.toks[i] { fd = i; break }
+        let sp = sync.tps > 0 ? ck.tps / sync.tps : 0
+        return String(format: """
+            [chunked] issue#7 layer-batch: chunk(K層)cross-layer 予測 prefetch + no-sync + chunk内 escalate
+              C=%d(≈%.1f GB) K=%d marginK=%d N=%d ref=%@
+              sync greedy(exact) : %.1f tok/s
+              chunked            : %.1f tok/s  (escalate %.1f 層/token=%.0f%%, drain≈%d/token)
+              → speedup=%.2fx  %@
+            """, C, Double(C)*Double(L)*1.77/1000+4.0, K, mK, N, (ref as NSString).lastPathComponent,
+            sync.tps, ck.tps, ck.esc, ck.esc/Double(L)*100, 2*((L+K-1)/K),
+            sp, match == N ? "✅ bit-exact" : "❌ \(N-match)/\(N)不一致(#\(fd))")
     }
 
     /// ★ issue#7 (c): forwardHiddenPrefetchWhole（背景 prefetch overlap + whole-token no-sync + escalate）の
