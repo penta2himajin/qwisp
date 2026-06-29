@@ -316,6 +316,7 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _scalePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _combinePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _gate16Pipeline: MTLComputePipelineState?
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -341,7 +342,7 @@ public enum RawMetalForward {
             float sp = max(x, 0.0f) + precise::log(1.0f + precise::exp(-metal::abs(x)));  // softplus
             g[i] = precise::exp(-precise::exp(aLog[i]) * sp);
         }
-        // gate: silu(z.f32)*normed.f32 → f16。silu=z*sigmoid(z)[T=float, metal::exp]
+        // gate: silu(z.f32)*normed.f32 → f16。silu=z*sigmoid(z)[T=float, metal::exp]。normed が f32(promote)版
         kernel void gate(device const half* z [[buffer(0)]], device const float* normed [[buffer(1)]],
                          device half* outV [[buffer(2)]], constant uint& total [[buffer(3)]],
                          uint i [[thread_position_in_grid]]) {
@@ -350,6 +351,16 @@ public enum RawMetalForward {
             float y = 1.0f / (1.0f + exp(metal::abs(zf)));          // sigmoid(z), metal::exp, float
             float s = (zf < 0.0f) ? y : (1.0f - y);
             outV[i] = (half)((zf * s) * normed[i]);
+        }
+        // gate16: normed が f16(non-promote, la_norm F16)版。f16 normed を widen して gate。
+        kernel void gate16(device const half* z [[buffer(0)]], device const half* normed [[buffer(1)]],
+                           device half* outV [[buffer(2)]], constant uint& total [[buffer(3)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            float zf = (float)z[i];
+            float y = 1.0f / (1.0f + exp(metal::abs(zf)));
+            float s = (zf < 0.0f) ? y : (1.0f - y);
+            outV[i] = (half)((zf * s) * (float)normed[i]);
         }
         // scale_mul: x[i] = (half)scale * x[i]（in-place, half 乗算）
         kernel void scale_mul(device half* x [[buffer(0)]], constant float& s [[buffer(1)]],
@@ -386,6 +397,7 @@ public enum RawMetalForward {
             _scalePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "scale_mul")!)
             _swigluPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "swiglu")!)
             _combinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine")!)
+            _gate16Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gate16")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -911,6 +923,7 @@ public enum RawMetalForward {
     struct GDNBuffers {
         let H, keyDim, valueDim, convDim, Dk, Dv, Hv, Hk, convKernel: Int
         let invScale: Float
+        let normF32: Bool                        // la_norm が F32(promote) か F16 か
         let bx: MTLBuffer
         let bQkvW, bQkvS, bQkvB, bZW, bZS, bZB, bAW, bAS, bAB, bBW, bBS, bBB, bOW, bOS, bOB: MTLBuffer
         let bConvW, bNormW, bALog, bDt, bOnes: MTLBuffer
@@ -933,15 +946,17 @@ public enum RawMetalForward {
               let bAW = w.aWq.asMTLBuffer(device: device, noCopy: false), let bAS = mtl(w.aSc, .float16), let bAB = mtl(w.aBi, .float16),
               let bBW = w.bWq.asMTLBuffer(device: device, noCopy: false), let bBS = mtl(w.bSc, .float16), let bBB = mtl(w.bBi, .float16),
               let bOW = w.outWq.asMTLBuffer(device: device, noCopy: false), let bOS = mtl(w.outSc, .float16), let bOB = mtl(w.outBi, .float16),
-              let bConvW = mtl(w.conv1dW, .float32), let bNormW = mtl(w.normWeight, .float32),
+              let bConvW = mtl(w.conv1dW, .float32),
+              let bNormW = mtl(w.normWeight, w.normWeight.dtype == .float32 ? .float32 : .float16),   // la_norm dtype 維持
               let bALog = mtl(w.aLog, .float32), let bDt = mtl(w.dtBias, .float32),
               let bOnes = MLXArray.ones([headKDim], dtype: .float16).asMTLBuffer(device: device, noCopy: false)
         else { print("[raw-gdn-se] weight buffer nil"); return nil }
+        let normF32 = (w.normWeight.dtype == .float32)
         let convInput = mk(convKernel * convDim * 2); memset(convInput.contents(), 0, convKernel * convDim * 2)  // zero 1 回（qkv が row(K-1)を毎回上書き）
         let stateBuf = mk(Hv * Dv * Dk * 4); memset(stateBuf.contents(), 0, Hv * Dv * Dk * 4)                   // cold state zero 1 回
         return GDNBuffers(
             H: H, keyDim: keyDim, valueDim: valueDim, convDim: convDim, Dk: Dk, Dv: Dv, Hv: Hv, Hk: Hk,
-            convKernel: convKernel, invScale: Float(pow(Double(headKDim), -0.5)),
+            convKernel: convKernel, invScale: Float(pow(Double(headKDim), -0.5)), normF32: normF32,
             bx: mk(H * 2),
             bQkvW: bQkvW, bQkvS: bQkvS, bQkvB: bQkvB, bZW: bZW, bZS: bZS, bZB: bZB,
             bAW: bAW, bAS: bAS, bAB: bAB, bBW: bBW, bBS: bBS, bBB: bBB, bOW: bOW, bOS: bOS, bOB: bOB,
@@ -949,7 +964,7 @@ public enum RawMetalForward {
             convInput: convInput, zBuf: mk(valueDim * 2), aBuf: mk(Hv * 2), bBuf: mk(Hv * 2),
             gBuf: mk(Hv * 4), betaBuf: mk(Hv * 4), convOut: mk(convDim * 2), qN: mk(keyDim * 2), kN: mk(keyDim * 2),
             stateBuf: stateBuf, stateOut: mk(Hv * Dv * Dk * 4), coreOut: mk(valueDim * 2),
-            normed: mk(valueDim * 4), outV: mk(valueDim * 2), outBuf: mk(H * 2))
+            normed: mk(valueDim * (normF32 ? 4 : 2)), outV: mk(valueDim * 2), outBuf: mk(H * 2))
     }
 
     /// ★ task#3: GDN 1 層を **単一 command buffer + 単一 encoder** で連結（中間 buffer GPU 常駐、
@@ -957,11 +972,12 @@ public enum RawMetalForward {
     ///   round-trip 版 gdnLayerRaw と bit-exact。pipeline は事前 warm 前提。cold cache(decode 1 step)。
     static func gdnLayerSingleEncoder(_ x: MLXArray, _ b: GDNBuffers, eps: Float = 1e-6) -> MLXArray? {
         guard let (_, queue) = ensure() else { return nil }
-        guard let qp = _qmmPipeline, let rp = _rmsPipeline, let rpf = _rmsPipelineF32,
+        guard let qp = _qmmPipeline, let rp = _rmsPipeline,
               let cp = _conv1dPipeline, let rcp = _recurPipeline,
               let cgb = _cgbPipeline, let gp = _gatePipeline, let scp = _scalePipeline else {
             print("[raw-gdn-se] pipeline 未 warm（先に gdnLayerRaw を呼ぶ）"); return nil
         }
+        if b.normF32 && _rmsPipelineF32 == nil { print("[raw-gdn-se] rmsF32 未 warm"); return nil }
         let H = b.H, keyDim = b.keyDim, valueDim = b.valueDim, convDim = b.convDim
         let Dk = b.Dk, Dv = b.Dv, Hv = b.Hv, Hk = b.Hk, convKernel = b.convKernel, invScale = b.invScale
         // x を常駐 buffer に書込み（per-call、H*2 bytes のみ）
@@ -989,7 +1005,7 @@ public enum RawMetalForward {
         }
         // rmsNorm helper（D≤4096, tg=ceil(D/4)→32倍数）。promote=true で f32 weight/out。
         func encRms(_ xb: MTLBuffer, xoff: Int, _ wb: MTLBuffer, _ ob: MTLBuffer, rows: Int, D: Int, promote: Bool) {
-            enc.setComputePipelineState(promote ? rpf : rp)
+            enc.setComputePipelineState(promote ? _rmsPipelineF32! : rp)
             enc.setBuffer(xb, offset: xoff, index: 0); enc.setBuffer(wb, offset: 0, index: 1); enc.setBuffer(ob, offset: 0, index: 2)
             var ee = eps, asz = UInt32(D), ws = UInt32(1)
             enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
@@ -1031,9 +1047,9 @@ public enum RawMetalForward {
         var tt = Int32(1); enc.setBytes(&tt, length: 4, index: 6)
         enc.setBuffer(coreOut, offset: 0, index: 7); enc.setBuffer(stateOut, offset: 0, index: 8)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
-        // ⑥ RMSNormGated: rmsNorm(promoteF32) → gate
-        encRms(coreOut, xoff: 0, bNormW, normed, rows: Hv, D: Dv, promote: true)
-        enc.setComputePipelineState(gp)
+        // ⑥ RMSNormGated: rmsNorm(promote=normF32) → gate(normF32 で f32/f16 版)
+        encRms(coreOut, xoff: 0, bNormW, normed, rows: Hv, D: Dv, promote: b.normF32)
+        enc.setComputePipelineState(b.normF32 ? gp : _gate16Pipeline!)
         enc.setBuffer(zBuf, offset: 0, index: 0); enc.setBuffer(normed, offset: 0, index: 1); enc.setBuffer(outV, offset: 0, index: 2)
         var vt = UInt32(valueDim); enc.setBytes(&vt, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: valueDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(gp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))

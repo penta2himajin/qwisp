@@ -186,6 +186,73 @@ public final class QwispModel {
         return h2 + mlpOut
     }
 
+    // ── SE full forward（task#4 速度）: GDN SE + MoE expert SE（resident buffer）。──
+    nonisolated(unsafe) var gdnBufCache: [Int: RawMetalForward.GDNBuffers] = [:]
+    nonisolated(unsafe) var moeBufCache: [Int: RawMetalForward.MoEBuffers] = [:]
+
+    /// SE decoder layer 1 層（GDN: SE / attn: round-trip raw / MoE: routing=MLX + expert SE + combine=MLX）。
+    func seDecoderLayer(_ h: MLXArray, _ i: Int) -> MLXArray? {
+        let p = "language_model.model.layers.\(i)", H = h.dim(-1)
+        guard let normed = RawMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
+        let r: MLXArray
+        if isLinear(i) {
+            let la = "\(p).linear_attn"
+            if gdnBufCache[i] == nil {
+                let rw = RawMetalForward.GDNRawWeights(
+                    qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
+                    zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
+                    bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
+                    aWq: store.req("\(la).in_proj_a.weight"), aSc: store.req("\(la).in_proj_a.scales"), aBi: store.req("\(la).in_proj_a.biases"),
+                    outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
+                    conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
+                    aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
+                gdnBufCache[i] = RawMetalForward.prepareGDNBuffers(rw, H: H)
+            }
+            guard let buf = gdnBufCache[i], let ro = RawMetalForward.gdnLayerSingleEncoder(normed.reshaped([1, 1, H]), buf, eps: eps) else { return nil }
+            r = ro
+        } else {
+            let sa = "\(p).self_attn"
+            let aw = RawMetalForward.AttnRawWeights(
+                qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
+                kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
+                vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
+                oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
+                qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
+            guard let ro = RawMetalForward.attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: false) else { return nil }
+            r = ro.asType(h.dtype)
+        }
+        let h2 = h + r
+        guard let postNorm = RawMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
+        // MoE: routing(MLX) + expert SE + combine(MLX)
+        let mp = "\(p).mlp"
+        let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: 256 - 8, axis: -1)
+        let inds = order[0..., (256 - 8)...].asType(.int32)
+        var scores = MLX.takeAlong(gates, inds, axis: -1)
+        scores = scores / scores.sum(axis: -1, keepDims: true)
+        if moeBufCache[i] == nil {
+            func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
+            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+                swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
+                shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
+                Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
+        }
+        guard let moeBuf = moeBufCache[i],
+              let (d, sharedY) = RawMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return nil }
+        let y = (d * scores.reshaped([8, 1])).sum(axis: 0).reshaped([1, H])
+        let gateScale = MLX.sigmoid(q("\(mp).shared_expert_gate", 8).apply(postNorm))
+        return h2 + (y + gateScale * sharedY)
+    }
+
+    /// SE full forward（GDN/MoE は single-encoder, attn は round-trip）。decode T=1。
+    public func seRawForward(_ ids: MLXArray) -> MLXArray? {
+        let e = embed(ids); let H = e.dim(-1)
+        var h = e.reshaped([1, H])
+        for i in 0 ..< numLayers { guard let h2 = seDecoderLayer(h, i) else { return nil }; h = h2 }
+        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        return headProj().apply(fn.reshaped([1, 1, H]))
+    }
+
     /// raw full forward（embed=MLX, 40 層=raw, final norm=raw, lm_head=MLX）。ids[1,1]→logits[1,1,vocab]。
     public func rawForward(_ ids: MLXArray) -> MLXArray? {
         let e = embed(ids); let H = e.dim(-1)
@@ -222,7 +289,18 @@ public final class QwispModel {
         t0 = now(); for _ in 0..<reps { model(ids).eval() }; let mlxMs = (now()-t0)/Double(reps)
         out += String(format: "\n  時間/forward: round-trip raw=%.1fms(%.1f tok/s) | MLX=%.1fms(%.1f tok/s) → %.2fx",
                       rawMs, 1000/rawMs, mlxMs, 1000/mlxMs, mlxMs/Swift.max(0.01, rawMs))
-        out += "\n  ※ round-trip(kernel毎 cmd buffer)は遅い。SE 化(GDN SE 2.64x/MoE expert SE)で高速化が本筋"
+        // ★ SE full forward（GDN/MoE single-encoder, attn round-trip）: bit-exact + tok/s
+        if let se = model.seRawForward(ids) {
+            se.eval()
+            let sf = se.reshaped([se.size])
+            let sd = MLX.max(MLX.abs(sf.asType(.float32) - rf.asType(.float32))).item(Float.self)
+            let srel = sd / (MLX.max(MLX.abs(rf.asType(.float32))).item(Float.self) + 1e-9)
+            let amS = MLX.argMax(sf).item(Int.self)
+            for _ in 0..<3 { _ = model.seRawForward(ids)?.eval() }
+            t0 = now(); for _ in 0..<reps { _ = model.seRawForward(ids)?.eval() }; let seMs = (now()-t0)/Double(reps)
+            out += String(format: "\n  ── SE full forward（GDN/MoE=single-encoder, attn=round-trip）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
+                          srel, amS, amR, amS == amR ? "✅" : "❌", seMs, 1000/seMs, mlxMs/Swift.max(0.01, seMs))
+        }
         // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
         if ProcessInfo.processInfo.environment["QWISP_FULL_DIAG"] == "1" {
             var hM = model.embed(ids); let H = hM.dim(-1)
