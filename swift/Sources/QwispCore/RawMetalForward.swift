@@ -15,6 +15,8 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var profSkipSingleThread = false  // route_top8/shared_gate8 を skip(timing 用)
     nonisolated(unsafe) static var profSkipMoEExperts = false    // gather g/u/d/swiglu/shared を skip(timing 用)
     nonisolated(unsafe) static var profSkipMixer = false         // mixer body を skip(timing 用)
+    nonisolated(unsafe) static var profSkipGDNMatmul = false      // GDN in_proj×4 + out_proj qmm を skip
+    nonisolated(unsafe) static var profSkipGDNRecur = false       // GDN recurrent を skip
     nonisolated(unsafe) static var _qmmPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmmF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmm8Pipeline: MTLComputePipelineState?     // 8bit qmv_fast（router gate）
@@ -1347,10 +1349,12 @@ public enum RawMetalForward {
             enc.dispatchThreads(MTLSize(width: convDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_shiftConvPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
         // ① in_proj 4 本。qkv は convInput の row(K-1) に直接書く（zero-pad は memset 済）。
-        encQmm(b.bQkvW, b.bQkvS, b.bQkvB, bx, xoff: 0, convInput, yoff: (convKernel - 1) * convDim * 2, K: H, N: convDim)
-        encQmm(b.bZW, b.bZS, b.bZB, bx, xoff: 0, zBuf, yoff: 0, K: H, N: valueDim)
-        encQmm(b.bAW, b.bAS, b.bAB, bx, xoff: 0, aBuf, yoff: 0, K: H, N: Hv)
-        encQmm(b.bBW, b.bBS, b.bBB, bx, xoff: 0, bBuf, yoff: 0, K: H, N: Hv)
+        if !profSkipGDNMatmul {
+            encQmm(b.bQkvW, b.bQkvS, b.bQkvB, bx, xoff: 0, convInput, yoff: (convKernel - 1) * convDim * 2, K: H, N: convDim)
+            encQmm(b.bZW, b.bZS, b.bZB, bx, xoff: 0, zBuf, yoff: 0, K: H, N: valueDim)
+            encQmm(b.bAW, b.bAS, b.bAB, bx, xoff: 0, aBuf, yoff: 0, K: H, N: Hv)
+            encQmm(b.bBW, b.bBS, b.bBB, bx, xoff: 0, bBuf, yoff: 0, K: H, N: Hv)
+        }
         // ② g/beta
         enc.setComputePipelineState(cgb)
         enc.setBuffer(aBuf, offset: 0, index: 0); enc.setBuffer(bBuf, offset: 0, index: 1)
@@ -1369,6 +1373,7 @@ public enum RawMetalForward {
         encRms(convOut, xoff: keyDim * 2, bOnes, kN, rows: Hk, D: Dk, promote: false)
         encScale(kN, invScale, keyDim)
         // ⑤ recurrent（v = convOut の 2*keyDim 以降）
+        if !profSkipGDNRecur {
         enc.setComputePipelineState(rcp)
         enc.setBuffer(qN, offset: 0, index: 0); enc.setBuffer(kN, offset: 0, index: 1); enc.setBuffer(convOut, offset: 2 * keyDim * 2, index: 2)
         enc.setBuffer(gBuf, offset: 0, index: 3); enc.setBuffer(betaBuf, offset: 0, index: 4); enc.setBuffer(stateBuf, offset: 0, index: 5)
@@ -1377,6 +1382,7 @@ public enum RawMetalForward {
         // state を読んでから書くので in-place 安全）。cold は別 stateOut（毎回独立）。
         enc.setBuffer(coreOut, offset: 0, index: 7); enc.setBuffer(decode ? stateBuf : stateOut, offset: 0, index: 8)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        }
         // ⑥ RMSNormGated: rmsNorm(promote=normF32) → gate(normF32 で f32/f16 版)
         encRms(coreOut, xoff: 0, bNormW, normed, rows: Hv, D: Dv, promote: b.normF32)
         enc.setComputePipelineState(b.normF32 ? gp : _gate16Pipeline!)
@@ -1384,7 +1390,7 @@ public enum RawMetalForward {
         var vt = UInt32(valueDim); enc.setBytes(&vt, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: valueDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(gp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         // ⑦ out_proj
-        encQmm(b.bOW, b.bOS, b.bOB, outV, xoff: 0, outBuf, yoff: 0, K: valueDim, N: H)
+        if !profSkipGDNMatmul { encQmm(b.bOW, b.bOS, b.bOB, outV, xoff: 0, outBuf, yoff: 0, K: valueDim, N: H) }
     }
 
     // ══════════ 層全体融合（task#4）: residual stream を resident GPU buffer に保持 ══════════

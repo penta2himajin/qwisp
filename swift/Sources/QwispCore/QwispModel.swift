@@ -816,6 +816,11 @@ public final class QwispModel {
         RawMetalForward.profSkipMoEExperts = false
         let noMix = measure("skip-mixer") { RawMetalForward.profSkipMixer = true }
         RawMetalForward.profSkipMixer = false
+        // mixer 内訳（GDN: matmul(in_proj×4+out_proj) vs recurrent）
+        let noMM = measure("skip-GDN-matmul") { RawMetalForward.profSkipGDNMatmul = true }
+        RawMetalForward.profSkipGDNMatmul = false
+        let noRec = measure("skip-GDN-recur") { RawMetalForward.profSkipGDNRecur = true }
+        RawMetalForward.profSkipGDNRecur = false
         // baseline: 素朴 MLX decode（caches, 32 step greedy）
         let T = 8
         let pid = MLXArray((0..<T).map { Int32($0 + 10) }, [1, T])
@@ -831,11 +836,13 @@ public final class QwispModel {
               single-thread(route_top8+shared_gate8) 寄与 ≈ %.2fms（full-skipST GPU-exec 差）
               MoE-experts(gather/swiglu/shared/combine/final) 寄与 ≈ %.2fms
               mixer(GDN/attn body) 寄与 ≈ %.2fms
+                └ GDN matmul(in_proj×4+out_proj) 寄与 ≈ %.2fms / GDN recurrent 寄与 ≈ %.2fms
               skip-ST GPU=%.2f / skip-MoE GPU=%.2f / skip-mixer GPU=%.2f
               ── baseline ── 素朴 MLX decode(caches, %d step): %.2fms/tok (%.1f tok/s)
               → 判定: single-thread 寄与が大なら②並列化で足りる。mixer/MoE 大 kernel 寄与が支配なら③ mx.fast 移植深掘り。
             """, full.wall, full.gpu, full.wall-full.gpu,
             full.gpu-noST.gpu, full.gpu-noMoE.gpu, full.gpu-noMix.gpu,
+            full.gpu-noMM.gpu, full.gpu-noRec.gpu,
             noST.gpu, noMoE.gpu, noMix.gpu, N, mlxMs, 1000/mlxMs)
     }
 
