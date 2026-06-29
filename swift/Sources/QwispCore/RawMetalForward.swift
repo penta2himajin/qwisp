@@ -40,6 +40,91 @@ public enum RawMetalForward {
         return opts
     }
 
+    nonisolated(unsafe) static var _qmm4TiledPipeline: MTLComputePipelineState?
+    /// ★ issue#6 absolute throughput de-risk: weight を threadgroup に 1 回 dequant し M 行で再利用する tiled qmm。
+    /// raw M=B の核心(memory-bound 重みロードを B で amortize)。bit-exact でなく near-tie(f32 accum)。
+    /// grid=(N,1,1) 各 threadgroup が出力 n を担当: weight 行 n を threadgroup に dequant→M 行と内積。
+    public static func qmm4TiledBench() -> String {
+        guard let (device, queue) = ensure() else { return "no device" }
+        let M = 8, K = 2048, N = 2048
+        let x = MLXRandom.normal([M, K]).asType(.float16)
+        let wf = MLXRandom.normal([N, K]).asType(.float16)
+        let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+        guard let bi = biOpt else { return "biases nil" }
+        MLX.eval([x, wq, sc, bi])
+        let ref = MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4, mode: .affine); ref.eval()
+        if _qmm4TiledPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void qmm4_tiled(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                   device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                   device half* y [[buffer(4)]], constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],
+                                   constant int& M [[buffer(7)]],
+                                   uint n [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                                   uint tgs [[threads_per_threadgroup]]) {
+                threadgroup float wdq[2048];          // dequant 済 weight 行 n（K≤2048）
+                threadgroup float red[256];
+                int Kg = K / 64;
+                // weight 行 n を協調 dequant（一度だけ＝M 行で共有）
+                for (int k = (int)lid; k < K; k += (int)tgs) {
+                    uint pack = w[n * (K/8) + k/8];
+                    uint nib = (pack >> (4*(k%8))) & 0xf;
+                    int g = k/64;
+                    wdq[k] = (float)scales[n*Kg+g] * (float)nib + (float)biases[n*Kg+g];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int m = 0; m < M; m++) {
+                    float acc = 0.0f;
+                    for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)x[m*K+k] * wdq[k];
+                    red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint s = tgs/2; s > 0; s >>= 1) { if (lid < s) red[lid] += red[lid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                    if (lid == 0) y[m*N + n] = (half)red[0];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 _qmm4TiledPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_tiled")!)
+            } catch { return "compile: \(error)" }
+        }
+        guard let bx = x.asMTLBuffer(device: device, noCopy: false), let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+              let bsc = sc.asType(.float16).asMTLBuffer(device: device, noCopy: false), let bbi = bi.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+        else { return "buf nil" }
+        let outBuf = device.makeBuffer(length: M*N*2, options: .storageModeShared)!
+        func runTiled() -> Double {
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(_qmm4TiledPipeline!)
+            enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1); enc.setBuffer(bbi, offset: 0, index: 2)
+            enc.setBuffer(bx, offset: 0, index: 3); enc.setBuffer(outBuf, offset: 0, index: 4)
+            var kk = Int32(K), nn = Int32(N), mm = Int32(M); enc.setBytes(&kk, length:4, index:5); enc.setBytes(&nn, length:4, index:6); enc.setBytes(&mm, length:4, index:7)
+            enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        }
+        // correctness
+        for _ in 0..<3 { _ = runTiled() }
+        _ = runTiled()
+        let gp = outBuf.contents().bindMemory(to: Float16.self, capacity: M*N)
+        let got = MLXArray(Array(UnsafeBufferPointer(start: gp, count: M*N)), [M, N])
+        let rel = relErr(got.reshaped([M*N]), ref.reshaped([M*N]))
+        // timing: tiled M=8 vs replicated(M=1 qmv ×8)
+        var tiledMs = 0.0; for _ in 0..<30 { tiledMs += runTiled() }; tiledMs /= 30
+        // replicated: 既存 qmm(M=1) を 8 回（amortize 無し）
+        let x1 = x[0..<1, 0...]
+        for _ in 0..<3 { _ = qmm(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N) }
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+        var t0 = now(); for _ in 0..<30 { for _ in 0..<M { _ = qmm(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)?.eval() } }; let repMs = (now()-t0)/30
+        for _ in 0..<3 { _ = qmm(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)?.eval() }
+        t0 = now(); for _ in 0..<30 { _ = qmm(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)?.eval() }; let oneMs = (now()-t0)/30
+        return String(format: """
+            [qmm4-tiled-bench] M=%d K=%d N=%d ── weight amortization de-risk
+              correctness vs MLX qmm: rel=%.3e %@
+              tiled M=%d GPU-exec=%.3fms  |  qmv M=1 wall=%.3fms ×%d=%.3fms(replicated, amortize無)
+              → tiled が M=1 に近い(≪ 8×)なら weight amortize 成立＝raw M=B の核心 de-risk
+            """, M, K, N, rel, rel < 5e-3 ? "✅ near" : "❌", M, tiledMs, oneMs, M, repMs)
+    }
+
     /// 4-bit affine quantized matmul（decode gemv 一般: x[M,K] · Wq[N,K] → out[M,N], transpose=true）。
     /// dequant: w[n,k] = scales[n, k/gs]·nibble + biases[n, k/gs]、nibble=低位から 8 個/uint32。
     /// MLX weight buffer(wq/scales/biases)を asMTLBuffer(noCopy)で共有して読む。
