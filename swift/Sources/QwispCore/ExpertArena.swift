@@ -438,4 +438,38 @@ public enum StreamingMoEValidation {
         return String(format: "[S2] streaming arena MoE vs resident: y_rel=%.2e  %@",
                       d, ok ? "OK ✅ in-place arena 正しい(concat無)" : "MISMATCH ❌")
     }
+
+    /// ★ issue#7 style A milestone A1: raw streaming gather(arena cache buffer を slot-remap で読む)が
+    /// MLX gather と bit-exact か検証。kernel は buffer 非依存ゆえほぼ既存資産(#5)。streaming 固有=slot binds。
+    /// env QWISP_RUN=raw-stream-gather。
+    public static func runRawStreamGather(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        try arena.load(0, Array(0 ..< 16))                      // expert e → slot e（layer 0）
+        let w = arena.arr("gate_proj", "weight"), s = arena.arr("gate_proj", "scales"), b = arena.arr("gate_proj", "biases")
+        let K = w.dim(-1) * 8, N = w.dim(-2)                    // K=Hin(2048), N=I(512)
+        let x = MLXRandom.normal([1, K]).asType(.float16); x.eval()
+        let slots = [0, 1, 2, 3, 4, 5, 6, 7]                    // slot 0-7（=expert 0-7）
+        // MLX gather（no-sync 経路と同形）
+        let remap = MLXArray(slots.map { Int32($0) }, [1, 8]).asType(.uint32)
+        let xe = x.expandedDimensions(axes: [-2, -3])
+        let mlxG = MLX.gatherQuantizedMatmul(xe, w, scales: s, biases: b, rhsIndices: remap,
+                                             transpose: true, groupSize: 64, bits: 4).reshaped([8, N]); mlxG.eval()
+        // raw gather（同 arena buffer + slot binds）
+        guard let rawG = RawMetalForward.gatherQmm(x, w, scales: s, biases: b,
+                                                   inds: MLXArray(slots.map { Int32($0) }), Ktop: 8, K: K, N: N) else {
+            return "[A1] raw gatherQmm 失敗(非fast?)"
+        }
+        rawG.eval()
+        let rel = MLX.max(MLX.abs(mlxG.asType(.float32) - rawG.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(mlxG.asType(.float32))).item(Float.self) + 1e-9)
+        return String(format: """
+            [A1 raw-stream-gather] raw gather(arena cache buffer[C=%d slots] + slot binds)vs MLX gather
+              K=%d N=%d, slots=0-7  rel=%.3e  %@
+              → bit/near-tie 一致なら style A の gather は既存 raw kernel で streaming 動作(A1 de-risk 完了)。
+                残=A3/A4(GPU miss判定+segment+CPU handshake)が真の新規。
+            """, 64, K, N, rel, rel < 5e-3 ? "✅ 一致(A1 OK)" : "❌乖離")
+    }
 }
