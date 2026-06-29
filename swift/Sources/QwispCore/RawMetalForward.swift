@@ -317,6 +317,9 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _combinePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _gate16Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _extractQPipeline: MTLComputePipelineState?     // attn SE: strided query 抽出
+    nonisolated(unsafe) static var _sigmoidMulPipeline: MTLComputePipelineState?   // attn SE: gated=attnOut*sigmoid(gate)
+    nonisolated(unsafe) static var _residAddPipeline: MTLComputePipelineState?     // 層融合: h += r（residual stream f16）
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -388,6 +391,34 @@ public enum RawMetalForward {
             for (uint k = 0; k < K; ++k) acc += d[k*N + n] * scores[k];
             y[n] = acc;
         }
+        // extract_q（attn SE）: qOut[Hh, qd2] の query 部 [:,0:headDim] を contiguous q[Hh, headDim] に複製。
+        //   rms の row-stride 問題(qOut の row stride=qd2≠headDim)を回避。純コピー(演算無し, bit-exact)。
+        kernel void extract_q(device const half* qOut [[buffer(0)]], device half* q [[buffer(1)]],
+                              constant uint& headDim [[buffer(2)]], constant uint& qd2 [[buffer(3)]],
+                              constant uint& total [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint h = i / headDim, d = i % headDim;
+            q[i] = qOut[h * qd2 + d];
+        }
+        // sigmoid_mul（attn SE）: gated[i]=attnOut[i]*sigmoid(gate[i])。gate は qOut[:,headDim:qd2] から strided 読み。
+        //   MLX gated=output_f16*sigmoid(gate_f16) を f16 で再現（sigmoid は MLX stable, half, metal::exp）。
+        kernel void sigmoid_mul(device const half* attnOut [[buffer(0)]], device const half* qOut [[buffer(1)]],
+                                device half* gated [[buffer(2)]], constant uint& headDim [[buffer(3)]],
+                                constant uint& qd2 [[buffer(4)]], constant uint& total [[buffer(5)]],
+                                uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint h = i / headDim, d = i % headDim;
+            half gv = qOut[h * qd2 + headDim + d];
+            half y = (half)1 / ((half)1 + exp(metal::abs(gv)));
+            half s = (gv < (half)0) ? y : ((half)1 - y);
+            gated[i] = attnOut[i] * s;
+        }
+        // resid_add（層融合）: h[i] = h[i] + r[i]（residual stream f16, in-place into h）。MLX h+r を f16 で再現。
+        kernel void resid_add(device half* h [[buffer(0)]], device const half* r [[buffer(1)]],
+                              constant uint& total [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            h[i] = h[i] + r[i];
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -398,6 +429,9 @@ public enum RawMetalForward {
             _swigluPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "swiglu")!)
             _combinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine")!)
             _gate16Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gate16")!)
+            _extractQPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "extract_q")!)
+            _sigmoidMulPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sigmoid_mul")!)
+            _residAddPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "resid_add")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -1265,6 +1299,123 @@ public enum RawMetalForward {
         }
     }
 
+    /// attention 計算の常駐 buffer（重み＋中間＝一度だけ確保）。decode S=1, cold cache, f16 経路。
+    struct AttnBuffers {
+        let H, numHeads, numKV, headDim, qd2, ropeDim: Int
+        let ropeBase, scale, eps: Float
+        let bx: MTLBuffer
+        let qW, qS, qB, kW, kS, kB, vW, vS, vB, oW, oS, oB, qNormW, kNormW: MTLBuffer
+        let qOut, keys, values, queries, qN, kN, qRot, kRot, attnOut, gated, outBuf: MTLBuffer
+    }
+
+    /// attn 重み・中間 buffer を一度だけ確保（GDN SE と同型）。real model は q/k_norm F16 → f16 経路のみ。
+    static func prepareAttnBuffers(_ w: AttnRawWeights,
+                                   numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
+                                   ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6,
+                                   H: Int = 2048) -> AttnBuffers? {
+        guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
+        let qd2 = 2 * headDim
+        func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { a.asType(t).asMTLBuffer(device: device, noCopy: false) }
+        func mk(_ bytes: Int) -> MTLBuffer { device.makeBuffer(length: bytes, options: .storageModeShared)! }
+        guard let qW = w.qWq.asMTLBuffer(device: device, noCopy: false), let qS = mtl(w.qSc, .float16), let qB = mtl(w.qBi, .float16),
+              let kW = w.kWq.asMTLBuffer(device: device, noCopy: false), let kS = mtl(w.kSc, .float16), let kB = mtl(w.kBi, .float16),
+              let vW = w.vWq.asMTLBuffer(device: device, noCopy: false), let vS = mtl(w.vSc, .float16), let vB = mtl(w.vBi, .float16),
+              let oW = w.oWq.asMTLBuffer(device: device, noCopy: false), let oS = mtl(w.oSc, .float16), let oB = mtl(w.oBi, .float16),
+              let qNormW = mtl(w.qNorm, .float16), let kNormW = mtl(w.kNorm, .float16)
+        else { print("[raw-attn-se] weight buffer nil"); return nil }
+        let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
+        return AttnBuffers(
+            H: H, numHeads: numHeads, numKV: numKV, headDim: headDim, qd2: qd2, ropeDim: ropeDim,
+            ropeBase: ropeBase, scale: Float(pow(Double(headDim), -0.5)), eps: eps,
+            bx: mk(H * 2),
+            qW: qW, qS: qS, qB: qB, kW: kW, kS: kS, kB: kB, vW: vW, vS: vS, vB: vB, oW: oW, oS: oS, oB: oB,
+            qNormW: qNormW, kNormW: kNormW,
+            qOut: mk(qDim * 2), keys: mk(kvDim * 2), values: mk(kvDim * 2), queries: mk(vDim * 2),
+            qN: mk(vDim * 2), kN: mk(kvDim * 2), qRot: mk(vDim * 2), kRot: mk(kvDim * 2),
+            attnOut: mk(vDim * 2), gated: mk(vDim * 2), outBuf: mk(H * 2))
+    }
+
+    /// ★ attention 1 層を **単一 command buffer + 単一 encoder** で連結（GDN SE 同型）。decode S=1, cold cache, f16。
+    ///   q/k/v proj→extract_q→qk-norm→RoPE→SDPA→sigmoid_mul→o_proj。round-trip attnLayerRaw(pf=false) と bit-exact。
+    ///   pipeline(qmm/rms/rope/sdpa)は事前 warm 前提（rawForward の attnLayerRaw が warm する）。
+    static func attnLayerSingleEncoder(_ x: MLXArray, _ b: AttnBuffers) -> MLXArray? {
+        guard let (_, queue) = ensure() else { return nil }
+        guard let qp = _qmmPipeline, let rp = _rmsPipeline, let rope = _ropePipeline, let sdpa = _sdpaPipeline,
+              let exq = _extractQPipeline, let sgm = _sigmoidMulPipeline else {
+            print("[raw-attn-se] pipeline 未 warm（先に attnLayerRaw を呼ぶ）"); return nil
+        }
+        let H = b.H, numHeads = b.numHeads, numKV = b.numKV, headDim = b.headDim, qd2 = b.qd2
+        let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
+        // x を常駐 buffer に書込み（per-call, H*2 bytes）
+        let xf = x.reshaped([H]).asType(.float16).asArray(Float16.self)
+        b.bx.contents().bindMemory(to: Float16.self, capacity: H).update(from: xf, count: H)
+
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        func encQmm(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K: Int, N: Int) {
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(sc, offset: 0, index: 1)
+            enc.setBuffer(bi, offset: 0, index: 2); enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
+            var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encRms(_ xb: MTLBuffer, _ wb: MTLBuffer, _ ob: MTLBuffer, rows: Int, D: Int) {
+            enc.setComputePipelineState(rp)
+            enc.setBuffer(xb, offset: 0, index: 0); enc.setBuffer(wb, offset: 0, index: 1); enc.setBuffer(ob, offset: 0, index: 2)
+            var ee = b.eps, asz = UInt32(D), ws = UInt32(1)
+            enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+            let tg = ((((D + 3) / 4) + 31) / 32) * 32
+            enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
+        }
+        func encRope(_ xb: MTLBuffer, _ ob: MTLBuffer, rows: Int) {
+            enc.setComputePipelineState(rope)
+            enc.setBuffer(xb, offset: 0, index: 0); enc.setBuffer(ob, offset: 0, index: 1)
+            var hd = UInt32(headDim), rd = UInt32(b.ropeDim), base = b.ropeBase, pos = Float(0)
+            enc.setBytes(&hd, length: 4, index: 2); enc.setBytes(&rd, length: 4, index: 3)
+            enc.setBytes(&base, length: 4, index: 4); enc.setBytes(&pos, length: 4, index: 5)
+            let total = rows * headDim, tgw = min(rope.maxTotalThreadsPerThreadgroup, 256)
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        }
+        func encElem(_ p: MTLComputePipelineState, _ total: Int, _ bind: () -> Void) {
+            enc.setComputePipelineState(p); bind()
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+        // ① q/k/v proj
+        encQmm(b.qW, b.qS, b.qB, b.bx, b.qOut, K: H, N: qDim)
+        encQmm(b.kW, b.kS, b.kB, b.bx, b.keys, K: H, N: kvDim)
+        encQmm(b.vW, b.vS, b.vB, b.bx, b.values, K: H, N: kvDim)
+        // ② query 抽出（qOut[:,0:headDim] → queries contiguous）→ qk-norm
+        encElem(exq, vDim) {
+            enc.setBuffer(b.qOut, offset: 0, index: 0); enc.setBuffer(b.queries, offset: 0, index: 1)
+            var hd = UInt32(headDim), q2 = UInt32(qd2), tot = UInt32(vDim)
+            enc.setBytes(&hd, length: 4, index: 2); enc.setBytes(&q2, length: 4, index: 3); enc.setBytes(&tot, length: 4, index: 4)
+        }
+        encRms(b.queries, b.qNormW, b.qN, rows: numHeads, D: headDim)
+        encRms(b.keys, b.kNormW, b.kN, rows: numKV, D: headDim)
+        // ③ RoPE（offset 0）
+        encRope(b.qN, b.qRot, rows: numHeads)
+        encRope(b.kN, b.kRot, rows: numKV)
+        // ④ SDPA（S=1, cold cache）
+        enc.setComputePipelineState(sdpa)
+        enc.setBuffer(b.qRot, offset: 0, index: 0); enc.setBuffer(b.kRot, offset: 0, index: 1)
+        enc.setBuffer(b.values, offset: 0, index: 2); enc.setBuffer(b.attnOut, offset: 0, index: 3)
+        var gqa = Int32(numHeads / numKV), nn = Int32(1), khs = Int32(headDim), kss = Int32(headDim)
+        var vhs = Int32(headDim), vss = Int32(headDim), sc = b.scale
+        enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&nn, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9); enc.setBytes(&sc, length: 4, index: 10)
+        enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+        // ⑤ gated = attnOut * sigmoid(gate)（gate は qOut から strided）→ o_proj
+        encElem(sgm, vDim) {
+            enc.setBuffer(b.attnOut, offset: 0, index: 0); enc.setBuffer(b.qOut, offset: 0, index: 1); enc.setBuffer(b.gated, offset: 0, index: 2)
+            var hd = UInt32(headDim), q2 = UInt32(qd2), tot = UInt32(vDim)
+            enc.setBytes(&hd, length: 4, index: 3); enc.setBytes(&q2, length: 4, index: 4); enc.setBytes(&tot, length: 4, index: 5)
+        }
+        encQmm(b.oW, b.oS, b.oB, b.gated, b.outBuf, K: vDim, N: H)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = b.outBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: H)), [1, H])
+    }
+
     /// 検証: attention 1 層 raw assembly vs MLX AttentionLayer（同量子化, decode S=1）。
     /// - env: QWISP_RUN=raw-attn-test / QWISP_ATTN_REF(既定 /tmp/qwisp_attn_ref.safetensors)
     public static func runAttnLayerTest() -> String {
@@ -1296,6 +1447,21 @@ public enum RawMetalForward {
             out += String(format: "\n  promoteF32=%@: rel=%.3e %@", pf ? "true " : "false",
                           rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ 近似" : "❌"))
         }
+        // ★ attn SE（single-encoder, f16）vs round-trip raw（pf=false）: bit-exact 不変条件 + 速度。
+        //   real model は q/k_norm F16 → SE は f16 経路で round-trip(pf=false) と byte 一致すべき。
+        let rtF16 = attnLayerRaw(x, rw, promoteF32: false)!; rtF16.eval()
+        if let buf = prepareAttnBuffers(rw), let se = attnLayerSingleEncoder(x, buf) {
+            se.eval()
+            let seRel = relErr(se.reshaped([se.size]), rtF16.reshaped([rtF16.size]))
+            func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+            let reps = 300
+            for _ in 0..<5 { _ = attnLayerSingleEncoder(x, buf)?.eval() }
+            var t0 = now(); for _ in 0..<reps { _ = attnLayerSingleEncoder(x, buf)?.eval() }; let seMs = (now()-t0)/Double(reps)
+            for _ in 0..<5 { _ = attnLayerRaw(x, rw, promoteF32: false)?.eval() }
+            t0 = now(); for _ in 0..<reps { _ = attnLayerRaw(x, rw, promoteF32: false)?.eval() }; let rtMs = (now()-t0)/Double(reps)
+            out += String(format: "\n  ── attn SE（single-encoder, f16）vs round-trip ──\n   SE-vs-RT rel=%.3e %@  SE=%.3fms RT=%.3fms → %.2fx",
+                          seRel, seRel == 0 ? "✅ bit-exact" : (seRel < 2e-3 ? "△ near" : "❌"), seMs, rtMs, rtMs/Swift.max(0.001, seMs))
+        } else { out += "\n  attn SE: prepare/実行 失敗" }
         return out
     }
 

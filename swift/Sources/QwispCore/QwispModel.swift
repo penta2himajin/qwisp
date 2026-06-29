@@ -189,6 +189,7 @@ public final class QwispModel {
     // ── SE full forward（task#4 速度）: GDN SE + MoE expert SE（resident buffer）。──
     nonisolated(unsafe) var gdnBufCache: [Int: RawMetalForward.GDNBuffers] = [:]
     nonisolated(unsafe) var moeBufCache: [Int: RawMetalForward.MoEBuffers] = [:]
+    nonisolated(unsafe) var attnBufCache: [Int: RawMetalForward.AttnBuffers] = [:]
 
     /// SE decoder layer 1 層（GDN: SE / attn: round-trip raw / MoE: routing=MLX + expert SE + combine=MLX）。
     func seDecoderLayer(_ h: MLXArray, _ i: Int) -> MLXArray? {
@@ -212,13 +213,16 @@ public final class QwispModel {
             r = ro
         } else {
             let sa = "\(p).self_attn"
-            let aw = RawMetalForward.AttnRawWeights(
-                qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
-                kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
-                vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
-                oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
-                qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
-            guard let ro = RawMetalForward.attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: false) else { return nil }
+            if attnBufCache[i] == nil {
+                let aw = RawMetalForward.AttnRawWeights(
+                    qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
+                    kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
+                    vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
+                    oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
+                    qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
+                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H)
+            }
+            guard let abuf = attnBufCache[i], let ro = RawMetalForward.attnLayerSingleEncoder(normed.reshaped([1, 1, H]), abuf) else { return nil }
             r = ro.asType(h.dtype)
         }
         let h2 = h + r
@@ -311,7 +315,7 @@ public final class QwispModel {
             let amS = MLX.argMax(sf).item(Int.self)
             for _ in 0..<3 { _ = model.seRawForward(ids)?.eval() }
             t0 = now(); for _ in 0..<reps { _ = model.seRawForward(ids)?.eval() }; let seMs = (now()-t0)/Double(reps)
-            out += String(format: "\n  ── SE full forward（GDN/MoE=single-encoder, attn=round-trip）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
+            out += String(format: "\n  ── SE full forward（GDN/attn/MoE=single-encoder）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
                           srel, amS, amR, amS == amR ? "✅" : "❌", seMs, 1000/seMs, mlxMs/Swift.max(0.01, seMs))
         }
         // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
