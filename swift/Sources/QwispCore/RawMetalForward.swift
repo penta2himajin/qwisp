@@ -2421,6 +2421,7 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _moeCsrPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _moeScatterPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _gqmmGroupedPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _gqmmBMlpPipeline: MTLComputePipelineState?
 
     static func compileMoEB() -> Bool {
         guard let (device, _) = ensure() else { return false }
@@ -2551,6 +2552,51 @@ public enum RawMetalForward {
             scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
             biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
             // gate/up(lhsPer=0): x は token b 共有[b]。down(lhsPer=1): h[b,ki]＝(b*Ktop+ki)行
+            size_t xrow = lhsPer ? (size_t)(b*Ktop + ki) : (size_t)b;
+            x += xrow * in_vec_size + simd_lid * values_per_thread;
+            y += (size_t)(b*Ktop + ki) * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16b(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U bb = bl[0];
+                    result[row] += qd4b(wl, x_thread, s, bb, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64; biases += block_size / 64; x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
+        // ★悪あがき: gqmm4_b_mlp = results_per_simdgroup 4→8(各スレッドが2倍の重みロードを in-flight=MLP↑)。
+        //   grid height=N/16。BW 飽和に近づくか実測用。数式は gqmm4_b と同一(near-tie)。
+        kernel void gqmm4_b_mlp(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                            device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                            device const int* inds [[buffer(4)]], device half* y [[buffer(5)]],
+                            constant int& in_vec_size [[buffer(6)]], constant int& out_vec_size [[buffer(7)]],
+                            constant uint& lhsPer [[buffer(8)]], constant uint& Ktop [[buffer(9)]],
+                            uint3 tid [[threadgroup_position_in_grid]],
+                            uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 8;
+            constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+            constexpr int block_size = 512, scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U; thread U x_thread[16]; thread U result[8] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            uint b = tid.x, ki = tid.z;
+            uint e = (uint)inds[b * Ktop + ki];
+            ws     += (size_t)e * out_vec_size * in_vec_size_w;
+            scales += (size_t)e * out_vec_size * in_vec_size_g;
+            biases += (size_t)e * out_vec_size * in_vec_size_g;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
             size_t xrow = lhsPer ? (size_t)(b*Ktop + ki) : (size_t)b;
             x += xrow * in_vec_size + simd_lid * values_per_thread;
             y += (size_t)(b*Ktop + ki) * out_vec_size + out_row;
@@ -2707,6 +2753,7 @@ public enum RawMetalForward {
             _moeCsrPipeline = try mk("moe_csr")
             _moeScatterPipeline = try mk("moe_scatter")
             _gqmmGroupedPipeline = try mk("gqmm4_grouped")
+            _gqmmBMlpPipeline = try mk("gqmm4_b_mlp")
             return true
         } catch { print("[raw-moe-b] compile: \(error)"); return false }
     }
@@ -2953,13 +3000,15 @@ public enum RawMetalForward {
         hbuf.contents().bindMemory(to: Float16.self, capacity: topK*I).update(from: MLXRandom.normal([topK*I]).asType(.float16).asArray(Float16.self), count: topK*I)
         let bp = binds.contents().bindMemory(to: Int32.self, capacity: topK)
         func setInds(_ base: Int) { for k in 0..<topK { bp[k] = Int32((base*topK + k) % E) } }
+        let mlp = ProcessInfo.processInfo.environment["QWISP_GATHER_MLP"] == "1"
+        let rps = mlp ? 16 : 8   // results_per_simdgroup×num_simdgroups=出力行/threadgroup(baseline 8, mlp 16)
         func encGather(_ enc: MTLComputeCommandEncoder, _ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
-            enc.setComputePipelineState(_gqmmBPipeline!)
+            enc.setComputePipelineState(mlp ? _gqmmBMlpPipeline! : _gqmmBPipeline!)
             enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
             enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
             var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0), kt = UInt32(topK)
             enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: topK), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/rps, depth: topK), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         // 1 call = g/u/d gather（8 expert 分の routed 重みロード）
         func runOnce(_ base: Int) -> Double {
@@ -2984,12 +3033,12 @@ public enum RawMetalForward {
         let hotBW = totBytes / (hot*1e-3) / 1e9, coldBW = totBytes / (cold*1e-3) / 1e9
         return String(format: """
             [m1-floor] M=1 routed gather(8 expert g/u/d, dominant)の実効帯域 ── 帯域飽和か latency 律速か
-              load/call=%.2f MB(weight %.2f+scale/bias %.2f)  ピーク帯域=%.0f GB/s(QWISP_PEAK_GBS)
+              kernel=%@  load/call=%.2f MB(weight %.2f+scale/bias %.2f)  ピーク帯域=%.0f GB/s(QWISP_PEAK_GBS)
               cache-hot(固定expert): %.3f ms → 実効 %.0f GB/s(%.0f%% of peak)
               DRAM-cold(expert回転): %.3f ms → 実効 %.0f GB/s(%.0f%% of peak)
               → cold が peak に遠い(≪100%%)なら **帯域非飽和=低 occupancy/latency 律速→カーネルで MLP↑の余地**。
                 peak 近傍なら帯域床=量子化(低bit)以外に M=1 単流高速化の余地無し。
-            """, totBytes/1e6, wBytes/1e6, sbBytes/1e6, peak,
+            """, mlp ? "gqmm4_b_mlp(rps=16)" : "gqmm4_b(rps=8, MLX-tuned)", totBytes/1e6, wBytes/1e6, sbBytes/1e6, peak,
             hot, hotBW, hotBW/peak*100, cold, coldBW, coldBW/peak*100)
     }
 
