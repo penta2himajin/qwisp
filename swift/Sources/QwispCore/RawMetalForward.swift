@@ -526,6 +526,8 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _extractQPipeline: MTLComputePipelineState?     // attn SE: strided query 抽出
     nonisolated(unsafe) static var _sigmoidMulPipeline: MTLComputePipelineState?   // attn SE: gated=attnOut*sigmoid(gate)
     nonisolated(unsafe) static var _residAddPipeline: MTLComputePipelineState?     // 層融合: h += r（residual stream f16）
+    nonisolated(unsafe) static var _sharedGate8Pipeline: MTLComputePipelineState?  // all-GPU MoE: shared gate scalar
+    nonisolated(unsafe) static var _finalCombinePipeline: MTLComputePipelineState? // all-GPU MoE: y+gateScale*sharedY
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -625,6 +627,30 @@ public enum RawMetalForward {
             if (i >= total) return;
             h[i] = h[i] + r[i];
         }
+        // shared_gate8（all-GPU MoE）: shared_expert_gate(8bit, N=1, K, gs=64)の dot → sigmoid → scalar[0]。
+        //   MLX qmv 形(per-group scale*Σx·q + bias*Σx)。単一 thread(K=2048 軽量)。near-tie 許容ゆえ f32 accum。
+        kernel void shared_gate8(device const uint8_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                 device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                 device half* out [[buffer(4)]], constant uint& K [[buffer(5)]],
+                                 uint tid [[thread_position_in_grid]]) {
+            if (tid != 0) return;
+            float acc = 0.0f;
+            uint G = K / 64;
+            for (uint g = 0; g < G; g++) {
+                float sq = 0.0f, sx = 0.0f;
+                for (uint j = 0; j < 64; j++) { uint k = g*64 + j; float xv = (float)x[k]; sq += xv * (float)w[k]; sx += xv; }
+                acc += (float)scales[g] * sq + (float)biases[g] * sx;
+            }
+            float y = 1.0f / (1.0f + precise::exp(metal::abs(acc)));     // sigmoid(acc) stable
+            out[0] = (half)(acc < 0.0f ? y : (1.0f - y));
+        }
+        // final_combine（all-GPU MoE）: combined[i] = y[i] + gateScale[0]*sharedY[i]（f16）。
+        kernel void final_combine(device const half* y [[buffer(0)]], device const half* sharedY [[buffer(1)]],
+                                  device const half* gateScale [[buffer(2)]], device half* combined [[buffer(3)]],
+                                  constant uint& H [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+            if (i >= H) return;
+            combined[i] = y[i] + gateScale[0] * sharedY[i];
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -638,6 +664,8 @@ public enum RawMetalForward {
             _extractQPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "extract_q")!)
             _sigmoidMulPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sigmoid_mul")!)
             _residAddPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "resid_add")!)
+            _sharedGate8Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shared_gate8")!)
+            _finalCombinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -1387,6 +1415,129 @@ public enum RawMetalForward {
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeResidAdd(enc, h: hBuf, r: combinedBuf, total: H)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+    }
+
+    // ══════════ all-GPU 層融合（task#8, 多層 1-CB）: routing/combine も Metal＝forward 全体 MLX 非依存 ══════════
+    // routing は near-tie で lossless 検証済(route-decode-lossless)。全 kernel を **単一 serial encoder** に連結し、
+    // 複数層を 1 command buffer に詰めて per-layer waitUntilCompleted を排除→GPU が層間 pipeline。
+
+    /// gate router(8bit) 重み常駐 buffer。
+    struct Gate8Buffers { let wq, sc, bi: MTLBuffer; let N: Int }
+    static func prepareGate8(_ w: MLXArray, _ s: MLXArray, _ b: MLXArray) -> Gate8Buffers? {
+        guard let (device, _) = ensure(), compileQmm8(), compileRoute() else { return nil }
+        guard let wq = w.asMTLBuffer(device: device, noCopy: false),
+              let sc = s.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bi = b.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        return Gate8Buffers(wq: wq, sc: sc, bi: bi, N: w.dim(0))
+    }
+
+    /// all-GPU 層融合の共有中間 buffer（全層で再利用＝serial 実行ゆえ安全）。
+    struct GPUScratch { let postNorm, gateLogits, scores, y, gateScale, combined: MTLBuffer }
+    static func makeGPUScratch(H: Int, E: Int, K: Int) -> GPUScratch? {
+        guard let (device, _) = ensure() else { return nil }
+        func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        return GPUScratch(postNorm: mk(H*2), gateLogits: mk(E*2), scores: mk(K*2), y: mk(H*2), gateScale: mk(2), combined: mk(H*2))
+    }
+
+    /// mixer-half を encoder に encode（CB/commit 無し, postNorm は postNormBuf に残る）。多層 1-CB 用。
+    static func encodeMixerHalf(_ enc: MTLComputeCommandEncoder, hBuf: MTLBuffer, nw: NormWeightBuffers,
+                                postNormBuf: MTLBuffer, gdn: GDNBuffers?, attn: AttnBuffers?, H: Int, eps: Float,
+                                pendingResid: MTLBuffer?) {
+        if let pr = pendingResid { encodeResidAdd(enc, h: hBuf, r: pr, total: H) }
+        let mixerBx: MTLBuffer, mixerOut: MTLBuffer
+        if let g = gdn { mixerBx = g.bx; mixerOut = g.outBuf } else { mixerBx = attn!.bx; mixerOut = attn!.outBuf }
+        encodeRms(enc, src: hBuf, w: nw.inputNormW, out: mixerBx, D: H, eps: eps)
+        if let g = gdn { encodeGDNBody(enc, g, eps: eps) } else { encodeAttnBody(enc, attn!) }
+        encodeResidAdd(enc, h: hBuf, r: mixerOut, total: H)
+        encodeRms(enc, src: hBuf, w: nw.postNormW, out: postNormBuf, D: H, eps: eps)
+    }
+
+    /// MoE 全体（gate→route→experts→combine→shared→final）を encoder に encode（全 GPU, MLX 非依存）。
+    /// 出力 = sc.combined（= y + gateScale*sharedY）。inds は moe.binds に直接書く（gather が読む）。
+    static func encodeMoEGPU(_ enc: MTLComputeCommandEncoder, postNorm: MTLBuffer, gate: Gate8Buffers,
+                             moe: MoEBuffers, sc: GPUScratch, sharedGateW: Gate8Buffers, H: Int, E: Int, K: Int) {
+        let qp = _qmmPipeline!, gqp = _gqmmPipeline!, swp = _swigluPipeline!
+        let Hin = moe.Hin, I = moe.I
+        // ① gate qmm8: postNorm → gateLogits[E]
+        enc.setComputePipelineState(_qmm8Pipeline!)
+        enc.setBuffer(gate.wq, offset: 0, index: 0); enc.setBuffer(gate.sc, offset: 0, index: 1); enc.setBuffer(gate.bi, offset: 0, index: 2)
+        enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateLogits, offset: 0, index: 4)
+        var kk = Int32(H), nn = Int32(E); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: E/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        // ② route_top8: gateLogits → moe.binds(inds), scores
+        enc.setComputePipelineState(_routePipeline!)
+        enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
+        var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        // ③ experts: g/u gather(postNorm) → swiglu → d gather(per-expert)
+        func encGather(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
+            enc.setComputePipelineState(gqp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(moe.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
+            var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0)
+            enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encQmm(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int) {
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
+            var k = Int32(kk), n = Int32(nn); enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encSwiglu(_ g: MTLBuffer, _ u: MTLBuffer, _ h: MTLBuffer, _ total: Int) {
+            enc.setComputePipelineState(swp)
+            enc.setBuffer(g, offset: 0, index: 0); enc.setBuffer(u, offset: 0, index: 1); enc.setBuffer(h, offset: 0, index: 2)
+            var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(swp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+        encGather(moe.swGW, moe.swGS, moe.swGB, postNorm, moe.g, K: Hin, N: I, lhs: false)
+        encGather(moe.swUW, moe.swUS, moe.swUB, postNorm, moe.u, K: Hin, N: I, lhs: false)
+        encSwiglu(moe.g, moe.u, moe.h, K * I)
+        encGather(moe.swDW, moe.swDS, moe.swDB, moe.h, moe.d, K: I, N: Hin, lhs: true)
+        // shared expert: sg/su qmm(postNorm) → swiglu → sharedY qmm
+        encQmm(moe.shGW, moe.shGS, moe.shGB, postNorm, moe.sg, K: Hin, N: I)
+        encQmm(moe.shUW, moe.shUS, moe.shUB, postNorm, moe.su, K: Hin, N: I)
+        encSwiglu(moe.sg, moe.su, moe.shAct, I)
+        encQmm(moe.shDW, moe.shDS, moe.shDB, moe.shAct, moe.sharedY, K: I, N: Hin)
+        // ④ combine: d[K,H]·scores → y[H]
+        enc.setComputePipelineState(_combinePipeline!)
+        enc.setBuffer(moe.d, offset: 0, index: 0); enc.setBuffer(sc.scores, offset: 0, index: 1); enc.setBuffer(sc.y, offset: 0, index: 2)
+        var ck = UInt32(K), cn = UInt32(Hin); enc.setBytes(&ck, length: 4, index: 3); enc.setBytes(&cn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_combinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        // ⑤ shared gate scalar(sigmoid) → final_combine: combined = y + gateScale*sharedY
+        enc.setComputePipelineState(_sharedGate8Pipeline!)
+        enc.setBuffer(sharedGateW.wq, offset: 0, index: 0); enc.setBuffer(sharedGateW.sc, offset: 0, index: 1); enc.setBuffer(sharedGateW.bi, offset: 0, index: 2)
+        enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateScale, offset: 0, index: 4)
+        var sk = UInt32(H); enc.setBytes(&sk, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.setComputePipelineState(_finalCombinePipeline!)
+        enc.setBuffer(sc.y, offset: 0, index: 0); enc.setBuffer(moe.sharedY, offset: 0, index: 1); enc.setBuffer(sc.gateScale, offset: 0, index: 2); enc.setBuffer(sc.combined, offset: 0, index: 3)
+        var fh = UInt32(Hin); enc.setBytes(&fh, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_finalCombinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// all-GPU 1 層分の常駐 buffer 束（QwispModel の cache から構築）。
+    struct GPULayer {
+        let nw: NormWeightBuffers; let gdn: GDNBuffers?; let attn: AttnBuffers?
+        let moe: MoEBuffers; let gate: Gate8Buffers; let sharedGate: Gate8Buffers
+    }
+
+    /// ★ 多層 1-CB forward: 全層の mixer+MoE を **単一 serial encoder + 単一 command buffer** に詰め、
+    ///   per-layer waitUntilCompleted を排除（GPU が層間 pipeline）。embed→hBuf 書込み済前提、hBuf に結果。
+    ///   各層 MoE residual は次層 mixer 先頭で hBuf に畳む（pendingResid=scratch.combined）。最終層は末尾 flush。
+    static func fusedForwardGPU(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
+                                H: Int, E: Int, K: Int, eps: Float) {
+        guard let (_, queue) = ensure() else { return }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        for (i, L) in layers.enumerated() {
+            encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
+                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined)
+            encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
+                         sharedGateW: L.sharedGate, H: H, E: E, K: K)
+        }
+        encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)    // 最終層 MoE residual
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()        // ★全40層で sync 1 回のみ
     }
 
     /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。

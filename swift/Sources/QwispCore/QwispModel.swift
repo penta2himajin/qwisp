@@ -262,6 +262,14 @@ public final class QwispModel {
             normWeightCache[i] = RawMetalForward.prepareNormWeights(
                 input: store.req("\(p).input_layernorm.weight"), post: store.req("\(p).post_attention_layernorm.weight"))
         }
+        if moeBufCache[i] == nil {
+            let mp = "\(p).mlp"
+            func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
+            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+                swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
+                shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
+                Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
+        }
         if isLinear(i) {
             if gdnBufCache[i] == nil {
                 let la = "\(p).linear_attn"
@@ -348,6 +356,45 @@ public final class QwispModel {
         }
         RawMetalForward.fusedMoEResidual(hBuf: hb, combinedBuf: cb, H: H)  // 最終層 MoE residual を flush
         let h = RawMetalForward.readBuffer(hb, H)                  // hBuf → MLXArray（最後だけ readback）
+        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        return headProj().apply(fn.reshaped([1, 1, H]))
+    }
+
+    // ── all-GPU 多層 1-CB forward（task#8: routing/combine も Metal＝MLX 非依存, 層間 sync 排除）──
+    nonisolated(unsafe) var gate8Cache: [Int: RawMetalForward.Gate8Buffers] = [:]
+    nonisolated(unsafe) var sharedGate8Cache: [Int: RawMetalForward.Gate8Buffers] = [:]
+    nonisolated(unsafe) var gpuScratch: RawMetalForward.GPUScratch?
+    nonisolated(unsafe) var gpuWarmed = false
+
+    /// ★ all-GPU forward: embed/final norm/lm_head 以外を全 Metal、全40層を単一 command buffer で実行。
+    /// routing(qmm8+route_top8) は near-tie で lossless 検証済(route-decode-lossless)。decode T=1, cold state。
+    public func fusedRawForwardGPU(_ ids: MLXArray) -> MLXArray? {
+        let e = embed(ids); let H = e.dim(-1)
+        // 初回 warm: rawForward が GDN/attn/qmm/rms/conv/recur/rope/sdpa/gqmm を compile。
+        if !gpuWarmed { _ = rawForward(ids)?.eval(); gpuWarmed = true }
+        // 各層 buffer を ensure（GDN/attn/MoE/norm + gate8/sharedGate8）。
+        var layers: [RawMetalForward.GPULayer] = []
+        for i in 0 ..< numLayers {
+            let isGDN = ensureFusedBuffers(i, H: H)
+            let mp = "language_model.model.layers.\(i).mlp"
+            if gate8Cache[i] == nil {
+                gate8Cache[i] = RawMetalForward.prepareGate8(store.req("\(mp).gate.weight"), store.req("\(mp).gate.scales"), store.req("\(mp).gate.biases"))
+            }
+            if sharedGate8Cache[i] == nil {
+                sharedGate8Cache[i] = RawMetalForward.prepareGate8(store.req("\(mp).shared_expert_gate.weight"), store.req("\(mp).shared_expert_gate.scales"), store.req("\(mp).shared_expert_gate.biases"))
+            }
+            guard let nw = normWeightCache[i], let moe = moeBufCache[i],
+                  let g8 = gate8Cache[i], let sg8 = sharedGate8Cache[i] else { return nil }
+            layers.append(RawMetalForward.GPULayer(
+                nw: nw, gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i],
+                moe: moe, gate: g8, sharedGate: sg8))
+        }
+        if gpuScratch == nil { gpuScratch = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
+        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        guard let hb = hBuf, let sc = gpuScratch else { return nil }
+        RawMetalForward.writeBuffer(hb, e, H)
+        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps)
+        let h = RawMetalForward.readBuffer(hb, H)
         guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
@@ -465,6 +512,18 @@ public final class QwispModel {
         }
         RawMetalForward.metalRoute = true; measureFused("routing=Metal(qmm8+top8), task#8")
         RawMetalForward.metalRoute = false
+        // ★★ all-GPU 多層 1-CB forward（routing/combine 全 Metal, 層間 sync 排除）
+        if let gpu = model.fusedRawForwardGPU(ids) {
+            gpu.eval()
+            let gv = gpu.reshaped([gpu.size])
+            let gd = MLX.max(MLX.abs(gv.asType(.float32) - rf.asType(.float32))).item(Float.self)
+            let grel = gd / (MLX.max(MLX.abs(rf.asType(.float32))).item(Float.self) + 1e-9)
+            let amG2 = MLX.argMax(gv).item(Int.self)
+            for _ in 0..<3 { _ = model.fusedRawForwardGPU(ids)?.eval() }
+            t0 = now(); for _ in 0..<reps { _ = model.fusedRawForwardGPU(ids)?.eval() }; let gMs = (now()-t0)/Double(reps)
+            out += String(format: "\n  ── ★all-GPU 多層 1-CB forward（routing/combine 全 Metal, 層間 sync 排除）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
+                          grel, amG2, amR, amG2 == amR ? "✅" : "❌", gMs, 1000/gMs, mlxMs/Swift.max(0.01, gMs))
+        }
         out += "\n   ※注: 上の hidden rel(0.13)は lossless 指標でない（1 境界 expert flip で hidden が膨張するが argmax は別物）。"
             + "\n     プロジェクト基準(near-tie rank≤2 除く argmax 一致)での判定は raw-route-lossless を参照"
             + "\n     →routing 単独の不一致は near-tie 支配(GDN drift と同クラス)。多層融合は未閉鎖。"
@@ -534,6 +593,22 @@ public final class QwispModel {
         out += "  ※両 routing とも fused mixer の GDN 1-ULP drift(2.97e-3) を共有。GDN drift 自体も token を flip しうる。\n"
         out += classify("routing=MLX  (GDN drift のみ)", metal: false) + "\n"
         out += classify("routing=Metal(qmm8+top8)   ", metal: true) + "\n"
+        // all-GPU path（combine/shared_gate8 kernel 込み）の argmax を MLX 参照と rank 分類。
+        do {
+            var match = 0, near = 0, tru = 0; var ex: [String] = []
+            for t in 0 ..< N {
+                let tid = Int32((t * 9973 + 17) % vocab); let ids = MLXArray([tid], [1, 1])
+                let ref = model(ids); ref.eval(); let rv = ref.reshaped([ref.size])
+                guard let got = model.fusedRawForwardGPU(ids) else { continue }; got.eval()
+                let amR = MLX.argMax(rv).item(Int.self), amG = MLX.argMax(got.reshaped([got.size])).item(Int.self)
+                if amG == amR { match += 1; continue }
+                let rank = MLX.sum(rv .> rv[amG]).item(Int.self)
+                if rank <= 2 { near += 1 } else { tru += 1 }
+                if ex.count < 6 { ex.append("t\(t):rank\(rank)") }
+            }
+            out += String(format: "  [all-GPU 1-CB] argmax一致 %d/%d=%.1f%% 不一致=%d (near-tie %d, 真の乖離 %d) %@\n",
+                          match, N, Double(match)/Double(N)*100, N - match, near, tru, ex.isEmpty ? "" : ex.joined(separator: " "))
+        }
         // ★ routing 単独の影響を分離: fused(MLX) vs fused(Metal) を直接比較（GDN drift は両者共通で相殺）。
         var agree = 0, rtNear = 0, rtTrue = 0; var rtEx: [String] = []
         for t in 0 ..< N {
