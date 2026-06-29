@@ -441,6 +441,33 @@ public enum RawMetalForward {
         } catch { print("[raw-slot-remap] compile: \(error)"); return false }
     }
 
+    nonisolated(unsafe) static var _vecCopyPipeline: MTLComputePipelineState?
+    /// ★ issue#7 style A milestone A3b-opt: hBuf(f16 H)を per-layer checkpoint buffer に GPU copy。
+    ///   checkpoint-resume が miss 層 m から再開する際の hBuf 復元点(layer m 入口の hidden)を保存。
+    static func compileVecCopy() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _vecCopyPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void vec_copy(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+            if (tid < n) dst[tid] = src[tid];
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _vecCopyPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "vec_copy")!)
+             return true
+        } catch { print("[raw-veccopy] compile: \(error)"); return false }
+    }
+    static func encodeVecCopy(_ enc: MTLComputeCommandEncoder, dst: MTLBuffer, src: MTLBuffer, n: Int) {
+        enc.setComputePipelineState(_vecCopyPipeline!)
+        enc.setBuffer(dst, offset: 0, index: 0); enc.setBuffer(src, offset: 0, index: 1)
+        var nn = UInt32(n); enc.setBytes(&nn, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(_vecCopyPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
     nonisolated(unsafe) static var _residencyCheckPipeline: MTLComputePipelineState?
     /// ★ issue#7 style A milestone A3a: route_top8 が出した inds(expert id, slot_remap 前)を hotMask で照合し、
     ///   cache 未収容(=miss)の expert を missExperts[layer*K + j] に、その数を missCount[layer] に emit。
@@ -1896,6 +1923,35 @@ public enum RawMetalForward {
                          missCount: missCount, missExperts: missExperts, layerIdx: i)
         }
         encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)
+        if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+    }
+
+    /// ★ A3b-opt: checkpoint-resume 版 streaming forward。layer `startLayer` から 1 CB を encode し、
+    ///   各層入口で hBuf を ckptH[i] に保存(GPU copy)→次回 miss 層 m から hBuf=ckptH[m] で再開可能に。
+    ///   MoE residual fold は **mixer の外で明示**(i>startLayer のみ)＝ckptH[i] は前層 MoE 畳込み済の
+    ///   layer i 入口 hidden。startLayer の hBuf は呼び元が ckptH[startLayer] からセット済前提。
+    static func fusedForwardGPUStreamingResume(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
+                                               slotTables: [MTLBuffer], hotMasks: [MTLBuffer],
+                                               missCount: MTLBuffer, missExperts: MTLBuffer, ckptH: [MTLBuffer],
+                                               startLayer: Int, H: Int, E: Int, K: Int, eps: Float,
+                                               decode: Bool = false, pos: Int = 0, finalNormW: MTLBuffer? = nil) {
+        guard let (_, queue) = ensure() else { return }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        for i in startLayer ..< layers.count {
+            let L = layers[i]
+            if i > startLayer { encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H) }   // 前層 MoE を fold
+            encodeVecCopy(enc, dst: ckptH[i], src: hBuf, n: H)                                   // layer i 入口を checkpoint
+            encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
+                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: nil,         // fold は上で済
+                            decode: decode, pos: pos)
+            encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
+                         sharedGateW: L.sharedGate, H: H, E: E, K: K,
+                         slotTable: slotTables[i], hotMask: hotMasks[i],
+                         missCount: missCount, missExperts: missExperts, layerIdx: i)
+        }
+        encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)                              // 最終層 MoE を fold
         if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0

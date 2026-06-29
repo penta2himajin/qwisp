@@ -90,6 +90,7 @@ if CommandLine.arguments.contains("stream") {
         ("raw-stream-layer",      { md, _ in try StreamingMoEValidation.runRawStreamLayer(modelDir: md) }),
         ("raw-stream-miss",       { md, _ in try StreamingMoEValidation.runRawStreamMissDetect(modelDir: md) }),
         ("raw-stream-fused",      { md, _ in try StreamingMoEValidation.runRawStreamFused(modelDir: md) }),
+        ("raw-stream-resume",     { md, _ in try StreamingMoEValidation.runRawStreamResume(modelDir: md) }),
         ("moe-union",             { md, _ in try QwispModel.runMoeUnionProbe(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),

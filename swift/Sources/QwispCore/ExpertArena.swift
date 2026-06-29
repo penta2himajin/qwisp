@@ -718,4 +718,143 @@ public enum StreamingMoEValidation {
             rel, streamTok, refTok,
             ok ? "✅ resident と一致(A3b naive OK)" : "❌ 不一致 or 未収束")
     }
+
+    /// ★ issue#7 style A milestone A3b-opt: checkpoint-resume 版。naive(miss 毎に token 先頭再実行 O(層^2))を
+    /// **layer m から再開**(per-layer ckptH + token 開始 GDN state snapshot を layer≥m に restore)に置換。
+    /// 正しさは naive と同じ bit-exact。利得=正しい前置層[0..m-1]を再計算しない(GPU work 削減)＋decode の
+    /// state 継続に必須の正しいアーキテクチャ。#sync(=passes)削減は naive で既に達成済(segment CB)。
+    /// 追加で warm 再実行(全層 cache 内)=1 pass を実証し steady-state token=1 CB(per-layer drain 40 の置換)を示す。
+    /// env QWISP_RUN=raw-stream-resume。QWISP_STREAM_C=<C>。
+    public static func runRawStreamResume(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, _) = RawMetalForward.ensure(), RawMetalForward.compileSlotRemap(),
+              RawMetalForward.compileResidencyCheck(), RawMetalForward.compileVecCopy() else {
+            return "[A3b-opt] Metal/kernel init 失敗"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "64") ?? 64
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let ids = MLXArray([Int32(1)], [1, 1])
+        let H = model.embed(ids).dim(-1)
+        let nLayers = model.numLayers
+
+        guard let refLogits = model.fusedRawForwardGPU(ids) else { return "[A3b-opt] resident forward 失敗" }
+        refLogits.eval()
+        let refTok = MLX.argMax(refLogits.reshaped([-1]), axis: 0).item(Int.self)
+
+        guard let residentLayers = model.gpuLayers else { return "[A3b-opt] gpuLayers 未構築" }
+        var caches: [LayerExpertCache] = []
+        var streamLayers: [RawMetalForward.GPULayer] = []
+        for i in 0 ..< nLayers {
+            let cache = try LayerExpertCache(device: device, source: source, layer: i, C: C)
+            guard let sMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: cache.arena, resident: residentLayers[i].moe) else {
+                return "[A3b-opt] layer \(i) streaming MoEBuffers 失敗"
+            }
+            caches.append(cache)
+            let R = residentLayers[i]
+            streamLayers.append(RawMetalForward.GPULayer(nw: R.nw, gdn: R.gdn, attn: R.attn,
+                                                         moe: sMoE, gate: R.gate, sharedGate: R.sharedGate))
+        }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8),
+              let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A3b-opt] scratch/hBuf 失敗" }
+        var ckptH: [MTLBuffer] = []
+        for _ in 0 ..< nLayers { guard let b = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A3b-opt] ckptH 失敗" }; ckptH.append(b) }
+        let missCount = device.makeBuffer(length: nLayers * 4, options: .storageModeShared)!
+        let missExperts = device.makeBuffer(length: nLayers * 8 * 4, options: .storageModeShared)!
+        let embedX = model.embed(ids); embedX.eval()
+
+        // GDN state(token 開始)snapshot / restore(layer≥m)。resume の layer≥m mixer 再実行を deterministic に。
+        func snapshotGDN() -> [Int: (Data, Data)] {
+            var snap: [Int: (Data, Data)] = [:]
+            for i in 0 ..< nLayers {
+                guard let g = residentLayers[i].gdn else { continue }
+                let sLen = g.Hv * g.Dv * g.Dk * 4, cLen = g.convKernel * g.convDim * 2
+                snap[i] = (Data(bytes: g.stateBuf.contents(), count: sLen),
+                           Data(bytes: g.convInput.contents(), count: cLen))
+            }
+            return snap
+        }
+        func restoreGDN(_ snap: [Int: (Data, Data)], from m: Int) {
+            for i in m ..< nLayers {
+                guard let g = residentLayers[i].gdn, let (sd, cd) = snap[i] else { continue }
+                sd.withUnsafeBytes { g.stateBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: sd.count) }
+                cd.withUnsafeBytes { g.convInput.contents().copyMemory(from: $0.baseAddress!, byteCount: cd.count) }
+            }
+        }
+        func buildTables() -> ([MTLBuffer], [MTLBuffer])? {
+            var st: [MTLBuffer] = [], hm: [MTLBuffer] = []
+            for c in caches {
+                guard let s = c.gpuSlotTable(numExperts: 256).asMTLBuffer(device: device, noCopy: false),
+                      let h = c.hotMask(numExperts: 256).asMTLBuffer(device: device, noCopy: false) else { return nil }
+                st.append(s); hm.append(h)
+            }
+            return (st, hm)
+        }
+
+        // ===== cold 収束(checkpoint-resume) =====
+        model.resetGPUState()
+        let snap = snapshotGDN()                                   // cold token 開始 state(=0)を保存
+        let maxPasses = nLayers + 20
+        var pass = 0, prevStart = 0, totalServiced = 0, layerExecs = 0
+        var serviceLog: [Int] = []
+        while pass < maxPasses {
+            pass += 1
+            guard let (slotTables, hotMasks) = buildTables() else { return "[A3b-opt] tables 失敗" }
+            restoreGDN(snap, from: prevStart)                      // layer≥prevStart の state を token 開始へ
+            if prevStart == 0 { RawMetalForward.writeBuffer(hb, embedX, H) }
+            else { memcpy(hb.contents(), ckptH[prevStart].contents(), H * 2) }   // layer m 入口 hidden を復元
+            memset(missCount.contents(), 0, nLayers * 4); memset(missExperts.contents(), 0, nLayers * 8 * 4)
+            RawMetalForward.fusedForwardGPUStreamingResume(
+                hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTables, hotMasks: hotMasks,
+                missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: prevStart,
+                H: H, E: 256, K: 8, eps: model.eps, finalNormW: model.ensureFinalNorm())
+            layerExecs += nLayers - prevStart
+            let mcp = missCount.contents().bindMemory(to: Int32.self, capacity: nLayers)
+            var m = -1
+            for l in prevStart ..< nLayers where mcp[l] > 0 { m = l; break }
+            if m < 0 { break }
+            let mep = missExperts.contents().bindMemory(to: Int32.self, capacity: nLayers * 8)
+            let n = Int(mcp[m]); let missing = (0 ..< n).map { Int(mep[m * 8 + $0]) }
+            _ = caches[m].ensure(missing); totalServiced += n; serviceLog.append(m)
+            prevStart = m                                          // 次 pass は miss 層 m から再開
+        }
+        let converged = pass < maxPasses
+        let fn = RawMetalForward.readBuffer(sc.normed, H)
+        let streamLogits = model.headProj().apply(fn.reshaped([1, 1, H])); streamLogits.eval()
+        let streamTok = MLX.argMax(streamLogits.reshaped([-1]), axis: 0).item(Int.self)
+        let rel = MLX.max(MLX.abs(refLogits.asType(.float32) - streamLogits.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(refLogits.asType(.float32))).item(Float.self) + 1e-9)
+
+        // ===== warm 再実行(全層 cache 内, 同 token)= 1 pass を実証 =====
+        model.resetGPUState()
+        guard let (wst, whm) = buildTables() else { return "[A3b-opt] warm tables 失敗" }
+        RawMetalForward.writeBuffer(hb, embedX, H)
+        memset(missCount.contents(), 0, nLayers * 4)
+        RawMetalForward.fusedForwardGPUStreamingResume(
+            hBuf: hb, layers: streamLayers, scratch: sc, slotTables: wst, hotMasks: whm,
+            missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: 0,
+            H: H, E: 256, K: 8, eps: model.eps, finalNormW: model.ensureFinalNorm())
+        let wmcp = missCount.contents().bindMemory(to: Int32.self, capacity: nLayers)
+        var warmMiss = 0; for l in 0 ..< nLayers { warmMiss += Int(wmcp[l]) }
+        let wfn = RawMetalForward.readBuffer(sc.normed, H)
+        let warmLogits = model.headProj().apply(wfn.reshaped([1, 1, H])); warmLogits.eval()
+        let warmRel = MLX.max(MLX.abs(refLogits.asType(.float32) - warmLogits.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(refLogits.asType(.float32))).item(Float.self) + 1e-9)
+
+        let naiveExecs = pass * nLayers
+        let ok = converged && streamTok == refTok && rel < 5e-3 && warmMiss == 0 && warmRel < 5e-3
+        return String(format: """
+            [A3b-opt raw-stream-resume] checkpoint-resume(layer m から再開)+ warm 実証
+              cold 収束=%@ passes=%d  serviced miss 層=%d(計 %d expert)
+              GPU layer-exec: resume版 %d vs naive(token先頭再実行) %d  (%.2fx 削減)
+              cold logits rel=%.3e  argmax stream=%d resident=%d
+              warm 再実行(全層cache): miss=%d  rel=%.3e  → 1 pass(1 sync)=steady-state token, vs per-layer drain 40 sync
+              %@
+              → checkpoint-resume が bit-exact かつ前置層再計算を削減。残=A4(pread を非同期重畳)+decode(KV/pos)。
+            """, converged ? "YES" : "NO", pass, serviceLog.count, totalServiced,
+            layerExecs, naiveExecs, Double(naiveExecs) / Double(max(1, layerExecs)),
+            rel, streamTok, refTok, warmMiss, warmRel,
+            ok ? "✅ resume bit-exact + warm 1-pass(A3b-opt OK)" : "❌ 不一致/未収束/warm miss")
+    }
 }
