@@ -472,4 +472,66 @@ public enum StreamingMoEValidation {
                 残=A3/A4(GPU miss判定+segment+CPU handshake)が真の新規。
             """, 64, K, N, rel, rel < 5e-3 ? "✅ 一致(A1 OK)" : "❌乖離")
     }
+
+    /// ★ issue#7 style A milestone A2: raw streaming 1層 forward（mixer raw + MoE が arena cache 経由）。
+    /// layer 0 を resident(expert 重み[E=256]) と streaming(arena[C=64] + GPU slot-remap binds) の2経路で走らせ、
+    /// MoE 出力(sc.combined) が bit-exact か照合。mixer は両経路同一(resident)、差は MoE gather の slot index のみ。
+    /// route_top8→slot_remap→arena gather の chain 全体を検証(A1 は単一 gather のみ)。env QWISP_RUN=raw-stream-layer。
+    public static func runRawStreamLayer(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, queue) = RawMetalForward.ensure(), RawMetalForward.compileSlotRemap() else {
+            return "[A2] Metal/slot_remap init 失敗"
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let ids = MLXArray([Int32(1)], [1, 1])
+        let H = model.embed(ids).dim(-1)
+        guard let layers = model.buildGPULayers(ids, H) else { return "[A2] buildGPULayers 失敗" }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) else { return "[A2] scratch 失敗" }
+        guard let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A2] hBuf 失敗" }
+        let L0 = layers[0]
+
+        // 単一層 forward(mixer + MoE)を encode。slotTable!=nil で streaming(arena gather)。
+        func runLayer(_ moe: RawMetalForward.MoEBuffers, slotTable: MTLBuffer?, x: MLXArray) -> MLXArray {
+            model.resetGPUState()                                  // GDN conv/recurrent state を 0 に(同一入力で同一 postNorm)
+            RawMetalForward.writeBuffer(hb, x, H)
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            RawMetalForward.encodeMixerHalf(enc, hBuf: hb, nw: L0.nw, postNormBuf: sc.postNorm,
+                                            gdn: L0.gdn, attn: L0.attn, H: H, eps: model.eps, pendingResid: nil)
+            RawMetalForward.encodeMoEGPU(enc, postNorm: sc.postNorm, gate: L0.gate, moe: moe, sc: sc,
+                                         sharedGateW: L0.sharedGate, H: H, E: 256, K: 8, slotTable: slotTable)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return RawMetalForward.readBuffer(sc.combined, H)
+        }
+
+        let x = MLXRandom.normal([1, 1, H]).asType(.float16); x.eval()
+        // ① resident 経路(基準)。route_top8 が選んだ expert id を binds から回収。
+        let yRef = runLayer(L0.moe, slotTable: nil, x: x)
+        let bp = L0.moe.binds.contents().bindMemory(to: Int32.self, capacity: 8)
+        let routed = Array(UnsafeBufferPointer(start: bp, count: 8))                  // 選択 expert id(8 distinct)
+
+        // ② arena(C=64) に routed expert を slot i へロードし slotTable(expert→slot)を構築。
+        let arena = try ExpertArena(device: device, source: source, N: 64, refLayer: 0)
+        try arena.load(0, routed.map { Int($0) })                                     // expert routed[i] → slot i
+        var st = [Int32](repeating: 0, count: 256)
+        for (i, e) in routed.enumerated() { st[Int(e)] = Int32(i) }
+        let stBuf = device.makeBuffer(bytes: &st, length: 256 * 4, options: .storageModeShared)!
+        guard let streamMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: arena, resident: L0.moe) else {
+            return "[A2] streaming MoEBuffers 構築失敗"
+        }
+        // ③ streaming 経路: 同一 x、arena gather + GPU slot-remap。
+        let yStream = runLayer(streamMoE, slotTable: stBuf, x: x)
+
+        let rel = MLX.max(MLX.abs(yRef.asType(.float32) - yStream.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(yRef.asType(.float32))).item(Float.self) + 1e-9)
+        return String(format: """
+            [A2 raw-stream-layer] layer0 forward(mixer raw + MoE) resident vs streaming(arena C=64 + GPU slot-remap)
+              routed experts=%@  H=%d
+              MoE out rel=%.3e  %@
+              → 一致なら route_top8→slot_remap→arena gather の全 chain が streaming 動作(A2 OK)。
+                残=A3(GPU miss判定+segment境界), A4(CPU miss-service+CB再開, MTLSharedEvent)が真の新規。
+            """, routed.map { String($0) }.joined(separator: ","), H,
+            rel, rel < 5e-3 ? "✅ bit/near-tie 一致(A2 OK)" : "❌乖離")
+    }
 }

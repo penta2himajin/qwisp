@@ -418,6 +418,29 @@ public enum RawMetalForward {
         } catch { print("[raw-route] compile: \(error)"); return false }
     }
 
+    nonisolated(unsafe) static var _slotRemapPipeline: MTLComputePipelineState?
+    /// ★ issue#7 style A: route_top8 が出した inds(expert id)を arena cache の slot id に GPU 上で remap。
+    ///   inds[k] = slotTable[inds[k]]。slotTable[e]=expert e の slot(未cache=0)。streaming gather が slot で index。
+    ///   A3(segmented CB)でも同じ remap を miss 判定前に挟む＝この kernel は A2/A3 共通の核部品。
+    static func compileSlotRemap() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _slotRemapPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void slot_remap(device int* inds [[buffer(0)]],
+                               device const int* slotTable [[buffer(1)]],
+                               constant uint& K [[buffer(2)]],
+                               uint tid [[thread_position_in_threadgroup]]) {
+            if (tid < K) inds[tid] = slotTable[inds[tid]];
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _slotRemapPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "slot_remap")!)
+             return true
+        } catch { print("[raw-slot-remap] compile: \(error)"); return false }
+    }
+
     /// standalone routing（検証用）: gate_logits[N] → (inds[K] int32, scores[K] f16)。
     static func routeTop8(_ logits: MLXArray, N: Int, K: Int) -> (MLXArray, MLXArray)? {
         guard let (device, queue) = ensure(), compileRoute() else { return nil }
@@ -1677,7 +1700,8 @@ public enum RawMetalForward {
     /// MoE 全体（gate→route→experts→combine→shared→final）を encoder に encode（全 GPU, MLX 非依存）。
     /// 出力 = sc.combined（= y + gateScale*sharedY）。inds は moe.binds に直接書く（gather が読む）。
     static func encodeMoEGPU(_ enc: MTLComputeCommandEncoder, postNorm: MTLBuffer, gate: Gate8Buffers,
-                             moe: MoEBuffers, sc: GPUScratch, sharedGateW: Gate8Buffers, H: Int, E: Int, K: Int) {
+                             moe: MoEBuffers, sc: GPUScratch, sharedGateW: Gate8Buffers, H: Int, E: Int, K: Int,
+                             slotTable: MTLBuffer? = nil) {
         let qp = _qmmPipeline!, gqp = _gqmmPipeline!, swp = _swigluPipeline!
         let Hin = moe.Hin, I = moe.I
         // ① gate qmm8: postNorm → gateLogits[E]
@@ -1692,6 +1716,13 @@ public enum RawMetalForward {
             enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
             var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            // ★ style A streaming: expert id → arena slot id を GPU remap（resident は slotTable=nil で skip）。
+            if let st = slotTable, let srp = _slotRemapPipeline {
+                enc.setComputePipelineState(srp)
+                enc.setBuffer(moe.binds, offset: 0, index: 0); enc.setBuffer(st, offset: 0, index: 1)
+                var kn = UInt32(K); enc.setBytes(&kn, length: 4, index: 2)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
         }
         if profSkipMoEExperts { return }   // gather/swiglu/shared/combine/final を skip(timing)
         // ③ experts: g/u gather(postNorm) → swiglu → d gather(per-expert)
@@ -2224,6 +2255,25 @@ public enum RawMetalForward {
             swGW: swGW, swGS: swGS, swGB: swGB, swUW: swUW, swUS: swUS, swUB: swUB, swDW: swDW, swDS: swDS, swDB: swDB,
             shGW: shGW, shGS: shGS, shGB: shGB, shUW: shUW, shUS: shUS, shUB: shUB, shDW: shDW, shDS: shDS, shDB: shDB,
             g: mk(topK * I * 2), u: mk(topK * I * 2), h: mk(topK * I * 2), d: mk(topK * Hin * 2),
+            sg: mk(I * 2), su: mk(I * 2), shAct: mk(I * 2), sharedY: mk(Hin * 2))
+    }
+
+    /// ★ issue#7 style A(A2): expert(gate/up/down)の重みを **arena cache buffer**（[C,...] slot）に向けた
+    ///   streaming MoEBuffers。shared/gate/scratch は resident の物を流用。gather は slot-remap した binds で index。
+    static func prepareStreamingMoEBuffers(arena: ExpertArena, resident: MoEBuffers) -> MoEBuffers? {
+        guard let (device, _) = ensure() else { return nil }
+        func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        func ab(_ proj: String, _ part: String) -> MTLBuffer? { arena.slots["\(proj).\(part)"]?.buf }
+        let Hin = resident.Hin, I = resident.I, K = resident.topK
+        guard let swGW = ab("gate_proj", "weight"), let swGS = ab("gate_proj", "scales"), let swGB = ab("gate_proj", "biases"),
+              let swUW = ab("up_proj", "weight"), let swUS = ab("up_proj", "scales"), let swUB = ab("up_proj", "biases"),
+              let swDW = ab("down_proj", "weight"), let swDS = ab("down_proj", "scales"), let swDB = ab("down_proj", "biases") else { return nil }
+        return MoEBuffers(Hin: Hin, I: I, topK: K, bx: mk(Hin * 2), binds: mk(K * 4),
+            swGW: swGW, swGS: swGS, swGB: swGB, swUW: swUW, swUS: swUS, swUB: swUB, swDW: swDW, swDS: swDS, swDB: swDB,
+            shGW: resident.shGW, shGS: resident.shGS, shGB: resident.shGB,
+            shUW: resident.shUW, shUS: resident.shUS, shUB: resident.shUB,
+            shDW: resident.shDW, shDS: resident.shDS, shDB: resident.shDB,
+            g: mk(K * I * 2), u: mk(K * I * 2), h: mk(K * I * 2), d: mk(K * Hin * 2),
             sg: mk(I * 2), su: mk(I * 2), shAct: mk(I * 2), sharedY: mk(Hin * 2))
     }
 
