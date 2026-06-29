@@ -945,6 +945,18 @@ public enum StreamingMoEValidation {
             }
             return (st, hm)
         }
+        // ★ A5b: cross-layer 予測 prefetch。layer i の routing を hidden h から gate_i(h) top-(8+margin) で予測。
+        //   resume の再 seed(prevStart 深化)で予測距離が縮み精度向上=自己補正。env QWISP_PREDICT=0 で無効、QWISP_MARGIN。
+        let doPredict = (ProcessInfo.processInfo.environment["QWISP_PREDICT"] ?? "1") != "0"
+        let predictK = 8 + (Int(ProcessInfo.processInfo.environment["QWISP_MARGIN"] ?? "16") ?? 16)
+        func predictLayer(_ i: Int, _ h: MLXArray) -> MLXArray {
+            let p = "language_model.model.layers.\(i).mlp.gate"
+            let logits = MLX.quantizedMatmul(h, store.req("\(p).weight"), scales: store.req("\(p).scales"),
+                                             biases: store.req("\(p).biases"), transpose: true, groupSize: 64, bits: 8).reshaped([256])
+            let order = MLX.argPartition(logits, kth: 256 - predictK)
+            return order[(256 - predictK)...].asType(.int32)
+        }
+
         // 1 token の checkpoint-resume decode step。(予測 argmax, #passes) を返す。
         // GPU-exec(lastGPUExecMs) と pread(LayerExpertCache.preadNanos)を分離計測し CPU bookkeeping を切り分け。
         let maxPasses = nLayers + 20
@@ -955,6 +967,16 @@ public enum StreamingMoEValidation {
             var prevStart = 0, passes = 0
             while passes < maxPasses {
                 passes += 1
+                // 予測 prefetch: suffix [prevStart..39] を ckptH[prevStart](正しい hidden)から予測しキャッシュ確保。
+                if doPredict {
+                    let seedH = prevStart == 0 ? embedX.reshaped([1, H]) : RawMetalForward.readBuffer(ckptH[prevStart], H)
+                    var preds: [MLXArray] = []
+                    for L in prevStart ..< nLayers { preds.append(predictLayer(L, seedH)) }
+                    MLX.eval(preds)
+                    for (idx, L) in (prevStart ..< nLayers).enumerated() {
+                        _ = caches[L].ensure(preds[idx].asArray(Int32.self).map { Int($0) })
+                    }
+                }
                 guard let (slotTables, hotMasks) = buildTables() else { break }
                 restoreGDN(snap, from: prevStart)
                 if prevStart == 0 { RawMetalForward.writeBuffer(hb, embedX, H) }
