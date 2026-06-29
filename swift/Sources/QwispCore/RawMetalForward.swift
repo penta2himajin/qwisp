@@ -2416,6 +2416,11 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _combineBPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _sharedGate8BPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _finalCombineBPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _moeZeroPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _moeCountPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _moeCsrPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _moeScatterPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _gqmmGroupedPipeline: MTLComputePipelineState?
 
     static func compileMoEB() -> Bool {
         guard let (device, _) = ensure() else { return false }
@@ -2601,6 +2606,91 @@ public enum RawMetalForward {
             if (idx >= B*H) return; uint b = idx / H;
             combined[idx] = y[idx] + gateScale[b] * sharedY[idx];
         }
+        // ── Stage B: routed union grouping（unique expert を1回 dequant→該当 token に適用）──
+        // moe_zero: counts/writeptr を 0、Ubuf[0]=0 に。grid width=E
+        kernel void moe_zero(device atomic_uint* counts [[buffer(0)]], device atomic_uint* writeptr [[buffer(1)]],
+                             device atomic_uint* Ubuf [[buffer(2)]], constant uint& E [[buffer(3)]],
+                             uint e [[thread_position_in_grid]]) {
+            if (e >= E) return;
+            atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+            atomic_store_explicit(&writeptr[e], 0u, memory_order_relaxed);
+            if (e == 0) atomic_store_explicit(&Ubuf[0], 0u, memory_order_relaxed);
+        }
+        // moe_count: 各 (b,k) で counts[binds[b*K+k]]++。grid width=B*Ktop
+        kernel void moe_count(device const int* binds [[buffer(0)]], device atomic_uint* counts [[buffer(1)]],
+                              constant uint& BK [[buffer(2)]], uint idx [[thread_position_in_grid]]) {
+            if (idx >= BK) return;
+            atomic_fetch_add_explicit(&counts[(uint)binds[idx]], 1u, memory_order_relaxed);
+        }
+        // moe_csr: 単一 thread で exclusive prefix→offsets/writeptr 初期化 + 非空 expert を uExperts に compaction。
+        kernel void moe_csr(device const atomic_uint* counts [[buffer(0)]], device uint* offsets [[buffer(1)]],
+                            device atomic_uint* writeptr [[buffer(2)]], device uint* uExperts [[buffer(3)]],
+                            device atomic_uint* Ubuf [[buffer(4)]], constant uint& E [[buffer(5)]],
+                            uint tid [[thread_position_in_threadgroup]]) {
+            if (tid != 0) return;
+            uint acc = 0, U = 0;
+            for (uint e = 0; e < E; e++) {
+                uint c = atomic_load_explicit(&counts[e], memory_order_relaxed);
+                offsets[e] = acc;
+                atomic_store_explicit(&writeptr[e], acc, memory_order_relaxed);
+                if (c > 0) { uExperts[U] = e; U++; }
+                acc += c;
+            }
+            atomic_store_explicit(&Ubuf[0], U, memory_order_relaxed);
+        }
+        // moe_scatter: 各 (b,k) を pairBK[writeptr[e]++]=b*Ktop+k（expert 順に整列）。grid width=B*Ktop
+        kernel void moe_scatter(device const int* binds [[buffer(0)]], device atomic_uint* writeptr [[buffer(1)]],
+                                device uint* pairBK [[buffer(2)]], constant uint& BK [[buffer(3)]],
+                                uint idx [[thread_position_in_grid]]) {
+            if (idx >= BK) return;
+            uint e = (uint)binds[idx];
+            uint pos = atomic_fetch_add_explicit(&writeptr[e], 1u, memory_order_relaxed);
+            pairBK[pos] = idx;
+        }
+        // gqmm4_grouped: weight 行 (e,n) を 1 回 dequant→expert e に route した全 pair に適用（union amortize）。
+        //   grid (N, Umax)。threadgroup(n=tgid.x, u=tgid.y): u>=U は早期 return。
+        //   lhsPer=0(gate/up): x=token b。lhsPer=1(down): x=h[b*Ktop+k]＝pair 行そのもの。
+        kernel void gqmm4_grouped(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                  device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                  device const uint* pairBK [[buffer(4)]], device const uint* offsets [[buffer(5)]],
+                                  device const atomic_uint* counts [[buffer(6)]], device const uint* uExperts [[buffer(7)]],
+                                  device const atomic_uint* Ubuf [[buffer(8)]], device half* y [[buffer(9)]],
+                                  constant int& K [[buffer(10)]], constant int& N [[buffer(11)]],
+                                  constant uint& Ktop [[buffer(12)]], constant uint& lhsPer [[buffer(13)]],
+                                  uint3 tg [[threadgroup_position_in_grid]], uint3 lid3 [[thread_position_in_threadgroup]],
+                                  uint3 tgs3 [[threads_per_threadgroup]]) {
+            uint lid = lid3.x, tgs = tgs3.x;
+            uint U = atomic_load_explicit(&Ubuf[0], memory_order_relaxed);
+            if (tg.y >= U) return;
+            uint n = tg.x; uint e = uExperts[tg.y];
+            uint cnt = atomic_load_explicit(&counts[e], memory_order_relaxed);
+            if (cnt == 0) return;
+            threadgroup float wdq[2048]; threadgroup float red[256];
+            int Kg = K / 64;
+            // weight 行 (e,n) を協調 dequant（一度だけ＝この expert の全 pair で共有）
+            const device uint32_t* we = w + (size_t)e * N * (K/8);
+            const device half* se = scales + (size_t)e * N * Kg;
+            const device half* be = biases + (size_t)e * N * Kg;
+            for (int k = (int)lid; k < K; k += (int)tgs) {
+                uint pack = we[n * (K/8) + k/8];
+                uint nib = (pack >> (4*(k%8))) & 0xf;
+                int g = k/64;
+                wdq[k] = (float)se[n*Kg+g] * (float)nib + (float)be[n*Kg+g];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint base = offsets[e];
+            for (uint p = 0; p < cnt; p++) {
+                uint bk = pairBK[base + p];
+                size_t xrow = lhsPer ? (size_t)bk : (size_t)(bk / Ktop);
+                const device half* xp = x + xrow * K;
+                float acc = 0.0f;
+                for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)xp[k] * wdq[k];
+                red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (lid < s) red[lid] += red[lid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (lid == 0) y[(size_t)bk * N + n] = (half)red[0];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -2612,6 +2702,11 @@ public enum RawMetalForward {
             _combineBPipeline = try mk("combine_b")
             _sharedGate8BPipeline = try mk("shared_gate8_b")
             _finalCombineBPipeline = try mk("final_combine_b")
+            _moeZeroPipeline = try mk("moe_zero")
+            _moeCountPipeline = try mk("moe_count")
+            _moeCsrPipeline = try mk("moe_csr")
+            _moeScatterPipeline = try mk("moe_scatter")
+            _gqmmGroupedPipeline = try mk("gqmm4_grouped")
             return true
         } catch { print("[raw-moe-b] compile: \(error)"); return false }
     }
@@ -2624,8 +2719,43 @@ public enum RawMetalForward {
         let swGW, swGS, swGB, swUW, swUS, swUB, swDW, swDS, swDB: MTLBuffer   // routed 4bit
         let shGW, shGS, shGB, shUW, shUS, shUB, shDW, shDS, shDB: MTLBuffer   // shared 4bit
         let sgW, sgS, sgB: MTLBuffer                 // shared_expert_gate 8bit
+        let counts, offsets, writeptr, pairBK, uExperts, Ubuf: MTLBuffer      // Stage B union grouping(CSR)
     }
-    static func encodeMoEGPUB(_ enc: MTLComputeCommandEncoder, _ b: MoEBuffersB) {
+    /// Stage B: route 後に CSR(counts→offsets→pairBK, 非空 uExperts)を単一 CB 内で構築し、3 gather で再利用。
+    static func encodeMoECSR(_ enc: MTLComputeCommandEncoder, _ b: MoEBuffersB) {
+        let BK = b.B * b.topK
+        enc.setComputePipelineState(_moeZeroPipeline!)
+        enc.setBuffer(b.counts, offset: 0, index: 0); enc.setBuffer(b.writeptr, offset: 0, index: 1); enc.setBuffer(b.Ubuf, offset: 0, index: 2)
+        var eN = UInt32(b.E); enc.setBytes(&eN, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: b.E, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_moeZeroPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc.setComputePipelineState(_moeCountPipeline!)
+        enc.setBuffer(b.binds, offset: 0, index: 0); enc.setBuffer(b.counts, offset: 0, index: 1)
+        var bk = UInt32(BK); enc.setBytes(&bk, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: BK, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_moeCountPipeline!.maxTotalThreadsPerThreadgroup, BK), height: 1, depth: 1))
+        enc.setComputePipelineState(_moeCsrPipeline!)
+        enc.setBuffer(b.counts, offset: 0, index: 0); enc.setBuffer(b.offsets, offset: 0, index: 1); enc.setBuffer(b.writeptr, offset: 0, index: 2)
+        enc.setBuffer(b.uExperts, offset: 0, index: 3); enc.setBuffer(b.Ubuf, offset: 0, index: 4)
+        var eN2 = UInt32(b.E); enc.setBytes(&eN2, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.setComputePipelineState(_moeScatterPipeline!)
+        enc.setBuffer(b.binds, offset: 0, index: 0); enc.setBuffer(b.writeptr, offset: 0, index: 1); enc.setBuffer(b.pairBK, offset: 0, index: 2)
+        var bk2 = UInt32(BK); enc.setBytes(&bk2, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: BK, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_moeScatterPipeline!.maxTotalThreadsPerThreadgroup, BK), height: 1, depth: 1))
+    }
+    /// Stage B grouped gather: w[E,N,K] · x → y[B*Ktop, N]（union amortize）。grid (N, B*Ktop)。
+    static func encodeGroupedGather(_ enc: MTLComputeCommandEncoder, _ b: MoEBuffersB,
+                                    _ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer,
+                                    K kk: Int, N nn: Int, lhs: Bool) {
+        enc.setComputePipelineState(_gqmmGroupedPipeline!)
+        enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+        enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(b.pairBK, offset: 0, index: 4); enc.setBuffer(b.offsets, offset: 0, index: 5)
+        enc.setBuffer(b.counts, offset: 0, index: 6); enc.setBuffer(b.uExperts, offset: 0, index: 7); enc.setBuffer(b.Ubuf, offset: 0, index: 8)
+        enc.setBuffer(y, offset: 0, index: 9)
+        var k = Int32(kk), n = Int32(nn), kt = UInt32(b.topK), l = UInt32(lhs ? 1 : 0)
+        enc.setBytes(&k, length: 4, index: 10); enc.setBytes(&n, length: 4, index: 11); enc.setBytes(&kt, length: 4, index: 12); enc.setBytes(&l, length: 4, index: 13)
+        enc.dispatchThreadgroups(MTLSize(width: nn, height: b.B * b.topK, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    static func encodeMoEGPUB(_ enc: MTLComputeCommandEncoder, _ b: MoEBuffersB, grouped: Bool = false) {
         let B = b.B, Hin = b.Hin, I = b.I, K = b.topK, E = b.E
         // ① gate qmm8_tiled: bx[B,H] → gateLogits[B,E]
         enc.setComputePipelineState(_qmm8TiledBPipeline!)
@@ -2662,10 +2792,18 @@ public enum RawMetalForward {
             enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6); enc.setBytes(&bn, length: 4, index: 7)
             enc.dispatchThreadgroups(MTLSize(width: nn, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
-        encGather(b.swGW, b.swGS, b.swGB, b.bx, b.g, K: Hin, N: I, lhs: false)
-        encGather(b.swUW, b.swUS, b.swUB, b.bx, b.u, K: Hin, N: I, lhs: false)
-        encSwiglu(b.g, b.u, b.h, B * K * I)
-        encGather(b.swDW, b.swDS, b.swDB, b.h, b.d, K: I, N: Hin, lhs: true)
+        if grouped {   // Stage B: CSR を 1 回構築→3 gather で union amortize
+            encodeMoECSR(enc, b)
+            encodeGroupedGather(enc, b, b.swGW, b.swGS, b.swGB, b.bx, b.g, K: Hin, N: I, lhs: false)
+            encodeGroupedGather(enc, b, b.swUW, b.swUS, b.swUB, b.bx, b.u, K: Hin, N: I, lhs: false)
+            encSwiglu(b.g, b.u, b.h, B * K * I)
+            encodeGroupedGather(enc, b, b.swDW, b.swDS, b.swDB, b.h, b.d, K: I, N: Hin, lhs: true)
+        } else {       // Stage A: per-(b,k)
+            encGather(b.swGW, b.swGS, b.swGB, b.bx, b.g, K: Hin, N: I, lhs: false)
+            encGather(b.swUW, b.swUS, b.swUB, b.bx, b.u, K: Hin, N: I, lhs: false)
+            encSwiglu(b.g, b.u, b.h, B * K * I)
+            encGather(b.swDW, b.swDS, b.swDB, b.h, b.d, K: I, N: Hin, lhs: true)
+        }
         // shared expert: sg/su tiled(4bit) → swiglu → sharedY tiled
         encTiled(_qmm4TiledBPipeline!, b.shGW, b.shGS, b.shGB, b.bx, b.sg, K: Hin, N: I)
         encTiled(_qmm4TiledBPipeline!, b.shUW, b.shUS, b.shUB, b.bx, b.su, K: Hin, N: I)
@@ -2730,14 +2868,16 @@ public enum RawMetalForward {
                 gateW: gateWb, gateS: gateSb, gateB: gateBb,
                 swGW: swGWb, swGS: swGSb, swGB: swGBb, swUW: swUWb, swUS: swUSb, swUB: swUBb, swDW: swDWb, swDS: swDSb, swDB: swDBb,
                 shGW: shGWb, shGS: shGSb, shGB: shGBb, shUW: shUWb, shUS: shUSb, shUB: shUBb, shDW: shDWb, shDS: shDSb, shDB: shDBb,
-                sgW: sgWb, sgS: sgSb, sgB: sgBb)
+                sgW: sgWb, sgS: sgSb, sgB: sgBb,
+                counts: mk(E*4), offsets: mk(E*4), writeptr: mk(E*4), pairBK: mk(Bv*topK*4), uExperts: mk(Bv*topK*4), Ubuf: mk(4))
             let xf = xb.reshaped([Bv*Hin]).asType(.float16).asArray(Float16.self)
             mb.bx.contents().bindMemory(to: Float16.self, capacity: Bv*Hin).update(from: xf, count: Bv*Hin)
             return mb
         }
+        let grouped = ProcessInfo.processInfo.environment["QWISP_MOE_GROUPED"] == "1"
         func runB(_ mb: MoEBuffersB) -> Double {
             let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-            encodeMoEGPUB(enc, mb); enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            encodeMoEGPUB(enc, mb, grouped: grouped); enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             return (cb.gpuEndTime - cb.gpuStartTime) * 1000
         }
         // workload 生成（diverse=独立, similar=共有+微小ノイズ）
@@ -2768,11 +2908,11 @@ public enum RawMetalForward {
         let t1 = timeFor(1), t2 = timeFor(2), t4 = timeFor(4), t8 = timeFor(8)
         return String(format: """
             [raw-moe-b] M=B MoE block all-GPU（gate/route/experts/combine/shared/final 全 raw, 単一 CB）vs MLX MoEBlock
-              workload=%@  E=%d topK=%d Hin=%d I=%d
+              workload=%@  routed=%@  E=%d topK=%d Hin=%d I=%d
               correctness(B=8) per-token rel: max=%.3e mean=%.3e %@（near-tie 基準）
               GPU-exec 償却カーブ: B=1 %.3fms(%.3f/tok) | B=2 %.3fms(%.3f/tok) | B=4 %.3fms(%.3f/tok) | B=8 %.3fms(%.3f/tok)
-              → B=8/B=1 = %.2f×（理想 8×, 8/比 = %.2f× の実効 amortize）。dense 償却済, routed=Stage A per-(b,k)
-            """, similar ? "similar(共有+ノイズ)" : "diverse(独立)", E, topK, Hin, I,
+              → B=8/B=1 = %.2f×（理想 8×, 8/比 = %.2f× の実効 amortize）
+            """, similar ? "similar(共有+ノイズ)" : "diverse(独立)", grouped ? "Stage B union grouping" : "Stage A per-(b,k)", E, topK, Hin, I,
             maxRel, sumRel/Double(B), maxRel < 5e-3 ? "✅ near" : "❌乖離",
             t1, t1, t2, t2/2, t4, t4/4, t8, t8/8, t8/t1, 8.0/(t8/t1))
     }
