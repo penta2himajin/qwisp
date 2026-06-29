@@ -73,6 +73,7 @@ if CommandLine.arguments.contains("stream") {
         ("route-decode-lossless", { md, rp in try QwispModel.runRouteDecodeLossless(modelDir: md, refPath: rp) }),
         ("decode-gpu",            { md, rp in try QwispModel.runDecodeGPULossless(modelDir: md, refPath: rp) }),
         ("profile-gpu",           { md, _ in try QwispModel.runProfileGPU(modelDir: md) }),
+        ("batch-scale",           { md, _ in try QwispModel.runBatchScale(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("cost-model-validate",   { try Tell.runCostModelValidate(modelDir: $0, refPath: $1) }),

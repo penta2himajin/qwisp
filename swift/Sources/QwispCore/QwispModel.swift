@@ -856,6 +856,30 @@ public final class QwispModel {
             noST.gpu, noMoE.gpu, noMix.gpu, N, mlxMs, 1000/mlxMs)
     }
 
+    /// ★ issue#6 第一歩: 既存 MLX batched forward の throughput スケール実測（C=256 resident, cold [B,1]）。
+    /// dense amortization vs MoE expert-union の綱引きを B=1..32 で。新 kernel 無し。env QWISP_RUN=batch-scale。
+    public static func runBatchScale(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()   // C=256 全常駐（IO ノイズ排除、batching の sweet spot 前提）
+        let model = QwispModel(store: store)
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        var out = "[batch-scale] MLX batched forward throughput（C=256 resident, cold [B,1]）\n"
+        out += "  B    ms/forward   tok/s(=B/ms)   vs B=1 throughput\n"
+        var base1 = 0.0
+        for B in [1, 2, 4, 8, 16, 32] {
+            let ids = MLXArray((0 ..< B).map { Int32(($0 * 131 + 7) % 100000) }, [B, 1])
+            for _ in 0..<3 { model(ids).eval() }
+            let reps = 15; let t0 = now()
+            for _ in 0..<reps { model(ids).eval() }
+            let ms = (now() - t0) / Double(reps)
+            let tokps = Double(B) / ms * 1000
+            if B == 1 { base1 = tokps }
+            out += String(format: "  %-4d %8.1f %12.1f %14.2fx\n", B, ms, tokps, tokps / base1)
+        }
+        out += "  → throughput が B で伸びれば batching 有効（dense amortize 勝ち）。頭打ちなら MoE expert-union 律速。"
+        return out
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
