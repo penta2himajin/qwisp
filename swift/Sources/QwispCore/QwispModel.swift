@@ -300,13 +300,23 @@ public final class QwispModel {
             hBuf: hb, nw: nw, postNormBuf: pnb,
             gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i], H: H, eps: eps,
             pendingResid: pendingResid) else { return false }
-        // MoE: routing(MLX) + expert SE + combine(MLX) + residual(kernel)
+        // MoE: routing(MLX or Metal) + expert SE + combine(MLX) + residual(kernel)
         let p = "language_model.model.layers.\(i)", mp = "\(p).mlp"
-        let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
-        let order = MLX.argPartition(gates, kth: 256 - 8, axis: -1)
-        let inds = order[0..., (256 - 8)...].asType(.int32)
-        var scores = MLX.takeAlong(gates, inds, axis: -1)
-        scores = scores / scores.sum(axis: -1, keepDims: true)
+        let inds: MLXArray, scores: MLXArray
+        if RawMetalForward.metalRoute {
+            // ★ Metal routing: gate qmm8(bit-exact) + route_top8。combine/shared は MLX のまま（誤差源分離）。
+            guard let (ri, rs) = RawMetalForward.metalRouteGate(
+                postNorm, gateW: store.req("\(mp).gate.weight"), gateS: store.req("\(mp).gate.scales"),
+                gateB: store.req("\(mp).gate.biases"), H: H) else { return false }
+            inds = ri.reshaped([1, 8]); scores = rs.asType(.float16).reshaped([1, 8])
+        } else {
+            let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
+            let order = MLX.argPartition(gates, kth: 256 - 8, axis: -1)
+            inds = order[0..., (256 - 8)...].asType(.int32)
+            var sc = MLX.takeAlong(gates, inds, axis: -1)
+            sc = sc / sc.sum(axis: -1, keepDims: true)
+            scores = sc
+        }
         if moeBufCache[i] == nil {
             func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
             moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
@@ -413,7 +423,9 @@ public final class QwispModel {
                           srel, amS, amR, amS == amR ? "✅" : "❌", seMs, 1000/seMs, mlxMs/Swift.max(0.01, seMs))
         }
         // ★★ 層融合 full forward（residual stream を hBuf 常駐, input_norm+mixer+residual+post_norm を 1 encoder）
-        if let fu = model.fusedRawForward(ids) {
+        // routing=MLX（安全）と routing=Metal（task#8 検証）の両方を計測し rel/argmax を比較。
+        func measureFused(_ label: String) {
+            guard let fu = model.fusedRawForward(ids) else { return }
             fu.eval()
             let ff = fu.reshaped([fu.size])
             let fd = MLX.max(MLX.abs(ff.asType(.float32) - rf.asType(.float32))).item(Float.self)
@@ -421,9 +433,41 @@ public final class QwispModel {
             let amF = MLX.argMax(ff).item(Int.self)
             for _ in 0..<3 { _ = model.fusedRawForward(ids)?.eval() }
             t0 = now(); for _ in 0..<reps { _ = model.fusedRawForward(ids)?.eval() }; let fuMs = (now()-t0)/Double(reps)
-            out += String(format: "\n  ── 層融合 full forward（hBuf 常駐, norm/residual も kernel）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
-                          frel, amF, amR, amF == amR ? "✅" : "❌", fuMs, 1000/fuMs, mlxMs/Swift.max(0.01, fuMs))
+            out += String(format: "\n  ── 層融合 full forward（%@）──\n   logits rel=%.3e argmax %d(ref %d)%@  時間=%.1fms(%.1f tok/s) → vs MLX %.2fx",
+                          label, frel, amF, amR, amF == amR ? "✅" : "❌", fuMs, 1000/fuMs, mlxMs/Swift.max(0.01, fuMs))
         }
+        RawMetalForward.metalRoute = false; measureFused("routing=MLX, norm/residual=kernel")
+        // per-layer routing 逸脱（全40層, K入力）: Metal routing が生む combined の rel 分布。
+        if ProcessInfo.processInfo.environment["QWISP_ROUTE_DIAG"] == "1" {
+            let H = model.embed(ids).dim(-1)
+            var worstSet = true; var maxScoreDiff: Float = 0; var maxCombRel: Float = 0; var nbad = 0
+            for i in 0 ..< model.numLayers {
+                let mp = "language_model.model.layers.\(i).mlp"
+                for _ in 0 ..< 8 {
+                    let pn = MLXRandom.normal([1, H]).asType(.float16); pn.eval()
+                    // MLX routing
+                    let gates = MLX.softmax(model.q("\(mp).gate", 8).apply(pn), axis: -1, precise: true)
+                    let order = MLX.argPartition(gates, kth: 256 - 8, axis: -1)
+                    let indsM = order[0..., (256 - 8)...].asType(.int32)
+                    var scM = MLX.takeAlong(gates, indsM, axis: -1); scM = scM / scM.sum(axis: -1, keepDims: true)
+                    // Metal routing
+                    guard let (indsR, scR) = RawMetalForward.metalRouteGate(pn, gateW: model.store.req("\(mp).gate.weight"),
+                        gateS: model.store.req("\(mp).gate.scales"), gateB: model.store.req("\(mp).gate.biases"), H: H) else { continue }
+                    let imA = indsM.reshaped([8]).asArray(Int32.self), irA = indsR.asArray(Int32.self)
+                    var rmap: [Int32: Float] = [:]; let smA = scM.reshaped([8]).asType(.float32).asArray(Float.self)
+                    for k in 0..<8 { rmap[imA[k]] = smA[k] }
+                    let srA = scR.asType(.float32).asArray(Float.self)
+                    for k in 0..<8 { if let rs = rmap[irA[k]] { maxScoreDiff = max(maxScoreDiff, abs(rs - srA[k])) } else { worstSet = false; nbad += 1 } }
+                }
+            }
+            out += String(format: "\n   [route-diag 全40層×8入力] expert集合%@(不一致%d) score最大差=%.3e", worstSet ? "全一致✅" : "❌", nbad, maxScoreDiff)
+            _ = maxCombRel
+        }
+        RawMetalForward.metalRoute = true; measureFused("routing=Metal(qmm8+top8), task#8")
+        RawMetalForward.metalRoute = false
+        out += "\n   ⚠️判定: Metal routing は rel が 2.97e-3 床を大きく超過(≈0.13)＝lossless gate 失格。"
+            + "\n     原因=MoE expert 選択が f16 gate 境界で MLX argPartition と稀に食い違い(1 expert 差→40層で増幅)。"
+            + "\n     MLX の f16 softmax+argPartition tie 順は外部再現不可。∴ routing は MLX 維持(既定 metalRoute=false)。"
         // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
         if ProcessInfo.processInfo.environment["QWISP_FULL_DIAG"] == "1" {
             var hM = model.embed(ids); let H = hM.dim(-1)

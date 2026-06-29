@@ -9,6 +9,7 @@ import MLXRandom
 /// 組むための基盤。第一歩 = quantized matmul(4-bit affine, gs=64)を MLX の quantizedMatmul と bit-exact
 /// 照合（最難関の format + MLX weight buffer 共有 を検証）。
 public enum RawMetalForward {
+    nonisolated(unsafe) static var metalRoute = false    // task#8 検証: MoE routing を Metal(qmm8+route_top8)で行う
     nonisolated(unsafe) static var _qmmPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmmF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmm8Pipeline: MTLComputePipelineState?     // 8bit qmv_fast（router gate）
@@ -286,16 +287,18 @@ public enum RawMetalForward {
                                constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
                                uint tid [[thread_position_in_grid]]) {
             if (tid != 0) return;
-            half gates[256]; half work[256];
+            half gates[256]; float work[256];
             float m = -INFINITY;
-            for (uint i = 0; i < N; i++) { float v = (float)logits[i]; m = max(m, v); }
+            for (uint i = 0; i < N; i++) { float v = (float)logits[i]; m = max(m, v); work[i] = v; }
             float Z = 0.0f;
             for (uint i = 0; i < N; i++) Z += precise::exp((float)logits[i] - m);
-            for (uint i = 0; i < N; i++) { half g = (half)(precise::exp((float)logits[i] - m) / Z); gates[i] = g; work[i] = g; }
+            for (uint i = 0; i < N; i++) gates[i] = (half)(precise::exp((float)logits[i] - m) / Z);
+            // ★ expert 選択は logits（f32, Z 非依存・単調）で top-K。f16 gates の Z 依存丸めで境界 tie が
+            //   MLX と食い違うのを回避。scores は選んだ index の f16 gates から取る（MLX takeAlong 相当）。
             for (uint k = 0; k < K; k++) {
                 float best = -INFINITY; int bi = 0;
-                for (uint i = 0; i < N; i++) { float v = (float)work[i]; if (v > best) { best = v; bi = (int)i; } }
-                inds[k] = bi; scores[k] = gates[bi]; work[bi] = (half)(-INFINITY);
+                for (uint i = 0; i < N; i++) { float v = work[i]; if (v > best) { best = v; bi = (int)i; } }
+                inds[k] = bi; scores[k] = gates[bi]; work[bi] = -INFINITY;
             }
             half ssum = (half)0;
             for (uint k = 0; k < K; k++) ssum += scores[k];
@@ -324,6 +327,14 @@ public enum RawMetalForward {
         let sp = bScores.contents().bindMemory(to: Float16.self, capacity: K)
         return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: K))),
                 MLXArray(Array(UnsafeBufferPointer(start: sp, count: K))))
+    }
+
+    /// Metal routing（gate qmm8 + route_top8）: postNorm[H] → (inds[K] int32, scores[K] f16)。
+    /// gate logits は qmm8（MLX と bit-exact 検証済）、選択/正規化は route_top8。combine/shared は呼び元（現状 MLX）。
+    static func metalRouteGate(_ postNorm: MLXArray, gateW: MLXArray, gateS: MLXArray, gateB: MLXArray,
+                               H: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
+        guard let logits = qmm8(postNorm.reshaped([1, H]), gateW, scales: gateS, biases: gateB, M: 1, K: H, N: N) else { return nil }
+        return routeTop8(logits.reshaped([N]), N: N, K: K)
     }
 
     /// 検証: route_top8 vs MLX routing（softmax precise→argPartition→takeAlong→normalize）。順序非依存で集合一致。
