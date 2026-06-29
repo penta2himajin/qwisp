@@ -770,13 +770,25 @@ public final class QwispModel {
         }
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let tokps = Double(steps) / secs
+        // ── decode step glue 分解（embed / forward CB / lm_head+argmax）──
+        func nowMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        var tEmbed = 0.0, tFwd = 0.0, tHead = 0.0, gpuExec = 0.0; let pr = 16
+        for _ in 0 ..< pr {
+            var s = nowMs(); let e = model.embed(MLXArray([cur], [1, 1])); e.eval(); tEmbed += nowMs()-s
+            s = nowMs(); _ = model.fusedDecodeStepGPU(cur, pos: pos, H: H); tFwd += nowMs()-s; gpuExec += RawMetalForward.lastGPUExecMs
+            let fn = RawMetalForward.readBuffer(model.gpuScratch!.normed, H)
+            s = nowMs(); let lg = model.headProj().apply(fn.reshaped([1,1,H])); let am = MLX.argMax(lg.reshaped([lg.size])).item(Int.self); tHead += nowMs()-s; _ = am
+            pos += 1
+        }
         return String(format: """
             [decode-gpu] all-GPU decode（GDN state feedback + KV cache）prompt T=\(prompt.count), N=\(N)
               lossless（teacher-forced vs mlx_lm, near-tie rank≤2 許容）: argmax %d/%d=%.1f%% 不一致%d（near-tie %d, 真の乖離 %d）
               %@
               tok/s（free-running greedy 32 step）: %.1f tok/s (%.1f ms/tok)
+              glue 分解(/tok): embed=%.2fms  forwardStep=%.2fms(GPU-exec %.2fms)  lm_head+argmax=%.2fms
             """, match, N, Double(match)/Double(N)*100, N - match, near, tru,
-            ex.isEmpty ? "(完全一致)" : "first: " + ex.joined(separator: " | "), tokps, secs/Double(steps)*1000)
+            ex.isEmpty ? "(完全一致)" : "first: " + ex.joined(separator: " | "), tokps, secs/Double(steps)*1000,
+            tEmbed/Double(pr), tFwd/Double(pr), gpuExec/Double(pr), tHead/Double(pr))
     }
 
     /// ★ task#9 owner 指摘①: per-kernel GPU-exec 帰属 profile（②single-thread 並列化で足りるか③大 kernel 移植が要るか）。

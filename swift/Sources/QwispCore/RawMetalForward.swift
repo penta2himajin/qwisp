@@ -1590,22 +1590,38 @@ public enum RawMetalForward {
     /// ★ 多層 1-CB forward: 全層の mixer+MoE を **単一 serial encoder + 単一 command buffer** に詰め、
     ///   per-layer waitUntilCompleted を排除（GPU が層間 pipeline）。embed→hBuf 書込み済前提、hBuf に結果。
     ///   各層 MoE residual は次層 mixer 先頭で hBuf に畳む（pendingResid=scratch.combined）。最終層は末尾 flush。
+    nonisolated(unsafe) static var fusedNumCB = 1   // 層を G 個の CB に分割。実測 G>1 は inter-CB gap で逆効果＝1 が最速
+
     static func fusedForwardGPU(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
                                 H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0,
                                 finalNormW: MTLBuffer? = nil) {
         guard let (_, queue) = ensure() else { return }
-        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        for (i, L) in layers.enumerated() {
-            encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
-                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined,
-                            decode: decode, pos: pos)
-            encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
-                         sharedGateW: L.sharedGate, H: H, E: E, K: K)
+        // ★ 多 command buffer: 各 CB を commit(待たず)→GPU が CB_g を実行中に CPU が CB_{g+1} を encode＝
+        //   CPU-encode bubble を GPU-exec の裏に隠す。同一 queue の CB は commit 順に serial 実行＋メモリ整合。
+        let G = max(1, min(fusedNumCB, layers.count))
+        let per = (layers.count + G - 1) / G
+        var cbs: [MTLCommandBuffer] = []
+        for g in 0 ..< G {
+            let lo = g * per, hi = min((g + 1) * per, layers.count)
+            if lo >= hi { break }
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            for i in lo ..< hi {
+                let L = layers[i]
+                encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
+                                gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined,
+                                decode: decode, pos: pos)
+                encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
+                             sharedGateW: L.sharedGate, H: H, E: E, K: K)
+            }
+            if hi == layers.count {   // 最終 CB に最終 residual + final norm
+                encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)
+                if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }
+            }
+            enc.endEncoding(); cb.commit()    // ★待たずに commit（次 CB の encode と GPU-exec を overlap）
+            cbs.append(cb)
         }
-        encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)    // 最終層 MoE residual
-        if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }  // final norm 同梱
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()        // ★全40層+final norm で sync 1 回のみ
-        lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0     // GPU-exec（CPU-encode と分離）
+        cbs.last?.waitUntilCompleted()        // 最後だけ wait
+        if let f = cbs.first, let l = cbs.last { lastGPUExecMs = (l.gpuEndTime - f.gpuStartTime) * 1000.0 }
     }
 
     /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。
