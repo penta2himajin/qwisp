@@ -11,6 +11,7 @@ import MLXRandom
 public enum RawMetalForward {
     nonisolated(unsafe) static var _qmmPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmmF32Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _qmm8Pipeline: MTLComputePipelineState?     // 8bit qmv_fast（router gate）
     nonisolated(unsafe) static var _ropeF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _sdpaF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _device: MTLDevice?
@@ -169,6 +170,200 @@ public enum RawMetalForward {
         }
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+    }
+
+    /// 8bit qmv_fast 移植（router gate: postNorm[H]→gate_logits[N], f16）。MLX qmv_fast<half,gs=64,bits=8>。
+    /// bits=8 は load_vector/qdot が単純（x_thread=x そのまま、accum=Σ x·w_byte）。fast 条件 N%8==0 && K%512==0。
+    /// 単一 encoder 融合用に encodeQmm8 も提供。
+    static func compileQmm8() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _qmm8Pipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        #define SIMD_SIZE 32
+        // MLX load_vector<bits=8>: x_thread=x そのまま, sum=Σ x（昇格無し, 4bit の 16^j 除算は無し）。
+        inline float ld8(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 8; i++) { float v = x[i]; sum += v; xt[i] = v; }
+            return sum;
+        }
+        // MLX qdot<bits=8>: accum = Σ_i xt[i]*w_byte[i]（i=0..7 順次）, return scale*accum + sum*bias。
+        inline float qd8(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            for (int i = 0; i < 8; i++) accum += xt[i] * (float)w[i];
+            return scale * accum + sum * bias;
+        }
+        kernel void qmm8(device const uint32_t* w      [[buffer(0)]],
+                         device const half*     scales [[buffer(1)]],
+                         device const half*     biases [[buffer(2)]],
+                         device const half*     x      [[buffer(3)]],
+                         device half*           y      [[buffer(4)]],
+                         constant int&          in_vec_size  [[buffer(5)]],   // K
+                         constant int&          out_vec_size [[buffer(6)]],   // N
+                         uint3 tid      [[threadgroup_position_in_grid]],
+                         uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                         uint  simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 4;
+            constexpr int pack_factor = 4;             // 32/8
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 8;       // pack_factor*packs_per_thread
+            constexpr int block_size = 256;            // vpt*SIMD_SIZE
+            constexpr int scale_step_per_thread = 8;   // gs(64)/vpt(8)
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[8];
+            thread U result[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;   // K bytes
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            x += tid.x * in_vec_size + simd_lid * values_per_thread;
+            y += tid.x * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld8(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U b = bl[0];
+                    result[row] += qd8(wl, x_thread, s, b, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+            _qmm8Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm8")!)
+            return true
+        } catch { print("[raw-qmm8] compile: \(error)"); return false }
+    }
+
+    static func qmm8(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = ensure(), compileQmm8() else { return nil }
+        guard N % 8 == 0, K % 512 == 0 else { print("[raw-qmm8] 非fast N=\(N) K=\(K)"); return nil }
+        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_qmm8Pipeline!)
+        enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+        enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3); enc.setBuffer(outBuf, offset: 0, index: 4)
+        var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+    }
+
+    nonisolated(unsafe) static var _routePipeline: MTLComputePipelineState?
+    /// MoE routing top-8 選択 kernel（gate_logits[N]→inds[K] int32, scores[K] f16）。
+    /// MLX softmax(precise)→argPartition(top-K)→takeAlong→normalize を再現。renorm で softmax Z は相殺するが
+    /// MLX は f16 gates を経由するので f16 丸めも再現（gates=f16(exp/Z), scores=f16 gates[top], ssum=f16 順次）。
+    /// 単一 thread（decode M=1, N=256 は軽量）。値ベース top-K は argPartition と同一 expert 集合を選ぶ。
+    static func compileRoute() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _routePipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void route_top8(device const half* logits [[buffer(0)]],
+                               device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                               constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                               uint tid [[thread_position_in_grid]]) {
+            if (tid != 0) return;
+            half gates[256]; half work[256];
+            float m = -INFINITY;
+            for (uint i = 0; i < N; i++) { float v = (float)logits[i]; m = max(m, v); }
+            float Z = 0.0f;
+            for (uint i = 0; i < N; i++) Z += precise::exp((float)logits[i] - m);
+            for (uint i = 0; i < N; i++) { half g = (half)(precise::exp((float)logits[i] - m) / Z); gates[i] = g; work[i] = g; }
+            for (uint k = 0; k < K; k++) {
+                float best = -INFINITY; int bi = 0;
+                for (uint i = 0; i < N; i++) { float v = (float)work[i]; if (v > best) { best = v; bi = (int)i; } }
+                inds[k] = bi; scores[k] = gates[bi]; work[bi] = (half)(-INFINITY);
+            }
+            half ssum = (half)0;
+            for (uint k = 0; k < K; k++) ssum += scores[k];
+            for (uint k = 0; k < K; k++) scores[k] = scores[k] / ssum;
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _routePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8")!)
+             return true
+        } catch { print("[raw-route] compile: \(error)"); return false }
+    }
+
+    /// standalone routing（検証用）: gate_logits[N] → (inds[K] int32, scores[K] f16)。
+    static func routeTop8(_ logits: MLXArray, N: Int, K: Int) -> (MLXArray, MLXArray)? {
+        guard let (device, queue) = ensure(), compileRoute() else { return nil }
+        guard let bl = logits.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let bInds = device.makeBuffer(length: K * 4, options: .storageModeShared)!
+        let bScores = device.makeBuffer(length: K * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_routePipeline!)
+        enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1); enc.setBuffer(bScores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ip = bInds.contents().bindMemory(to: Int32.self, capacity: K)
+        let sp = bScores.contents().bindMemory(to: Float16.self, capacity: K)
+        return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: K))),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: K))))
+    }
+
+    /// 検証: route_top8 vs MLX routing（softmax precise→argPartition→takeAlong→normalize）。順序非依存で集合一致。
+    public static func runRouteTest() -> String {
+        let N = 256, K = 8
+        let logits = MLXRandom.normal([1, N]).asType(.float16); logits.eval()
+        let gates = MLX.softmax(logits, axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: N - K, axis: -1)
+        let indsM = order[0..., (N - K)...].asType(.int32)
+        var scoresM = MLX.takeAlong(gates, indsM, axis: -1)
+        scoresM = scoresM / scoresM.sum(axis: -1, keepDims: true)
+        let indsMA = indsM.reshaped([K]).asArray(Int32.self)
+        let scMA = scoresM.reshaped([K]).asArray(Float.self)
+        var refMap: [Int32: Float] = [:]; for i in 0..<K { refMap[indsMA[i]] = scMA[i] }
+        guard let (indsR, scoresR) = routeTop8(logits.reshaped([N]), N: N, K: K) else { return "[raw-route] 実行失敗" }
+        let indsRA = indsR.asArray(Int32.self), scRA = scoresR.asType(.float32).asArray(Float.self)
+        var setOK = true; var maxScoreDiff: Float = 0
+        for i in 0..<K {
+            guard let rs = refMap[indsRA[i]] else { setOK = false; continue }
+            maxScoreDiff = max(maxScoreDiff, abs(rs - scRA[i]))
+        }
+        return String(format: "[raw-route-test] top-%d 選択 vs MLX argPartition: expert集合%@ score最大差=%.3e %@",
+                      K, setOK ? "一致✅" : "不一致❌", maxScoreDiff,
+                      setOK && maxScoreDiff < 2e-3 ? "✅ argmax-lossless 同等" : "⚠️")
+    }
+
+    /// 検証: 8bit qmv (router gate) vs MLX quantizedMatmul(bits=8)。env QWISP_RUN=raw-router-test。
+    public static func runRouterTest() -> String {
+        let H = 2048, N = 256
+        let x = MLXRandom.normal([1, H]).asType(.float16)
+        let wf = MLXRandom.normal([N, H]).asType(.float16)
+        let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine)
+        guard let bi = biOpt else { return "[raw-router] biases nil" }
+        MLX.eval([x, wq, sc, bi])
+        let ref = MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 8, mode: .affine); ref.eval()
+        guard let got = qmm8(x, wq, scales: sc, biases: bi, M: 1, K: H, N: N) else { return "[raw-router] qmm8 失敗" }
+        got.eval()
+        let rel = relErr(got.reshaped([N]), ref.reshaped([N]))
+        return String(format: "[raw-router-test] 8bit qmv (gate %d←%d) vs MLX: rel=%.3e %@",
+                      N, H, rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ near" : "❌"))
     }
 
     nonisolated(unsafe) static var _rmsPipeline: MTLComputePipelineState?
