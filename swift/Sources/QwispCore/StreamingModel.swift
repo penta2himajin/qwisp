@@ -184,6 +184,62 @@ public final class StreamingQwispModel {
         return (hidden, headProj().apply(hidden))
     }
 
+    /// ★ issue#7 (c): 背景 prefetch overlap + whole-token no-sync + escalate-from-first-miss。
+    /// 前トークンの per-layer inds(priorInds)を hint に背景スレッドが全層を先行 ensure（per-layer
+    /// semaphore=CPU 同期、GPU barrier 無し）。main は whole-token を no-sync lazy 実行（per-layer drain
+    /// 排除）→ 単一 eval + per-layer miss。miss 層から sync 再計算で exact 維持。lastInds に当 token の
+    /// 実 routing を残す（次 token prefetch 用）。priorInds=nil の token は全層 sync(cold-start 初手)。
+    public func forwardHiddenPrefetchWhole(_ ids: MLXArray, caches: [LayerCache], priorInds: [[Int]]?, isLin: [Bool])
+        throws -> (hidden: MLXArray, logits: MLXArray, esc: Int) {
+        let L = numLayers
+        let trim = ids.dim(1)
+        // 背景 prefetch（前トークン inds を全層先行 ensure）
+        let sem = (0 ..< L).map { _ in DispatchSemaphore(value: 0) }
+        if let pi = priorInds {
+            let q = DispatchQueue(label: "qwisp.prefetch")
+            q.async { [expertCaches] in
+                for i in 0 ..< L { _ = expertCaches[i].ensure(pi[i]); sem[i].signal() }
+            }
+        } else {
+            for i in 0 ..< L { sem[i].signal() }   // prior 無し＝prefetch せず（全層 miss→escalate=実質 sync）
+        }
+        let snaps = caches.map { $0.snapshot() }
+        StreamingMoEBlock.captureInds = true      // 当 token の実 routing を lastInds に残す
+        var h = embed(ids)
+        var hInputs: [MLXArray] = []; var perLayerMiss: [MLXArray] = []
+        let nosync = priorInds != nil
+        for i in 0 ..< L {
+            sem[i].wait()                         // 背景が層 i を ensure 済（CPU-CPU 同期, GPU 非 barrier）
+            hInputs.append(h)
+            StreamingMoEBlock.hotMissAccum = nil
+            StreamingMoEBlock.probeNoSync = nosync
+            StreamingMoEBlock.countHotMiss = nosync
+            h = try layers[i](h, cache: caches[i])
+            perLayerMiss.append(StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0)))
+        }
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+        let hid0 = MLXFast.rmsNorm(h, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        let lg0 = headProj().apply(hid0)
+        // 単一 eval（per-layer miss + 全 cache state + lastInds + logits）
+        MLX.eval([lg0] + perLayerMiss + caches.flatMap { $0.stateArrays } + expertCaches.compactMap { $0.lastInds })
+        // 最初の miss 層を特定
+        var firstMiss = -1
+        if nosync { for i in 0 ..< L where perLayerMiss[i].item(Int32.self) != 0 { firstMiss = i; break } }
+        if firstMiss < 0 {
+            StreamingMoEBlock.captureInds = false
+            return (hid0, lg0, 0)                  // 全層 exact（no-sync が全常駐）
+        }
+        // escalate: miss 層以降を sync 再計算（cache 復元）。層 0..firstMiss-1 は resident＝exact, 保持。
+        for i in firstMiss ..< L { caches[i].restore(snaps[i], isLinear: isLin[i], trim: trim) }
+        var hh = hInputs[firstMiss]
+        for i in firstMiss ..< L { hh = try layers[i](hh, cache: caches[i]) }   // sync(ensure で miss ロード)
+        StreamingMoEBlock.captureInds = false
+        let hid = MLXFast.rmsNorm(hh, weight: store.req("language_model.model.norm.weight"), eps: eps)
+        let lg = headProj().apply(hid)
+        MLX.eval([lg] + caches.flatMap { $0.stateArrays } + expertCaches.compactMap { $0.lastInds })
+        return (hid, lg, L - firstMiss)
+    }
+
     /// layer-skip draft 用: skip に含まれる層は identity(計算ごと省略)。draft を計算ごと安くする。
     /// 注意: skip 層は cache を更新しないので draft state は近似（throwaway 前提）。
     public func forwardHiddenSkip(_ ids: MLXArray, caches: [LayerCache], skip: Set<Int>)
@@ -334,6 +390,87 @@ public enum StreamingDecode {
         return "[step0-resident] cold-start single-pass nl decode（\(ref), gen=\(N)）の per-layer 全常駐率"
             + "\n  #7 機構: per-layer 粒度で resident 層 no-sync / miss 層のみ sync。下の per-layer 率に比例して sync 削減。"
             + blocks
+    }
+
+    /// ★ issue#7 (c): forwardHiddenPrefetchWhole（背景 prefetch overlap + whole-token no-sync + escalate）の
+    /// 実 greedy decode 速度 + bit-exact + escalation を sync greedy と比較。env QWISP_RUN=prefetch-whole /
+    /// QWISP_RESID_REF(既定 long) / QWISP_CACHE_C(既定 128) / QWISP_GEN。
+    public static func runPrefetchWhole(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let ref = ProcessInfo.processInfo.environment["QWISP_RESID_REF"] ?? "/tmp/qwisp_long_ref.safetensors"
+        let r = try loadArrays(url: URL(fileURLWithPath: ref))
+        guard let promptArr = r["spec_prompt"] else { return "[prefetch-whole] spec_prompt 無し(\(ref))" }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "128") ?? 128
+        let genCap = (r["spec_greedy"]?.dim(0)) ?? 128
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, genCap)
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
+        defer {
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false
+            StreamingMoEBlock.captureInds = false; StreamingMoEBlock.captureK = 0
+        }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let isLin = model.isLinearFlags
+        let L = model.numLayers
+        func distinct(_ a: MLXArray?) -> [Int] {
+            guard let a = a else { return [] }
+            var seen = Set<Int>(); var u: [Int] = []
+            for e in a.asArray(Int32.self) { let v = Int(e); if seen.insert(v).inserted { u.append(v) } }
+            return u
+        }
+        // ── sync greedy 参照（exact, 真 token 列）──
+        func greedySync() throws -> (toks: [Int], tps: Double) {
+            let mc = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.captureInds = false
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1]); MLX.eval([u] + mc.flatMap { $0.stateArrays })
+            var toks: [Int] = []; let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(u, caches: mc)
+                u = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([u] + mc.flatMap { $0.stateArrays }); toks.append(u.item(Int.self))
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9))
+        }
+        let marginK = Int(ProcessInfo.processInfo.environment["QWISP_MARGIN_K"] ?? "8") ?? 8
+        // ── prefetch-whole greedy ──
+        func greedyPrefetch() throws -> (toks: [Int], tps: Double, esc: Double) {
+            let mc = model.makeCaches()
+            StreamingMoEBlock.captureInds = true
+            StreamingMoEBlock.captureK = marginK        // 前token top-marginK を hint に（churn 被覆）
+            var (_, lg) = try model.prefillChunked(ids, caches: mc)
+            MLX.eval([lg] + mc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+            var u = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1]); MLX.eval([u])
+            var priorInds: [[Int]]? = (0 ..< L).map { distinct(model.expertCaches[$0].lastInds) }   // prefill の routing を初手 hint
+            var toks: [Int] = []; var escTot = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< N {
+                let (_, plg, esc) = try model.forwardHiddenPrefetchWhole(u, caches: mc, priorInds: priorInds, isLin: isLin)
+                priorInds = (0 ..< L).map { distinct(model.expertCaches[$0].lastInds) }   // 当 token routing→次 hint
+                u = MLX.argMax(plg[0, 0], axis: -1).reshaped([1, 1]); MLX.eval([u]); toks.append(u.item(Int.self)); escTot += esc
+            }
+            return (toks, Double(N) / (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9), Double(escTot) / Double(N))
+        }
+        let sync = try greedySync()
+        let pf = try greedyPrefetch()
+        let match = zip(sync.toks, pf.toks).filter { $0 == $1 }.count
+        var firstDiv = N; for i in 0 ..< N where sync.toks[i] != pf.toks[i] { firstDiv = i; break }
+        let speedup = sync.tps > 0 ? pf.tps / sync.tps : 0
+        let tag = match == N ? "✅ bit-exact" : "❌ \(N-match)/\(N) 不一致(先頭#\(firstDiv))"
+        return String(format: """
+            [prefetch-whole] issue#7(c) 背景prefetch overlap + whole-token no-sync + escalate-from-first-miss
+              C=%d(≈%.1f GB) N=%d marginK=%d ref=%@
+              sync greedy(exact)     : %.1f tok/s
+              prefetch-whole         : %.1f tok/s  (escalate %.1f 層/token=%.0f%%)
+              → speedup=%.2fx  %@
+              機構: 前token inds を背景全層先行ensure(per-layer semaphore=GPU barrier無)、whole-token no-sync
+                    lazy(per-layer drain排除)→単一eval→miss層から sync再計算。per-layer headroom を per-token
+                    drain に畳めるか=#7 の勝ち筋検証。
+            """, C, Double(C) * Double(L) * 1.77 / 1000 + 4.0, N, marginK, (ref as NSString).lastPathComponent,
+            sync.tps, pf.tps, pf.esc, pf.esc / Double(L) * 100, speedup, tag)
     }
 
     /// margin 適応 fast decode: fast logits の top1-top2 gap が小さい(near-tie=harmful 候補)token

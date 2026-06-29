@@ -83,6 +83,7 @@ if CommandLine.arguments.contains("stream") {
         ("raw-moe-b",             { _, _ in RawMetalForward.runMoeBlockTestB() }),
         ("m1-floor",              { _, _ in RawMetalForward.runM1FloorProbe() }),
         ("step0-resident",        { try StreamingDecode.runResidencyProbe(modelDir: $0, refPath: $1) }),
+        ("prefetch-whole",        { try StreamingDecode.runPrefetchWhole(modelDir: $0, refPath: $1) }),
         ("moe-union",             { md, _ in try QwispModel.runMoeUnionProbe(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
