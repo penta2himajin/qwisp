@@ -2930,6 +2930,69 @@ public enum RawMetalForward {
             maxRel, sumRel/Double(B), maxRel < 5e-3 ? "✅ near" : "❌乖離", rows)
     }
 
+    /// ★ 悪あがき probe: M=1 routed gather(dominant)の実効メモリ帯域を **DRAM-cold(expert 回転) vs cache-hot** で
+    /// 計測し、ピーク帯域に対する % を出す。M=1 が帯域飽和か低 occupancy/latency 律速かを判定→カーネル最適化余地を確定。
+    /// env QWISP_RUN=m1-floor / QWISP_DEC0_REF / QWISP_PEAK_GBS(既定 400=M1 Max)。
+    public static func runM1FloorProbe() -> String {
+        guard let (device, queue) = ensure(), compileMoEB() else { return "[m1-floor] init 失敗" }
+        let refPath = ProcessInfo.processInfo.environment["QWISP_DEC0_REF"] ?? "/tmp/qwisp_dec0_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else { return "[m1-floor] ref 読込失敗" }
+        guard let swGW = r["switch_mlp.gate_proj.weight"], let swGS = r["switch_mlp.gate_proj.scales"], let swGB = r["switch_mlp.gate_proj.biases"],
+              let swUW = r["switch_mlp.up_proj.weight"], let swUS = r["switch_mlp.up_proj.scales"], let swUB = r["switch_mlp.up_proj.biases"],
+              let swDW = r["switch_mlp.down_proj.weight"], let swDS = r["switch_mlp.down_proj.scales"], let swDB = r["switch_mlp.down_proj.biases"]
+        else { return "[m1-floor] ref キー不足" }
+        let Hin = swGS.dim(-1) * 64, topK = 8, E = 256, I = swGW.dim(-2)
+        func wb(_ a: MLXArray) -> MTLBuffer { a.asMTLBuffer(device: device, noCopy: false)! }
+        func fb(_ a: MLXArray) -> MTLBuffer { a.asType(.float16).asMTLBuffer(device: device, noCopy: false)! }
+        func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        let gW = wb(swGW), gS = fb(swGS), gB = fb(swGB), uW = wb(swUW), uS = fb(swUS), uB = fb(swUB), dW = wb(swDW), dS = fb(swDS), dB = fb(swDB)
+        let bx = mk(Hin*2), hbuf = mk(topK*I*2), gOut = mk(topK*I*2), uOut = mk(topK*I*2), dOut = mk(topK*Hin*2), binds = mk(topK*4)
+        // x を適当に埋める
+        let xf = MLXRandom.normal([Hin]).asType(.float16).asArray(Float16.self)
+        bx.contents().bindMemory(to: Float16.self, capacity: Hin).update(from: xf, count: Hin)
+        hbuf.contents().bindMemory(to: Float16.self, capacity: topK*I).update(from: MLXRandom.normal([topK*I]).asType(.float16).asArray(Float16.self), count: topK*I)
+        let bp = binds.contents().bindMemory(to: Int32.self, capacity: topK)
+        func setInds(_ base: Int) { for k in 0..<topK { bp[k] = Int32((base*topK + k) % E) } }
+        func encGather(_ enc: MTLComputeCommandEncoder, _ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
+            enc.setComputePipelineState(_gqmmBPipeline!)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
+            var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0), kt = UInt32(topK)
+            enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: topK), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        // 1 call = g/u/d gather（8 expert 分の routed 重みロード）
+        func runOnce(_ base: Int) -> Double {
+            setInds(base)
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            encGather(enc, gW, gS, gB, bx, gOut, K: Hin, N: I, lhs: false)
+            encGather(enc, uW, uS, uB, bx, uOut, K: Hin, N: I, lhs: false)
+            encGather(enc, dW, dS, dB, hbuf, dOut, K: I, N: Hin, lhs: true)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        }
+        // bytes: 8 expert × 3 matmul × (4bit weight I*Hin/2) + scales/biases(f16, /64 group ×2)
+        let wBytes = Double(topK * 3) * Double(I*Hin) / 2.0
+        let sbBytes = Double(topK * 3) * Double(I) * Double(Hin/64) * 2.0 * 2.0
+        let totBytes = wBytes + sbBytes
+        let peak = Double(ProcessInfo.processInfo.environment["QWISP_PEAK_GBS"].flatMap { Double($0) } ?? 400)
+        // hot: 固定 expert(0..7) を繰返し→L2/SLC 滞留。cold: expert 回転(32 set=256 expert 全)→DRAM。
+        for _ in 0..<10 { _ = runOnce(0) }
+        var hot = 0.0; for _ in 0..<50 { hot += runOnce(0) }; hot /= 50
+        for i in 0..<10 { _ = runOnce(i % 32) }
+        var cold = 0.0; for i in 0..<64 { cold += runOnce(i % 32) }; cold /= 64
+        let hotBW = totBytes / (hot*1e-3) / 1e9, coldBW = totBytes / (cold*1e-3) / 1e9
+        return String(format: """
+            [m1-floor] M=1 routed gather(8 expert g/u/d, dominant)の実効帯域 ── 帯域飽和か latency 律速か
+              load/call=%.2f MB(weight %.2f+scale/bias %.2f)  ピーク帯域=%.0f GB/s(QWISP_PEAK_GBS)
+              cache-hot(固定expert): %.3f ms → 実効 %.0f GB/s(%.0f%% of peak)
+              DRAM-cold(expert回転): %.3f ms → 実効 %.0f GB/s(%.0f%% of peak)
+              → cold が peak に遠い(≪100%%)なら **帯域非飽和=低 occupancy/latency 律速→カーネルで MLP↑の余地**。
+                peak 近傍なら帯域床=量子化(低bit)以外に M=1 単流高速化の余地無し。
+            """, totBytes/1e6, wBytes/1e6, sbBytes/1e6, peak,
+            hot, hotBW, hotBW/peak*100, cold, coldBW, coldBW/peak*100)
+    }
+
     /// MoE block を raw kernel で forward（routing/combine は MLX glue, gather/swiglu/shared は raw, decode T=1）。
     /// runMoeBlockTest で bit-exact 検証済の経路を関数化（decoder layer 結線用）。x[1,H] → [1,H]。
     static func moeRawForward(_ x: MLXArray, gate: Proj, sharedGate: Proj,

@@ -81,6 +81,7 @@ if CommandLine.arguments.contains("stream") {
         ("continuous-run2",       { md, _ in try QwispModel.runContinuousRun2(modelDir: md) }),
         ("qmm4-tiled-bench",      { _, _ in RawMetalForward.qmm4TiledBench() }),
         ("raw-moe-b",             { _, _ in RawMetalForward.runMoeBlockTestB() }),
+        ("m1-floor",              { _, _ in RawMetalForward.runM1FloorProbe() }),
         ("moe-union",             { md, _ in try QwispModel.runMoeUnionProbe(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
