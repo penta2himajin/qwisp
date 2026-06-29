@@ -293,7 +293,7 @@ public final class QwispModel {
                     vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
                     oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
                     qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
-                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H)
+                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H, maxLen: gpuMaxLen)
             }
             return false
         }
@@ -365,14 +365,13 @@ public final class QwispModel {
     nonisolated(unsafe) var sharedGate8Cache: [Int: RawMetalForward.Gate8Buffers] = [:]
     nonisolated(unsafe) var gpuScratch: RawMetalForward.GPUScratch?
     nonisolated(unsafe) var gpuWarmed = false
+    nonisolated(unsafe) var gpuLayers: [RawMetalForward.GPULayer]?
+    nonisolated(unsafe) var gpuMaxLen = 2048      // decode KV cache 最大長（prompt+生成）
 
-    /// ★ all-GPU forward: embed/final norm/lm_head 以外を全 Metal、全40層を単一 command buffer で実行。
-    /// routing(qmm8+route_top8) は near-tie で lossless 検証済(route-decode-lossless)。decode T=1, cold state。
-    public func fusedRawForwardGPU(_ ids: MLXArray) -> MLXArray? {
-        let e = embed(ids); let H = e.dim(-1)
-        // 初回 warm: rawForward が GDN/attn/qmm/rms/conv/recur/rope/sdpa/gqmm を compile。
-        if !gpuWarmed { _ = rawForward(ids)?.eval(); gpuWarmed = true }
-        // 各層 buffer を ensure（GDN/attn/MoE/norm + gate8/sharedGate8）。
+    /// 全層 GPU buffer を ensure し [GPULayer] を構築（初回のみ, cache）。
+    func buildGPULayers(_ ids: MLXArray, _ H: Int) -> [RawMetalForward.GPULayer]? {
+        if !gpuWarmed { _ = rawForward(ids)?.eval(); gpuWarmed = true }   // 標準 kernel compile
+        if let cached = gpuLayers { return cached }
         var layers: [RawMetalForward.GPULayer] = []
         for i in 0 ..< numLayers {
             let isGDN = ensureFusedBuffers(i, H: H)
@@ -389,11 +388,43 @@ public final class QwispModel {
                 nw: nw, gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i],
                 moe: moe, gate: g8, sharedGate: sg8))
         }
+        gpuLayers = layers
+        return layers
+    }
+
+    /// GDN conv cache / recurrent state を 0 リセット（新シーケンス開始時）。KV cache は write-before-read で不要。
+    func resetGPUState() {
+        for (_, b) in gdnBufCache {
+            memset(b.convInput.contents(), 0, b.convKernel * b.convDim * 2)
+            memset(b.stateBuf.contents(), 0, b.Hv * b.Dv * b.Dk * 4)
+        }
+    }
+
+    /// ★ all-GPU forward: embed/final norm/lm_head 以外を全 Metal、全40層を単一 command buffer で実行。
+    /// routing(qmm8+route_top8) は near-tie で lossless 検証済(route-decode-lossless)。cold state T=1（benchmark）。
+    public func fusedRawForwardGPU(_ ids: MLXArray) -> MLXArray? {
+        let e = embed(ids); let H = e.dim(-1)
+        guard let layers = buildGPULayers(ids, H) else { return nil }
         if gpuScratch == nil { gpuScratch = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
         if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         RawMetalForward.writeBuffer(hb, e, H)
         RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps)
+        let h = RawMetalForward.readBuffer(hb, H)
+        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        return headProj().apply(fn.reshaped([1, 1, H]))
+    }
+
+    /// ★ all-GPU **decode 1 step**: token を pos に投入（GDN state feedback + KV cache）。logits[1,1,vocab]。
+    /// 事前に buildGPULayers + resetGPUState（シーケンス先頭）が必要。
+    public func fusedDecodeStepGPU(_ tokenId: Int32, pos: Int, H: Int) -> MLXArray? {
+        guard let layers = gpuLayers else { return nil }
+        if gpuScratch == nil { gpuScratch = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
+        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        guard let hb = hBuf, let sc = gpuScratch else { return nil }
+        let e = embed(MLXArray([tokenId], [1, 1]))
+        RawMetalForward.writeBuffer(hb, e, H)
+        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps, decode: true, pos: pos)
         let h = RawMetalForward.readBuffer(hb, H)
         guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))
@@ -685,6 +716,59 @@ public final class QwispModel {
             \(line("routing=Metal", met))
               → Metal の『真の乖離』が MLX と同数なら、routing 差は fidelity を悪化させず＝プロジェクト基準で lossless 同等（多層融合 GO）。
             """
+    }
+
+    /// ★ task#9: all-GPU decode path（GDN state feedback + KV cache）の lossless 検証 + tok/s。
+    /// teacher-forced で mlx_lm(spec_greedy)参照に rank 比較。env QWISP_RUN=decode-gpu / QWISP_GEN。
+    public static func runDecodeGPULossless(modelDir: String, refPath: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        let model = QwispModel(store: store)
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)),
+              let pa = r["spec_prompt"], let gRefArr = r["spec_greedy"] else {
+            return "[decode-gpu] skip: spec_prompt/spec_greedy 無し \(refPath)"
+        }
+        let prompt = pa.asType(.int32).asArray(Int32.self)
+        let gR = gRefArr.asArray(Int32.self).map { Int($0) }
+        let N = Swift.min(ProcessInfo.processInfo.environment["QWISP_GEN"].flatMap { Int($0) } ?? 64, gR.count)
+        let H = model.embed(MLXArray([Int32(0)], [1, 1])).dim(-1)
+        guard model.buildGPULayers(MLXArray([Int32(1)], [1, 1]), H) != nil else { return "[decode-gpu] build 失敗" }
+        // 1. teacher-forced fidelity（vs mlx_lm）
+        model.resetGPUState()
+        var pos = 0; var v: MLXArray? = nil
+        for t in prompt { v = model.fusedDecodeStepGPU(t, pos: pos, H: H); pos += 1 }
+        var match = 0, near = 0, tru = 0; var ex: [String] = []
+        func record(_ i: Int, _ lg: MLXArray) {
+            let vv = lg.reshaped([lg.size]); let pred = MLX.argMax(vv).item(Int.self)
+            if pred == gR[i] { match += 1; return }
+            let rank = MLX.sum(vv .> vv[gR[i]]).item(Int.self)
+            if rank <= 2 { near += 1 } else { tru += 1 }
+            if ex.count < 8 { ex.append("p\(i):pred=\(pred) ref=\(gR[i])(rank\(rank))") }
+        }
+        if let v0 = v { record(0, v0) }
+        for i in 0 ..< (N - 1) {
+            guard let lg = model.fusedDecodeStepGPU(Int32(gR[i]), pos: pos, H: H) else { break }
+            lg.eval(); pos += 1; record(i + 1, lg)
+        }
+        // 2. tok/s（free-running greedy 32 step, prompt 既 prefill 済の state を作り直して計測）
+        model.resetGPUState(); pos = 0; var last: MLXArray? = nil
+        for t in prompt { last = model.fusedDecodeStepGPU(t, pos: pos, H: H); pos += 1 }
+        last?.eval()
+        var cur = Int32(MLX.argMax(last!.reshaped([last!.size])).item(Int.self))
+        let t0 = DispatchTime.now()
+        let steps = 32
+        for _ in 0 ..< steps {
+            guard let lg = model.fusedDecodeStepGPU(cur, pos: pos, H: H) else { break }
+            cur = Int32(MLX.argMax(lg.reshaped([lg.size])).item(Int.self)); pos += 1
+        }
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        let tokps = Double(steps) / secs
+        return String(format: """
+            [decode-gpu] all-GPU decode（GDN state feedback + KV cache）prompt T=\(prompt.count), N=\(N)
+              lossless（teacher-forced vs mlx_lm, near-tie rank≤2 許容）: argmax %d/%d=%.1f%% 不一致%d（near-tie %d, 真の乖離 %d）
+              %@
+              tok/s（free-running greedy 32 step）: %.1f tok/s (%.1f ms/tok)
+            """, match, N, Double(match)/Double(N)*100, N - match, near, tru,
+            ex.isEmpty ? "(完全一致)" : "first: " + ex.joined(separator: " | "), tokps, secs/Double(steps)*1000)
     }
 
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。

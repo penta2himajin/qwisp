@@ -528,6 +528,8 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _residAddPipeline: MTLComputePipelineState?     // 層融合: h += r（residual stream f16）
     nonisolated(unsafe) static var _sharedGate8Pipeline: MTLComputePipelineState?  // all-GPU MoE: shared gate scalar
     nonisolated(unsafe) static var _finalCombinePipeline: MTLComputePipelineState? // all-GPU MoE: y+gateScale*sharedY
+    nonisolated(unsafe) static var _shiftConvPipeline: MTLComputePipelineState?    // GDN decode: conv cache shift
+    nonisolated(unsafe) static var _writeKVPipeline: MTLComputePipelineState?      // attn decode: KV cache 散布
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -651,6 +653,22 @@ public enum RawMetalForward {
             if (i >= H) return;
             combined[i] = y[i] + gateScale[0] * sharedY[i];
         }
+        // shift_conv（GDN decode）: conv cache を 1 行上シフト（最古を捨て新トークン分を空ける）。
+        //   thread=列 c（race-free: 各 thread 自分の列の K 行を昇順 read/write）。その後 qkv が row(K-1)を書く。
+        kernel void shift_conv(device half* conv [[buffer(0)]], constant uint& K [[buffer(1)]],
+                               constant uint& C [[buffer(2)]], uint c [[thread_position_in_grid]]) {
+            if (c >= C) return;
+            for (uint j = 0; j + 1 < K; j++) conv[j*C + c] = conv[(j+1)*C + c];
+        }
+        // write_kv（attention decode）: src[KV, D] を cache[KV, maxLen, D] の seq 位置 pos に散布。
+        kernel void write_kv(device const half* src [[buffer(0)]], device half* cache [[buffer(1)]],
+                             constant uint& KV [[buffer(2)]], constant uint& D [[buffer(3)]],
+                             constant uint& maxLen [[buffer(4)]], constant uint& pos [[buffer(5)]],
+                             uint i [[thread_position_in_grid]]) {
+            if (i >= KV * D) return;
+            uint h = i / D, d = i % D;
+            cache[h * maxLen * D + pos * D + d] = src[h * D + d];
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -666,6 +684,8 @@ public enum RawMetalForward {
             _residAddPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "resid_add")!)
             _sharedGate8Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shared_gate8")!)
             _finalCombinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine")!)
+            _shiftConvPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shift_conv")!)
+            _writeKVPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "write_kv")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -1263,7 +1283,7 @@ public enum RawMetalForward {
 
     /// GDN 1 層の kernel chain を既存 encoder に encode（b.bx → b.outBuf）。input_norm/residual/post_norm は含まない。
     /// gdnLayerSingleEncoder（単体）と fusedDecoderLayer（層融合）で共有する単一ソース。
-    static func encodeGDNBody(_ enc: MTLComputeCommandEncoder, _ b: GDNBuffers, eps: Float) {
+    static func encodeGDNBody(_ enc: MTLComputeCommandEncoder, _ b: GDNBuffers, eps: Float, decode: Bool = false) {
         let qp = _qmmPipeline!, rp = _rmsPipeline!, cp = _conv1dPipeline!, rcp = _recurPipeline!
         let cgb = _cgbPipeline!, gp = _gatePipeline!, scp = _scalePipeline!
         let H = b.H, keyDim = b.keyDim, valueDim = b.valueDim, convDim = b.convDim
@@ -1296,6 +1316,13 @@ public enum RawMetalForward {
             enc.setBuffer(xb, offset: 0, index: 0); enc.setBytes(&ss, length: 4, index: 1); enc.setBytes(&tt, length: 4, index: 2)
             enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(scp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
+        // ⓪ decode: conv cache を 1 行上シフト（最古を捨てる）。cold(prefill 先頭)は memset 済ゆえ不要。
+        if decode {
+            enc.setComputePipelineState(_shiftConvPipeline!)
+            enc.setBuffer(convInput, offset: 0, index: 0)
+            var kk = UInt32(convKernel), cc = UInt32(convDim); enc.setBytes(&kk, length: 4, index: 1); enc.setBytes(&cc, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: convDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_shiftConvPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
         // ① in_proj 4 本。qkv は convInput の row(K-1) に直接書く（zero-pad は memset 済）。
         encQmm(b.bQkvW, b.bQkvS, b.bQkvB, bx, xoff: 0, convInput, yoff: (convKernel - 1) * convDim * 2, K: H, N: convDim)
         encQmm(b.bZW, b.bZS, b.bZB, bx, xoff: 0, zBuf, yoff: 0, K: H, N: valueDim)
@@ -1323,7 +1350,9 @@ public enum RawMetalForward {
         enc.setBuffer(qN, offset: 0, index: 0); enc.setBuffer(kN, offset: 0, index: 1); enc.setBuffer(convOut, offset: 2 * keyDim * 2, index: 2)
         enc.setBuffer(gBuf, offset: 0, index: 3); enc.setBuffer(betaBuf, offset: 0, index: 4); enc.setBuffer(stateBuf, offset: 0, index: 5)
         var tt = Int32(1); enc.setBytes(&tt, length: 4, index: 6)
-        enc.setBuffer(coreOut, offset: 0, index: 7); enc.setBuffer(stateOut, offset: 0, index: 8)
+        // decode は state を in-place 更新（stateBuf を out にも＝次トークンへ feedback。recurrent は register に
+        // state を読んでから書くので in-place 安全）。cold は別 stateOut（毎回独立）。
+        enc.setBuffer(coreOut, offset: 0, index: 7); enc.setBuffer(decode ? stateBuf : stateOut, offset: 0, index: 8)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: Hv), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         // ⑥ RMSNormGated: rmsNorm(promote=normF32) → gate(normF32 で f32/f16 版)
         encRms(coreOut, xoff: 0, bNormW, normed, rows: Hv, D: Dv, promote: b.normF32)
@@ -1442,12 +1471,12 @@ public enum RawMetalForward {
     /// mixer-half を encoder に encode（CB/commit 無し, postNorm は postNormBuf に残る）。多層 1-CB 用。
     static func encodeMixerHalf(_ enc: MTLComputeCommandEncoder, hBuf: MTLBuffer, nw: NormWeightBuffers,
                                 postNormBuf: MTLBuffer, gdn: GDNBuffers?, attn: AttnBuffers?, H: Int, eps: Float,
-                                pendingResid: MTLBuffer?) {
+                                pendingResid: MTLBuffer?, decode: Bool = false, pos: Int = 0) {
         if let pr = pendingResid { encodeResidAdd(enc, h: hBuf, r: pr, total: H) }
         let mixerBx: MTLBuffer, mixerOut: MTLBuffer
         if let g = gdn { mixerBx = g.bx; mixerOut = g.outBuf } else { mixerBx = attn!.bx; mixerOut = attn!.outBuf }
         encodeRms(enc, src: hBuf, w: nw.inputNormW, out: mixerBx, D: H, eps: eps)
-        if let g = gdn { encodeGDNBody(enc, g, eps: eps) } else { encodeAttnBody(enc, attn!) }
+        if let g = gdn { encodeGDNBody(enc, g, eps: eps, decode: decode) } else { encodeAttnBody(enc, attn!, decode: decode, pos: pos) }
         encodeResidAdd(enc, h: hBuf, r: mixerOut, total: H)
         encodeRms(enc, src: hBuf, w: nw.postNormW, out: postNormBuf, D: H, eps: eps)
     }
@@ -1527,12 +1556,13 @@ public enum RawMetalForward {
     ///   per-layer waitUntilCompleted を排除（GPU が層間 pipeline）。embed→hBuf 書込み済前提、hBuf に結果。
     ///   各層 MoE residual は次層 mixer 先頭で hBuf に畳む（pendingResid=scratch.combined）。最終層は末尾 flush。
     static func fusedForwardGPU(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
-                                H: Int, E: Int, K: Int, eps: Float) {
+                                H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0) {
         guard let (_, queue) = ensure() else { return }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         for (i, L) in layers.enumerated() {
             encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
-                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined)
+                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined,
+                            decode: decode, pos: pos)
             encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
                          sharedGateW: L.sharedGate, H: H, E: E, K: K)
         }
@@ -1747,18 +1777,20 @@ public enum RawMetalForward {
 
     /// attention 計算の常駐 buffer（重み＋中間＝一度だけ確保）。decode S=1, cold cache, f16 経路。
     struct AttnBuffers {
-        let H, numHeads, numKV, headDim, qd2, ropeDim: Int
+        let H, numHeads, numKV, headDim, qd2, ropeDim, maxLen: Int
         let ropeBase, scale, eps: Float
         let bx: MTLBuffer
         let qW, qS, qB, kW, kS, kB, vW, vS, vB, oW, oS, oB, qNormW, kNormW: MTLBuffer
         let qOut, keys, values, queries, qN, kN, qRot, kRot, attnOut, gated, outBuf: MTLBuffer
+        let kCache, vCache: MTLBuffer   // decode 用 KV cache [numKV, maxLen, headDim]（post-RoPE k / raw v）
     }
 
     /// attn 重み・中間 buffer を一度だけ確保（GDN SE と同型）。real model は q/k_norm F16 → f16 経路のみ。
+    /// maxLen>0 で decode 用 KV cache を確保（prefill+生成の最大長）。
     static func prepareAttnBuffers(_ w: AttnRawWeights,
                                    numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
                                    ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6,
-                                   H: Int = 2048) -> AttnBuffers? {
+                                   H: Int = 2048, maxLen: Int = 0) -> AttnBuffers? {
         guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
         let qd2 = 2 * headDim
         func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { a.asType(t).asMTLBuffer(device: device, noCopy: false) }
@@ -1770,15 +1802,17 @@ public enum RawMetalForward {
               let qNormW = mtl(w.qNorm, .float16), let kNormW = mtl(w.kNorm, .float16)
         else { print("[raw-attn-se] weight buffer nil"); return nil }
         let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
+        let cacheLen = max(1, maxLen)
         return AttnBuffers(
-            H: H, numHeads: numHeads, numKV: numKV, headDim: headDim, qd2: qd2, ropeDim: ropeDim,
+            H: H, numHeads: numHeads, numKV: numKV, headDim: headDim, qd2: qd2, ropeDim: ropeDim, maxLen: cacheLen,
             ropeBase: ropeBase, scale: Float(pow(Double(headDim), -0.5)), eps: eps,
             bx: mk(H * 2),
             qW: qW, qS: qS, qB: qB, kW: kW, kS: kS, kB: kB, vW: vW, vS: vS, vB: vB, oW: oW, oS: oS, oB: oB,
             qNormW: qNormW, kNormW: kNormW,
             qOut: mk(qDim * 2), keys: mk(kvDim * 2), values: mk(kvDim * 2), queries: mk(vDim * 2),
             qN: mk(vDim * 2), kN: mk(kvDim * 2), qRot: mk(vDim * 2), kRot: mk(kvDim * 2),
-            attnOut: mk(vDim * 2), gated: mk(vDim * 2), outBuf: mk(H * 2))
+            attnOut: mk(vDim * 2), gated: mk(vDim * 2), outBuf: mk(H * 2),
+            kCache: mk(numKV * cacheLen * headDim * 2), vCache: mk(numKV * cacheLen * headDim * 2))
     }
 
     /// ★ attention 1 層を **単一 command buffer + 単一 encoder** で連結（GDN SE 同型）。decode S=1, cold cache, f16。
@@ -1806,7 +1840,8 @@ public enum RawMetalForward {
     }
 
     /// attention 1 層の kernel chain を既存 encoder に encode（b.bx → b.outBuf）。input_norm/residual/post_norm 非含。
-    static func encodeAttnBody(_ enc: MTLComputeCommandEncoder, _ b: AttnBuffers) {
+    /// decode=true: RoPE offset=pos, post-RoPE k と raw v を KV cache(seq pos)に書き SDPA を N=pos+1 で。
+    static func encodeAttnBody(_ enc: MTLComputeCommandEncoder, _ b: AttnBuffers, decode: Bool = false, pos: Int = 0) {
         let qp = _qmmPipeline!, rp = _rmsPipeline!, rope = _ropePipeline!, sdpa = _sdpaPipeline!
         let exq = _extractQPipeline!, sgm = _sigmoidMulPipeline!
         let H = b.H, numHeads = b.numHeads, numKV = b.numKV, headDim = b.headDim, qd2 = b.qd2
@@ -1829,11 +1864,19 @@ public enum RawMetalForward {
         func encRope(_ xb: MTLBuffer, _ ob: MTLBuffer, rows: Int) {
             enc.setComputePipelineState(rope)
             enc.setBuffer(xb, offset: 0, index: 0); enc.setBuffer(ob, offset: 0, index: 1)
-            var hd = UInt32(headDim), rd = UInt32(b.ropeDim), base = b.ropeBase, pos = Float(0)
+            var hd = UInt32(headDim), rd = UInt32(b.ropeDim), base = b.ropeBase, p = Float(pos)   // decode: offset=pos
             enc.setBytes(&hd, length: 4, index: 2); enc.setBytes(&rd, length: 4, index: 3)
-            enc.setBytes(&base, length: 4, index: 4); enc.setBytes(&pos, length: 4, index: 5)
+            enc.setBytes(&base, length: 4, index: 4); enc.setBytes(&p, length: 4, index: 5)
             let total = rows * headDim, tgw = min(rope.maxTotalThreadsPerThreadgroup, 256)
             enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        }
+        func encWriteKV(_ src: MTLBuffer, _ cache: MTLBuffer) {
+            enc.setComputePipelineState(_writeKVPipeline!)
+            enc.setBuffer(src, offset: 0, index: 0); enc.setBuffer(cache, offset: 0, index: 1)
+            var kv = UInt32(numKV), d = UInt32(headDim), ml = UInt32(b.maxLen), p = UInt32(pos)
+            enc.setBytes(&kv, length: 4, index: 2); enc.setBytes(&d, length: 4, index: 3)
+            enc.setBytes(&ml, length: 4, index: 4); enc.setBytes(&p, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: numKV * headDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_writeKVPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
         func encElem(_ p: MTLComputePipelineState, _ total: Int, _ bind: () -> Void) {
             enc.setComputePipelineState(p); bind()
@@ -1851,15 +1894,18 @@ public enum RawMetalForward {
         }
         encRms(b.queries, b.qNormW, b.qN, rows: numHeads, D: headDim)
         encRms(b.keys, b.kNormW, b.kN, rows: numKV, D: headDim)
-        // ③ RoPE（offset 0）
+        // ③ RoPE（decode: offset=pos）。decode は post-RoPE k と raw v を KV cache(seq pos)へ。
         encRope(b.qN, b.qRot, rows: numHeads)
         encRope(b.kN, b.kRot, rows: numKV)
-        // ④ SDPA（S=1, cold cache）
+        if decode { encWriteKV(b.kRot, b.kCache); encWriteKV(b.values, b.vCache) }
+        // ④ SDPA。cold: N=1（kRot/values）。decode: N=pos+1（kCache/vCache, head_stride=maxLen*D）。
+        let keysBuf = decode ? b.kCache : b.kRot, valsBuf = decode ? b.vCache : b.values
+        let seqStrideDim = decode ? b.maxLen * headDim : headDim
         enc.setComputePipelineState(sdpa)
-        enc.setBuffer(b.qRot, offset: 0, index: 0); enc.setBuffer(b.kRot, offset: 0, index: 1)
-        enc.setBuffer(b.values, offset: 0, index: 2); enc.setBuffer(b.attnOut, offset: 0, index: 3)
-        var gqa = Int32(numHeads / numKV), nn = Int32(1), khs = Int32(headDim), kss = Int32(headDim)
-        var vhs = Int32(headDim), vss = Int32(headDim), sc = b.scale
+        enc.setBuffer(b.qRot, offset: 0, index: 0); enc.setBuffer(keysBuf, offset: 0, index: 1)
+        enc.setBuffer(valsBuf, offset: 0, index: 2); enc.setBuffer(b.attnOut, offset: 0, index: 3)
+        var gqa = Int32(numHeads / numKV), nn = Int32(decode ? pos + 1 : 1), khs = Int32(seqStrideDim), kss = Int32(headDim)
+        var vhs = Int32(seqStrideDim), vss = Int32(headDim), sc = b.scale
         enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&nn, length: 4, index: 5)
         enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
         enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9); enc.setBytes(&sc, length: 4, index: 10)
