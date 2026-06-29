@@ -1075,17 +1075,21 @@ public final class QwispModel {
                 if convs.allSatisfy({ $0 != nil }) { gdnCaches[i].gdn.convState = MLX.concatenated(convs.map { $0! }, axis: 0) }
             } else { for b in 0..<B { attnKV[i][b] = pf[b][i].kv } }
         }
-        let tC0 = now()
+        let tC0 = now(); var prefillMs = 0.0, decodeSteps = 0; var activeAcc = 0
         while done < N {
+            let ts = now()
             let lg = model.forwardContinuous(MLXArray(cur, [B,1]), positions: positions, gdnCaches: gdnCaches, attnKV: attnKV)
             let nx = MLX.argMax(lg[0..., 0], axis: -1); nx.eval()
             MLX.eval(gdnCaches.flatMap { $0.stateArrays })
+            decodeSteps += 1; _ = ts
+            activeAcc += (0..<B).filter { slotReq[$0] >= 0 }.count   // この step の active(非idle) slot 数
             let nxA = nx.asArray(Int32.self)
             for b in 0..<B { cur[b]=nxA[b]; positions[b] += 1; slotRemain[b] -= 1 }
             // 完了 slot を補充
             for b in 0..<B where slotRemain[b] <= 0 && slotReq[b] >= 0 {
                 done += 1; slotReq[b] = -1
                 if nextReq < N {
+                    let tp = now()
                     let (c, t, pl) = prefillSlot(nextReq)
                     for i in 0..<L {
                         if model.isLinear(i) {
@@ -1093,11 +1097,13 @@ public final class QwispModel {
                             if let cv = c[i].gdn.convState, gdnCaches[i].gdn.convState != nil { gdnCaches[i].gdn.convState![b] = cv.squeezed(axis: 0) }
                         } else { attnKV[i][b] = c[i].kv }
                     }
+                    prefillMs += now() - tp
                     slotReq[b]=nextReq; slotRemain[b]=reqGens[nextReq]; positions[b]=pl; cur[b]=t; nextReq += 1
                 } else { slotRemain[b] = Int.max }   // queue 空＝この slot は idle（active 数減）
             }
         }
         let contMs = now() - tC0
+        let avgActive = Double(activeAcc) / Double(max(1, decodeSteps))
         // ── (a) static-wave: B 本ずつ、wave 内最長 gen まで全 slot 回す（finished idle）。
         let tS0 = now(); var i = 0
         while i < N {
@@ -1114,8 +1120,11 @@ public final class QwispModel {
         return String(format: """
             [continuous-run] B=%d, N=%d req(可変 gen), total %d tok ── 実走 continuous vs static
               continuous: %.1f s, %.1f tok/s   static-wave: %.1f s, %.1f tok/s   → 利得 %.2fx
-              （continuous=slot 即補充で常時満杯, static=wave で最長 gen を待ち短 req idle）
-            """, B, N, totTok, contMs/1000, Double(totTok)/contMs*1000, statMs/1000, Double(totTok)/statMs*1000, statMs/contMs)
+              ★内訳: continuous %d decode-step, prefill %.1f s(%.0f%%), 平均 active slot %.1f/%d
+                （定常 decode rate ≈ %.1f tok/s。差は prefill(同期 %d 回)+末尾 idle slot(平均 active<%d)）
+            """, B, N, totTok, contMs/1000, Double(totTok)/contMs*1000, statMs/1000, Double(totTok)/statMs*1000, statMs/contMs,
+            decodeSteps, prefillMs/1000, prefillMs/contMs*100, avgActive, B,
+            Double(totTok)/((contMs-prefillMs)/1000), N, B)
     }
 
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
