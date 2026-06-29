@@ -2899,22 +2899,35 @@ public enum RawMetalForward {
         let got = MLXArray(Array(UnsafeBufferPointer(start: cp, count: B*Hin)), [B, Hin])
         var maxRel = 0.0, sumRel = 0.0
         for b in 0..<B { let rel = Double(relErr(got[b..<(b+1), 0...].reshaped([Hin]), ref[b..<(b+1), 0...].reshaped([Hin]))); maxRel = max(maxRel, rel); sumRel += rel }
-        // ── amortization カーブ（同一カーネルで B=1,2,4,8 の GPU-exec/token）──
-        func timeFor(_ Bv: Int) -> Double {
+        // ── ★crux: raw M=B 1-CB vs MLX MoEBlock を **wall-clock**(CPU-encode 込=raw の主張エッジ)で同一 B 比較。
+        //   B∈{1,8,24,32}: 8/32=continuous batching, 24≈SuffixSpec maxK(verify=M=K forward)。
+        //   wall を使う理由: raw のエッジは per-dispatch(CPU-encode)除去。GPU-exec 単体では隠れる。
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+        func rawWall(_ Bv: Int) -> Double {
             let mb = makeBuf(Bv, makeX(Bv))
-            for _ in 0..<5 { _ = runB(mb) }
-            var ms = 0.0; for _ in 0..<30 { ms += runB(mb) }; return ms/30
+            for _ in 0..<10 { _ = runB(mb) }
+            let t0 = now(); for _ in 0..<50 { _ = runB(mb) }; return (now()-t0)/50
         }
-        let t1 = timeFor(1), t2 = timeFor(2), t4 = timeFor(4), t8 = timeFor(8)
+        func mlxWall(_ Bv: Int) -> Double {
+            let x = makeX(Bv)
+            for _ in 0..<10 { let y = blk(x); y.eval() }
+            let t0 = now(); for _ in 0..<50 { let y = blk(x); y.eval() }; return (now()-t0)/50
+        }
+        let Bs = [1, 8, 24, 32]
+        var rows = ""
+        for bv in Bs {
+            let rw = rawWall(bv), mw = mlxWall(bv)
+            rows += String(format: "\n   B=%2d: raw %.3fms(%.3f/tok)  MLX %.3fms(%.3f/tok)  → raw/MLX %.2f× %@",
+                           bv, rw, rw/Double(bv), mw, mw/Double(bv), rw/mw, rw < mw ? "✅raw勝" : "❌MLX勝")
+        }
         return String(format: """
-            [raw-moe-b] M=B MoE block all-GPU（gate/route/experts/combine/shared/final 全 raw, 単一 CB）vs MLX MoEBlock
+            [raw-moe-b] M=B MoE block: raw all-GPU 1-CB vs MLX MoEBlock（wall-clock=CPU-encode 込）
               workload=%@  routed=%@  E=%d topK=%d Hin=%d I=%d
               correctness(B=8) per-token rel: max=%.3e mean=%.3e %@（near-tie 基準）
-              GPU-exec 償却カーブ: B=1 %.3fms(%.3f/tok) | B=2 %.3fms(%.3f/tok) | B=4 %.3fms(%.3f/tok) | B=8 %.3fms(%.3f/tok)
-              → B=8/B=1 = %.2f×（理想 8×, 8/比 = %.2f× の実効 amortize）
+              ★crux(独自カーネル+batching/SuffixSpec の go/no-go): raw が MLX に勝てるか%@
+              → raw のエッジ(dispatch 除去)は B↑ で MLX が dispatch 償却するほど薄れる。raw/MLX<1 の B でのみ独自カーネル有効。
             """, similar ? "similar(共有+ノイズ)" : "diverse(独立)", grouped ? "Stage B union grouping" : "Stage A per-(b,k)", E, topK, Hin, I,
-            maxRel, sumRel/Double(B), maxRel < 5e-3 ? "✅ near" : "❌乖離",
-            t1, t1, t2, t2/2, t4, t4/4, t8, t8/8, t8/t1, 8.0/(t8/t1))
+            maxRel, sumRel/Double(B), maxRel < 5e-3 ? "✅ near" : "❌乖離", rows)
     }
 
     /// MoE block を raw kernel で forward（routing/combine は MLX glue, gather/swiglu/shared は raw, decode T=1）。
