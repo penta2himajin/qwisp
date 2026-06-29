@@ -914,6 +914,63 @@ public final class QwispModel {
         return out
     }
 
+    /// ★ issue#6 #1: continuous(ragged) vs static batching の throughput 利得を**実測 per-B コスト駆動で定量化**。
+    /// 可変 gen 長の workload で、static(wave で最長 gen を待つ＝finished slot idle)と continuous(slot を即埋め)を
+    /// 実 decode ms(B) で simulate。利得が大なら本実装(per-stream RoPE/mask)の価値確定。env QWISP_RUN=continuous-sim。
+    public static func runContinuousSim(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let model = QwispModel(store: store)
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        // 1. ms(B) 実測（batched decode step）
+        var msB: [Int: Double] = [:]
+        let Bs = [1, 2, 4, 8, 16]
+        for B in Bs {
+            let pid = MLXArray((0 ..< B*4).map { Int32(($0 * 97 + 3) % 100000) }, [B, 4])
+            let caches = model.makeCaches()
+            var lg = model(pid, caches: caches)
+            var nxt = MLX.argMax(lg[0..., 3], axis: -1).reshaped([B, 1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays })
+            for _ in 0..<3 { lg = model(nxt, caches: caches); nxt = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays }) }
+            let steps = 12; let t0 = now()
+            for _ in 0..<steps { lg = model(nxt, caches: caches); nxt = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays }) }
+            msB[B] = (now()-t0)/Double(steps)
+        }
+        // 2. workload: N requests、gen 長は可変（決定論的 LCG, 16..160 の歪み分布）。
+        let N = 256
+        var gens: [Int] = []; var seed: UInt64 = 12345
+        for _ in 0..<N { seed = seed &* 6364136223846793005 &+ 1; let r = Double((seed >> 33) & 0xFFFF) / 65535.0
+            gens.append(16 + Int(pow(r, 2.2) * 144)) }   // 歪み（多くは短く、少数が長い）
+        let totalTok = gens.reduce(0, +)
+        // 3. simulate: static-wave vs continuous（同一 B で比較）。ms(B) を per-step コストに使用。
+        func simStatic(_ B: Int) -> Double {   // wave ごとに最長 gen を全 slot が待つ
+            var t = 0.0; var i = 0
+            while i < N { let wave = Array(gens[i ..< Swift.min(i+B, N)]); t += Double(wave.max()!) * msB[B]!; i += B }
+            return t
+        }
+        func simContinuous(_ B: Int) -> Double {  // B slot を常に埋める＝総 token-step / B（端数は減衰）
+            // 到着順に slot へ。各 step で active slot 数だけ進む。finished は即 queue から補充。
+            var t = 0.0; var queue = gens; var slots: [Int] = []   // slot は残り step 数
+            var qi = 0
+            while !slots.isEmpty || qi < queue.count {
+                while slots.count < B && qi < queue.count { slots.append(queue[qi]); qi += 1 }
+                let active = slots.count
+                t += msB[active] ?? msB[B]!            // active 数に応じた step コスト（埋まってれば ms(B)）
+                slots = slots.map { $0 - 1 }.filter { $0 > 0 }
+            }
+            return t
+        }
+        var out = "[continuous-sim] continuous vs static batching 利得（実測 ms(B) 駆動, N=\(N) req, total \(totalTok) tok）\n"
+        out += "  実測 ms/step: " + Bs.map { "B\($0)=\(String(format: "%.0f", msB[$0]!))" }.joined(separator: " ") + "\n"
+        out += "  B    static(s)  continuous(s)  利得   static tok/s  continuous tok/s\n"
+        for B in [4, 8, 16] {
+            let st = simStatic(B)/1000, co = simContinuous(B)/1000
+            out += String(format: "  %-4d %9.1f %13.1f %6.2fx %12.0f %16.0f\n",
+                          B, st, co, st/co, Double(totalTok)/st, Double(totalTok)/co)
+        }
+        out += "  → 利得が大なら continuous 本実装(per-stream RoPE/mask + slot 即補充)の価値確定。static は短 req が長 req を待ち idle。"
+        return out
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
