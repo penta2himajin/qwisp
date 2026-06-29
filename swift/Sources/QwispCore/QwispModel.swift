@@ -1127,6 +1127,125 @@ public final class QwispModel {
             Double(totTok)/((contMs-prefillMs)/1000), N, B)
     }
 
+    /// ★ issue#6 #2: scheduler 最適化。診断（continuous-run）で判明した overhead のうち末尾 idle slot を
+    /// **動的 batch 縮小**で回収する。queue が枯れた後、完了 slot を物理 batch から compact（gather）して
+    /// active 行のみ forward する。同一 workload で (a)static (b)continuous full-B (c)continuous+shrink を
+    /// 実走比較し、縮小の真の wall-clock 利得を切り分ける。env QWISP_RUN=continuous-run2.
+    public static func runContinuousRun2(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store); let L = model.numLayers
+        let B = 8, N = 48
+        func gens() -> [Int] {   // 同一 workload を毎回再生成（seed 固定）
+            var seed: UInt64 = 999
+            func nextGen() -> Int { seed = seed &* 6364136223846793005 &+ 1; let r = Double((seed>>33)&0xFFFF)/65535.0; return 8 + Int(pow(r,2.0)*56) }
+            return (0..<N).map { _ in nextGen() }
+        }
+        func prompt(_ id: Int) -> MLXArray { MLXArray((0..<6).map { Int32(($0*53+id*17+1)%100000) }, [1, 6]) }
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+        func prefillSlot(_ id: Int) -> ([LayerCache], Int32, Int) {
+            let c = model.makeCaches(); let p = prompt(id); let lg = model(p, caches: c); lg.eval()
+            MLX.eval(c.flatMap { $0.stateArrays })
+            return (c, Int32(MLX.argMax(lg[0, p.dim(1)-1], axis: -1).item(Int.self)), p.dim(1))
+        }
+
+        // ── continuous 実走（shrink フラグで末尾挙動を切替）─────────────────────────────
+        // shrink=false: queue 枯渇後も idle slot を B 行のまま forward（既存 continuous-run の挙動）
+        // shrink=true : 完了 slot を物理 batch から gather で除去し active 行のみ forward
+        struct Stat { var ms = 0.0; var steps = 0; var prefillMs = 0.0; var activeAcc = 0 }
+        func runContinuous(_ reqGens: [Int], shrink: Bool) -> Stat {
+            var gdnCaches: [LayerCache] = (0..<L).map { _ in LayerCache() }
+            var attnKV: [[KVCache]] = (0..<L).map { _ in (0..<B).map { _ in KVCache() } }
+            // 並列配列（物理 batch 行に対応。shrink 時は compact で縮む）
+            var slotReq = [Int](repeating: -1, count: B), slotRemain = [Int](repeating: 0, count: B)
+            var positions = [Int](repeating: 0, count: B), cur = [Int32](repeating: 0, count: B)
+            var nextReq = 0, done = 0, M = B
+            var pf: [[LayerCache]] = []
+            for b in 0..<B { let (c, t, pl) = prefillSlot(nextReq); pf.append(c); slotReq[b]=nextReq; slotRemain[b]=reqGens[nextReq]; positions[b]=pl; cur[b]=t; nextReq += 1 }
+            for i in 0..<L {
+                if model.isLinear(i) {
+                    gdnCaches[i].gdn.recState = MLX.concatenated(pf.map { $0[i].gdn.recState! }, axis: 0)
+                    let convs = pf.map { $0[i].gdn.convState }
+                    if convs.allSatisfy({ $0 != nil }) { gdnCaches[i].gdn.convState = MLX.concatenated(convs.map { $0! }, axis: 0) }
+                } else { for b in 0..<B { attnKV[i][b] = pf[b][i].kv } }
+            }
+            var st = Stat(); let t0 = now()
+            while done < N {
+                let lg = model.forwardContinuous(MLXArray(Array(cur[0..<M]), [M,1]), positions: Array(positions[0..<M]), gdnCaches: gdnCaches, attnKV: attnKV.map { Array($0[0..<M]) })
+                let nx = MLX.argMax(lg[0..., 0], axis: -1); nx.eval()
+                MLX.eval(gdnCaches.flatMap { $0.stateArrays })
+                st.steps += 1; st.activeAcc += (0..<M).filter { slotReq[$0] >= 0 }.count
+                let nxA = nx.asArray(Int32.self)
+                for b in 0..<M { cur[b]=nxA[b]; positions[b] += 1; slotRemain[b] -= 1 }
+                var removeRows: [Int] = []
+                for b in 0..<M where slotRemain[b] <= 0 && slotReq[b] >= 0 {
+                    done += 1
+                    if nextReq < N {   // 補充（in-place、M 不変）
+                        let tp = now(); let (c, t, pl) = prefillSlot(nextReq)
+                        for i in 0..<L {
+                            if model.isLinear(i) {
+                                gdnCaches[i].gdn.recState![b] = c[i].gdn.recState!.squeezed(axis: 0)
+                                if let cv = c[i].gdn.convState, gdnCaches[i].gdn.convState != nil { gdnCaches[i].gdn.convState![b] = cv.squeezed(axis: 0) }
+                            } else { attnKV[i][b] = c[i].kv }
+                        }
+                        st.prefillMs += now() - tp
+                        slotReq[b]=nextReq; slotRemain[b]=reqGens[nextReq]; positions[b]=pl; cur[b]=t; nextReq += 1
+                    } else {   // queue 空＝この slot は終了
+                        slotReq[b] = -1
+                        if shrink { removeRows.append(b) } else { slotRemain[b] = Int.max }
+                    }
+                }
+                if shrink && !removeRows.isEmpty {   // 物理 batch を active 行へ compact（gather）
+                    let keep = (0..<M).filter { !removeRows.contains($0) }
+                    let idx = MLXArray(keep.map { Int32($0) })
+                    for i in 0..<L {
+                        if model.isLinear(i) {
+                            gdnCaches[i].gdn.recState = MLX.take(gdnCaches[i].gdn.recState!, idx, axis: 0)
+                            if let cv = gdnCaches[i].gdn.convState { gdnCaches[i].gdn.convState = MLX.take(cv, idx, axis: 0) }
+                        } else { attnKV[i] = keep.map { attnKV[i][$0] } }
+                    }
+                    for b in 0..<keep.count { let s = keep[b]; cur[b]=cur[s]; positions[b]=positions[s]; slotReq[b]=slotReq[s]; slotRemain[b]=slotRemain[s] }
+                    M = keep.count
+                    if M > 0 { MLX.eval(gdnCaches.flatMap { $0.stateArrays }) }
+                }
+            }
+            st.ms = now() - t0
+            return st
+        }
+
+        let reqGens = gens()
+        let totTok = reqGens.reduce(0,+)
+        // ウォームアップ（1 回、計測外）
+        _ = runContinuous(gens(), shrink: true)
+        let full = runContinuous(gens(), shrink: false)
+        let shr  = runContinuous(gens(), shrink: true)
+
+        // ── (a) static-wave 参照 ───────────────────────────────────────────────
+        let tS0 = now(); var i = 0
+        while i < N {
+            let wave = Array(reqGens[i ..< Swift.min(i+B, N)]); let bb = wave.count; let maxg = wave.max()!
+            var pf2: [[LayerCache]] = []; var c2 = [Int32](repeating:0,count:bb); var pos2=[Int](repeating:0,count:bb)
+            for b in 0..<bb { let (c,t,pl) = prefillSlot(i+b); pf2.append(c); c2[b]=t; pos2[b]=pl }
+            var g2: [LayerCache] = (0..<L).map { _ in LayerCache() }; var a2: [[KVCache]] = (0..<L).map { _ in (0..<bb).map { _ in KVCache() } }
+            for li in 0..<L { if model.isLinear(li) { g2[li].gdn.recState = MLX.concatenated(pf2.map { $0[li].gdn.recState! }, axis: 0); let cv = pf2.map { $0[li].gdn.convState }; if cv.allSatisfy({ $0 != nil }) { g2[li].gdn.convState = MLX.concatenated(cv.map { $0! }, axis: 0) } } else { for b in 0..<bb { a2[li][b] = pf2[b][li].kv } } }
+            for _ in 0..<maxg { let lg = model.forwardContinuous(MLXArray(c2,[bb,1]), positions: pos2, gdnCaches: g2, attnKV: a2); let nx = MLX.argMax(lg[0...,0],axis: -1); nx.eval(); MLX.eval(g2.flatMap { $0.stateArrays }); let na = nx.asArray(Int32.self); for b in 0..<bb { c2[b]=na[b]; pos2[b] += 1 } }
+            i += B
+        }
+        let statMs = now() - tS0
+
+        let fa = Double(full.activeAcc)/Double(max(1,full.steps)), sa = Double(shr.activeAcc)/Double(max(1,shr.steps))
+        return String(format: """
+            [continuous-run2] B=%d, N=%d req(可変 gen), total %d tok ── 動的 batch 縮小の利得切り分け
+              (a) static-wave        : %.2f s, %.1f tok/s
+              (b) continuous full-B  : %.2f s, %.1f tok/s  (%d step, 平均 active %.2f/%d, prefill %.0f%%)
+              (c) continuous +shrink : %.2f s, %.1f tok/s  (%d step, 平均 active %.2f/%d, prefill %.0f%%)
+              → shrink 利得 vs full-B: %.2fx（末尾 idle 行を forward しない分）。static 比: full %.2fx / shrink %.2fx
+            """, B, N, totTok,
+            statMs/1000, Double(totTok)/statMs*1000,
+            full.ms/1000, Double(totTok)/full.ms*1000, full.steps, fa, B, full.prefillMs/full.ms*100,
+            shr.ms/1000, Double(totTok)/shr.ms*1000, shr.steps, sa, B, shr.prefillMs/shr.ms*100,
+            full.ms/shr.ms, statMs/full.ms, statMs/shr.ms)
+    }
+
     /// ★ issue#6 #1: raw M=B の MoE amortization 上限を実測。B 行が層ごとに選ぶ top-8 expert の **union** を
     /// (a)diverse stream (b)similar stream(共有 prompt)で計測。union が小=amortize, 大(≈8B)=sub-B。env QWISP_RUN=moe-union.
     public static func runMoeUnionProbe(modelDir: String) throws -> String {

@@ -78,6 +78,7 @@ if CommandLine.arguments.contains("stream") {
         ("continuous-attn-test",  { _, _ in AttentionLayer.continuousAttnTest() }),
         ("continuous-batch",      { md, _ in try QwispModel.runContinuousBatch(modelDir: md) }),
         ("continuous-run",        { md, _ in try QwispModel.runContinuousRun(modelDir: md) }),
+        ("continuous-run2",       { md, _ in try QwispModel.runContinuousRun2(modelDir: md) }),
         ("qmm4-tiled-bench",      { _, _ in RawMetalForward.qmm4TiledBench() }),
         ("moe-union",             { md, _ in try QwispModel.runMoeUnionProbe(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
