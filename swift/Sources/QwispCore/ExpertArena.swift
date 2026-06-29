@@ -618,4 +618,104 @@ public enum StreamingMoEValidation {
             mc, emitted.map { String($0) }.joined(separator: ","),
             ok ? "✅ miss 検出・emit 正しい(A3a OK)" : "❌ miss 検出不一致")
     }
+
+    /// ★ issue#7 style A milestone A3b(naive): fused 40層 streaming forward + miss-service resume ループ。
+    /// 全40層を arena(per-layer C slot)gather + slot_remap + residency_check で1 CB 楽観実行→CPU が
+    /// firstMissLayer m を検出→layer m の miss expert を pread→**token 先頭から再実行**(cold T=1 ゆえ
+    /// resetGPUState で deterministic)。miss が無くなれば収束＝全層 cache 内＝no-sync exact forward。
+    /// 収束 logits を resident fusedRawForwardGPU と照合(bit-exact なら A3b 成立)。
+    /// env QWISP_RUN=raw-stream-fused。QWISP_STREAM_C=<C>(per-layer slot 数, 既定 64)。
+    public static func runRawStreamFused(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, _) = RawMetalForward.ensure(),
+              RawMetalForward.compileSlotRemap(), RawMetalForward.compileResidencyCheck() else {
+            return "[A3b] Metal/kernel init 失敗"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "64") ?? 64
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let ids = MLXArray([Int32(1)], [1, 1])
+        let H = model.embed(ids).dim(-1)
+        let nLayers = model.numLayers
+
+        // ① resident 基準 logits（全 expert 常駐の raw fused forward）。
+        guard let refLogits = model.fusedRawForwardGPU(ids) else { return "[A3b] resident forward 失敗" }
+        refLogits.eval()
+        let refTok = MLX.argMax(refLogits.reshaped([-1]), axis: 0).item(Int.self)
+
+        // ② per-layer streaming 構成（arena cache + streaming MoEBuffers）。resident layers は ① で構築済。
+        guard let residentLayers = model.gpuLayers else { return "[A3b] gpuLayers 未構築" }
+        var caches: [LayerExpertCache] = []
+        var streamLayers: [RawMetalForward.GPULayer] = []
+        for i in 0 ..< nLayers {
+            let cache = try LayerExpertCache(device: device, source: source, layer: i, C: C)
+            guard let sMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: cache.arena, resident: residentLayers[i].moe) else {
+                return "[A3b] layer \(i) streaming MoEBuffers 失敗"
+            }
+            caches.append(cache)
+            let R = residentLayers[i]
+            streamLayers.append(RawMetalForward.GPULayer(nw: R.nw, gdn: R.gdn, attn: R.attn,
+                                                         moe: sMoE, gate: R.gate, sharedGate: R.sharedGate))
+        }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8),
+              let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A3b] scratch/hBuf 失敗" }
+        let missCount = device.makeBuffer(length: nLayers * 4, options: .storageModeShared)!
+        let missExperts = device.makeBuffer(length: nLayers * 8 * 4, options: .storageModeShared)!
+        let embedX = model.embed(ids); embedX.eval()
+
+        // ③ resume ループ（naive: miss 検出毎に token 先頭から再実行）。
+        let maxPasses = nLayers + 20
+        var pass = 0, totalServiced = 0
+        var serviceLog: [(layer: Int, n: Int)] = []
+        while pass < maxPasses {
+            pass += 1
+            // pass 毎に slotTable/hotMask を現 cache 状態から再構築。
+            var slotTables: [MTLBuffer] = [], hotMasks: [MTLBuffer] = []
+            for c in caches {
+                guard let st = c.gpuSlotTable(numExperts: 256).asMTLBuffer(device: device, noCopy: false),
+                      let hm = c.hotMask(numExperts: 256).asMTLBuffer(device: device, noCopy: false) else {
+                    return "[A3b] slotTable/hotMask buffer 失敗"
+                }
+                slotTables.append(st); hotMasks.append(hm)
+            }
+            model.resetGPUState()
+            RawMetalForward.writeBuffer(hb, embedX, H)
+            memset(missCount.contents(), 0, nLayers * 4); memset(missExperts.contents(), 0, nLayers * 8 * 4)
+            RawMetalForward.fusedForwardGPUStreaming(
+                hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTables, hotMasks: hotMasks,
+                missCount: missCount, missExperts: missExperts, H: H, E: 256, K: 8, eps: model.eps,
+                finalNormW: model.ensureFinalNorm())
+            // firstMissLayer 検出。
+            let mcp = missCount.contents().bindMemory(to: Int32.self, capacity: nLayers)
+            var m = -1
+            for l in 0 ..< nLayers where mcp[l] > 0 { m = l; break }
+            if m < 0 { break }   // miss 無し＝収束
+            // layer m の miss expert を pread（cache に確保）。
+            let mep = missExperts.contents().bindMemory(to: Int32.self, capacity: nLayers * 8)
+            let n = Int(mcp[m])
+            let missing = (0 ..< n).map { Int(mep[m * 8 + $0]) }
+            _ = caches[m].ensure(missing)
+            totalServiced += n; serviceLog.append((m, n))
+        }
+        let converged = pass < maxPasses
+
+        // ④ 収束 logits を resident と照合。
+        let fn = RawMetalForward.readBuffer(sc.normed, H)
+        let streamLogits = model.headProj().apply(fn.reshaped([1, 1, H])); streamLogits.eval()
+        let streamTok = MLX.argMax(streamLogits.reshaped([-1]), axis: 0).item(Int.self)
+        let rel = MLX.max(MLX.abs(refLogits.asType(.float32) - streamLogits.asType(.float32))).item(Float.self)
+            / (MLX.max(MLX.abs(refLogits.asType(.float32))).item(Float.self) + 1e-9)
+        let firstSvc = serviceLog.prefix(8).map { "L\($0.layer):\($0.n)" }.joined(separator: " ")
+        let ok = converged && streamTok == refTok && rel < 5e-3
+        return String(format: """
+            [A3b raw-stream-fused] fused 40層 streaming(arena C=%d + slot_remap + residency_check)+ resume ループ
+              収束=%@  passes=%d  serviced miss 層=%d(計 %d expert)  例: %@ ...
+              logits rel=%.3e  argmax stream=%d resident=%d
+              %@
+              → bit-exact なら全層 cache 内で no-sync exact forward 成立(A3b naive OK)。残=A4(CPU service と pread を非同期重畳)+ checkpoint-resume 最適化。
+            """, C, converged ? "YES" : "NO(maxPasses 到達)", pass, serviceLog.count, totalServiced, firstSvc,
+            rel, streamTok, refTok,
+            ok ? "✅ resident と一致(A3b naive OK)" : "❌ 不一致 or 未収束")
+    }
 }

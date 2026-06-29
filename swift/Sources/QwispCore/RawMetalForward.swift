@@ -1874,6 +1874,33 @@ public enum RawMetalForward {
         if let f = cbs.first, let l = cbs.last { lastGPUExecMs = (l.gpuEndTime - f.gpuStartTime) * 1000.0 }
     }
 
+    /// ★ issue#7 style A milestone A3b: streaming 版 1-CB forward（per-layer arena gather + GPU slot-remap +
+    ///   residency_check）。全40層を1 CB に楽観 encode→各層が hotMask で miss を emit。CB 完了後 CPU が
+    ///   firstMissLayer を missCount 走査で確定し、miss expert を pread→resume(naive=token 先頭から再実行)。
+    ///   slotTables[i]/hotMasks[i] は cache 状態(pass)依存ゆえ呼び元が pass 毎に再構築して渡す。
+    static func fusedForwardGPUStreaming(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
+                                         slotTables: [MTLBuffer], hotMasks: [MTLBuffer],
+                                         missCount: MTLBuffer, missExperts: MTLBuffer,
+                                         H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0,
+                                         finalNormW: MTLBuffer? = nil) {
+        guard let (_, queue) = ensure() else { return }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        for i in 0 ..< layers.count {
+            let L = layers[i]
+            encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: scratch.postNorm,
+                            gdn: L.gdn, attn: L.attn, H: H, eps: eps, pendingResid: i == 0 ? nil : scratch.combined,
+                            decode: decode, pos: pos)
+            encodeMoEGPU(enc, postNorm: scratch.postNorm, gate: L.gate, moe: L.moe, sc: scratch,
+                         sharedGateW: L.sharedGate, H: H, E: E, K: K,
+                         slotTable: slotTables[i], hotMask: hotMasks[i],
+                         missCount: missCount, missExperts: missExperts, layerIdx: i)
+        }
+        encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)
+        if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: scratch.normed, D: H, eps: eps) }
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+    }
+
     /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。
     /// - env: QWISP_RUN=raw-gdn-test / QWISP_GDN_REF(ref path, 既定 /tmp/qwisp_gdn_layer_ref.safetensors)
     public static func runGdnLayerTest() -> String {
