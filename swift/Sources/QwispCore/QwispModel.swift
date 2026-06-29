@@ -378,7 +378,7 @@ public final class QwispModel {
 
     /// 全層 GPU buffer を ensure し [GPULayer] を構築（初回のみ, cache）。
     func buildGPULayers(_ ids: MLXArray, _ H: Int) -> [RawMetalForward.GPULayer]? {
-        if !gpuWarmed { _ = rawForward(ids)?.eval(); gpuWarmed = true }   // 標準 kernel compile
+        if !gpuWarmed { _ = rawForward(ids)?.eval(); _ = RawMetalForward.compileGqmmSwiglu(); gpuWarmed = true }   // 標準 + 融合 kernel compile
         if let cached = gpuLayers { return cached }
         var layers: [RawMetalForward.GPULayer] = []
         for i in 0 ..< numLayers {
@@ -809,6 +809,15 @@ public final class QwispModel {
             return ((now()-t0)/Double(reps), gpuAcc/Double(reps))
         }
         _ = model.fusedRawForwardGPU(ids)?.eval()   // warm + build layers
+        // ★ A/B: MoE gate+up gather+swiglu 融合の効果（GPU-exec, min over reps で thermal 耐性）
+        func measureMin(_ setup: () -> Void) -> Double {
+            setup(); for _ in 0..<3 { _ = model.fusedRawForwardGPU(ids)?.eval() }
+            var mn = 1e9; for _ in 0..<40 { _ = model.fusedRawForwardGPU(ids)?.eval(); mn = Swift.min(mn, RawMetalForward.lastGPUExecMs) }
+            return mn
+        }
+        let gFuse = measureMin { RawMetalForward.moeFuseGateUp = true }
+        let gNoFuse = measureMin { RawMetalForward.moeFuseGateUp = false }
+        RawMetalForward.moeFuseGateUp = true
         let full = measure("full") { RawMetalForward.profSkipSingleThread = false; RawMetalForward.profSkipMoEExperts = false; RawMetalForward.profSkipMixer = false }
         let noST = measure("skip-ST") { RawMetalForward.profSkipSingleThread = true }
         RawMetalForward.profSkipSingleThread = false
@@ -832,6 +841,7 @@ public final class QwispModel {
         let mlxMs = (now()-st)/Double(N)
         return String(format: """
             [profile-gpu] GPU-exec 帰属（owner 指摘①, cold T=1 forward, M1 系）
+              ★MoE gate+up 融合 A/B（GPU-exec min over 40）: 融合=%.2fms / 非融合=%.2fms → 差 %.2fms
               full:        wall %.1fms / GPU-exec %.2fms（CPU-encode bubble = wall-gpu = %.2fms）
               single-thread(route_top8+shared_gate8) 寄与 ≈ %.2fms（full-skipST GPU-exec 差）
               MoE-experts(gather/swiglu/shared/combine/final) 寄与 ≈ %.2fms
@@ -840,7 +850,7 @@ public final class QwispModel {
               skip-ST GPU=%.2f / skip-MoE GPU=%.2f / skip-mixer GPU=%.2f
               ── baseline ── 素朴 MLX decode(caches, %d step): %.2fms/tok (%.1f tok/s)
               → 判定: single-thread 寄与が大なら②並列化で足りる。mixer/MoE 大 kernel 寄与が支配なら③ mx.fast 移植深掘り。
-            """, full.wall, full.gpu, full.wall-full.gpu,
+            """, gFuse, gNoFuse, gNoFuse-gFuse, full.wall, full.gpu, full.wall-full.gpu,
             full.gpu-noST.gpu, full.gpu-noMoE.gpu, full.gpu-noMix.gpu,
             full.gpu-noMM.gpu, full.gpu-noRec.gpu,
             noST.gpu, noMoE.gpu, noMix.gpu, N, mlxMs, 1000/mlxMs)

@@ -552,6 +552,10 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _finalCombinePipeline: MTLComputePipelineState? // all-GPU MoE: y+gateScale*sharedY
     nonisolated(unsafe) static var _shiftConvPipeline: MTLComputePipelineState?    // GDN decode: conv cache shift
     nonisolated(unsafe) static var _writeKVPipeline: MTLComputePipelineState?      // attn decode: KV cache 散布
+    nonisolated(unsafe) static var _gqmmSwigluPipeline: MTLComputePipelineState?   // MoE: gate+up gather+swiglu 融合
+    nonisolated(unsafe) static var profSkipMoERouted = false
+    nonisolated(unsafe) static var profSkipMoEShared = false
+    nonisolated(unsafe) static var moeFuseGateUp = true   // gate+up gather+swiglu を 1 kernel に融合
 
     /// single-encoder GDN 用 補助 kernel を compile（lazy, safe-math）。
     ///  - compute_g_beta: g=exp(-exp(aLog)*softplus(a+dtBias))[f32], beta=sigmoid(b)[f16→f32]。MLX 厳密一致。
@@ -877,6 +881,74 @@ public enum RawMetalForward {
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: Ktop * N)), [Ktop, N])
+    }
+
+    /// ★ gate+up gather+swiglu 融合 kernel: x を 1 回ロード(ld16)し gate/up 両方の qdot → swiglu → h 直書き。
+    /// gather_g + gather_u + swiglu(3 dispatch + g/u 中間 buffer)を 1 dispatch に。x 読みも 2→1。bit-exact 維持
+    /// (各 result を (half)化してから swiglu＝分離版と同一)。grid=(1, N/8, Ktop), group=(32,2,1)。
+    static func compileGqmmSwiglu() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _gqmmSwigluPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) { sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+                xt[i]=x[i]; xt[i+1]=x[i+1]/16.0f; xt[i+2]=x[i+2]/256.0f; xt[i+3]=x[i+3]/4096.0f; }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f; const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]*(float)(ws[i]&0x000f) + xt[4*i+1]*(float)(ws[i]&0x00f0) +
+                          xt[4*i+2]*(float)(ws[i]&0x0f00) + xt[4*i+3]*(float)(ws[i]&0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void gqmm4_swiglu(device const uint32_t* gw [[buffer(0)]], device const half* gsc [[buffer(1)]], device const half* gbi [[buffer(2)]],
+                                 device const uint32_t* uw [[buffer(3)]], device const half* usc [[buffer(4)]], device const half* ubi [[buffer(5)]],
+                                 device const half* x [[buffer(6)]], device const int* inds [[buffer(7)]], device half* h [[buffer(8)]],
+                                 constant int& in_vec_size [[buffer(9)]], constant int& out_vec_size [[buffer(10)]],
+                                 uint3 tid [[threadgroup_position_in_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+            constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+            constexpr int block_size = 512, scale_step_per_thread = 4;
+            const device uint8_t* gws = (const device uint8_t*)gw;
+            const device uint8_t* uws = (const device uint8_t*)uw;
+            typedef float U;
+            thread U x_thread[16]; thread U gres[4] = {0}, ures[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            uint ki = tid.z; uint e = (uint)inds[ki];
+            size_t eOffW = (size_t)e * out_vec_size * in_vec_size_w, eOffG = (size_t)e * out_vec_size * in_vec_size_g;
+            gws += eOffW; uws += eOffW; gsc += eOffG; gbi += eOffG; usc += eOffG; ubi += eOffG;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+            uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+            gsc += out_row*in_vec_size_g + simd_lid/scale_step_per_thread; gbi += out_row*in_vec_size_g + simd_lid/scale_step_per_thread;
+            usc += out_row*in_vec_size_g + simd_lid/scale_step_per_thread; ubi += out_row*in_vec_size_g + simd_lid/scale_step_per_thread;
+            x += simd_lid * values_per_thread;
+            h += ki * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16(x, x_thread);   // ★ x ロードは 1 回（gate/up で共有）
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    gres[row] += qd4((const device uint8_t*)(gws + row*in_vec_size_w), x_thread, gsc[row*in_vec_size_g], gbi[row*in_vec_size_g], sum);
+                    ures[row] += qd4((const device uint8_t*)(uws + row*in_vec_size_w), x_thread, usc[row*in_vec_size_g], ubi[row*in_vec_size_g], sum);
+                }
+                gws += block_size*bytes_per_pack/pack_factor; uws += block_size*bytes_per_pack/pack_factor;
+                gsc += block_size/64; gbi += block_size/64; usc += block_size/64; ubi += block_size/64; x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                half gv = (half)simd_sum(gres[row]); half uv = (half)simd_sum(ures[row]);
+                if (simd_lid == 0) { half y = (half)1/((half)1+exp(metal::abs(gv))); half s = (gv<(half)0)?y:((half)1-y); h[row] = (gv*s)*uv; }
+            }
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _gqmmSwigluPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4_swiglu")!)
+             return true
+        } catch { print("[raw-gqmm-swiglu] compile: \(error)"); return false }
     }
 
     /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
@@ -1559,15 +1631,29 @@ public enum RawMetalForward {
             var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
             enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(swp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
-        encGather(moe.swGW, moe.swGS, moe.swGB, postNorm, moe.g, K: Hin, N: I, lhs: false)
-        encGather(moe.swUW, moe.swUS, moe.swUB, postNorm, moe.u, K: Hin, N: I, lhs: false)
-        encSwiglu(moe.g, moe.u, moe.h, K * I)
-        encGather(moe.swDW, moe.swDS, moe.swDB, moe.h, moe.d, K: I, N: Hin, lhs: true)
+        if !profSkipMoERouted {
+            if moeFuseGateUp, let fp = _gqmmSwigluPipeline {
+                // ★ gate+up gather+swiglu 融合: x 1 回ロード + g/u 中間 buffer 排除（3 dispatch→1）
+                enc.setComputePipelineState(fp)
+                enc.setBuffer(moe.swGW, offset: 0, index: 0); enc.setBuffer(moe.swGS, offset: 0, index: 1); enc.setBuffer(moe.swGB, offset: 0, index: 2)
+                enc.setBuffer(moe.swUW, offset: 0, index: 3); enc.setBuffer(moe.swUS, offset: 0, index: 4); enc.setBuffer(moe.swUB, offset: 0, index: 5)
+                enc.setBuffer(postNorm, offset: 0, index: 6); enc.setBuffer(moe.binds, offset: 0, index: 7); enc.setBuffer(moe.h, offset: 0, index: 8)
+                var k = Int32(Hin), n = Int32(I); enc.setBytes(&k, length: 4, index: 9); enc.setBytes(&n, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: I/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+            } else {
+                encGather(moe.swGW, moe.swGS, moe.swGB, postNorm, moe.g, K: Hin, N: I, lhs: false)
+                encGather(moe.swUW, moe.swUS, moe.swUB, postNorm, moe.u, K: Hin, N: I, lhs: false)
+                encSwiglu(moe.g, moe.u, moe.h, K * I)
+            }
+            encGather(moe.swDW, moe.swDS, moe.swDB, moe.h, moe.d, K: I, N: Hin, lhs: true)
+        }
         // shared expert: sg/su qmm(postNorm) → swiglu → sharedY qmm
-        encQmm(moe.shGW, moe.shGS, moe.shGB, postNorm, moe.sg, K: Hin, N: I)
-        encQmm(moe.shUW, moe.shUS, moe.shUB, postNorm, moe.su, K: Hin, N: I)
-        encSwiglu(moe.sg, moe.su, moe.shAct, I)
-        encQmm(moe.shDW, moe.shDS, moe.shDB, moe.shAct, moe.sharedY, K: I, N: Hin)
+        if !profSkipMoEShared {
+            encQmm(moe.shGW, moe.shGS, moe.shGB, postNorm, moe.sg, K: Hin, N: I)
+            encQmm(moe.shUW, moe.shUS, moe.shUB, postNorm, moe.su, K: Hin, N: I)
+            encSwiglu(moe.sg, moe.su, moe.shAct, I)
+            encQmm(moe.shDW, moe.shDS, moe.shDB, moe.shAct, moe.sharedY, K: I, N: Hin)
+        }
         // ④ combine: d[K,H]·scores → y[H]
         enc.setComputePipelineState(_combinePipeline!)
         enc.setBuffer(moe.d, offset: 0, index: 0); enc.setBuffer(sc.scores, offset: 0, index: 1); enc.setBuffer(sc.y, offset: 0, index: 2)
