@@ -289,6 +289,19 @@ public final class QwispModel {
         t0 = now(); for _ in 0..<reps { model(ids).eval() }; let mlxMs = (now()-t0)/Double(reps)
         out += String(format: "\n  時間/forward: round-trip raw=%.1fms(%.1f tok/s) | MLX=%.1fms(%.1f tok/s) → %.2fx",
                       rawMs, 1000/rawMs, mlxMs, 1000/mlxMs, mlxMs/Swift.max(0.01, rawMs))
+        // SE vs round-trip 層別診断（同一 h で seDecoderLayer vs rawDecoderLayer）
+        if ProcessInfo.processInfo.environment["QWISP_SE_DIAG"] == "1" {
+            var hh = model.embed(ids); let H = hh.dim(-1)
+            for i in 0 ..< model.numLayers {
+                if let se = model.seDecoderLayer(hh.reshaped([1, H]), i), let rt = model.rawDecoderLayer(hh.reshaped([1, H]), i) {
+                    se.eval(); rt.eval()
+                    let lr = MLX.max(MLX.abs(se.reshaped([H]).asType(.float32) - rt.reshaped([H]).asType(.float32))).item(Float.self)
+                       / (MLX.max(MLX.abs(rt.asType(.float32))).item(Float.self) + 1e-9)
+                    if lr > 1e-6 { out += String(format: "\n   SE-vs-RT layer %d (%@): rel=%.3e", i, model.isLinear(i) ? "GDN" : "attn", lr) }
+                    hh = rt.reshaped([1, H])
+                }
+            }
+        }
         // ★ SE full forward（GDN/MoE single-encoder, attn round-trip）: bit-exact + tok/s
         if let se = model.seRawForward(ids) {
             se.eval()
