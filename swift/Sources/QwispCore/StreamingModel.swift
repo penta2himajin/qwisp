@@ -267,6 +267,75 @@ public enum StreamingDecode {
             C, RE, Double(N) / secs, match, N, Double(match) / Double(N) * 100)
     }
 
+    /// ★ issue#7 Step 0: cold-start single-pass nl decode で **per-layer all-resident 率**を直接計測。
+    /// per-token all-hit でなく per-layer 粒度（#7 の核心: token escalation は cliff だが per-layer は graceful）。
+    /// 通常 sync streaming で計測しても実 per-layer-no-sync と cache 状態は同一（resident 層は load 不要・不変、
+    /// miss 層は load=sync と同じ）＝faithful。prefill 後に accumulator reset＝decode 相のみ。warming artifact 無し。
+    /// env QWISP_RUN=step0-resident / QWISP_RESID_REF(既定 long) / QWISP_RESID_CS(既定 "128,192") / QWISP_GEN。
+    public static func runResidencyProbe(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let ref = ProcessInfo.processInfo.environment["QWISP_RESID_REF"] ?? "/tmp/qwisp_long_ref.safetensors"
+        let r = try loadArrays(url: URL(fileURLWithPath: ref))
+        guard let promptArr = r["spec_prompt"] else { return "[step0-resident] spec_prompt 無し(\(ref))" }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let genCap = (r["spec_greedy"]?.dim(0)) ?? 128
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "128") ?? 128, genCap)
+        let Cs = (ProcessInfo.processInfo.environment["QWISP_RESID_CS"] ?? "128,192").split(separator: ",").compactMap { Int($0) }
+        var blocks = ""
+        for C in Cs {
+            // cold cache（毎回 arena/model 新規＝warming 無し）
+            let arena = try ExpertArena(device: device, source: source, N: 64)
+            let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+            let caches = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false
+            LayerExpertCache.measureResident = false
+            var (_, lg) = try model.prefillChunked(ids, caches: caches)   // prefill で自然 warm（計測外）
+            var next = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+            MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            // decode 相のみ計測（prefill 後に reset）
+            LayerExpertCache.residAllHit = [:]; LayerExpertCache.residTotal = [:]; LayerExpertCache.residMissSum = [:]
+            LayerExpertCache.measureResident = true
+            for _ in 0 ..< N {
+                (_, lg) = try model.forwardHidden(next, caches: caches)   // 通常 sync streaming（ensure で計測）
+                next = MLX.argMax(lg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([next] + caches.flatMap { $0.stateArrays })
+            }
+            LayerExpertCache.measureResident = false
+            // 集計
+            let L = model.numLayers
+            var allHit = 0, total = 0, missSum = 0
+            var perLayer: [(layer: Int, rate: Double)] = []
+            for i in 0 ..< L {
+                let t = LayerExpertCache.residTotal[i] ?? 0
+                guard t > 0 else { continue }
+                let h = LayerExpertCache.residAllHit[i] ?? 0
+                allHit += h; total += t; missSum += LayerExpertCache.residMissSum[i] ?? 0
+                perLayer.append((i, Double(h) / Double(t)))
+            }
+            let layerToks = total / max(1, perLayer.count)   // ≈ N（各層 N token 計測）
+            let overall = total > 0 ? Double(allHit) / Double(total) * 100 : 0
+            let avgMissPerTok = layerToks > 0 ? Double(missSum) / Double(layerToks) : 0
+            let perTokAllHit = pow(overall / 100, Double(perLayer.count)) * 100   // 参考: per-token all-hit 推定
+            let worst = perLayer.sorted { $0.rate < $1.rate }.prefix(8)
+            let worstStr = worst.map { String(format: "L%d %.0f%%", $0.layer, $0.rate * 100) }.joined(separator: " ")
+            let fullResLayers = perLayer.filter { $0.rate >= 0.999 }.count
+            let memGB = Double(C) * Double(L) * 1.77 / 1000 + 4.0
+            blocks += String(format: """
+
+                ── C=%d (≈%.1f GB) ──
+                  per-layer all-resident（全 (層,token) 中 top-8 全常駐の割合）= %.1f%%
+                  完全常駐層(>99.9%%)= %d/%d 層   平均 miss expert/token(全40層計)= %.1f
+                  最悪層: %@
+                  （参考 per-token all-hit 推定 = %.2e%% ＝ token escalation だとほぼ全 escalate）
+                """, C, memGB, overall, fullResLayers, perLayer.count, avgMissPerTok, worstStr, perTokAllHit)
+        }
+        return "[step0-resident] cold-start single-pass nl decode（\(ref), gen=\(N)）の per-layer 全常駐率"
+            + "\n  #7 機構: per-layer 粒度で resident 層 no-sync / miss 層のみ sync。下の per-layer 率に比例して sync 削減。"
+            + blocks
+    }
+
     /// margin 適応 fast decode: fast logits の top1-top2 gap が小さい(near-tie=harmful 候補)token
     /// だけ sync 訂正。benign miss は margin 大で素通し→選択的に安定化。
     public static func runMarginFast(modelDir: String, refPath: String) throws -> String {

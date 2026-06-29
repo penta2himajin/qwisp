@@ -84,6 +84,11 @@ public final class LayerExpertCache {
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
     nonisolated(unsafe) public static var preadNanos: UInt64 = 0    // loadMany(pread IO) のみ
     nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
+    // ★ issue#7 Step 0: per-layer all-resident 計測（ensure 前=no-sync が exact になる層か）。
+    nonisolated(unsafe) public static var measureResident = false
+    nonisolated(unsafe) public static var residAllHit: [Int: Int] = [:]   // 層→(top-8 全常駐だった token 数)
+    nonisolated(unsafe) public static var residTotal: [Int: Int] = [:]    // 層→(計測 token 数)
+    nonisolated(unsafe) public static var residMissSum: [Int: Int] = [:]  // 層→(miss expert 数の累積)
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
@@ -184,6 +189,14 @@ public final class LayerExpertCache {
         defer { LayerExpertCache.ensureNanos += DispatchTime.now().uptimeNanoseconds - t0 }
         var result: [Int: Int] = [:]
         var missList: [(e: Int, slot: Int)] = []
+        // ★ issue#7 Step 0: ensure 前(=この token のロード前)の per-layer 残留を計測。
+        //   全 distinct expert が既に常駐なら、この層は no-sync gather が exact になる。cold-start で自然蓄積。
+        if LayerExpertCache.measureResident {
+            let missCnt = experts.reduce(0) { $0 + (slotOf[$1] == nil ? 1 : 0) }
+            LayerExpertCache.residTotal[layer, default: 0] += 1
+            LayerExpertCache.residMissSum[layer, default: 0] += missCnt
+            if missCnt == 0 { LayerExpertCache.residAllHit[layer, default: 0] += 1 }
+        }
         for e in experts {
             clock += 1
             if let s = slotOf[e] { tick[s] = clock; hits += 1; result[e] = s; continue }
