@@ -10,6 +10,11 @@ import MLXRandom
 /// 照合（最難関の format + MLX weight buffer 共有 を検証）。
 public enum RawMetalForward {
     nonisolated(unsafe) static var metalRoute = false    // task#8 検証: MoE routing を Metal(qmm8+route_top8)で行う
+    // ── profile（task#9 owner 指摘①: per-kernel GPU-exec 帰属）──
+    nonisolated(unsafe) static var lastGPUExecMs = 0.0    // 直近 fusedForwardGPU の GPU-exec(gpuEnd-gpuStart)
+    nonisolated(unsafe) static var profSkipSingleThread = false  // route_top8/shared_gate8 を skip(timing 用)
+    nonisolated(unsafe) static var profSkipMoEExperts = false    // gather g/u/d/swiglu/shared を skip(timing 用)
+    nonisolated(unsafe) static var profSkipMixer = false         // mixer body を skip(timing 用)
     nonisolated(unsafe) static var _qmmPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmmF32Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _qmm8Pipeline: MTLComputePipelineState?     // 8bit qmv_fast（router gate）
@@ -282,27 +287,42 @@ public enum RawMetalForward {
         let src = """
         #include <metal_stdlib>
         using namespace metal;
+        // ★並列化(1 threadgroup, N lanes): max/Z を木 reduction、top-K は K 回の argmax(値+index)reduction。
+        //   選択は logits(Z 非依存・単調)＝single-thread 版と同じ集合(near-tie lossless 維持)。tie は lower-index。
         kernel void route_top8(device const half* logits [[buffer(0)]],
                                device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
                                constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
-                               uint tid [[thread_position_in_grid]]) {
-            if (tid != 0) return;
-            half gates[256]; float work[256];
-            float m = -INFINITY;
-            for (uint i = 0; i < N; i++) { float v = (float)logits[i]; m = max(m, v); work[i] = v; }
-            float Z = 0.0f;
-            for (uint i = 0; i < N; i++) Z += precise::exp((float)logits[i] - m);
-            for (uint i = 0; i < N; i++) gates[i] = (half)(precise::exp((float)logits[i] - m) / Z);
-            // ★ expert 選択は logits（f32, Z 非依存・単調）で top-K。f16 gates の Z 依存丸めで境界 tie が
-            //   MLX と食い違うのを回避。scores は選んだ index の f16 gates から取る（MLX takeAlong 相当）。
+                               uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float red[256]; threadgroup int redi[256];
+            threadgroup float gates[256]; threadgroup float work[256];
+            threadgroup float bcast[1];
+            float lg = (tid < N) ? (float)logits[tid] : -INFINITY;
+            // max
+            red[tid] = lg; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+            float m = bcast[0];
+            // Z = Σ exp(lg-m)
+            float e = (tid < N) ? precise::exp(lg - m) : 0.0f;
+            red[tid] = e; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+            float Z = bcast[0];
+            if (tid < N) { gates[tid] = (float)(half)(e / Z); work[tid] = lg; }
+            else { work[tid] = -INFINITY; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // top-K: K 回の argmax(値+index)reduction
             for (uint k = 0; k < K; k++) {
-                float best = -INFINITY; int bi = 0;
-                for (uint i = 0; i < N; i++) { float v = work[i]; if (v > best) { best = v; bi = (int)i; } }
-                inds[k] = bi; scores[k] = gates[bi]; work[bi] = -INFINITY;
+                red[tid] = work[tid]; redi[tid] = (int)tid; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) {
+                    if (tid < s) { if (red[tid+s] > red[tid]) { red[tid] = red[tid+s]; redi[tid] = redi[tid+s]; } }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) { int bi = redi[0]; inds[k] = bi; scores[k] = (half)gates[bi]; work[bi] = -INFINITY; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            half ssum = (half)0;
-            for (uint k = 0; k < K; k++) ssum += scores[k];
-            for (uint k = 0; k < K; k++) scores[k] = scores[k] / ssum;
+            // normalize(thread0, K 小)
+            if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scores[k]; for (uint k = 0; k < K; k++) scores[k] = scores[k] / ss; }
         }
         """
         do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -321,7 +341,7 @@ public enum RawMetalForward {
         enc.setComputePipelineState(_routePipeline!)
         enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1); enc.setBuffer(bScores, offset: 0, index: 2)
         var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
-        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ip = bInds.contents().bindMemory(to: Int32.self, capacity: K)
         let sp = bScores.contents().bindMemory(to: Float16.self, capacity: K)
@@ -630,21 +650,24 @@ public enum RawMetalForward {
             h[i] = h[i] + r[i];
         }
         // shared_gate8（all-GPU MoE）: shared_expert_gate(8bit, N=1, K, gs=64)の dot → sigmoid → scalar[0]。
-        //   MLX qmv 形(per-group scale*Σx·q + bias*Σx)。単一 thread(K=2048 軽量)。near-tie 許容ゆえ f32 accum。
+        //   ★並列化(threadgroup reduction): 各 thread が group を stride 分担し partial sum → 木 reduction。
+        //   near-tie 許容ゆえ reduction 順序差は無害(shared gate は元々 f32 近似)。1 threadgroup。
         kernel void shared_gate8(device const uint8_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
                                  device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
                                  device half* out [[buffer(4)]], constant uint& K [[buffer(5)]],
-                                 uint tid [[thread_position_in_grid]]) {
-            if (tid != 0) return;
-            float acc = 0.0f;
+                                 uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float part[256];
             uint G = K / 64;
-            for (uint g = 0; g < G; g++) {
+            float acc = 0.0f;
+            for (uint g = tid; g < G; g += tgs) {
                 float sq = 0.0f, sx = 0.0f;
                 for (uint j = 0; j < 64; j++) { uint k = g*64 + j; float xv = (float)x[k]; sq += xv * (float)w[k]; sx += xv; }
                 acc += (float)scales[g] * sq + (float)biases[g] * sx;
             }
-            float y = 1.0f / (1.0f + precise::exp(metal::abs(acc)));     // sigmoid(acc) stable
-            out[0] = (half)(acc < 0.0f ? y : (1.0f - y));
+            part[tid] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs / 2; s > 0; s >>= 1) { if (tid < s) part[tid] += part[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) { float a = part[0]; float y = 1.0f / (1.0f + precise::exp(metal::abs(a))); out[0] = (half)(a < 0.0f ? y : (1.0f - y)); }
         }
         // final_combine（all-GPU MoE）: combined[i] = y[i] + gateScale[0]*sharedY[i]（f16）。
         kernel void final_combine(device const half* y [[buffer(0)]], device const half* sharedY [[buffer(1)]],
@@ -1476,7 +1499,9 @@ public enum RawMetalForward {
         let mixerBx: MTLBuffer, mixerOut: MTLBuffer
         if let g = gdn { mixerBx = g.bx; mixerOut = g.outBuf } else { mixerBx = attn!.bx; mixerOut = attn!.outBuf }
         encodeRms(enc, src: hBuf, w: nw.inputNormW, out: mixerBx, D: H, eps: eps)
-        if let g = gdn { encodeGDNBody(enc, g, eps: eps, decode: decode) } else { encodeAttnBody(enc, attn!, decode: decode, pos: pos) }
+        if !profSkipMixer {
+            if let g = gdn { encodeGDNBody(enc, g, eps: eps, decode: decode) } else { encodeAttnBody(enc, attn!, decode: decode, pos: pos) }
+        }
         encodeResidAdd(enc, h: hBuf, r: mixerOut, total: H)
         encodeRms(enc, src: hBuf, w: nw.postNormW, out: postNormBuf, D: H, eps: eps)
     }
@@ -1493,11 +1518,14 @@ public enum RawMetalForward {
         enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateLogits, offset: 0, index: 4)
         var kk = Int32(H), nn = Int32(E); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: E/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
-        // ② route_top8: gateLogits → moe.binds(inds), scores
-        enc.setComputePipelineState(_routePipeline!)
-        enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
-        var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
-        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        // ② route_top8: gateLogits → moe.binds(inds), scores（single-thread; profile で skip 可）
+        if !profSkipSingleThread {
+            enc.setComputePipelineState(_routePipeline!)
+            enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
+            var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        if profSkipMoEExperts { return }   // gather/swiglu/shared/combine/final を skip(timing)
         // ③ experts: g/u gather(postNorm) → swiglu → d gather(per-expert)
         func encGather(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
             enc.setComputePipelineState(gqp)
@@ -1535,11 +1563,13 @@ public enum RawMetalForward {
         var ck = UInt32(K), cn = UInt32(Hin); enc.setBytes(&ck, length: 4, index: 3); enc.setBytes(&cn, length: 4, index: 4)
         enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_combinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         // ⑤ shared gate scalar(sigmoid) → final_combine: combined = y + gateScale*sharedY
-        enc.setComputePipelineState(_sharedGate8Pipeline!)
-        enc.setBuffer(sharedGateW.wq, offset: 0, index: 0); enc.setBuffer(sharedGateW.sc, offset: 0, index: 1); enc.setBuffer(sharedGateW.bi, offset: 0, index: 2)
-        enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateScale, offset: 0, index: 4)
-        var sk = UInt32(H); enc.setBytes(&sk, length: 4, index: 5)
-        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        if !profSkipSingleThread {
+            enc.setComputePipelineState(_sharedGate8Pipeline!)
+            enc.setBuffer(sharedGateW.wq, offset: 0, index: 0); enc.setBuffer(sharedGateW.sc, offset: 0, index: 1); enc.setBuffer(sharedGateW.bi, offset: 0, index: 2)
+            enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateScale, offset: 0, index: 4)
+            var sk = UInt32(H); enc.setBytes(&sk, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
         enc.setComputePipelineState(_finalCombinePipeline!)
         enc.setBuffer(sc.y, offset: 0, index: 0); enc.setBuffer(moe.sharedY, offset: 0, index: 1); enc.setBuffer(sc.gateScale, offset: 0, index: 2); enc.setBuffer(sc.combined, offset: 0, index: 3)
         var fh = UInt32(Hin); enc.setBytes(&fh, length: 4, index: 4)
@@ -1568,6 +1598,7 @@ public enum RawMetalForward {
         }
         encodeResidAdd(enc, h: hBuf, r: scratch.combined, total: H)    // 最終層 MoE residual
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()        // ★全40層で sync 1 回のみ
+        lastGPUExecMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0     // GPU-exec（CPU-encode と分離）
     }
 
     /// 検証: GDN 1 層 raw assembly vs MLX GatedDeltaNetLayer（同一量子化重み・f32Conv）を bit-exact 照合。

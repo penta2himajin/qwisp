@@ -771,6 +771,54 @@ public final class QwispModel {
             ex.isEmpty ? "(完全一致)" : "first: " + ex.joined(separator: " | "), tokps, secs/Double(steps)*1000)
     }
 
+    /// ★ task#9 owner 指摘①: per-kernel GPU-exec 帰属 profile（②single-thread 並列化で足りるか③大 kernel 移植が要るか）。
+    /// + baseline: 素朴 MLX decode tok/s。env QWISP_RUN=profile-gpu。
+    public static func runProfileGPU(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        let model = QwispModel(store: store)
+        let prevF32 = GatedDeltaNetLayer.f32Conv; GatedDeltaNetLayer.f32Conv = true
+        defer { GatedDeltaNetLayer.f32Conv = prevF32 }
+        let ids = MLXArray([Int32(100)], [1, 1])
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+        // GPU forward を測る（wall + GPU-exec）。skip フラグで category 帰属。
+        func measure(_ label: String, _ setup: () -> Void) -> (wall: Double, gpu: Double) {
+            setup()
+            for _ in 0..<3 { _ = model.fusedRawForwardGPU(ids)?.eval() }
+            let reps = 30; var gpuAcc = 0.0; let t0 = now()
+            for _ in 0..<reps { _ = model.fusedRawForwardGPU(ids)?.eval(); gpuAcc += RawMetalForward.lastGPUExecMs }
+            return ((now()-t0)/Double(reps), gpuAcc/Double(reps))
+        }
+        _ = model.fusedRawForwardGPU(ids)?.eval()   // warm + build layers
+        let full = measure("full") { RawMetalForward.profSkipSingleThread = false; RawMetalForward.profSkipMoEExperts = false; RawMetalForward.profSkipMixer = false }
+        let noST = measure("skip-ST") { RawMetalForward.profSkipSingleThread = true }
+        RawMetalForward.profSkipSingleThread = false
+        let noMoE = measure("skip-MoE") { RawMetalForward.profSkipMoEExperts = true }
+        RawMetalForward.profSkipMoEExperts = false
+        let noMix = measure("skip-mixer") { RawMetalForward.profSkipMixer = true }
+        RawMetalForward.profSkipMixer = false
+        // baseline: 素朴 MLX decode（caches, 32 step greedy）
+        let T = 8
+        let pid = MLXArray((0..<T).map { Int32($0 + 10) }, [1, T])
+        let caches = model.makeCaches()
+        var lg = model(pid, caches: caches)
+        var nxt = MLX.argMax(lg[0, T-1], axis: -1).reshaped([1,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays })
+        let st = now(); let N = 32
+        for _ in 0..<N { lg = model(nxt, caches: caches); nxt = MLX.argMax(lg[0,0], axis:-1).reshaped([1,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays }) }
+        let mlxMs = (now()-st)/Double(N)
+        return String(format: """
+            [profile-gpu] GPU-exec 帰属（owner 指摘①, cold T=1 forward, M1 系）
+              full:        wall %.1fms / GPU-exec %.2fms（CPU-encode bubble = wall-gpu = %.2fms）
+              single-thread(route_top8+shared_gate8) 寄与 ≈ %.2fms（full-skipST GPU-exec 差）
+              MoE-experts(gather/swiglu/shared/combine/final) 寄与 ≈ %.2fms
+              mixer(GDN/attn body) 寄与 ≈ %.2fms
+              skip-ST GPU=%.2f / skip-MoE GPU=%.2f / skip-mixer GPU=%.2f
+              ── baseline ── 素朴 MLX decode(caches, %d step): %.2fms/tok (%.1f tok/s)
+              → 判定: single-thread 寄与が大なら②並列化で足りる。mixer/MoE 大 kernel 寄与が支配なら③ mx.fast 移植深掘り。
+            """, full.wall, full.gpu, full.wall-full.gpu,
+            full.gpu-noST.gpu, full.gpu-noMoE.gpu, full.gpu-noMix.gpu,
+            noST.gpu, noMoE.gpu, noMix.gpu, N, mlxMs, 1000/mlxMs)
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
