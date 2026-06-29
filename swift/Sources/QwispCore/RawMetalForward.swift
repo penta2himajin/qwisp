@@ -2404,6 +2404,379 @@ public enum RawMetalForward {
             E, topK, Hin, I, rel, rel == 0 ? "✅ TRUE bit-exact" : (rel < 2e-3 ? "△ 近似(raw combine)" : "❌"), note)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ★ issue#6 #1 raw M=B: M=B 専用カーネル族（`_b`）。M=1 経路と分離・温存して独立設計。
+    //   dense(gate/shared) は tiled で weight amortize、routed gather は Stage A=per-(b,k)。
+    //   全 f16 in/out・f32 accum（near-tie, bit-exact 不要）。MoE block を単一 CB で all-GPU。
+    // ═══════════════════════════════════════════════════════════════════════════════
+    nonisolated(unsafe) static var _qmm8TiledBPipeline: MTLComputePipelineState?  // gate 8bit tiled
+    nonisolated(unsafe) static var _qmm4TiledBPipeline: MTLComputePipelineState?  // shared 4bit tiled
+    nonisolated(unsafe) static var _routeBPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _gqmmBPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _combineBPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sharedGate8BPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _finalCombineBPipeline: MTLComputePipelineState?
+
+    static func compileMoEB() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _gqmmBPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // ── dense tiled（weight 行を threadgroup に 1 回 dequant→B 行で共有＝amortize）──
+        // qmm8_tiled: w[N,K] 8bit(1byte/値, gs=64) · x[B,K] → y[B,N]
+        kernel void qmm8_tiled_b(device const uint8_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                 device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                 device half* y [[buffer(4)]], constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],
+                                 constant int& B [[buffer(7)]],
+                                 uint n [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                                 uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float wdq[2048]; threadgroup float red[256];
+            int Kg = K / 64;
+            for (int k = (int)lid; k < K; k += (int)tgs) {
+                int g = k / 64;
+                wdq[k] = (float)scales[n*Kg+g] * (float)w[n*K+k] + (float)biases[n*Kg+g];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int b = 0; b < B; b++) {
+                float acc = 0.0f;
+                for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)x[b*K+k] * wdq[k];
+                red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (lid < s) red[lid] += red[lid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (lid == 0) y[b*N + n] = (half)red[0];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        // qmm4_tiled: w[N,K] 4bit(8値/uint32, gs=64) · x[B,K] → y[B,N]（shared expert 用）
+        kernel void qmm4_tiled_b(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                 device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                 device half* y [[buffer(4)]], constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],
+                                 constant int& B [[buffer(7)]],
+                                 uint n [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                                 uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float wdq[2048]; threadgroup float red[256];
+            int Kg = K / 64;
+            for (int k = (int)lid; k < K; k += (int)tgs) {
+                uint pack = w[n * (K/8) + k/8];
+                uint nib = (pack >> (4*(k%8))) & 0xf;
+                int g = k/64;
+                wdq[k] = (float)scales[n*Kg+g] * (float)nib + (float)biases[n*Kg+g];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int b = 0; b < B; b++) {
+                float acc = 0.0f;
+                for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)x[b*K+k] * wdq[k];
+                red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (lid < s) red[lid] += red[lid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (lid == 0) y[b*N + n] = (half)red[0];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        // route_top8_b: 各 threadgroup が token b を担当（grid width=B）。logits[B,E]→inds[B,K],scores[B,K]
+        kernel void route_top8_b(device const half* logits [[buffer(0)]],
+                                 device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                                 constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                                 uint bgid [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float red[256]; threadgroup int redi[256];
+            threadgroup float gates[256]; threadgroup float work[256]; threadgroup float bcast[1];
+            const device half* lgp = logits + bgid * N;
+            device int* indp = inds + bgid * K;
+            device half* scp = scores + bgid * K;
+            float lg = (tid < N) ? (float)lgp[tid] : -INFINITY;
+            red[tid] = lg; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+            float m = bcast[0];
+            float e = (tid < N) ? precise::exp(lg - m) : 0.0f;
+            red[tid] = e; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+            float Z = bcast[0];
+            if (tid < N) { gates[tid] = (float)(half)(e / Z); work[tid] = lg; } else { work[tid] = -INFINITY; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = 0; k < K; k++) {
+                red[tid] = work[tid]; redi[tid] = (int)tid; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) {
+                    if (tid < s) { if (red[tid+s] > red[tid]) { red[tid] = red[tid+s]; redi[tid] = redi[tid+s]; } }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) { int bi = redi[0]; indp[k] = bi; scp[k] = (half)gates[bi]; work[bi] = -INFINITY; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scp[k]; for (uint k = 0; k < K; k++) scp[k] = scp[k] / ss; }
+        }
+        // gqmm4_b: routed gather（Stage A=per-(b,k)）。w[E,N,K] · x → y[B,Ktop,N]。grid (B, N/8, Ktop)
+        #define SIMD_SIZE 32
+        inline float ld16b(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) { sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+                xt[i]=x[i]; xt[i+1]=x[i+1]/16.0f; xt[i+2]=x[i+2]/256.0f; xt[i+3]=x[i+3]/4096.0f; }
+            return sum;
+        }
+        inline float qd4b(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f; const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]*(float)(ws[i]&0x000f) + xt[4*i+1]*(float)(ws[i]&0x00f0) +
+                          xt[4*i+2]*(float)(ws[i]&0x0f00) + xt[4*i+3]*(float)(ws[i]&0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void gqmm4_b(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                            device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                            device const int* inds [[buffer(4)]], device half* y [[buffer(5)]],
+                            constant int& in_vec_size [[buffer(6)]], constant int& out_vec_size [[buffer(7)]],
+                            constant uint& lhsPer [[buffer(8)]], constant uint& Ktop [[buffer(9)]],
+                            uint3 tid [[threadgroup_position_in_grid]],
+                            uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+            constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+            constexpr int block_size = 512, scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U; thread U x_thread[16]; thread U result[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            uint b = tid.x, ki = tid.z;
+            uint e = (uint)inds[b * Ktop + ki];
+            ws     += (size_t)e * out_vec_size * in_vec_size_w;
+            scales += (size_t)e * out_vec_size * in_vec_size_g;
+            biases += (size_t)e * out_vec_size * in_vec_size_g;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            // gate/up(lhsPer=0): x は token b 共有[b]。down(lhsPer=1): h[b,ki]＝(b*Ktop+ki)行
+            size_t xrow = lhsPer ? (size_t)(b*Ktop + ki) : (size_t)b;
+            x += xrow * in_vec_size + simd_lid * values_per_thread;
+            y += (size_t)(b*Ktop + ki) * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16b(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U bb = bl[0];
+                    result[row] += qd4b(wl, x_thread, s, bb, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64; biases += block_size / 64; x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
+        // combine_b: y[b,n] = Σ_k d[b,k,n]*scores[b,k]。grid (N, B)
+        kernel void combine_b(device const half* d [[buffer(0)]], device const half* scores [[buffer(1)]],
+                              device half* y [[buffer(2)]], constant uint& K [[buffer(3)]],
+                              constant uint& N [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+            uint n = gid.x, b = gid.y; if (n >= N) return;
+            half acc = (half)0;
+            for (uint k = 0; k < K; ++k) acc += d[(b*K+k)*N + n] * scores[b*K+k];
+            y[b*N + n] = acc;
+        }
+        // shared_gate8_b: token b の shared_expert_gate(8bit,N=1)→sigmoid→gateScale[b]。grid width=B
+        kernel void shared_gate8_b(device const uint8_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                   device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                   device half* out [[buffer(4)]], constant uint& K [[buffer(5)]],
+                                   uint bgid [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float part[256];
+            const device half* xp = x + bgid * K;
+            uint G = K / 64; float acc = 0.0f;
+            for (uint g = tid; g < G; g += tgs) {
+                float sq = 0.0f, sx = 0.0f;
+                for (uint j = 0; j < 64; j++) { uint k = g*64 + j; float xv = (float)xp[k]; sq += xv*(float)w[k]; sx += xv; }
+                acc += (float)scales[g]*sq + (float)biases[g]*sx;
+            }
+            part[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) part[tid] += part[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (tid == 0) { float a = part[0]; float yy = 1.0f/(1.0f+precise::exp(metal::abs(a))); out[bgid] = (half)(a < 0.0f ? yy : (1.0f-yy)); }
+        }
+        // final_combine_b: combined[b,i] = y[b,i] + gateScale[b]*sharedY[b,i]。grid total=B*H
+        kernel void final_combine_b(device const half* y [[buffer(0)]], device const half* sharedY [[buffer(1)]],
+                                    device const half* gateScale [[buffer(2)]], device half* combined [[buffer(3)]],
+                                    constant uint& H [[buffer(4)]], constant uint& B [[buffer(5)]],
+                                    uint idx [[thread_position_in_grid]]) {
+            if (idx >= B*H) return; uint b = idx / H;
+            combined[idx] = y[idx] + gateScale[b] * sharedY[idx];
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+            func mk(_ n: String) throws -> MTLComputePipelineState { try device.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
+            _qmm8TiledBPipeline = try mk("qmm8_tiled_b")
+            _qmm4TiledBPipeline = try mk("qmm4_tiled_b")
+            _routeBPipeline = try mk("route_top8_b")
+            _gqmmBPipeline = try mk("gqmm4_b")
+            _combineBPipeline = try mk("combine_b")
+            _sharedGate8BPipeline = try mk("shared_gate8_b")
+            _finalCombineBPipeline = try mk("final_combine_b")
+            return true
+        } catch { print("[raw-moe-b] compile: \(error)"); return false }
+    }
+
+    /// M=B MoE 全体（gate→route→experts→combine→shared→final）を単一 encoder に encode。出力=cb.combined[B,H]。
+    struct MoEBuffersB {
+        let B, Hin, I, topK, E: Int
+        let bx, gateLogits, binds, scores, g, u, h, d, y, sg, su, shAct, sharedY, gateScale, combined: MTLBuffer
+        let gateW, gateS, gateB: MTLBuffer          // gate 8bit
+        let swGW, swGS, swGB, swUW, swUS, swUB, swDW, swDS, swDB: MTLBuffer   // routed 4bit
+        let shGW, shGS, shGB, shUW, shUS, shUB, shDW, shDS, shDB: MTLBuffer   // shared 4bit
+        let sgW, sgS, sgB: MTLBuffer                 // shared_expert_gate 8bit
+    }
+    static func encodeMoEGPUB(_ enc: MTLComputeCommandEncoder, _ b: MoEBuffersB) {
+        let B = b.B, Hin = b.Hin, I = b.I, K = b.topK, E = b.E
+        // ① gate qmm8_tiled: bx[B,H] → gateLogits[B,E]
+        enc.setComputePipelineState(_qmm8TiledBPipeline!)
+        enc.setBuffer(b.gateW, offset: 0, index: 0); enc.setBuffer(b.gateS, offset: 0, index: 1); enc.setBuffer(b.gateB, offset: 0, index: 2)
+        enc.setBuffer(b.bx, offset: 0, index: 3); enc.setBuffer(b.gateLogits, offset: 0, index: 4)
+        var kH = Int32(Hin), nE = Int32(E), bb = Int32(B)
+        enc.setBytes(&kH, length: 4, index: 5); enc.setBytes(&nE, length: 4, index: 6); enc.setBytes(&bb, length: 4, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        // ② route_top8_b: gateLogits[B,E] → binds[B,K], scores[B,K]
+        enc.setComputePipelineState(_routeBPipeline!)
+        enc.setBuffer(b.gateLogits, offset: 0, index: 0); enc.setBuffer(b.binds, offset: 0, index: 1); enc.setBuffer(b.scores, offset: 0, index: 2)
+        var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        // ③ routed experts: g/u gather(bx) → swiglu → d gather(h, per-expert)
+        func encGather(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
+            enc.setComputePipelineState(_gqmmBPipeline!)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(b.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
+            var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0), kt = UInt32(K)
+            enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
+            enc.dispatchThreadgroups(MTLSize(width: B, height: nn/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encSwiglu(_ gb: MTLBuffer, _ ub: MTLBuffer, _ hb: MTLBuffer, _ total: Int) {
+            enc.setComputePipelineState(_swigluPipeline!)
+            enc.setBuffer(gb, offset: 0, index: 0); enc.setBuffer(ub, offset: 0, index: 1); enc.setBuffer(hb, offset: 0, index: 2)
+            var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_swigluPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+        func encTiled(_ pipe: MTLComputePipelineState, _ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ yb: MTLBuffer, K kk: Int, N nn: Int) {
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(yb, offset: 0, index: 4)
+            var k = Int32(kk), n = Int32(nn), bn = Int32(B)
+            enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6); enc.setBytes(&bn, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: nn, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        encGather(b.swGW, b.swGS, b.swGB, b.bx, b.g, K: Hin, N: I, lhs: false)
+        encGather(b.swUW, b.swUS, b.swUB, b.bx, b.u, K: Hin, N: I, lhs: false)
+        encSwiglu(b.g, b.u, b.h, B * K * I)
+        encGather(b.swDW, b.swDS, b.swDB, b.h, b.d, K: I, N: Hin, lhs: true)
+        // shared expert: sg/su tiled(4bit) → swiglu → sharedY tiled
+        encTiled(_qmm4TiledBPipeline!, b.shGW, b.shGS, b.shGB, b.bx, b.sg, K: Hin, N: I)
+        encTiled(_qmm4TiledBPipeline!, b.shUW, b.shUS, b.shUB, b.bx, b.su, K: Hin, N: I)
+        encSwiglu(b.sg, b.su, b.shAct, B * I)
+        encTiled(_qmm4TiledBPipeline!, b.shDW, b.shDS, b.shDB, b.shAct, b.sharedY, K: I, N: Hin)
+        // ④ combine: d[B,K,H]·scores[B,K] → y[B,H]
+        enc.setComputePipelineState(_combineBPipeline!)
+        enc.setBuffer(b.d, offset: 0, index: 0); enc.setBuffer(b.scores, offset: 0, index: 1); enc.setBuffer(b.y, offset: 0, index: 2)
+        var ck = UInt32(K), cn = UInt32(Hin); enc.setBytes(&ck, length: 4, index: 3); enc.setBytes(&cn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: Hin, height: B, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_combineBPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        // ⑤ shared gate scalar(sigmoid)[B] → final_combine: combined[B,H] = y + gateScale*sharedY
+        enc.setComputePipelineState(_sharedGate8BPipeline!)
+        enc.setBuffer(b.sgW, offset: 0, index: 0); enc.setBuffer(b.sgS, offset: 0, index: 1); enc.setBuffer(b.sgB, offset: 0, index: 2)
+        enc.setBuffer(b.bx, offset: 0, index: 3); enc.setBuffer(b.gateScale, offset: 0, index: 4)
+        var sk = UInt32(Hin); enc.setBytes(&sk, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(_finalCombineBPipeline!)
+        enc.setBuffer(b.y, offset: 0, index: 0); enc.setBuffer(b.sharedY, offset: 0, index: 1); enc.setBuffer(b.gateScale, offset: 0, index: 2); enc.setBuffer(b.combined, offset: 0, index: 3)
+        var fh = UInt32(Hin), fb = UInt32(B); enc.setBytes(&fh, length: 4, index: 4); enc.setBytes(&fb, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: B * Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_finalCombineBPipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// ★ 検証: M=B MoE block(all-GPU raw)を MLX MoEBlock と per-token 比較 + raw M=B vs B×M=1 計測。
+    /// env QWISP_RUN=raw-moe-b / QWISP_DEC0_REF / QWISP_MOE_SIM=1(similar stream)。
+    public static func runMoeBlockTestB() -> String {
+        guard let (device, queue) = ensure(), compileMoEB(), ensureAuxPipelines() else { return "[raw-moe-b] init 失敗" }
+        let refPath = ProcessInfo.processInfo.environment["QWISP_DEC0_REF"] ?? "/tmp/qwisp_dec0_ref.safetensors"
+        guard let r = try? loadArrays(url: URL(fileURLWithPath: refPath)) else { return "[raw-moe-b] ref 読込失敗 \(refPath)" }
+        func q(_ n: String, _ bits: Int) -> Proj? {
+            guard let w = r["\(n).weight"], let s = r["\(n).scales"], let bi = r["\(n).biases"] else { return nil }
+            return .quantized(w, s, bi, bits)
+        }
+        guard let gate = q("gate", 8), let shGate = q("shared_expert.gate_proj", 4),
+              let shUp = q("shared_expert.up_proj", 4), let shDown = q("shared_expert.down_proj", 4),
+              let sharedGate = q("shared_expert_gate", 8),
+              let swGW = r["switch_mlp.gate_proj.weight"], let swGS = r["switch_mlp.gate_proj.scales"], let swGB = r["switch_mlp.gate_proj.biases"],
+              let swUW = r["switch_mlp.up_proj.weight"], let swUS = r["switch_mlp.up_proj.scales"], let swUB = r["switch_mlp.up_proj.biases"],
+              let swDW = r["switch_mlp.down_proj.weight"], let swDS = r["switch_mlp.down_proj.scales"], let swDB = r["switch_mlp.down_proj.biases"]
+        else { return "[raw-moe-b] ref キー不足" }
+        func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!) }
+        let sgT = tup("shared_expert.gate_proj"), suT = tup("shared_expert.up_proj"), sdT = tup("shared_expert.down_proj")
+        let gT = tup("gate"), sgGateT = tup("shared_expert_gate")
+        let Hin = swGS.dim(-1) * 64, topK = 8, E = 256, I = swGW.dim(-2)
+        let blk = MoEBlock(topK: topK, numExperts: E, normTopk: true, expertBits: 4, gate: gate,
+                           swGateW: swGW, swGateS: swGS, swGateB: swGB, swUpW: swUW, swUpS: swUS, swUpB: swUB,
+                           swDownW: swDW, swDownS: swDS, swDownB: swDB, shGate: shGate, shUp: shUp, shDown: shDown, sharedGate: sharedGate)
+        let similar = ProcessInfo.processInfo.environment["QWISP_MOE_SIM"] == "1"
+        func wb(_ a: MLXArray) -> MTLBuffer { a.asMTLBuffer(device: device, noCopy: false)! }
+        func fb(_ a: MLXArray) -> MTLBuffer { a.asType(.float16).asMTLBuffer(device: device, noCopy: false)! }
+        func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        // 重み buffer は B 非依存（共有）。一度だけ作る。
+        let gateWb = wb(gT.0), gateSb = fb(gT.1), gateBb = fb(gT.2)
+        let swGWb = wb(swGW), swGSb = fb(swGS), swGBb = fb(swGB), swUWb = wb(swUW), swUSb = fb(swUS), swUBb = fb(swUB), swDWb = wb(swDW), swDSb = fb(swDS), swDBb = fb(swDB)
+        let shGWb = wb(sgT.0), shGSb = fb(sgT.1), shGBb = fb(sgT.2), shUWb = wb(suT.0), shUSb = fb(suT.1), shUBb = fb(suT.2), shDWb = wb(sdT.0), shDSb = fb(sdT.1), shDBb = fb(sdT.2)
+        let sgWb = wb(sgGateT.0), sgSb = fb(sgGateT.1), sgBb = fb(sgGateT.2)
+        // 指定 B の buffer 束を作り、xb を書込んで返す。
+        func makeBuf(_ Bv: Int, _ xb: MLXArray) -> MoEBuffersB {
+            let mb = MoEBuffersB(B: Bv, Hin: Hin, I: I, topK: topK, E: E,
+                bx: mk(Bv*Hin*2), gateLogits: mk(Bv*E*2), binds: mk(Bv*topK*4), scores: mk(Bv*topK*2),
+                g: mk(Bv*topK*I*2), u: mk(Bv*topK*I*2), h: mk(Bv*topK*I*2), d: mk(Bv*topK*Hin*2), y: mk(Bv*Hin*2),
+                sg: mk(Bv*I*2), su: mk(Bv*I*2), shAct: mk(Bv*I*2), sharedY: mk(Bv*Hin*2), gateScale: mk(Bv*2), combined: mk(Bv*Hin*2),
+                gateW: gateWb, gateS: gateSb, gateB: gateBb,
+                swGW: swGWb, swGS: swGSb, swGB: swGBb, swUW: swUWb, swUS: swUSb, swUB: swUBb, swDW: swDWb, swDS: swDSb, swDB: swDBb,
+                shGW: shGWb, shGS: shGSb, shGB: shGBb, shUW: shUWb, shUS: shUSb, shUB: shUBb, shDW: shDWb, shDS: shDSb, shDB: shDBb,
+                sgW: sgWb, sgS: sgSb, sgB: sgBb)
+            let xf = xb.reshaped([Bv*Hin]).asType(.float16).asArray(Float16.self)
+            mb.bx.contents().bindMemory(to: Float16.self, capacity: Bv*Hin).update(from: xf, count: Bv*Hin)
+            return mb
+        }
+        func runB(_ mb: MoEBuffersB) -> Double {
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            encodeMoEGPUB(enc, mb); enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        }
+        // workload 生成（diverse=独立, similar=共有+微小ノイズ）
+        func makeX(_ Bv: Int) -> MLXArray {
+            let x: MLXArray
+            if similar { let base = MLXRandom.normal([1, Hin]); x = (base + MLXRandom.normal([Bv, Hin]) * 0.02).asType(.float16) }
+            else { x = MLXRandom.normal([Bv, Hin]).asType(.float16) }
+            x.eval(); return x
+        }
+        // ── correctness（B=8, per-token vs MLX MoEBlock）──
+        let B = 8
+        let xb = makeX(B)
+        var refRows: [MLXArray] = []
+        for b in 0..<B { let y = blk(xb[b..<(b+1), 0...]); y.eval(); refRows.append(y.reshaped([1, Hin])) }
+        let ref = MLX.concatenated(refRows, axis: 0); ref.eval()
+        let mb8 = makeBuf(B, xb)
+        for _ in 0..<3 { _ = runB(mb8) }; _ = runB(mb8)
+        let cp = mb8.combined.contents().bindMemory(to: Float16.self, capacity: B*Hin)
+        let got = MLXArray(Array(UnsafeBufferPointer(start: cp, count: B*Hin)), [B, Hin])
+        var maxRel = 0.0, sumRel = 0.0
+        for b in 0..<B { let rel = Double(relErr(got[b..<(b+1), 0...].reshaped([Hin]), ref[b..<(b+1), 0...].reshaped([Hin]))); maxRel = max(maxRel, rel); sumRel += rel }
+        // ── amortization カーブ（同一カーネルで B=1,2,4,8 の GPU-exec/token）──
+        func timeFor(_ Bv: Int) -> Double {
+            let mb = makeBuf(Bv, makeX(Bv))
+            for _ in 0..<5 { _ = runB(mb) }
+            var ms = 0.0; for _ in 0..<30 { ms += runB(mb) }; return ms/30
+        }
+        let t1 = timeFor(1), t2 = timeFor(2), t4 = timeFor(4), t8 = timeFor(8)
+        return String(format: """
+            [raw-moe-b] M=B MoE block all-GPU（gate/route/experts/combine/shared/final 全 raw, 単一 CB）vs MLX MoEBlock
+              workload=%@  E=%d topK=%d Hin=%d I=%d
+              correctness(B=8) per-token rel: max=%.3e mean=%.3e %@（near-tie 基準）
+              GPU-exec 償却カーブ: B=1 %.3fms(%.3f/tok) | B=2 %.3fms(%.3f/tok) | B=4 %.3fms(%.3f/tok) | B=8 %.3fms(%.3f/tok)
+              → B=8/B=1 = %.2f×（理想 8×, 8/比 = %.2f× の実効 amortize）。dense 償却済, routed=Stage A per-(b,k)
+            """, similar ? "similar(共有+ノイズ)" : "diverse(独立)", E, topK, Hin, I,
+            maxRel, sumRel/Double(B), maxRel < 5e-3 ? "✅ near" : "❌乖離",
+            t1, t1, t2, t2/2, t4, t4/4, t8, t8/8, t8/t1, 8.0/(t8/t1))
+    }
+
     /// MoE block を raw kernel で forward（routing/combine は MLX glue, gather/swiglu/shared は raw, decode T=1）。
     /// runMoeBlockTest で bit-exact 検証済の経路を関数化（decoder layer 結線用）。x[1,H] → [1,H]。
     static func moeRawForward(_ x: MLXArray, gate: Proj, sharedGate: Proj,
