@@ -293,12 +293,13 @@ public final class QwispModel {
 
     /// 層融合 1 層: mixer-half（input_norm+mixer+residual+post_norm を 1 encoder, hBuf 直更新）→
     /// routing(MLX) → expert SE → combine(MLX) → MoE residual(kernel)。hBuf は GPU 常駐のまま。
-    func fusedDecoderLayer(_ i: Int, H: Int) -> Bool {
+    func fusedDecoderLayer(_ i: Int, H: Int, pendingResid: MTLBuffer?) -> Bool {
         let isGDN = ensureFusedBuffers(i, H: H)
         guard let nw = normWeightCache[i], let hb = hBuf, let pnb = postNormBuf, let cb = combinedBuf else { return false }
         guard let postNorm = RawMetalForward.fusedMixerHalf(
             hBuf: hb, nw: nw, postNormBuf: pnb,
-            gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i], H: H, eps: eps) else { return false }
+            gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i], H: H, eps: eps,
+            pendingResid: pendingResid) else { return false }
         // MoE: routing(MLX) + expert SE + combine(MLX) + residual(kernel)
         let p = "language_model.model.layers.\(i)", mp = "\(p).mlp"
         let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
@@ -319,7 +320,7 @@ public final class QwispModel {
         let gateScale = MLX.sigmoid(q("\(mp).shared_expert_gate", 8).apply(postNorm))
         let combined = y + gateScale * sharedY
         combined.eval()
-        RawMetalForward.fusedMoEResidual(hBuf: hb, combined: combined, combinedBuf: cb, H: H)
+        RawMetalForward.writeBuffer(cb, combined, H)   // combinedBuf に保存→次層 mixer 先頭で hBuf に畳む
         return true
     }
 
@@ -329,9 +330,13 @@ public final class QwispModel {
         if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
         if postNormBuf == nil { postNormBuf = RawMetalForward.makeResidentBuffer(H * 2) }
         if combinedBuf == nil { combinedBuf = RawMetalForward.makeResidentBuffer(H * 2) }
-        guard let hb = hBuf else { return nil }
+        guard let hb = hBuf, let cb = combinedBuf else { return nil }
         RawMetalForward.writeBuffer(hb, e, H)                      // embed → hBuf
-        for i in 0 ..< numLayers { if !fusedDecoderLayer(i, H: H) { return nil } }
+        // 各層 MoE residual は次層 mixer encoder 先頭に畳む（pendingResid）。初層は無し。
+        for i in 0 ..< numLayers {
+            if !fusedDecoderLayer(i, H: H, pendingResid: i == 0 ? nil : cb) { return nil }
+        }
+        RawMetalForward.fusedMoEResidual(hBuf: hb, combinedBuf: cb, H: H)  // 最終層 MoE residual を flush
         let h = RawMetalForward.readBuffer(hb, H)                  // hBuf → MLXArray（最後だけ readback）
         guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))

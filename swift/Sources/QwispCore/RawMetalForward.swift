@@ -1153,13 +1153,16 @@ public enum RawMetalForward {
     /// hBuf(residual stream, in/out, f16) を直読/直更新。postNorm を返す（MoE routing 用, MLXArray）。
     /// gdn か attn のどちらか一方を渡す。mixer の入力 buffer(b.bx) に input_norm 結果を書く。
     static func fusedMixerHalf(hBuf: MTLBuffer, nw: NormWeightBuffers, postNormBuf: MTLBuffer,
-                               gdn: GDNBuffers?, attn: AttnBuffers?, H: Int, eps: Float) -> MLXArray? {
+                               gdn: GDNBuffers?, attn: AttnBuffers?, H: Int, eps: Float,
+                               pendingResid: MTLBuffer? = nil) -> MLXArray? {
         guard let (_, queue) = ensure(), _rmsPipeline != nil, _residAddPipeline != nil else { return nil }
         let mixerBx: MTLBuffer, mixerOut: MTLBuffer
         if let g = gdn { guard checkGDNPipelines(g) else { return nil }; mixerBx = g.bx; mixerOut = g.outBuf }
         else if let a = attn { guard checkAttnPipelines() else { return nil }; mixerBx = a.bx; mixerOut = a.outBuf }
         else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        // ⓪ 前層 MoE residual を畳む（hBuf += prevCombined）。別 CB を消し本 encoder 先頭に統合。
+        if let pr = pendingResid { encodeResidAdd(enc, h: hBuf, r: pr, total: H) }
         // ① input_norm: hBuf → mixer.bx（f16, non-promote）
         encodeRms(enc, src: hBuf, w: nw.inputNormW, out: mixerBx, D: H, eps: eps)
         // ② mixer: mixer.bx → mixer.outBuf
@@ -1172,10 +1175,9 @@ public enum RawMetalForward {
         return readBuffer(postNormBuf, H)
     }
 
-    /// 層融合 MoE residual: hBuf += combined（MLXArray[1,H]）。combinedBuf に書込み後 resid_add 1 dispatch。
-    static func fusedMoEResidual(hBuf: MTLBuffer, combined: MLXArray, combinedBuf: MTLBuffer, H: Int) {
+    /// 層融合 MoE residual flush: hBuf += combinedBuf（最終層のみ。中間層は次層 mixer 先頭で畳む）。
+    static func fusedMoEResidual(hBuf: MTLBuffer, combinedBuf: MTLBuffer, H: Int) {
         guard let (_, queue) = ensure(), _residAddPipeline != nil else { return }
-        writeBuffer(combinedBuf, combined, H)
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeResidAdd(enc, h: hBuf, r: combinedBuf, total: H)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
