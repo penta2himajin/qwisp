@@ -895,7 +895,22 @@ public final class QwispModel {
         }
         out += String(format: "  [per-stream correct] batched vs standalone(B=%d): 一致 %d/%d, 不一致=%d（near-tie %d, 真の乖離 %d）%@\n",
                       Bc, matchC, Bc, Bc - matchC, nearC, truC, exc.isEmpty ? "" : exc.joined(separator: " "))
-        out += "  → 不一致が全 near-tie なら各 stream は correct greedy（batch 構成で near-tie flip＝issue#6 既知, 実用許容）。"
+        out += "  → 不一致が全 near-tie なら各 stream は correct greedy（batch 構成で near-tie flip＝issue#6 既知, 実用許容）。\n"
+        // ★ batched decode throughput（per-stream KV+GDN state cache, prefill [B,T]→N step [B,1]）＝実 throughput。
+        out += "  ── batched decode throughput（caches, prefill T=8 → 16 step）──\n"
+        out += "  B    ms/step   tok/s(=B/ms)\n"
+        for B in [1, 4, 8, 16] {
+            let pid = MLXArray((0 ..< B*8).map { Int32(($0 * 97 + 3) % 100000) }, [B, 8])
+            let caches = model.makeCaches()
+            var lg = model(pid, caches: caches)
+            var nxt = MLX.argMax(lg[0..., 7], axis: -1).reshaped([B, 1])
+            MLX.eval([nxt] + caches.flatMap { $0.stateArrays })
+            for _ in 0..<3 { lg = model(nxt, caches: caches); nxt = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays }) }
+            let steps = 16; let t0 = now()
+            for _ in 0..<steps { lg = model(nxt, caches: caches); nxt = MLX.argMax(lg[0..., 0], axis: -1).reshaped([B,1]); MLX.eval([nxt] + caches.flatMap { $0.stateArrays }) }
+            let ms = (now()-t0)/Double(steps)
+            out += String(format: "  %-4d %8.1f %12.1f\n", B, ms, Double(B)/ms*1000)
+        }
         return out
     }
 
