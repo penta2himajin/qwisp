@@ -891,11 +891,14 @@ public enum StreamingMoEValidation {
         last?.eval()
         var cur = Int32(MLX.argMax(last!.reshaped([last!.size])).item(Int.self))
         var refGen: [Int32] = []
+        let tRef0 = DispatchTime.now().uptimeNanoseconds
         for _ in 0 ..< N {
             refGen.append(cur)
             guard let lg = model.fusedDecodeStepGPU(cur, pos: pos, H: H) else { break }
             lg.eval(); pos += 1; cur = Int32(MLX.argMax(lg.reshaped([lg.size])).item(Int.self))
         }
+        let refSecs = Double(DispatchTime.now().uptimeNanoseconds - tRef0) / 1e9
+        let refTokps = Double(N) / refSecs   // resident(全 expert 常駐, 32GB+ tier)decode tok/s
 
         // ===== ② streaming 構成 =====
         var caches: [LayerExpertCache] = []
@@ -943,7 +946,9 @@ public enum StreamingMoEValidation {
             return (st, hm)
         }
         // 1 token の checkpoint-resume decode step。(予測 argmax, #passes) を返す。
+        // GPU-exec(lastGPUExecMs) と pread(LayerExpertCache.preadNanos)を分離計測し CPU bookkeeping を切り分け。
         let maxPasses = nLayers + 20
+        var gpuMsAccum = 0.0
         func decodeStep(_ inputTok: Int32, _ pos: Int) -> (Int, Int) {
             let snap = snapshotGDN()                                   // token 開始 GDN state
             let embedX = model.embed(MLXArray([inputTok], [1, 1])); embedX.eval()
@@ -959,6 +964,7 @@ public enum StreamingMoEValidation {
                     hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTables, hotMasks: hotMasks,
                     missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: prevStart,
                     H: H, E: 256, K: 8, eps: model.eps, decode: true, pos: pos, finalNormW: model.ensureFinalNorm())
+                gpuMsAccum += RawMetalForward.lastGPUExecMs
                 let mcp = missCount.contents().bindMemory(to: Int32.self, capacity: nLayers)
                 var m = -1
                 for l in prevStart ..< nLayers where mcp[l] > 0 { m = l; break }
@@ -982,12 +988,19 @@ public enum StreamingMoEValidation {
             if idx == prompt.count - 1 && pred == Int(refGen[0]) { match += 1 }
             pos += 1
         }
-        // teacher-forced 生成: refGen[i] を投入し予測 == refGen[i+1] を照合。
+        // teacher-forced 生成: refGen[i] を投入し予測 == refGen[i+1] を照合。wall-clock/GPU/pread を分離計測。
         var genPasses: [Int] = []
+        gpuMsAccum = 0.0; LayerExpertCache.preadNanos = 0
+        let tStream0 = DispatchTime.now().uptimeNanoseconds
         for i in 0 ..< (N - 1) {
             let (pred, p) = decodeStep(refGen[i], pos); genPasses.append(p); pos += 1
             if pred == Int(refGen[i + 1]) { match += 1 }
         }
+        let streamSecs = Double(DispatchTime.now().uptimeNanoseconds - tStream0) / 1e9
+        let streamTokps = Double(N - 1) / streamSecs
+        let gpuMsPerTok = gpuMsAccum / Double(N - 1)
+        let preadMsPerTok = Double(LayerExpertCache.preadNanos) / 1e6 / Double(N - 1)
+        let cpuMsPerTok = streamSecs / Double(N - 1) * 1000 - gpuMsPerTok - preadMsPerTok
 
         let coldPasses = promptPasses.first ?? 0
         let warmProm = promptPasses.dropFirst().map { $0 }
@@ -1003,12 +1016,19 @@ public enum StreamingMoEValidation {
                 cold first token=%d(=#miss 40 近傍, 想定通り)
                 prompt warm tail=%@
                 generated: avg=%.1f  min=%d  max=%d  trace=%@
-              → warm token の #sync が per-layer drain 40 を大きく下回れば style A payoff 確定。
-                (synthetic/teacher-forced prompt は expert locality 控えめ=保守的見積り。layer-batch 予測 prefetch で更に低減可)
+              wall-clock(Debug, ratio 有効/絶対値は遅い):
+                streaming(C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok, %.1f CB/tok)
+                  内訳/tok: GPU-exec=%.1fms(suffix 再計算込) + pread=%.1fms + CPU bookkeeping=%.1fms
+                resident(全 expert 常駐, 32GB+ tier)=%.1f tok/s(%.1f ms/tok, 1 CB/tok)
+                → streaming/resident=%.2fx。GPU-exec 比で suffix 再計算コスト、CPU 比で bookkeeping を切り分け。
               %@
             """, C, prompt.count, N, match, matchable,
             coldPasses, warmProm.map { String($0) }.joined(separator: ","),
             avgGen, minGen, maxGen, genTrace,
+            C, streamTokps, streamSecs / Double(N - 1) * 1000, avgGen,
+            gpuMsPerTok, preadMsPerTok, cpuMsPerTok,
+            refTokps, refSecs / Double(N) * 1000,
+            streamTokps / refTokps,
             ok ? "✅ lossless 一致(A5 decode 配線 OK)" : "❌ argmax 乖離")
     }
 }
