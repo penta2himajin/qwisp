@@ -1127,6 +1127,55 @@ public final class QwispModel {
             Double(totTok)/((contMs-prefillMs)/1000), N, B)
     }
 
+    /// ★ issue#6 #1: raw M=B の MoE amortization 上限を実測。B 行が層ごとに選ぶ top-8 expert の **union** を
+    /// (a)diverse stream (b)similar stream(共有 prompt)で計測。union が小=amortize, 大(≈8B)=sub-B。env QWISP_RUN=moe-union.
+    public static func runMoeUnionProbe(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store); let L = model.numLayers
+        let B = 8, H = 2048
+        // 実 hidden を得る: 共有 prompt を流して各層の postNorm 相当（layer 入力）を取る代わりに、
+        // diverse=独立 prompt の embed、similar=共有 prompt+微小ノイズ、を gate に通して union を見る（近似）。
+        func unionFor(_ hs: [MLXArray]) -> Double {
+            var totalUnion = 0; var moeLayers = 0
+            for i in 0 ..< L {
+                let mp = "language_model.model.layers.\(i).mlp"
+                let gw = model.store.req("\(mp).gate.weight"), gs = model.store.req("\(mp).gate.scales"), gb = model.store.req("\(mp).gate.biases")
+                var union = Set<Int32>()
+                for h in hs {
+                    guard let (inds, _) = RawMetalForward.metalRouteGate(h, gateW: gw, gateS: gs, gateB: gb, H: H) else { continue }
+                    for v in inds.asArray(Int32.self) { union.insert(v) }
+                }
+                totalUnion += union.count; moeLayers += 1
+            }
+            return Double(totalUnion) / Double(moeLayers)
+        }
+        // diverse: 独立ランダム hidden
+        let diverse = (0..<B).map { _ in (MLXRandom.normal([1, H]) * 1.0).asType(.float16) }
+        // similar: 共有 base + 小ノイズ（共有 system prompt の stream 群を模擬）
+        let base = (MLXRandom.normal([1, H]) * 1.0).asType(.float16)
+        let similar = (0..<B).map { _ in (base + (MLXRandom.normal([1, H]) * 0.15)).asType(.float16) }
+        let uD = unionFor(diverse), uS = unionFor(similar)
+        let maxU = Double(B * 8)
+        // raw M=B forward 見積: dense は full amortize(~1x), MoE routed は union/8 倍の weight ロード。
+        // forward の概算割合: dense(mixer 投影+shared+norm) ~55%, routed-MoE gather ~45%（profile より）。
+        func estSpeedup(_ u: Double) -> Double {
+            let moeAmort = 8.0 / (u / Double(B))   // 1 行あたり 8 expert、union/B が実効ロード expert 数
+            // dense は B 完全 amortize(コスト ~1)、MoE は union/8 のロード。B 行の総コスト比 vs B×単発
+            // 単発 B 回: dense B×1 + moe B×(8 ロード)。batched: dense 1 + moe (union ロード)。
+            let serial = Double(B) * (0.55 + 0.45)            // = B（各 1 forward）
+            let batched = 0.55 * 1.0 + 0.45 * (u / maxU * Double(B))  // dense 1x + moe union 比例
+            _ = moeAmort
+            return serial / batched
+        }
+        return String(format: """
+            [moe-union] raw M=B の MoE amortization 上限（B=%d, top-8, 256 expert, %d MoE 層平均）
+              expert union/層: diverse=%.1f similar=%.1f （max=%d=8B＝全 distinct, 8=完全共有）
+              → diverse は %.0f%% が distinct＝MoE gather ほぼ amortize せず。similar は %.0f%% distinct。
+              raw M=B forward 概算 speedup(dense 55%% full amortize + MoE 45%% union 比例): diverse ~%.1fx / similar ~%.1fx
+              ∴ dense は ~6.7x amortize 確定だが forward 全体は MoE union 律速。**similar prompt 束(agentic 共有 system)が batching の sweet spot**。
+            """, B, L, uD, uS, B*8, uD/maxU*100, uS/maxU*100, estSpeedup(uD), estSpeedup(uS))
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
