@@ -1042,6 +1042,82 @@ public final class QwispModel {
             """, B, match, B, B-match, near, tru, ms, Double(B)/ms*1000)
     }
 
+    /// ★ issue#6 #1: continuous batching scheduler（slot 即補充）の real throughput vs static。
+    /// 可変 gen 長 workload を (a)static-wave (b)continuous で実走し total 時間を比較。env QWISP_RUN=continuous-run。
+    public static func runContinuousRun(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store); let L = model.numLayers
+        let B = 8, N = 48
+        var seed: UInt64 = 999
+        func nextGen() -> Int { seed = seed &* 6364136223846793005 &+ 1; let r = Double((seed>>33)&0xFFFF)/65535.0; return 8 + Int(pow(r,2.0)*56) }
+        let reqGens = (0..<N).map { _ in nextGen() }   // 各 req の生成トークン数
+        func prompt(_ id: Int) -> MLXArray { MLXArray((0..<6).map { Int32(($0*53+id*17+1)%100000) }, [1, 6]) }
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+
+        // ── (b) continuous: B slot を queue から即補充。GDN は batched(行 reset)、attn は per-slot KV 差替。
+        func prefillSlot(_ id: Int) -> ([LayerCache], Int32, Int) {
+            let c = model.makeCaches(); let p = prompt(id); let lg = model(p, caches: c); lg.eval()
+            MLX.eval(c.flatMap { $0.stateArrays })
+            return (c, Int32(MLX.argMax(lg[0, p.dim(1)-1], axis: -1).item(Int.self)), p.dim(1))
+        }
+        var gdnCaches: [LayerCache] = (0..<L).map { _ in LayerCache() }
+        var attnKV: [[KVCache]] = (0..<L).map { _ in (0..<B).map { _ in KVCache() } }
+        var slotReq = [Int](repeating: -1, count: B), slotRemain = [Int](repeating: 0, count: B)
+        var positions = [Int](repeating: 0, count: B), cur = [Int32](repeating: 0, count: B)
+        var nextReq = 0, done = 0
+        // 初期 B slot を埋める（standalone prefill → batched に stack/inject）
+        var pf: [[LayerCache]] = []
+        for b in 0..<B { let (c, t, pl) = prefillSlot(nextReq); pf.append(c); slotReq[b]=nextReq; slotRemain[b]=reqGens[nextReq]; positions[b]=pl; cur[b]=t; nextReq += 1 }
+        for i in 0..<L {
+            if model.isLinear(i) {
+                gdnCaches[i].gdn.recState = MLX.concatenated(pf.map { $0[i].gdn.recState! }, axis: 0)
+                let convs = pf.map { $0[i].gdn.convState }
+                if convs.allSatisfy({ $0 != nil }) { gdnCaches[i].gdn.convState = MLX.concatenated(convs.map { $0! }, axis: 0) }
+            } else { for b in 0..<B { attnKV[i][b] = pf[b][i].kv } }
+        }
+        let tC0 = now()
+        while done < N {
+            let lg = model.forwardContinuous(MLXArray(cur, [B,1]), positions: positions, gdnCaches: gdnCaches, attnKV: attnKV)
+            let nx = MLX.argMax(lg[0..., 0], axis: -1); nx.eval()
+            MLX.eval(gdnCaches.flatMap { $0.stateArrays })
+            let nxA = nx.asArray(Int32.self)
+            for b in 0..<B { cur[b]=nxA[b]; positions[b] += 1; slotRemain[b] -= 1 }
+            // 完了 slot を補充
+            for b in 0..<B where slotRemain[b] <= 0 && slotReq[b] >= 0 {
+                done += 1; slotReq[b] = -1
+                if nextReq < N {
+                    let (c, t, pl) = prefillSlot(nextReq)
+                    for i in 0..<L {
+                        if model.isLinear(i) {
+                            gdnCaches[i].gdn.recState![b] = c[i].gdn.recState!.squeezed(axis: 0)
+                            if let cv = c[i].gdn.convState, gdnCaches[i].gdn.convState != nil { gdnCaches[i].gdn.convState![b] = cv.squeezed(axis: 0) }
+                        } else { attnKV[i][b] = c[i].kv }
+                    }
+                    slotReq[b]=nextReq; slotRemain[b]=reqGens[nextReq]; positions[b]=pl; cur[b]=t; nextReq += 1
+                } else { slotRemain[b] = Int.max }   // queue 空＝この slot は idle（active 数減）
+            }
+        }
+        let contMs = now() - tC0
+        // ── (a) static-wave: B 本ずつ、wave 内最長 gen まで全 slot 回す（finished idle）。
+        let tS0 = now(); var i = 0
+        while i < N {
+            let wave = Array(reqGens[i ..< Swift.min(i+B, N)]); let bb = wave.count; let maxg = wave.max()!
+            var pf2: [[LayerCache]] = []; var c2 = [Int32](repeating:0,count:bb); var pos2=[Int](repeating:0,count:bb)
+            for b in 0..<bb { let (c,t,pl) = prefillSlot(i+b); pf2.append(c); c2[b]=t; pos2[b]=pl }
+            var g2: [LayerCache] = (0..<L).map { _ in LayerCache() }; var a2: [[KVCache]] = (0..<L).map { _ in (0..<bb).map { _ in KVCache() } }
+            for li in 0..<L { if model.isLinear(li) { g2[li].gdn.recState = MLX.concatenated(pf2.map { $0[li].gdn.recState! }, axis: 0); let cv = pf2.map { $0[li].gdn.convState }; if cv.allSatisfy({ $0 != nil }) { g2[li].gdn.convState = MLX.concatenated(cv.map { $0! }, axis: 0) } } else { for b in 0..<bb { a2[li][b] = pf2[b][li].kv } } }
+            for _ in 0..<maxg { let lg = model.forwardContinuous(MLXArray(c2,[bb,1]), positions: pos2, gdnCaches: g2, attnKV: a2); let nx = MLX.argMax(lg[0...,0],axis: -1); nx.eval(); MLX.eval(g2.flatMap { $0.stateArrays }); let na = nx.asArray(Int32.self); for b in 0..<bb { c2[b]=na[b]; pos2[b] += 1 } }
+            i += B
+        }
+        let statMs = now() - tS0
+        let totTok = reqGens.reduce(0,+)
+        return String(format: """
+            [continuous-run] B=%d, N=%d req(可変 gen), total %d tok ── 実走 continuous vs static
+              continuous: %.1f s, %.1f tok/s   static-wave: %.1f s, %.1f tok/s   → 利得 %.2fx
+              （continuous=slot 即補充で常時満杯, static=wave で最長 gen を待ち短 req idle）
+            """, B, N, totTok, contMs/1000, Double(totTok)/contMs*1000, statMs/1000, Double(totTok)/statMs*1000, statMs/contMs)
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
