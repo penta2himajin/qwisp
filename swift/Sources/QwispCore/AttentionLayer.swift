@@ -145,6 +145,62 @@ public struct AttentionLayer {
 
         return oProj.apply(output * MLX.sigmoid(gate))
     }
+
+    /// ★ issue#6 continuous batching: 各 slot が**異なる position と独立 KV** を持つ decode step。
+    /// 投影/rmsNorm/o_proj は batched(amortize)、RoPE+SDPA だけ per-slot ループ(各 slot 自分の offset と KVCache)。
+    /// x[B,1,H], slotKV[B](per-slot 独立 KVCache), positions[B](各 slot の現在位置)。→ [B,1,H]。
+    public func callContinuous(_ x: MLXArray, slotKV: [KVCache], positions: [Int]) -> MLXArray {
+        let B = x.dim(0)
+        let qOut = qProj.apply(x).reshaped([B, 1, numHeads, 2 * headDim])
+        var queries = qOut[0..., 0..., 0..., 0 ..< headDim]                 // [B,1,nH,hd]
+        let gate = qOut[0..., 0..., 0..., headDim...].reshaped([B, 1, -1])
+        var keys = kProj.apply(x).reshaped([B, 1, numKVHeads, headDim])
+        var values = vProj.apply(x).reshaped([B, 1, numKVHeads, headDim])
+        queries = MLXFast.rmsNorm(queries, weight: qNorm, eps: eps).transposed(0, 2, 1, 3)  // [B,nH,1,hd]
+        keys = MLXFast.rmsNorm(keys, weight: kNorm, eps: eps).transposed(0, 2, 1, 3)         // [B,nKV,1,hd]
+        values = values.transposed(0, 2, 1, 3)
+        var outs: [MLXArray] = []; outs.reserveCapacity(B)
+        for b in 0 ..< B {
+            let qb = rope(queries[b ..< (b + 1)], positions[b])            // [1,nH,1,hd]（slot 自身の position）
+            let kb = rope(keys[b ..< (b + 1)], positions[b])               // [1,nKV,1,hd]
+            let vb = values[b ..< (b + 1)]
+            let (aK, aV) = slotKV[b].update(kb, vb)                        // slot 独立 KV に追記
+            outs.append(MLXFast.scaledDotProductAttention(queries: qb, keys: aK, values: aV, scale: scale, mask: .none))
+        }
+        let output = MLX.concatenated(outs, axis: 0).transposed(0, 2, 1, 3).reshaped([B, 1, -1])
+        return oProj.apply(output * MLX.sigmoid(gate))
+    }
+}
+
+public extension AttentionLayer {
+    /// 検証: callContinuous(2 slot, 異なる position) の各行が standalone decode と bit 一致するか。
+    static func continuousAttnTest() -> String {
+        let H = 2048, Pa = 5, Pb = 2
+        MLXRandom.seed(0)
+        func qp(_ outd: Int, _ ind: Int = H) -> Proj {
+            let w = (MLXRandom.normal([outd, ind]) * 0.02).asType(.float16)
+            let (wq, sq, bq) = MLX.quantized(w, groupSize: 64, bits: 4); return .quantized(wq, sq, bq!, 4)
+        }
+        let attn = AttentionLayer(numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
+            qProj: qp(16*256*2), kProj: qp(2*256), vProj: qp(2*256), oProj: qp(H, 16*256),
+            qNorm: MLXArray.ones([256]).asType(.float16), kNorm: MLXArray.ones([256]).asType(.float16))
+        // 共通 prefix を standalone(cA/cB) と continuous(cAc/cBc) の両 cache に同一適用 → 新 token を比較。
+        MLXRandom.seed(1)
+        let cA = KVCache(), cB = KVCache(), cAc = KVCache(), cBc = KVCache()
+        for _ in 0..<Pa { let t = (MLXRandom.normal([1,1,H])*0.5).asType(.float16); _ = attn(t, cache: cA); _ = attn(t, cache: cAc) }
+        for _ in 0..<Pb { let t = (MLXRandom.normal([1,1,H])*0.5).asType(.float16); _ = attn(t, cache: cB); _ = attn(t, cache: cBc) }
+        let newA = (MLXRandom.normal([1,1,H])*0.5).asType(.float16)
+        let newB = (MLXRandom.normal([1,1,H])*0.5).asType(.float16)
+        let soloA = attn(newA, cache: cA), soloB = attn(newB, cache: cB)
+        let batched = attn.callContinuous(MLX.concatenated([newA, newB], axis: 0), slotKV: [cAc, cBc], positions: [Pa, Pb])
+        soloA.eval(); soloB.eval(); batched.eval()
+        func rel(_ a: MLXArray, _ b: MLXArray) -> Float {
+            MLX.max(MLX.abs(a.asType(.float32)-b.asType(.float32))).item(Float.self) / (MLX.max(MLX.abs(b.asType(.float32))).item(Float.self)+1e-9)
+        }
+        let rA = rel(batched[0..<1], soloA), rB = rel(batched[1..<2], soloB)
+        return String(format: "[continuous-attn-test] 2 slot 異 position(A=%d,B=%d) callContinuous vs standalone: rowA rel=%.3e rowB rel=%.3e → %@",
+                      Pa, Pb, rA, rB, (rA < 1e-3 && rB < 1e-3) ? "✅ per-stream position 正しい" : "❌乖離")
+    }
 }
 
 extension AttentionLayer {

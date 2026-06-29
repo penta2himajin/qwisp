@@ -75,6 +75,7 @@ if CommandLine.arguments.contains("stream") {
         ("profile-gpu",           { md, _ in try QwispModel.runProfileGPU(modelDir: md) }),
         ("batch-scale",           { md, _ in try QwispModel.runBatchScale(modelDir: md) }),
         ("continuous-sim",        { md, _ in try QwispModel.runContinuousSim(modelDir: md) }),
+        ("continuous-attn-test",  { _, _ in AttentionLayer.continuousAttnTest() }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("cost-model-validate",   { try Tell.runCostModelValidate(modelDir: $0, refPath: $1) }),
