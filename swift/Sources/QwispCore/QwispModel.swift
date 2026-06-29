@@ -876,7 +876,26 @@ public final class QwispModel {
             if B == 1 { base1 = tokps }
             out += String(format: "  %-4d %8.1f %12.1f %14.2fx\n", B, ms, tokps, tokps / base1)
         }
-        out += "  → throughput が B で伸びれば batching 有効（dense amortize 勝ち）。頭打ちなら MoE expert-union 律速。"
+        out += "  → throughput が B で伸びれば batching 有効（dense amortize 勝ち）。頭打ちなら MoE expert-union 律速。\n"
+        // ★ per-stream correctness: batched 行 i の argmax vs 同 token の standalone [1,1] forward。
+        //   不一致を rank 分類（near-tie=batch-variance で実用許容, rank≫=真の bug）。
+        let Bc = 16
+        let toks = (0 ..< Bc).map { Int32(($0 * 4099 + 31) % 100000) }
+        let batched = model(MLXArray(toks, [Bc, 1])); batched.eval()   // [Bc, 1, vocab]
+        var matchC = 0, nearC = 0, truC = 0; var exc: [String] = []
+        for i in 0 ..< Bc {
+            let solo = model(MLXArray([toks[i]], [1, 1])); solo.eval()
+            let sv = solo.reshaped([solo.size]); let amS = MLX.argMax(sv).item(Int.self)
+            let bvRow = batched[i].reshaped([batched.dim(-1)])
+            let amB = MLX.argMax(bvRow).item(Int.self)
+            if amB == amS { matchC += 1; continue }
+            let rank = MLX.sum(sv .> sv[amB]).item(Int.self)   // standalone 内で batched-pred が何位
+            if rank <= 2 { nearC += 1 } else { truC += 1 }
+            if exc.count < 6 { exc.append("row\(i):rank\(rank)") }
+        }
+        out += String(format: "  [per-stream correct] batched vs standalone(B=%d): 一致 %d/%d, 不一致=%d（near-tie %d, 真の乖離 %d）%@\n",
+                      Bc, matchC, Bc, Bc - matchC, nearC, truC, exc.isEmpty ? "" : exc.joined(separator: " "))
+        out += "  → 不一致が全 near-tie なら各 stream は correct greedy（batch 構成で near-tie flip＝issue#6 既知, 実用許容）。"
         return out
     }
 
