@@ -66,6 +66,7 @@ if CommandLine.arguments.contains("stream") {
         ("raw-attn-test",         { _, _ in RawMetalForward.runAttnLayerTest() }),
         ("raw-moe-test",          { _, _ in RawMetalForward.runMoeBlockTest() }),
         ("raw-declayer-test",     { _, _ in RawMetalForward.runDecoderLayerTest() }),
+        ("raw-full-forward",      { md, _ in try QwispModel.runRawFullForward(modelDir: md) }),
         ("mtp-draft-calib",       { try Tell.runMTPDraftCalib(modelDir: $0, refPath: $1) }),
         ("device-probe",          { md, _ in try DeviceProbe.run(modelDir: md) }),
         ("cost-model-validate",   { try Tell.runCostModelValidate(modelDir: $0, refPath: $1) }),

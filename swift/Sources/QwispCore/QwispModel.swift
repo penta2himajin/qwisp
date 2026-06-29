@@ -145,6 +145,94 @@ public final class QwispModel {
         return headProj().apply(h)
     }
 
+    // ── raw-Metal full forward（task#4）: 全40層を raw decoder layer で回す。decode T=1, cold cache。──
+    /// raw decoder layer 1 層（input_norm→mixer raw→res→post_norm→MoE raw→res）。h[1,H]→[1,H]。
+    func rawDecoderLayer(_ h: MLXArray, _ i: Int) -> MLXArray? {
+        let p = "language_model.model.layers.\(i)", H = h.dim(-1)
+        guard let normed = RawMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
+        let r: MLXArray
+        if isLinear(i) {
+            let la = "\(p).linear_attn"
+            let rw = RawMetalForward.GDNRawWeights(
+                qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
+                zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
+                bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
+                aWq: store.req("\(la).in_proj_a.weight"), aSc: store.req("\(la).in_proj_a.scales"), aBi: store.req("\(la).in_proj_a.biases"),
+                outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
+                conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
+                aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
+            guard let ro = RawMetalForward.gdnLayerRaw(normed.reshaped([1, 1, H]), rw) else { return nil }
+            r = ro
+        } else {
+            let sa = "\(p).self_attn"
+            let aw = RawMetalForward.AttnRawWeights(
+                qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
+                kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
+                vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
+                oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
+                qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
+            let pf = (store.req("\(sa).q_norm.weight").dtype == .float32)
+            guard let ro = RawMetalForward.attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: pf) else { return nil }
+            r = ro.asType(h.dtype)
+        }
+        let h2 = h + r
+        guard let postNorm = RawMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
+        let mp = "\(p).mlp"
+        func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
+        guard let mlpOut = RawMetalForward.moeRawForward(postNorm, gate: q("\(mp).gate", 8), sharedGate: q("\(mp).shared_expert_gate", 8),
+            swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
+            shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"))
+        else { return nil }
+        return h2 + mlpOut
+    }
+
+    /// raw full forward（embed=MLX, 40 層=raw, final norm=raw, lm_head=MLX）。ids[1,1]→logits[1,1,vocab]。
+    public func rawForward(_ ids: MLXArray) -> MLXArray? {
+        let e = embed(ids); let H = e.dim(-1)
+        var h = e.reshaped([1, H])                                          // T=1
+        for i in 0 ..< numLayers { guard let h2 = rawDecoderLayer(h, i) else { return nil }; h = h2 }
+        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        return headProj().apply(fn.reshaped([1, 1, H]))
+    }
+
+    /// 検証: raw full forward(40層 raw) vs MLX full forward の logits（decode T=1）。
+    public static func runRawFullForward(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir)
+        let model = QwispModel(store: store)
+        let prevF32 = GatedDeltaNetLayer.f32Conv; GatedDeltaNetLayer.f32Conv = true   // raw conv は f32 累積＝MLX を f32Conv に合わせる
+        defer { GatedDeltaNetLayer.f32Conv = prevF32 }
+        let ids = MLXArray([Int32(100)], [1, 1])
+        let ref = model(ids); ref.eval()                                   // MLX forward(f16, f32Conv)
+        guard let got = model.rawForward(ids) else { return "[raw-full] rawForward 失敗" }
+        got.eval()
+        let rf = ref.reshaped([ref.size]), gf = got.reshaped([got.size])
+        let d = MLX.max(MLX.abs(gf.asType(.float32) - rf.asType(.float32))).item(Float.self)
+        let rel = d / (MLX.max(MLX.abs(rf.asType(.float32))).item(Float.self) + 1e-9)
+        let amR = MLX.argMax(rf).item(Int.self), amG = MLX.argMax(gf).item(Int.self)
+        var out = String(format: "[raw-full-forward] raw 40層 full forward vs MLX (decode T=1)\n"
+            + "  logits rel=%.3e  argmax raw=%d ref=%d %@  %@",
+            rel, amG, amR, amG == amR ? "一致✅" : "不一致❌",
+            rel == 0 ? "TRUE bit-exact ✅✅" : (rel < 1e-3 ? "△ near" : "❌ f16累積"))
+        // 層別診断: 同一 h(MLX 経路)を raw layer i と MLX layer i に入れ in-context per-layer rel を見る。
+        if ProcessInfo.processInfo.environment["QWISP_FULL_DIAG"] == "1" {
+            var hM = model.embed(ids); let H = hM.dim(-1)
+            var worst = 0; var worstRel: Float = 0
+            for i in 0 ..< model.numLayers {
+                let mlxOut = model.layers[i](hM); mlxOut.eval()
+                if let rawOut = model.rawDecoderLayer(hM.reshaped([1, H]), i) {
+                    rawOut.eval()
+                    let lr = MLX.max(MLX.abs(rawOut.reshaped([H]).asType(.float32) - mlxOut.reshaped([H]).asType(.float32))).item(Float.self)
+                       / (MLX.max(MLX.abs(mlxOut.asType(.float32))).item(Float.self) + 1e-9)
+                    if lr > worstRel { worstRel = lr; worst = i }
+                    if lr > 1e-5 { out += String(format: "\n   layer %d (%@): in-context rel=%.3e", i, model.isLinear(i) ? "GDN" : "attn", lr) }
+                }
+                hM = mlxOut                                                 // MLX 経路を進める(共通入力)
+            }
+            out += String(format: "\n   worst layer=%d rel=%.3e", worst, worstRel)
+        }
+        return out
+    }
+
     /// 中間 hidden を捕捉する forward（diagnostics）。captureLayers の各層後の h を返す。
     public func forwardCapturing(_ ids: MLXArray, _ captureLayers: Set<Int>)
         -> (logits: MLXArray, embed: MLXArray, captured: [Int: MLXArray], normed: MLXArray) {
