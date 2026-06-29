@@ -441,6 +441,22 @@ public enum RawMetalForward {
         } catch { print("[raw-slot-remap] compile: \(error)"); return false }
     }
 
+    // ★ A4 in-kernel stop flag: streaming resume で miss 検出後、suffix の重い MoE gather(gqmm4/gqmm4_swiglu)を
+    //   no-op 化し suffix 再計算 GPU コストを削減。activeStopFlag 非 nil(streaming)時のみ guard 発火、
+    //   nil(通常/テスト)は zeroStopBuf を bind ＝guard 不発で bit-exact 不変。
+    nonisolated(unsafe) static var activeStopFlag: MTLBuffer?
+    nonisolated(unsafe) static var _zeroStopBuf: MTLBuffer?
+    static func zeroStopBuf() -> MTLBuffer {
+        if _zeroStopBuf == nil, let (device, _) = ensure() {
+            _zeroStopBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
+            _zeroStopBuf!.contents().bindMemory(to: Int32.self, capacity: 1)[0] = 0
+        }
+        return _zeroStopBuf!
+    }
+    static func bindStop(_ enc: MTLComputeCommandEncoder, _ index: Int) {
+        enc.setBuffer(activeStopFlag ?? zeroStopBuf(), offset: 0, index: index)
+    }
+
     nonisolated(unsafe) static var _vecCopyPipeline: MTLComputePipelineState?
     /// ★ issue#7 style A milestone A3b-opt: hBuf(f16 H)を per-layer checkpoint buffer に GPU copy。
     ///   checkpoint-resume が miss 層 m から再開する際の hBuf 復元点(layer m 入口の hidden)を保存。
@@ -484,14 +500,17 @@ public enum RawMetalForward {
                                     device int*       missExperts [[buffer(3)]],   // [numLayers*K]
                                     constant uint& K     [[buffer(4)]],
                                     constant uint& layer [[buffer(5)]],
+                                    device int*       stopFlag    [[buffer(6)]],   // ★ A4: miss で 1 を立て suffix を no-op 化
                                     uint tid [[thread_position_in_threadgroup]]) {
             if (tid != 0) return;                       // K=8 小、single thread
+            if (stopFlag[0] != 0) return;               // 既に上流層が stop 済(本層は走らない想定だが防御)
             int cnt = 0;
             for (uint k = 0; k < K; k++) {
                 int e = inds[k];
                 if (hotMask[e] == 0) { missExperts[layer * K + cnt] = e; cnt++; }
             }
             missCount[layer] = cnt;
+            if (cnt > 0) stopFlag[0] = 1;               // ★ 本層 miss → 以降の gather を skip
         }
         """
         do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -984,9 +1003,11 @@ public enum RawMetalForward {
                               constant int& in_vec_size  [[buffer(6)]],
                               constant int& out_vec_size [[buffer(7)]],
                               constant uint& lhsPer      [[buffer(8)]],   // 1=x を ki 行で index(down用), 0=共有(gate/up)
+                              device const int* stopFlag [[buffer(9)]],   // ★ A4: 非0 で no-op(suffix skip)
                               uint3 tid      [[threadgroup_position_in_grid]],
                               uint  simd_gid [[simdgroup_index_in_threadgroup]],
                               uint  simd_lid [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;                            // ★ A4 stop flag guard
                 constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
                 constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
                 constexpr int block_size = 512, scale_step_per_thread = 4;
@@ -1043,6 +1064,7 @@ public enum RawMetalForward {
         enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
         var kk = Int32(K), nn = Int32(N), lhs = UInt32(lhsPerExpert ? 1 : 0)
         enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&lhs, length: 4, index: 8)
+        bindStop(enc, 9)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -1077,7 +1099,9 @@ public enum RawMetalForward {
                                  device const uint32_t* uw [[buffer(3)]], device const half* usc [[buffer(4)]], device const half* ubi [[buffer(5)]],
                                  device const half* x [[buffer(6)]], device const int* inds [[buffer(7)]], device half* h [[buffer(8)]],
                                  constant int& in_vec_size [[buffer(9)]], constant int& out_vec_size [[buffer(10)]],
+                                 device const int* stopFlag [[buffer(11)]],
                                  uint3 tid [[threadgroup_position_in_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;                               // ★ A4 stop flag guard
             constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
             constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
             constexpr int block_size = 512, scale_step_per_thread = 4;
@@ -1783,6 +1807,7 @@ public enum RawMetalForward {
                 enc.setBuffer(moe.binds, offset: 0, index: 0); enc.setBuffer(hm, offset: 0, index: 1)
                 enc.setBuffer(mc, offset: 0, index: 2); enc.setBuffer(me, offset: 0, index: 3)
                 var kn = UInt32(K), ln = UInt32(layerIdx); enc.setBytes(&kn, length: 4, index: 4); enc.setBytes(&ln, length: 4, index: 5)
+                enc.setBuffer(activeStopFlag ?? zeroStopBuf(), offset: 0, index: 6)   // ★ A4: miss で stop を立てる
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             }
             // ★ style A streaming: expert id → arena slot id を GPU remap（resident は slotTable=nil で skip）。
@@ -1801,6 +1826,7 @@ public enum RawMetalForward {
             enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(moe.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
             var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0)
             enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8)
+            bindStop(enc, 9)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encQmm(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int) {
@@ -1824,6 +1850,7 @@ public enum RawMetalForward {
                 enc.setBuffer(moe.swUW, offset: 0, index: 3); enc.setBuffer(moe.swUS, offset: 0, index: 4); enc.setBuffer(moe.swUB, offset: 0, index: 5)
                 enc.setBuffer(postNorm, offset: 0, index: 6); enc.setBuffer(moe.binds, offset: 0, index: 7); enc.setBuffer(moe.h, offset: 0, index: 8)
                 var k = Int32(Hin), n = Int32(I); enc.setBytes(&k, length: 4, index: 9); enc.setBytes(&n, length: 4, index: 10)
+                bindStop(enc, 11)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: I/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
             } else {
                 encGather(moe.swGW, moe.swGS, moe.swGB, postNorm, moe.g, K: Hin, N: I, lhs: false)
@@ -2420,6 +2447,7 @@ public enum RawMetalForward {
             enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(b.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
             var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0)
             enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8)
+            bindStop(enc, 9)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: nn / 8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         }
         func encQmm(_ wq: MTLBuffer, _ sc: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int) {

@@ -919,6 +919,9 @@ public enum StreamingMoEValidation {
         for _ in 0 ..< nLayers { guard let b = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A5] ckptH 失敗" }; ckptH.append(b) }
         let missCount = device.makeBuffer(length: nLayers * 4, options: .storageModeShared)!
         let missExperts = device.makeBuffer(length: nLayers * 8 * 4, options: .storageModeShared)!
+        // ★ A4 in-kernel stop flag: miss 後の suffix gather(gqmm4/gqmm4_swiglu)を no-op 化。常時有効
+        //   (residency_check が miss で stopFlag=1 を立てる→以降 gather skip)。lossless 維持・GPU-exec 削減。
+        let stopFlag = device.makeBuffer(length: 4, options: .storageModeShared)!
 
         // ★ bookkeeping 最適化(1): GDN snapshot/restore を **永続 backup buffer** で(Data heap alloc 排除)。
         var gdnStateBak: [Int: MTLBuffer] = [:], gdnConvBak: [Int: MTLBuffer] = [:]
@@ -992,6 +995,7 @@ public enum StreamingMoEValidation {
                 if prevStart == 0 { RawMetalForward.writeBuffer(hb, embedX, H) }
                 else { memcpy(hb.contents(), ckptH[prevStart].contents(), H * 2) }
                 memset(missCount.contents(), 0, nLayers * 4); memset(missExperts.contents(), 0, nLayers * 8 * 4)
+                stopFlag.contents().bindMemory(to: Int32.self, capacity: 1)[0] = 0   // ★ A4: pass 毎に stop 解除
                 RawMetalForward.fusedForwardGPUStreamingResume(
                     hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTableBufs, hotMasks: hotMaskBufs,
                     missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: prevStart,
@@ -1014,6 +1018,7 @@ public enum StreamingMoEValidation {
         model.resetGPUState(); pos = 0
         var promptPasses: [Int] = []
         var match = 0
+        RawMetalForward.activeStopFlag = stopFlag                      // ★ A4: streaming 区間のみ guard 有効化
         // prefill: 各 prompt token を投入。最後の token の予測 = refGen[0] のはず。
         for (idx, t) in prompt.enumerated() {
             let (pred, p) = decodeStep(t, pos); promptPasses.append(p)
@@ -1028,6 +1033,7 @@ public enum StreamingMoEValidation {
             let (pred, p) = decodeStep(refGen[i], pos); genPasses.append(p); pos += 1
             if pred == Int(refGen[i + 1]) { match += 1 }
         }
+        RawMetalForward.activeStopFlag = nil                          // ★ A4: guard 解除(他経路に影響させない)
         let streamSecs = Double(DispatchTime.now().uptimeNanoseconds - tStream0) / 1e9
         let streamTokps = Double(N - 1) / streamSecs
         let gpuMsPerTok = gpuMsAccum / Double(N - 1)
