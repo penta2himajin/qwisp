@@ -534,4 +534,88 @@ public enum StreamingMoEValidation {
             """, routed.map { String($0) }.joined(separator: ","), H,
             rel, rel < 5e-3 ? "✅ bit/near-tie 一致(A2 OK)" : "❌乖離")
     }
+
+    /// ★ issue#7 style A milestone A3a: GPU residency 判定 + miss-list emit の検証。
+    /// layer0 の routed 8 expert のうち **一部だけ arena に cache** し、residency_check kernel が
+    /// 未収容 expert を正しく検出・emit するか(missCount/missExperts vs CPU ground-truth)を照合。
+    /// 出力(MoE)は miss→slot0 garbage ゆえ検査しない。A3b の checkpoint-resume がこの emit を消費。
+    /// env QWISP_RUN=raw-stream-miss。QWISP_MISS_CACHED=<n>(cache する routed 数, 既定 5)。
+    public static func runRawStreamMissDetect(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, queue) = RawMetalForward.ensure(),
+              RawMetalForward.compileSlotRemap(), RawMetalForward.compileResidencyCheck() else {
+            return "[A3a] Metal/kernel init 失敗"
+        }
+        let nCached = Int(ProcessInfo.processInfo.environment["QWISP_MISS_CACHED"] ?? "5") ?? 5
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let ids = MLXArray([Int32(1)], [1, 1])
+        let H = model.embed(ids).dim(-1)
+        guard let layers = model.buildGPULayers(ids, H) else { return "[A3a] buildGPULayers 失敗" }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) else { return "[A3a] scratch 失敗" }
+        guard let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A3a] hBuf 失敗" }
+        let L0 = layers[0]
+        let x = MLXRandom.normal([1, 1, H]).asType(.float16); x.eval()
+
+        // ① resident 経路で layer0 の routed expert(ground-truth)を回収。
+        model.resetGPUState(); RawMetalForward.writeBuffer(hb, x, H)
+        do {
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            RawMetalForward.encodeMixerHalf(enc, hBuf: hb, nw: L0.nw, postNormBuf: sc.postNorm,
+                                            gdn: L0.gdn, attn: L0.attn, H: H, eps: model.eps, pendingResid: nil)
+            RawMetalForward.encodeMoEGPU(enc, postNorm: sc.postNorm, gate: L0.gate, moe: L0.moe, sc: sc,
+                                         sharedGateW: L0.sharedGate, H: H, E: 256, K: 8)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+        let bp = L0.moe.binds.contents().bindMemory(to: Int32.self, capacity: 8)
+        let routed = Array(UnsafeBufferPointer(start: bp, count: 8))                   // inds 順(logit 降順)
+
+        // ② arena に routed の先頭 nCached だけ cache（残り 8-nCached は miss になるはず）。
+        let cached = Array(routed.prefix(nCached))
+        let expectedMiss = Array(routed.suffix(8 - nCached))                           // inds 順で末尾が miss
+        let arena = try ExpertArena(device: device, source: source, N: 64, refLayer: 0)
+        try arena.load(0, cached.map { Int($0) })
+        var st = [Int32](repeating: 0, count: 256)                                     // slotTable(uncached=0)
+        var hot = [Int32](repeating: 0, count: 256)                                    // hotMask
+        for (i, e) in cached.enumerated() { st[Int(e)] = Int32(i); hot[Int(e)] = 1 }
+        let stBuf = device.makeBuffer(bytes: &st, length: 256 * 4, options: .storageModeShared)!
+        let hotBuf = device.makeBuffer(bytes: &hot, length: 256 * 4, options: .storageModeShared)!
+        let missCount = device.makeBuffer(length: 40 * 4, options: .storageModeShared)!
+        let missExperts = device.makeBuffer(length: 40 * 8 * 4, options: .storageModeShared)!
+        memset(missCount.contents(), 0, 40 * 4); memset(missExperts.contents(), 0, 40 * 8 * 4)
+        guard let streamMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: arena, resident: L0.moe) else {
+            return "[A3a] streaming MoEBuffers 構築失敗"
+        }
+
+        // ③ streaming 経路 + residency_check（layerIdx=0）。
+        model.resetGPUState(); RawMetalForward.writeBuffer(hb, x, H)
+        do {
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            RawMetalForward.encodeMixerHalf(enc, hBuf: hb, nw: L0.nw, postNormBuf: sc.postNorm,
+                                            gdn: L0.gdn, attn: L0.attn, H: H, eps: model.eps, pendingResid: nil)
+            RawMetalForward.encodeMoEGPU(enc, postNorm: sc.postNorm, gate: L0.gate, moe: streamMoE, sc: sc,
+                                         sharedGateW: L0.sharedGate, H: H, E: 256, K: 8, slotTable: stBuf,
+                                         hotMask: hotBuf, missCount: missCount, missExperts: missExperts, layerIdx: 0)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+        let mc = Int(missCount.contents().bindMemory(to: Int32.self, capacity: 40)[0])
+        let mep = missExperts.contents().bindMemory(to: Int32.self, capacity: 40 * 8)
+        let emitted = (0 ..< mc).map { mep[$0] }
+        let ok = mc == expectedMiss.count && emitted == expectedMiss
+        return String(format: """
+            [A3a raw-stream-miss] GPU residency 判定 + miss-list emit 検証(layer0, cache %d/8)
+              routed(inds順)=%@
+              cached=%@
+              expected miss=%@
+              GPU emit: count=%d  experts=%@
+              %@
+              → A3a OK なら fused 40層 + checkpoint-resume(A3b)へ。
+            """, nCached,
+            routed.map { String($0) }.joined(separator: ","),
+            cached.map { String($0) }.joined(separator: ","),
+            expectedMiss.map { String($0) }.joined(separator: ","),
+            mc, emitted.map { String($0) }.joined(separator: ","),
+            ok ? "✅ miss 検出・emit 正しい(A3a OK)" : "❌ miss 検出不一致")
+    }
 }

@@ -441,6 +441,38 @@ public enum RawMetalForward {
         } catch { print("[raw-slot-remap] compile: \(error)"); return false }
     }
 
+    nonisolated(unsafe) static var _residencyCheckPipeline: MTLComputePipelineState?
+    /// ★ issue#7 style A milestone A3a: route_top8 が出した inds(expert id, slot_remap 前)を hotMask で照合し、
+    ///   cache 未収容(=miss)の expert を missExperts[layer*K + j] に、その数を missCount[layer] に emit。
+    ///   firstMissLayer は CPU 側で missCount を走査(層は CB 内で順序実行)。A3b の checkpoint-resume が消費。
+    static func compileResidencyCheck() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _residencyCheckPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void residency_check(device const int* inds       [[buffer(0)]],   // [K] expert id(slot_remap 前)
+                                    device const int* hotMask     [[buffer(1)]],   // [E] 1=cached
+                                    device int*       missCount   [[buffer(2)]],   // [numLayers]
+                                    device int*       missExperts [[buffer(3)]],   // [numLayers*K]
+                                    constant uint& K     [[buffer(4)]],
+                                    constant uint& layer [[buffer(5)]],
+                                    uint tid [[thread_position_in_threadgroup]]) {
+            if (tid != 0) return;                       // K=8 小、single thread
+            int cnt = 0;
+            for (uint k = 0; k < K; k++) {
+                int e = inds[k];
+                if (hotMask[e] == 0) { missExperts[layer * K + cnt] = e; cnt++; }
+            }
+            missCount[layer] = cnt;
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _residencyCheckPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "residency_check")!)
+             return true
+        } catch { print("[raw-residency] compile: \(error)"); return false }
+    }
+
     /// standalone routing（検証用）: gate_logits[N] → (inds[K] int32, scores[K] f16)。
     static func routeTop8(_ logits: MLXArray, N: Int, K: Int) -> (MLXArray, MLXArray)? {
         guard let (device, queue) = ensure(), compileRoute() else { return nil }
@@ -1701,7 +1733,9 @@ public enum RawMetalForward {
     /// 出力 = sc.combined（= y + gateScale*sharedY）。inds は moe.binds に直接書く（gather が読む）。
     static func encodeMoEGPU(_ enc: MTLComputeCommandEncoder, postNorm: MTLBuffer, gate: Gate8Buffers,
                              moe: MoEBuffers, sc: GPUScratch, sharedGateW: Gate8Buffers, H: Int, E: Int, K: Int,
-                             slotTable: MTLBuffer? = nil) {
+                             slotTable: MTLBuffer? = nil,
+                             hotMask: MTLBuffer? = nil, missCount: MTLBuffer? = nil, missExperts: MTLBuffer? = nil,
+                             layerIdx: Int = 0) {
         let qp = _qmmPipeline!, gqp = _gqmmPipeline!, swp = _swigluPipeline!
         let Hin = moe.Hin, I = moe.I
         // ① gate qmm8: postNorm → gateLogits[E]
@@ -1716,6 +1750,14 @@ public enum RawMetalForward {
             enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
             var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            // ★ A3a: slot_remap 前に hotMask で miss(cache 未収容 routed expert)を GPU 検出・emit。
+            if let hm = hotMask, let mc = missCount, let me = missExperts, let rcp = _residencyCheckPipeline {
+                enc.setComputePipelineState(rcp)
+                enc.setBuffer(moe.binds, offset: 0, index: 0); enc.setBuffer(hm, offset: 0, index: 1)
+                enc.setBuffer(mc, offset: 0, index: 2); enc.setBuffer(me, offset: 0, index: 3)
+                var kn = UInt32(K), ln = UInt32(layerIdx); enc.setBytes(&kn, length: 4, index: 4); enc.setBytes(&ln, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
             // ★ style A streaming: expert id → arena slot id を GPU remap（resident は slotTable=nil で skip）。
             if let st = slotTable, let srp = _slotRemapPipeline {
                 enc.setComputePipelineState(srp)
