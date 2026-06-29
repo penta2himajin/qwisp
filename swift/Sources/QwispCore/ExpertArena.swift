@@ -920,31 +920,41 @@ public enum StreamingMoEValidation {
         let missCount = device.makeBuffer(length: nLayers * 4, options: .storageModeShared)!
         let missExperts = device.makeBuffer(length: nLayers * 8 * 4, options: .storageModeShared)!
 
-        func snapshotGDN() -> [Int: (Data, Data)] {
-            var snap: [Int: (Data, Data)] = [:]
+        // ★ bookkeeping 最適化(1): GDN snapshot/restore を **永続 backup buffer** で(Data heap alloc 排除)。
+        var gdnStateBak: [Int: MTLBuffer] = [:], gdnConvBak: [Int: MTLBuffer] = [:]
+        for i in 0 ..< nLayers {
+            guard let g = residentLayers[i].gdn else { continue }
+            gdnStateBak[i] = device.makeBuffer(length: g.Hv * g.Dv * g.Dk * 4, options: .storageModeShared)!
+            gdnConvBak[i] = device.makeBuffer(length: g.convKernel * g.convDim * 2, options: .storageModeShared)!
+        }
+        func snapshotGDN() {
             for i in 0 ..< nLayers {
                 guard let g = residentLayers[i].gdn else { continue }
-                snap[i] = (Data(bytes: g.stateBuf.contents(), count: g.Hv * g.Dv * g.Dk * 4),
-                           Data(bytes: g.convInput.contents(), count: g.convKernel * g.convDim * 2))
+                memcpy(gdnStateBak[i]!.contents(), g.stateBuf.contents(), g.Hv * g.Dv * g.Dk * 4)
+                memcpy(gdnConvBak[i]!.contents(), g.convInput.contents(), g.convKernel * g.convDim * 2)
             }
-            return snap
         }
-        func restoreGDN(_ snap: [Int: (Data, Data)], from m: Int) {
+        func restoreGDN(from m: Int) {
             for i in m ..< nLayers {
-                guard let g = residentLayers[i].gdn, let (sd, cd) = snap[i] else { continue }
-                sd.withUnsafeBytes { g.stateBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: sd.count) }
-                cd.withUnsafeBytes { g.convInput.contents().copyMemory(from: $0.baseAddress!, byteCount: cd.count) }
+                guard let g = residentLayers[i].gdn else { continue }
+                memcpy(g.stateBuf.contents(), gdnStateBak[i]!.contents(), g.Hv * g.Dv * g.Dk * 4)
+                memcpy(g.convInput.contents(), gdnConvBak[i]!.contents(), g.convKernel * g.convDim * 2)
             }
         }
-        func buildTables() -> ([MTLBuffer], [MTLBuffer])? {
-            var st: [MTLBuffer] = [], hm: [MTLBuffer] = []
-            for c in caches {
-                guard let s = c.gpuSlotTable(numExperts: 256).asMTLBuffer(device: device, noCopy: false),
-                      let h = c.hotMask(numExperts: 256).asMTLBuffer(device: device, noCopy: false) else { return nil }
-                st.append(s); hm.append(h)
-            }
-            return (st, hm)
+        // ★ bookkeeping 最適化(2): slotTable/hotMask を **永続 buffer** にし、cache 変更層のみ in-place 更新
+        //   (旧: 毎 pass 全40層 asMTLBuffer 再構築=80 alloc×passes)。
+        var slotTableBufs: [MTLBuffer] = [], hotMaskBufs: [MTLBuffer] = []
+        for _ in 0 ..< nLayers {
+            slotTableBufs.append(device.makeBuffer(length: 256 * 4, options: .storageModeShared)!)
+            hotMaskBufs.append(device.makeBuffer(length: 256 * 4, options: .storageModeShared)!)
         }
+        func refreshLayer(_ i: Int) {
+            let st = slotTableBufs[i].contents().bindMemory(to: Int32.self, capacity: 256)
+            let hm = hotMaskBufs[i].contents().bindMemory(to: Int32.self, capacity: 256)
+            memset(slotTableBufs[i].contents(), 0, 256 * 4); memset(hotMaskBufs[i].contents(), 0, 256 * 4)
+            for (e, s) in caches[i].slotMap { st[e] = Int32(s); hm[e] = 1 }
+        }
+        for i in 0 ..< nLayers { refreshLayer(i) }   // 初期(cold)
         // ★ A5b: cross-layer 予測 prefetch。layer i の routing を hidden h から gate_i(h) top-(8+margin) で予測。
         //   resume の再 seed(prevStart 深化)で予測距離が縮み精度向上=自己補正。env QWISP_PREDICT=0 で無効、QWISP_MARGIN。
         let doPredict = (ProcessInfo.processInfo.environment["QWISP_PREDICT"] ?? "1") != "0"
@@ -962,7 +972,7 @@ public enum StreamingMoEValidation {
         let maxPasses = nLayers + 20
         var gpuMsAccum = 0.0
         func decodeStep(_ inputTok: Int32, _ pos: Int) -> (Int, Int) {
-            let snap = snapshotGDN()                                   // token 開始 GDN state
+            snapshotGDN()                                             // token 開始 GDN state(永続 backup へ)
             let embedX = model.embed(MLXArray([inputTok], [1, 1])); embedX.eval()
             var prevStart = 0, passes = 0
             while passes < maxPasses {
@@ -975,15 +985,15 @@ public enum StreamingMoEValidation {
                     MLX.eval(preds)
                     for (idx, L) in (prevStart ..< nLayers).enumerated() {
                         _ = caches[L].ensure(preds[idx].asArray(Int32.self).map { Int($0) })
+                        refreshLayer(L)                                   // 予測 ensure で cache 変化→反映
                     }
                 }
-                guard let (slotTables, hotMasks) = buildTables() else { break }
-                restoreGDN(snap, from: prevStart)
+                restoreGDN(from: prevStart)
                 if prevStart == 0 { RawMetalForward.writeBuffer(hb, embedX, H) }
                 else { memcpy(hb.contents(), ckptH[prevStart].contents(), H * 2) }
                 memset(missCount.contents(), 0, nLayers * 4); memset(missExperts.contents(), 0, nLayers * 8 * 4)
                 RawMetalForward.fusedForwardGPUStreamingResume(
-                    hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTables, hotMasks: hotMasks,
+                    hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTableBufs, hotMasks: hotMaskBufs,
                     missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: prevStart,
                     H: H, E: 256, K: 8, eps: model.eps, decode: true, pos: pos, finalNormW: model.ensureFinalNorm())
                 gpuMsAccum += RawMetalForward.lastGPUExecMs
@@ -993,7 +1003,7 @@ public enum StreamingMoEValidation {
                 if m < 0 { break }
                 let mep = missExperts.contents().bindMemory(to: Int32.self, capacity: nLayers * 8)
                 let n = Int(mcp[m]); let missing = (0 ..< n).map { Int(mep[m * 8 + $0]) }
-                _ = caches[m].ensure(missing); prevStart = m
+                _ = caches[m].ensure(missing); refreshLayer(m); prevStart = m   // 変更層のみ in-place 更新
             }
             let fn = RawMetalForward.readBuffer(sc.normed, H)
             let lg = model.headProj().apply(fn.reshaped([1, 1, H])); lg.eval()
