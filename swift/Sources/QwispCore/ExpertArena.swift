@@ -857,4 +857,158 @@ public enum StreamingMoEValidation {
             rel, streamTok, refTok, warmMiss, warmRel,
             ok ? "✅ resume bit-exact + warm 1-pass(A3b-opt OK)" : "❌ 不一致/未収束/warm miss")
     }
+
+    /// ★ issue#7 style A milestone A5: decode regime での真の payoff 計測。連続 token を checkpoint-resume で
+    /// decode(decode=true, pos 前進, KV/GDN state 持続, per-layer arena cache 持続)し、**token あたり #sync(=passes)
+    /// vs per-layer drain 40** を実測。各 token の argmax を resident greedy decode と照合(lossless)。
+    /// cold first token は #miss=40 だが cache 持続で warm token は #miss(=新規 expert)へ収束＝payoff。
+    /// env QWISP_RUN=raw-stream-decode。QWISP_GEN=<N gen tokens, 既定16>。QWISP_STREAM_C=<C>。
+    public static func runRawStreamDecode(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, _) = RawMetalForward.ensure(), RawMetalForward.compileSlotRemap(),
+              RawMetalForward.compileResidencyCheck(), RawMetalForward.compileVecCopy() else {
+            return "[A5] Metal/kernel init 失敗"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "64") ?? 64
+        let N = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "16") ?? 16
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let H = model.embed(MLXArray([Int32(0)], [1, 1])).dim(-1)
+        let nLayers = model.numLayers
+        guard model.buildGPULayers(MLXArray([Int32(1)], [1, 1]), H) != nil else { return "[A5] build 失敗" }
+        guard let residentLayers = model.gpuLayers else { return "[A5] gpuLayers 未構築" }
+
+        // prompt: refPath の spec_prompt があれば使用、無ければ synthetic。
+        var prompt: [Int32] = [1, 2, 3, 4, 5, 6, 7, 8]
+        if let r = try? loadArrays(url: URL(fileURLWithPath: refPath)), let pa = r["spec_prompt"] {
+            prompt = pa.asType(.int32).asArray(Int32.self)
+        }
+
+        // ===== ① resident greedy decode 基準 =====
+        model.resetGPUState(); var pos = 0; var last: MLXArray? = nil
+        for t in prompt { last = model.fusedDecodeStepGPU(t, pos: pos, H: H); pos += 1 }
+        last?.eval()
+        var cur = Int32(MLX.argMax(last!.reshaped([last!.size])).item(Int.self))
+        var refGen: [Int32] = []
+        for _ in 0 ..< N {
+            refGen.append(cur)
+            guard let lg = model.fusedDecodeStepGPU(cur, pos: pos, H: H) else { break }
+            lg.eval(); pos += 1; cur = Int32(MLX.argMax(lg.reshaped([lg.size])).item(Int.self))
+        }
+
+        // ===== ② streaming 構成 =====
+        var caches: [LayerExpertCache] = []
+        var streamLayers: [RawMetalForward.GPULayer] = []
+        for i in 0 ..< nLayers {
+            let cache = try LayerExpertCache(device: device, source: source, layer: i, C: C)
+            guard let sMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: cache.arena, resident: residentLayers[i].moe) else {
+                return "[A5] layer \(i) streaming MoEBuffers 失敗"
+            }
+            caches.append(cache)
+            let R = residentLayers[i]
+            streamLayers.append(RawMetalForward.GPULayer(nw: R.nw, gdn: R.gdn, attn: R.attn,
+                                                         moe: sMoE, gate: R.gate, sharedGate: R.sharedGate))
+        }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8),
+              let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A5] scratch/hBuf 失敗" }
+        var ckptH: [MTLBuffer] = []
+        for _ in 0 ..< nLayers { guard let b = RawMetalForward.makeResidentBuffer(H * 2) else { return "[A5] ckptH 失敗" }; ckptH.append(b) }
+        let missCount = device.makeBuffer(length: nLayers * 4, options: .storageModeShared)!
+        let missExperts = device.makeBuffer(length: nLayers * 8 * 4, options: .storageModeShared)!
+
+        func snapshotGDN() -> [Int: (Data, Data)] {
+            var snap: [Int: (Data, Data)] = [:]
+            for i in 0 ..< nLayers {
+                guard let g = residentLayers[i].gdn else { continue }
+                snap[i] = (Data(bytes: g.stateBuf.contents(), count: g.Hv * g.Dv * g.Dk * 4),
+                           Data(bytes: g.convInput.contents(), count: g.convKernel * g.convDim * 2))
+            }
+            return snap
+        }
+        func restoreGDN(_ snap: [Int: (Data, Data)], from m: Int) {
+            for i in m ..< nLayers {
+                guard let g = residentLayers[i].gdn, let (sd, cd) = snap[i] else { continue }
+                sd.withUnsafeBytes { g.stateBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: sd.count) }
+                cd.withUnsafeBytes { g.convInput.contents().copyMemory(from: $0.baseAddress!, byteCount: cd.count) }
+            }
+        }
+        func buildTables() -> ([MTLBuffer], [MTLBuffer])? {
+            var st: [MTLBuffer] = [], hm: [MTLBuffer] = []
+            for c in caches {
+                guard let s = c.gpuSlotTable(numExperts: 256).asMTLBuffer(device: device, noCopy: false),
+                      let h = c.hotMask(numExperts: 256).asMTLBuffer(device: device, noCopy: false) else { return nil }
+                st.append(s); hm.append(h)
+            }
+            return (st, hm)
+        }
+        // 1 token の checkpoint-resume decode step。(予測 argmax, #passes) を返す。
+        let maxPasses = nLayers + 20
+        func decodeStep(_ inputTok: Int32, _ pos: Int) -> (Int, Int) {
+            let snap = snapshotGDN()                                   // token 開始 GDN state
+            let embedX = model.embed(MLXArray([inputTok], [1, 1])); embedX.eval()
+            var prevStart = 0, passes = 0
+            while passes < maxPasses {
+                passes += 1
+                guard let (slotTables, hotMasks) = buildTables() else { break }
+                restoreGDN(snap, from: prevStart)
+                if prevStart == 0 { RawMetalForward.writeBuffer(hb, embedX, H) }
+                else { memcpy(hb.contents(), ckptH[prevStart].contents(), H * 2) }
+                memset(missCount.contents(), 0, nLayers * 4); memset(missExperts.contents(), 0, nLayers * 8 * 4)
+                RawMetalForward.fusedForwardGPUStreamingResume(
+                    hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTables, hotMasks: hotMasks,
+                    missCount: missCount, missExperts: missExperts, ckptH: ckptH, startLayer: prevStart,
+                    H: H, E: 256, K: 8, eps: model.eps, decode: true, pos: pos, finalNormW: model.ensureFinalNorm())
+                let mcp = missCount.contents().bindMemory(to: Int32.self, capacity: nLayers)
+                var m = -1
+                for l in prevStart ..< nLayers where mcp[l] > 0 { m = l; break }
+                if m < 0 { break }
+                let mep = missExperts.contents().bindMemory(to: Int32.self, capacity: nLayers * 8)
+                let n = Int(mcp[m]); let missing = (0 ..< n).map { Int(mep[m * 8 + $0]) }
+                _ = caches[m].ensure(missing); prevStart = m
+            }
+            let fn = RawMetalForward.readBuffer(sc.normed, H)
+            let lg = model.headProj().apply(fn.reshaped([1, 1, H])); lg.eval()
+            return (MLX.argMax(lg.reshaped([lg.size])).item(Int.self), passes)
+        }
+
+        // ===== ③ streaming decode（prompt prefill → N 生成, teacher-forced on refGen）=====
+        model.resetGPUState(); pos = 0
+        var promptPasses: [Int] = []
+        var match = 0
+        // prefill: 各 prompt token を投入。最後の token の予測 = refGen[0] のはず。
+        for (idx, t) in prompt.enumerated() {
+            let (pred, p) = decodeStep(t, pos); promptPasses.append(p)
+            if idx == prompt.count - 1 && pred == Int(refGen[0]) { match += 1 }
+            pos += 1
+        }
+        // teacher-forced 生成: refGen[i] を投入し予測 == refGen[i+1] を照合。
+        var genPasses: [Int] = []
+        for i in 0 ..< (N - 1) {
+            let (pred, p) = decodeStep(refGen[i], pos); genPasses.append(p); pos += 1
+            if pred == Int(refGen[i + 1]) { match += 1 }
+        }
+
+        let coldPasses = promptPasses.first ?? 0
+        let warmProm = promptPasses.dropFirst().map { $0 }
+        let avgGen = genPasses.isEmpty ? 0.0 : Double(genPasses.reduce(0, +)) / Double(genPasses.count)
+        let minGen = genPasses.min() ?? 0, maxGen = genPasses.max() ?? 0
+        let genTrace = genPasses.prefix(16).map { String($0) }.joined(separator: ",")
+        let matchable = N                       // prefill 末尾予測 1 + 生成 N-1
+        let ok = match >= matchable
+        return String(format: """
+            [A5 raw-stream-decode] decode regime payoff 計測(C=%d, prompt T=%d, gen N=%d, teacher-forced)
+              lossless(streaming argmax vs resident greedy): %d/%d 一致
+              #sync(passes)/token:
+                cold first token=%d(=#miss 40 近傍, 想定通り)
+                prompt warm tail=%@
+                generated: avg=%.1f  min=%d  max=%d  trace=%@
+              → warm token の #sync が per-layer drain 40 を大きく下回れば style A payoff 確定。
+                (synthetic/teacher-forced prompt は expert locality 控えめ=保守的見積り。layer-batch 予測 prefetch で更に低減可)
+              %@
+            """, C, prompt.count, N, match, matchable,
+            coldPasses, warmProm.map { String($0) }.joined(separator: ","),
+            avgGen, minGen, maxGen, genTrace,
+            ok ? "✅ lossless 一致(A5 decode 配線 OK)" : "❌ argmax 乖離")
+    }
 }
