@@ -620,10 +620,12 @@ public enum RawMetalForward {
                                 constant float& eps    [[buffer(3)]],
                                 constant uint& axis_size [[buffer(4)]],
                                 constant uint& w_stride  [[buffer(5)]],
+                                device const int* stopFlag [[buffer(16)]],
                                 uint gid [[threadgroup_position_in_grid]],
                                 uint lid [[thread_position_in_threadgroup]],
                                 uint simd_lane_id  [[thread_index_in_simdgroup]],
                                 uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+                if (stopFlag[0] != 0) return;          // ★ A4 stop flag guard
                 constexpr int N_READS = 4;
                 constexpr int SIMD_SIZE = 32;
                 threadgroup float local_inv_mean[1];
@@ -675,6 +677,7 @@ public enum RawMetalForward {
         enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(bw, offset: 0, index: 1); enc.setBuffer(outBuf, offset: 0, index: 2)
         var ee = eps, asz = UInt32(D), ws = UInt32(1)
         enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+        bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         if promoteF32 {
@@ -1410,6 +1413,7 @@ public enum RawMetalForward {
                 enc.setComputePipelineState(_rmsPipeline!)
                 enc.setBuffer(a, offset: 0, index: 0); enc.setBuffer(bnw, offset: 0, index: 1); enc.setBuffer(b, offset: 0, index: 2)
                 enc.setBytes(&dd, length: 4, index: 3); enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hw, length: 4, index: 5)
+                bindStop(enc, 16)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(N,1024), height: 1, depth: 1))
                 src = b; swap(&a, &b)
             }
@@ -1613,6 +1617,7 @@ public enum RawMetalForward {
             enc.setBuffer(xb, offset: xoff, index: 0); enc.setBuffer(wb, offset: 0, index: 1); enc.setBuffer(ob, offset: 0, index: 2)
             var ee = eps, asz = UInt32(D), ws = UInt32(1)
             enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+            bindStop(enc, 16)
             let tg = ((((D + 3) / 4) + 31) / 32) * 32
             enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         }
@@ -1718,6 +1723,7 @@ public enum RawMetalForward {
         enc.setBuffer(src, offset: 0, index: 0); enc.setBuffer(w, offset: 0, index: 1); enc.setBuffer(out, offset: 0, index: 2)
         var ee = eps, asz = UInt32(D), ws = UInt32(1)
         enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+        bindStop(enc, 16)
         let tg = ((((D + 3) / 4) + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
     }
@@ -2297,6 +2303,7 @@ public enum RawMetalForward {
             enc.setBuffer(xb, offset: 0, index: 0); enc.setBuffer(wb, offset: 0, index: 1); enc.setBuffer(ob, offset: 0, index: 2)
             var ee = b.eps, asz = UInt32(D), ws = UInt32(1)
             enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
+            bindStop(enc, 16)
             let tg = ((((D + 3) / 4) + 31) / 32) * 32
             enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         }
