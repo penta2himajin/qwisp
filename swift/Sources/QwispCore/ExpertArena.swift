@@ -473,6 +473,65 @@ public enum StreamingMoEValidation {
             """, 64, K, N, rel, rel < 5e-3 ? "✅ 一致(A1 OK)" : "❌乖離")
     }
 
+    /// ★ task#4 Step B(de-risk): batched MoE gather(M=B verify)の compute vs memory bound を clean microbench で確定。
+    /// SUBPROF は barrier 計時で絶対値 inflate ゆえ、ここでは単一 eval で実 ms→achieved GFLOP/s・GB/s を測る。
+    /// small union(全 M 行→同 8 expert=最大 compute-bound)と large union(distinct=memory寄り)を M=1/8/24/48 で比較。
+    /// 判定: small union M=48 が matrix-unit peak(~10 TFLOP/s FP32 系)に近ければ LUT-GEMM は超えられない=NO-GO。
+    ///   memory/overhead-bound(低 GFLOP/s)なら MAC 削減は無効=NO-GO。実 layer-0 expert 重み使用。env QWISP_RUN=verify-gather-bench。
+    public static func runVerifyGatherBench(modelDir: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let E = 256, topK = 8
+        let arena = try ExpertArena(device: device, source: source, N: E)
+        try arena.load(0, Array(0 ..< E))                          // layer 0 全 expert を arena へ
+        let wg = arena.arr("gate_proj", "weight"), sg = arena.arr("gate_proj", "scales"), bg = arena.arr("gate_proj", "biases")
+        let wu = arena.arr("up_proj", "weight"),   su = arena.arr("up_proj", "scales"),   bu = arena.arr("up_proj", "biases")
+        let wd = arena.arr("down_proj", "weight"), sd = arena.arr("down_proj", "scales"), bd = arena.arr("down_proj", "biases")
+        let H = wg.dim(-1) * 8, I = wg.dim(-2)                     // H=2048(hidden), I=512(expert intermediate)
+        let reps = Int(ProcessInfo.processInfo.environment["QWISP_FC_REPS"] ?? "30") ?? 30
+        func gqmm(_ x: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray, _ remap: MLXArray) -> MLXArray {
+            MLX.gatherQuantizedMatmul(x, w, scales: s, biases: b, rhsIndices: remap,
+                                      transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false)
+        }
+        // 1 layer 分の MoE expert FFN(gate+up+swiglu+down)を M トークン分 gather。
+        func moeExpert(_ x: MLXArray, _ remap: MLXArray) -> MLXArray {
+            let xe = x.expandedDimensions(axes: [-2, -3])
+            let g = gqmm(xe, wg, sg, bg, remap), u = gqmm(xe, wu, su, bu, remap)
+            let h = (g * MLX.sigmoid(g)) * u
+            return gqmm(h, wd, sd, bd, remap).squeezed(axis: -2)
+        }
+        let Ms = [1, 8, 24, 48]
+        var rows: [String] = []
+        for unionSmall in [true, false] {
+            for M in Ms {
+                let x = (MLXRandom.normal([M, H]) * 0.1).asType(.float16)
+                // remap[M, topK]: small=全行同一[0..7](union=8), large=行毎に distinct(union≈min(M*8,256))
+                var idx = [Int32](repeating: 0, count: M * topK)
+                for m in 0 ..< M { for k in 0 ..< topK { idx[m * topK + k] = Int32(unionSmall ? k : (m * topK + k) % E) } }
+                let remap = MLXArray(idx, [M, topK]).asType(.uint32)
+                MLX.eval(x, remap)
+                for _ in 0 ..< 5 { moeExpert(x, remap).eval() }                 // warmup
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                for _ in 0 ..< reps { moeExpert(x, remap).eval() }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 / Double(reps)
+                // FLOP = 3 proj × M × topK × (I×H) MAC × 2。bytes = union × 3 × (I×H × 0.5byte[4bit])。
+                let flop = 3.0 * Double(M) * Double(topK) * Double(I) * Double(H) * 2.0
+                let union = unionSmall ? topK : Swift.min(M * topK, E)
+                let bytes = Double(union) * 3.0 * Double(I) * Double(H) * 0.5
+                let gflops = flop / (ms / 1e3) / 1e9
+                let gbps = bytes / (ms / 1e3) / 1e9
+                rows.append(String(format: "  union=%@ M=%2d: %6.3f ms  %7.1f GFLOP/s  %6.1f GB/s  (union=%d expert)",
+                                   unionSmall ? "small" : "large", M, ms, gflops, gbps, union))
+            }
+        }
+        return "[task#4 StepB verify-gather-bench] MLX gatherQuantizedMatmul(M=B verify gather, 実 layer0, H=\(H) I=\(I))\n"
+            + rows.joined(separator: "\n")
+            + "\n  M1 Max 概算 peak: ~10 TFLOP/s(FP32系) / ~200-400 GB/s。"
+            + "\n  → small union M=48 が高 GFLOP/s(peak 近傍)=matrix-units 飽和→LUT-GEMM 超えられず NO-GO。"
+            + "\n     低 GFLOP/s かつ低 GB/s=overhead 律速→MAC 削減無効。large union=memory-bound→LUT 無効。"
+    }
+
     /// ★ issue#7 style A milestone A2: raw streaming 1層 forward（mixer raw + MoE が arena cache 経由）。
     /// layer 0 を resident(expert 重み[E=256]) と streaming(arena[C=64] + GPU slot-remap binds) の2経路で走らせ、
     /// MoE 出力(sc.combined) が bit-exact か照合。mixer は両経路同一(resident)、差は MoE gather の slot index のみ。
