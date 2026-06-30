@@ -1080,7 +1080,12 @@ public enum StreamingMoEValidation {
         guard let (_, _) = RawMetalForward.ensure(), RawMetalForward.compileSlotRemap() else {
             return "[fix-2] Metal/kernel init 失敗"
         }
-        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "64") ?? 64
+        // ★ 本番: C は device 別自動選択(calibration layer, RAM tier 8→64/16→128/24→192/32+→256)。
+        //   QWISP_STREAM_C で明示上書き可。
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "") ?? DeviceCalibration.defaultC()
+        if ProcessInfo.processInfo.environment["QWISP_STREAM_C"] == nil {
+            print("[calibration] " + DeviceCalibration.recommend().summary)
+        }
         let N = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "16") ?? 16
         let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -1179,20 +1184,40 @@ public enum StreamingMoEValidation {
         let cpuMsPerTok = streamSecs / Double(N - 1) * 1000 - gpuMsPerTok - preadMsPerTok
         let missPerTok = Double(missAccum) / Double(N - 1)
         let matchable = N
-        let ok = match >= matchable
+        let tfOk = match >= matchable
+
+        // ④ ★本番 free-run 実生成: 自身の argmax を次入力に戻す（ref 非依存、真の product 挙動）。
+        //    cache は teacher-forced phase で warm 済 → cold IO を含まない steady-state tok/s。
+        model.resetGPUState(); pos = 0
+        var nextTok = refGen[0]
+        for (idx, t) in prompt.enumerated() { let p = decodeStep(t, pos); if idx == prompt.count - 1 { nextTok = Int32(p) }; pos += 1 }
+        var freeGen: [Int] = []
+        gpuMsAccum = 0.0; LayerExpertCache.preadNanos = 0
+        let tFree0 = DispatchTime.now().uptimeNanoseconds
+        for _ in 0 ..< N {
+            freeGen.append(Int(nextTok))
+            nextTok = Int32(decodeStep(nextTok, pos)); pos += 1
+        }
+        let freeSecs = Double(DispatchTime.now().uptimeNanoseconds - tFree0) / 1e9
+        let freeTokps = Double(N) / freeSecs
+        let freeMatch = zip(freeGen, refGen.map { Int($0) }).reduce(0) { $0 + ($1.0 == $1.1 ? 1 : 0) }
+        let freeOk = freeMatch == N
+        let ok = tfOk && freeOk
         return String(format: """
             [fix-2 raw-stream-decode-inline] inline demand-load(各層1回 dispatch, resume 無し)(C=%d, T=%d, gen N=%d)
-              lossless(streaming argmax vs resident greedy): %d/%d 一致
-              streaming(C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok, 41 CB/tok 固定, miss=%.1f/tok)
+              lossless: teacher-forced %d/%d, free-run(自回帰) %d/%d 一致(vs resident greedy)
+              ★本番 free-run(C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok)
+              teacher-forced streaming=%.1f tok/s(%.1f ms/tok, 41 CB/tok, miss=%.1f/tok)
                 内訳/tok: GPU-exec=%.1fms + pread=%.1fms + CPU bookkeeping=%.1fms
-              resident(全 expert 常駐)=%.1f tok/s(%.1f ms/tok, 1 CB/tok)
-                → streaming/resident=%.2fx
+              resident(全 expert 常駐, 32GB+ tier)=%.1f tok/s(%.1f ms/tok, 1 CB/tok)
+                → free-run/resident=%.2fx
               %@
-            """, C, prompt.count, N, match, matchable,
-            C, streamTokps, streamSecs / Double(N - 1) * 1000, missPerTok,
+            """, C, prompt.count, N, match, matchable, freeMatch, N,
+            C, freeTokps, freeSecs / Double(N) * 1000,
+            streamTokps, streamSecs / Double(N - 1) * 1000, missPerTok,
             gpuMsPerTok, preadMsPerTok, cpuMsPerTok,
             refTokps, refSecs / Double(N) * 1000,
-            streamTokps / refTokps,
-            ok ? "✅ lossless 一致(inline 配線 OK)" : "❌ argmax 乖離")
+            freeTokps / refTokps,
+            ok ? "✅ lossless 一致(inline 本番配線 OK)" : "❌ argmax 乖離")
     }
 }
