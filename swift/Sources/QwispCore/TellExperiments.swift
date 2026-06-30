@@ -1575,9 +1575,13 @@ extension Tell {
         _ = head(Hf[0..., 0 ..< (P - 1)], ids[0..., 1...], cache: mtpKV)
         MLX.eval([uArr, lastH] + [mtpKV.keys, mtpKV.values].compactMap { $0 } + mc.flatMap { $0.stateArrays })
         let prof = Tell.envFlag("QWISP_SPECK_PROF")
-        var tDraft: UInt64 = 0, tVerify: UInt64 = 0
+        var tDraft: UInt64 = 0, tVerify: UInt64 = 0, tVerifyFwd: UInt64 = 0
+        var nReject = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         var out: [Int] = []; var steps = 0, acc = 0
+        // ★ profile: IO(pread)/sync(per-layer drain) を全 C で切り分け
+        LayerExpertCache.preadNanos = 0; LayerExpertCache.ensureNanos = 0; LayerExpertCache.missTotal = 0
+        StreamingMoEBlock.syncNanos = 0
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
@@ -1611,7 +1615,8 @@ extension Tell {
             if prof { MLX.eval([seq] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
             let snaps = mc.map { $0.snapshot() }
             let (H, lg) = try model.forwardHidden(seq, caches: mc)        // ★batched f32-full exact verify
-            let evals = MLX.argMax(lg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            let evals = MLX.argMax(lg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }  // ← 主 forward を materialize
+            if prof { tVerifyFwd += now() - ts }                          // 主 batched verify forward(残=reject 再forward+mtpKV)
             let dArrI = draftToks.asArray(Int32.self).map { Int($0) }
             var p = 0
             while p < D && dArrI[p] == evals[p] { p += 1 }                // 最長受理 prefix
@@ -1620,6 +1625,7 @@ extension Tell {
             acc += p
             let pCorr = MLXArray([Int32(evals[p])], [1, 1])              // 次トークン(correction or next)
             if p < D {                                                   // reject: restore → committed 再forward
+                nReject += 1
                 for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
                 let commit = p > 0 ? MLX.concatenated([uArr, draftToks[0..., 0 ..< p]], axis: 1) : uArr
                 _ = try model.forwardHidden(commit, caches: mc)
@@ -1642,10 +1648,17 @@ extension Tell {
                      zip(outN, gSwift).filter { $0 == $1 }.count, N,
                      Double(zip(outN, gSwift).filter { $0 == $1 }.count) / Double(N) * 100)
         if prof {
-            let s = Double(steps)
+            let s = Double(steps), tok = Double(N)
+            let preadMs = Double(LayerExpertCache.preadNanos) / 1e6
+            let ensureMs = Double(LayerExpertCache.ensureNanos) / 1e6
+            let syncMs = Double(StreamingMoEBlock.syncNanos) / 1e6
             FileHandle.standardError.write(String(format:
-                "[MTPSpec-PROF/step] draft(MTP head×%d)=%.1f verify(f32-full batched)=%.1f (ms)  steps=%d\n",
-                depth, Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, steps).data(using: .utf8)!)
+                "[MTPSpec-PROF] C=%d depth=%d no-sync=%@ steps=%d accept/step=%.2f reject=%d miss=%d\n" +
+                "  /step(ms): draft=%.1f verify=%.1f [主fwd=%.1f reject再fwd+他=%.1f]\n" +
+                "  /token(ms): total=%.1f | pread(IO)=%.1f ensure=%.1f sync(drain)=%.1f\n",
+                C, depth, (noSyncVerify ? "Y" : "N"), steps, Double(acc)/s, nReject, LayerExpertCache.missTotal,
+                Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tVerifyFwd)/s/1e6, Double(tVerify - tVerifyFwd)/s/1e6,
+                secs/tok*1000, preadMs/tok, ensureMs/tok, syncMs/tok).data(using: .utf8)!)
         }
         return String(format: """
             [MTPSpecVerify] depth-%d MTP draft + batched f32-full verify(C=%d): %.1f tok/s  accept/step=%.3f  品質(vs Python) %d/%d=%.0f%%%@
