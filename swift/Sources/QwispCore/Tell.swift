@@ -135,8 +135,15 @@ public enum Tell {
         //   C 内に収まれば no-sync exact(per-layer sync 税を消し ~resident 天井へ)、超過時のみ escalate 再計算で
         //   lossless。streaming mix の 130→276 gap を狙う。QWISP_VERIFY_ESCALATE=1 + QWISP_NOSYNC_MIN=<=C で有効。
         let verifyEscalate = Tell.envFlag("QWISP_VERIFY_ESCALATE")
-        if pureNoSync { print("[SuffixSpec] no-sync pure ON (C=\(C)>=\(nE) 全 resident, 無条件 lossless ~1.7x)") }
-        else if escalateActive { print("[SuffixSpec] no-sync+escalation ON (C=\(C) in [\(escalMin),\(nE)), exact, 率監視 fallback)") }
+        // ★ ガード: pure no-sync は C>=nE(全 resident)でのみ無条件 lossless。C<nE では uncached expert が
+        //   slot-0 に alias する **近似**(2 agent 検証: verify が近似→true model に lossy, near-tie 非決定)。
+        //   QWISP_NOSYNC=1 を C<nE で許すのは研究/計測用途のみ→「lossless」と誤認しないよう明示警告。
+        if pureNoSync && C >= nE {
+            print("[SuffixSpec] no-sync pure ON (C=\(C)>=\(nE) 全 resident, 無条件 lossless ~1.7x)")
+        } else if pureNoSync {
+            print("[SuffixSpec] ⚠️ no-sync pure ON (C=\(C)<\(nE)) = **APPROXIMATE / near-lossless**"
+                + "(uncached expert→slot-0 alias, lossless 非保証・研究/計測用。lossless 化は QWISP_VERIFY_ESCALATE)")
+        } else if escalateActive { print("[SuffixSpec] no-sync+escalation ON (C=\(C) in [\(escalMin),\(nE)), exact, 率監視 fallback)") }
         var hist = ids.asArray(Int32.self).map { Int($0) }     // 履歴（prompt + commit token）
         let mc = model.makeCaches()
         StreamingMoEBlock.probeNoSync = pureNoSync
