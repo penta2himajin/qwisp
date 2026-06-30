@@ -212,6 +212,8 @@ public enum Tell {
         }
         func recordAccept(_ p: Int) { accWindow.append(p); if accWindow.count > adaptWin { accWindow.removeFirst() } }
         if adaptiveK { print("[SuffixSpec] accept-gated 適応 maxK ON(window=\(adaptWin) grace=\(adaptGrace), maxK≤\(maxK))") }
+        let missDbg = Tell.envFlag("QWISP_VERIFY_MISS_DBG")
+        var missAccumDbg = 0, missStepsDbg = 0, missRoutedDbg = 0
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0
         let t0 = DispatchTime.now()
         while out.count < N {
@@ -234,7 +236,15 @@ public enum Tell {
             setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
             let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1, D+1]
+            // ★ no-sync verify miss 診断: この verify で routed-not-cached が何個か(全 MoE 層累積)。
+            if missDbg { StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil }
             let vlg = try decodeForward(seq, rows: D + 1, escalate: verifyEscalate)
+            if missDbg {
+                let ma = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0)); MLX.eval([vlg, ma])
+                missAccumDbg += Int(ma.item(Int32.self)); missStepsDbg += 1
+                missRoutedDbg += (D + 1) * nMoE * 8   // 分母: 全 MoE 層 × (D+1)token × top8
+                StreamingMoEBlock.countHotMiss = false
+            }
             let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
@@ -257,6 +267,9 @@ public enum Tell {
             if prof { tVerify += now() - ts }
         }
         AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+        if missDbg && missStepsDbg > 0 {
+            FileHandle.standardError.write("DBG-MISS C=\(C): verify \(missStepsDbg) 回, hotMiss 累積=\(missAccumDbg) / routed \(missRoutedDbg) = \(String(format: "%.2f%%", Double(missAccumDbg)/Double(max(1,missRoutedDbg))*100)) (avg \(missAccumDbg/max(1,missStepsDbg))/verify)\n".data(using: .utf8)!)
+        }
         let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let match = zip(out.prefix(N), gR).filter { $0 == $1 }.count
         let outN = Array(out.prefix(N))
