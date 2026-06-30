@@ -109,6 +109,16 @@ public enum Tell {
                 .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
                 .prefix(C).map { $0.offset }))
         }
+        if Tell.envFlag("QWISP_PIN_DBG") {   // ★ no-sync C 依存バグ診断: hot-pin 充填 vs working-set
+            for mi in [0, 1, 20] where mi < model.expertCaches.count {
+                let ec = model.expertCaches[mi]
+                let ws = counts[mi].enumerated().filter { $0.element > 0 }.map { $0.offset }   // calib working set
+                let cached = ws.filter { ec.slotMap[$0] != nil }.count
+                let slotMax = ec.slotMap.values.max() ?? -1
+                let msg = "DBG-PIN layer\(mi) C=\(C): slotMap充填=\(ec.slotMap.count) working-set=\(ws.count) うち cached=\(cached) slot最大=\(slotMax)\n"
+                FileHandle.standardError.write(msg.data(using: .utf8)!)
+            }
+        }
 
         // phase 3: suffix-lookup draft + clean exact verify
         // ★ lever-1(issue#3): per-layer routing round-trip 除去で ~1.7-1.8x lossless（dispatch/sync 律速）。
