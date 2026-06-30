@@ -1146,8 +1146,12 @@ public enum StreamingMoEValidation {
             var routed: [Int] = []; routed.reserveCapacity(8)
             for k in 0 ..< 8 { routed.append(Int(bp[k])) }
             let before = caches[i].misses   // ★ misses は public cumulative（raw path は lastInds 無し＝missCount() 不可）
-            _ = caches[i].ensure(routed)
-            refreshLayer(i)                 // ★ 必ず slotTable を更新（slot 割当変化を反映）。raw path の正しさに必須
+            let res = caches[i].ensure(routed)
+            // ★ 最適化: O(C) full rebuild(refreshLayer)でなく **routed 8 expert の slot のみ** 更新。
+            //   slot_remap は binds(=今 ensure 済 routed)の st だけ読む→evict された stale entry は未読ゆえ安全
+            //   (次に同 expert が routed されれば ensure→res で再設定される)。CPU bookkeeping を ~O(8×40) に。
+            let st = slotTableBufs[i].contents().bindMemory(to: Int32.self, capacity: 256)
+            for (e, slot) in res { st[e] = Int32(slot) }
             if caches[i].misses != before { missAccum += 1 }
         }
         func decodeStep(_ inputTok: Int32, _ pos: Int) -> Int {
@@ -1205,19 +1209,19 @@ public enum StreamingMoEValidation {
         let ok = tfOk && freeOk
         return String(format: """
             [fix-2 raw-stream-decode-inline] inline demand-load(各層1回 dispatch, resume 無し)(C=%d, T=%d, gen N=%d)
-              lossless: teacher-forced %d/%d, free-run(自回帰) %d/%d 一致(vs resident greedy)
-              ★本番 free-run(C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok)
-              teacher-forced streaming=%.1f tok/s(%.1f ms/tok, 41 CB/tok, miss=%.1f/tok)
+              lossless: teacher-forced %d/%d, free-run(自回帰実生成) %d/%d 一致(vs resident greedy)
+              ★本番 streaming(steady-state, C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok, 41 CB/tok, miss=%.1f/tok)
                 内訳/tok: GPU-exec=%.1fms + pread=%.1fms + CPU bookkeeping=%.1fms
+              free-run(cold 再warming込, 参考)=%.1f tok/s(%.1f ms/tok)
               resident(全 expert 常駐, 32GB+ tier)=%.1f tok/s(%.1f ms/tok, 1 CB/tok)
-                → free-run/resident=%.2fx
+                → steady-state/resident=%.2fx
               %@
             """, C, prompt.count, N, match, matchable, freeMatch, N,
-            C, freeTokps, freeSecs / Double(N) * 1000,
-            streamTokps, streamSecs / Double(N - 1) * 1000, missPerTok,
+            C, streamTokps, streamSecs / Double(N - 1) * 1000, missPerTok,
             gpuMsPerTok, preadMsPerTok, cpuMsPerTok,
+            freeTokps, freeSecs / Double(N) * 1000,
             refTokps, refSecs / Double(N) * 1000,
-            freeTokps / refTokps,
+            streamTokps / refTokps,
             ok ? "✅ lossless 一致(inline 本番配線 OK)" : "❌ argmax 乖離")
     }
 }
