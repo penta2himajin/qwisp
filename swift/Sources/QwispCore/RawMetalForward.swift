@@ -1972,6 +1972,140 @@ public enum RawMetalForward {
         enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_finalCombinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 
+    // ===== ★ issue#7 fix-2: inline demand-load 用 split encode（route → CPU ensure → gather）=====
+    /// route phase: gate qmm8 + route_top8 → moe.binds(生 expert id)+ sc.scores。
+    /// residency_check/slot_remap は含まない（inline は CPU ensure 後に gather phase で slot_remap）。
+    static func encodeRoute(_ enc: MTLComputeCommandEncoder, postNorm: MTLBuffer, gate: Gate8Buffers,
+                            moe: MoEBuffers, sc: GPUScratch, H: Int, E: Int, K: Int) {
+        // ① gate qmm8: postNorm → gateLogits[E]
+        enc.setComputePipelineState(_qmm8Pipeline!)
+        enc.setBuffer(gate.wq, offset: 0, index: 0); enc.setBuffer(gate.sc, offset: 0, index: 1); enc.setBuffer(gate.bi, offset: 0, index: 2)
+        enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateLogits, offset: 0, index: 4)
+        var kk = Int32(H), nn = Int32(E); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        bindStop(enc, 16)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: E/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        // ② route_top8: gateLogits → moe.binds(生 inds), scores
+        enc.setComputePipelineState(_routePipeline!)
+        enc.setBuffer(sc.gateLogits, offset: 0, index: 0); enc.setBuffer(moe.binds, offset: 0, index: 1); enc.setBuffer(sc.scores, offset: 0, index: 2)
+        var en = UInt32(E), kn = UInt32(K); enc.setBytes(&en, length: 4, index: 3); enc.setBytes(&kn, length: 4, index: 4)
+        bindStop(enc, 16)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// gather phase: slot_remap(binds→slot) + experts gather/swiglu + shared + combine + final → sc.combined。
+    /// CPU ensure 後に呼ぶ前提（全 routed expert が arena 常駐＝miss 無し→stopFlag/residency_check 不要）。
+    /// encodeMoEGPU の ③④⑤ と bit-exact に一致させる。
+    static func encodeGatherRest(_ enc: MTLComputeCommandEncoder, postNorm: MTLBuffer, moe: MoEBuffers,
+                                 sc: GPUScratch, sharedGateW: Gate8Buffers, slotTable: MTLBuffer, H: Int, E: Int, K: Int) {
+        let qp = _qmmPipeline!, gqp = _gqmmPipeline!, swp = _swigluPipeline!
+        let Hin = moe.Hin, I = moe.I
+        // expert id → arena slot id を GPU remap
+        if let srp = _slotRemapPipeline {
+            enc.setComputePipelineState(srp)
+            enc.setBuffer(moe.binds, offset: 0, index: 0); enc.setBuffer(slotTable, offset: 0, index: 1)
+            var kn = UInt32(K); enc.setBytes(&kn, length: 4, index: 2)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+        func encGather(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int, lhs: Bool) {
+            enc.setComputePipelineState(gqp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(moe.binds, offset: 0, index: 4); enc.setBuffer(y, offset: 0, index: 5)
+            var k = Int32(kk), n = Int32(nn), l = UInt32(lhs ? 1 : 0)
+            enc.setBytes(&k, length: 4, index: 6); enc.setBytes(&n, length: 4, index: 7); enc.setBytes(&l, length: 4, index: 8)
+            bindStop(enc, 9)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encQmm(_ wq: MTLBuffer, _ s: MTLBuffer, _ bi: MTLBuffer, _ xb: MTLBuffer, _ y: MTLBuffer, K kk: Int, N nn: Int) {
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(wq, offset: 0, index: 0); enc.setBuffer(s, offset: 0, index: 1); enc.setBuffer(bi, offset: 0, index: 2)
+            enc.setBuffer(xb, offset: 0, index: 3); enc.setBuffer(y, offset: 0, index: 4)
+            var k = Int32(kk), n = Int32(nn); enc.setBytes(&k, length: 4, index: 5); enc.setBytes(&n, length: 4, index: 6)
+            bindStop(enc, 16)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: nn/8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        }
+        func encSwiglu(_ g: MTLBuffer, _ u: MTLBuffer, _ h: MTLBuffer, _ total: Int) {
+            enc.setComputePipelineState(swp)
+            enc.setBuffer(g, offset: 0, index: 0); enc.setBuffer(u, offset: 0, index: 1); enc.setBuffer(h, offset: 0, index: 2)
+            var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(swp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+        // ③ experts: g/u gather → swiglu → d gather
+        if moeFuseGateUp, let fp = _gqmmSwigluPipeline {
+            enc.setComputePipelineState(fp)
+            enc.setBuffer(moe.swGW, offset: 0, index: 0); enc.setBuffer(moe.swGS, offset: 0, index: 1); enc.setBuffer(moe.swGB, offset: 0, index: 2)
+            enc.setBuffer(moe.swUW, offset: 0, index: 3); enc.setBuffer(moe.swUS, offset: 0, index: 4); enc.setBuffer(moe.swUB, offset: 0, index: 5)
+            enc.setBuffer(postNorm, offset: 0, index: 6); enc.setBuffer(moe.binds, offset: 0, index: 7); enc.setBuffer(moe.h, offset: 0, index: 8)
+            var k = Int32(Hin), n = Int32(I); enc.setBytes(&k, length: 4, index: 9); enc.setBytes(&n, length: 4, index: 10)
+            bindStop(enc, 11)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: I/8, depth: K), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        } else {
+            encGather(moe.swGW, moe.swGS, moe.swGB, postNorm, moe.g, K: Hin, N: I, lhs: false)
+            encGather(moe.swUW, moe.swUS, moe.swUB, postNorm, moe.u, K: Hin, N: I, lhs: false)
+            encSwiglu(moe.g, moe.u, moe.h, K * I)
+        }
+        encGather(moe.swDW, moe.swDS, moe.swDB, moe.h, moe.d, K: I, N: Hin, lhs: true)
+        // shared expert
+        encQmm(moe.shGW, moe.shGS, moe.shGB, postNorm, moe.sg, K: Hin, N: I)
+        encQmm(moe.shUW, moe.shUS, moe.shUB, postNorm, moe.su, K: Hin, N: I)
+        encSwiglu(moe.sg, moe.su, moe.shAct, I)
+        encQmm(moe.shDW, moe.shDS, moe.shDB, moe.shAct, moe.sharedY, K: I, N: Hin)
+        // ④ combine: d[K,H]·scores → y[H]
+        enc.setComputePipelineState(_combinePipeline!)
+        enc.setBuffer(moe.d, offset: 0, index: 0); enc.setBuffer(sc.scores, offset: 0, index: 1); enc.setBuffer(sc.y, offset: 0, index: 2)
+        var ck = UInt32(K), cn = UInt32(Hin); enc.setBytes(&ck, length: 4, index: 3); enc.setBytes(&cn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_combinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        // ⑤ shared gate scalar → final_combine
+        enc.setComputePipelineState(_sharedGate8Pipeline!)
+        enc.setBuffer(sharedGateW.wq, offset: 0, index: 0); enc.setBuffer(sharedGateW.sc, offset: 0, index: 1); enc.setBuffer(sharedGateW.bi, offset: 0, index: 2)
+        enc.setBuffer(postNorm, offset: 0, index: 3); enc.setBuffer(sc.gateScale, offset: 0, index: 4)
+        var sk = UInt32(H); enc.setBytes(&sk, length: 4, index: 5)
+        bindStop(enc, 16)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(_finalCombinePipeline!)
+        enc.setBuffer(sc.y, offset: 0, index: 0); enc.setBuffer(moe.sharedY, offset: 0, index: 1); enc.setBuffer(sc.gateScale, offset: 0, index: 2); enc.setBuffer(sc.combined, offset: 0, index: 3)
+        var fh = UInt32(Hin); enc.setBytes(&fh, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: Hin, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(_finalCombinePipeline!.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// ★ issue#7 fix-2: inline demand-load forward。各層 [mixer+gate+route]→CPU ensure→[gather] を
+    ///   逐次実行（各層を厳密 1 回 dispatch、resume/no-op re-dispatch 無し、miss 検出/stopFlag/GDN restore 不要）。
+    ///   層 i の gather を CB_{i+1} 先頭へ merge（41 CB/token）。`routeAndEnsure(i)` は route(i) 完了後に CPU で
+    ///   moe[i].binds を読み→ensure→slotTables[i] を更新する閉路。出力 = sc.normed(finalNorm 適用後)。
+    static func fusedForwardGPUInlineDemand(hBuf: MTLBuffer, layers: [GPULayer], scratch sc: GPUScratch,
+                                            slotTables: [MTLBuffer], H: Int, E: Int, K: Int, eps: Float,
+                                            decode: Bool = false, pos: Int = 0, finalNormW: MTLBuffer? = nil,
+                                            routeAndEnsure: (Int) -> Void) {
+        guard let (_, queue) = ensure() else { return }
+        let n = layers.count
+        var gpuAccum = 0.0
+        for i in 0 ..< n {
+            // CB_i: 前層 gather を本 CB 先頭で（postNorm/scores/binds は前層のまま＝mixer 前に消費）+ mixer(i) + route(i)
+            let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+            if i > 0 {
+                let P = layers[i - 1]
+                encodeGatherRest(enc, postNorm: sc.postNorm, moe: P.moe, sc: sc, sharedGateW: P.sharedGate,
+                                 slotTable: slotTables[i - 1], H: H, E: E, K: K)
+            }
+            let L = layers[i]
+            encodeMixerHalf(enc, hBuf: hBuf, nw: L.nw, postNormBuf: sc.postNorm, gdn: L.gdn, attn: L.attn,
+                            H: H, eps: eps, pendingResid: i == 0 ? nil : sc.combined, decode: decode, pos: pos)
+            encodeRoute(enc, postNorm: sc.postNorm, gate: L.gate, moe: L.moe, sc: sc, H: H, E: E, K: K)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            gpuAccum += (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            routeAndEnsure(i)   // CPU: moe[i].binds 読み→ensure→slotTables[i] 更新（slot 割当を反映）
+        }
+        // 最終 CB: 最終層 gather + residual fold + final norm
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        let P = layers[n - 1]
+        encodeGatherRest(enc, postNorm: sc.postNorm, moe: P.moe, sc: sc, sharedGateW: P.sharedGate,
+                         slotTable: slotTables[n - 1], H: H, E: E, K: K)
+        encodeResidAdd(enc, h: hBuf, r: sc.combined, total: H)
+        if let fnw = finalNormW { encodeRms(enc, src: hBuf, w: fnw, out: sc.normed, D: H, eps: eps) }
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        gpuAccum += (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+        lastGPUExecMs = gpuAccum
+    }
+
     /// all-GPU 1 層分の常駐 buffer 束（QwispModel の cache から構築）。
     struct GPULayer {
         let nw: NormWeightBuffers; let gdn: GDNBuffers?; let attn: AttnBuffers?

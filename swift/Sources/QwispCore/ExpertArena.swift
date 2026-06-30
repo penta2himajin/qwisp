@@ -1071,4 +1071,128 @@ public enum StreamingMoEValidation {
             streamTokps / refTokps,
             ok ? "✅ lossless 一致(A5 decode 配線 OK)" : "❌ argmax 乖離")
     }
+
+    /// ★ issue#7 fix-2: inline demand-load 版 raw streaming decode。
+    /// 各層 route→CPU ensure→gather を逐次（各層 1 回 dispatch、resume 無し）。resume 版(runRawStreamDecode)の
+    /// no-op re-dispatch を排除し、small-C(高 miss)でも GPU-exec を ~resident 並みに抑えられるかを検証。
+    public static func runRawStreamDecodeInline(modelDir: String, refPath: String) throws -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        guard let (_, _) = RawMetalForward.ensure(), RawMetalForward.compileSlotRemap() else {
+            return "[fix-2] Metal/kernel init 失敗"
+        }
+        let C = Int(ProcessInfo.processInfo.environment["QWISP_STREAM_C"] ?? "64") ?? 64
+        let N = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "16") ?? 16
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let model = QwispModel(store: store)
+        let H = model.embed(MLXArray([Int32(0)], [1, 1])).dim(-1)
+        let nLayers = model.numLayers
+        guard model.buildGPULayers(MLXArray([Int32(1)], [1, 1]), H) != nil else { return "[fix-2] build 失敗" }
+        guard let residentLayers = model.gpuLayers else { return "[fix-2] gpuLayers 未構築" }
+
+        var prompt: [Int32] = [1, 2, 3, 4, 5, 6, 7, 8]
+        if let r = try? loadArrays(url: URL(fileURLWithPath: refPath)), let pa = r["spec_prompt"] {
+            prompt = pa.asType(.int32).asArray(Int32.self)
+        }
+
+        // ① resident greedy 基準
+        model.resetGPUState(); var pos = 0; var last: MLXArray? = nil
+        for t in prompt { last = model.fusedDecodeStepGPU(t, pos: pos, H: H); pos += 1 }
+        last?.eval()
+        var cur = Int32(MLX.argMax(last!.reshaped([last!.size])).item(Int.self))
+        var refGen: [Int32] = []
+        let tRef0 = DispatchTime.now().uptimeNanoseconds
+        for _ in 0 ..< N {
+            refGen.append(cur)
+            guard let lg = model.fusedDecodeStepGPU(cur, pos: pos, H: H) else { break }
+            lg.eval(); pos += 1; cur = Int32(MLX.argMax(lg.reshaped([lg.size])).item(Int.self))
+        }
+        let refSecs = Double(DispatchTime.now().uptimeNanoseconds - tRef0) / 1e9
+        let refTokps = Double(N) / refSecs
+
+        // ② streaming 構成（arena + slotTable）
+        var caches: [LayerExpertCache] = []
+        var streamLayers: [RawMetalForward.GPULayer] = []
+        for i in 0 ..< nLayers {
+            let cache = try LayerExpertCache(device: device, source: source, layer: i, C: C)
+            guard let sMoE = RawMetalForward.prepareStreamingMoEBuffers(arena: cache.arena, resident: residentLayers[i].moe) else {
+                return "[fix-2] layer \(i) streaming MoEBuffers 失敗"
+            }
+            caches.append(cache)
+            let R = residentLayers[i]
+            streamLayers.append(RawMetalForward.GPULayer(nw: R.nw, gdn: R.gdn, attn: R.attn,
+                                                         moe: sMoE, gate: R.gate, sharedGate: R.sharedGate))
+        }
+        guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8),
+              let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[fix-2] scratch/hBuf 失敗" }
+        var slotTableBufs: [MTLBuffer] = []
+        for _ in 0 ..< nLayers { slotTableBufs.append(device.makeBuffer(length: 256 * 4, options: .storageModeShared)!) }
+        func refreshLayer(_ i: Int) {
+            let st = slotTableBufs[i].contents().bindMemory(to: Int32.self, capacity: 256)
+            memset(slotTableBufs[i].contents(), 0, 256 * 4)
+            for (e, s) in caches[i].slotMap { st[e] = Int32(s) }
+        }
+        for i in 0 ..< nLayers { refreshLayer(i) }
+
+        var gpuMsAccum = 0.0, missAccum = 0
+        // route(i) 完了後: moe[i].binds(生 expert id)を読み→ensure→slotTable 更新。
+        func routeAndEnsure(_ i: Int) {
+            let bp = streamLayers[i].moe.binds.contents().bindMemory(to: Int32.self, capacity: 8)
+            var routed: [Int] = []; routed.reserveCapacity(8)
+            for k in 0 ..< 8 { routed.append(Int(bp[k])) }
+            let before = caches[i].misses   // ★ misses は public cumulative（raw path は lastInds 無し＝missCount() 不可）
+            _ = caches[i].ensure(routed)
+            refreshLayer(i)                 // ★ 必ず slotTable を更新（slot 割当変化を反映）。raw path の正しさに必須
+            if caches[i].misses != before { missAccum += 1 }
+        }
+        func decodeStep(_ inputTok: Int32, _ pos: Int) -> Int {
+            let embedX = model.embed(MLXArray([inputTok], [1, 1])); embedX.eval()
+            RawMetalForward.writeBuffer(hb, embedX, H)
+            RawMetalForward.fusedForwardGPUInlineDemand(
+                hBuf: hb, layers: streamLayers, scratch: sc, slotTables: slotTableBufs,
+                H: H, E: 256, K: 8, eps: model.eps, decode: true, pos: pos,
+                finalNormW: model.ensureFinalNorm(), routeAndEnsure: routeAndEnsure)
+            gpuMsAccum += RawMetalForward.lastGPUExecMs
+            let fn = RawMetalForward.readBuffer(sc.normed, H)
+            let lg = model.headProj().apply(fn.reshaped([1, 1, H])); lg.eval()
+            return MLX.argMax(lg.reshaped([lg.size])).item(Int.self)
+        }
+
+        // ③ streaming decode（teacher-forced on refGen）
+        model.resetGPUState(); pos = 0
+        var match = 0
+        for (idx, t) in prompt.enumerated() {
+            let pred = decodeStep(t, pos)
+            if idx == prompt.count - 1 && pred == Int(refGen[0]) { match += 1 }
+            pos += 1
+        }
+        gpuMsAccum = 0.0; LayerExpertCache.preadNanos = 0; missAccum = 0
+        let tStream0 = DispatchTime.now().uptimeNanoseconds
+        for i in 0 ..< (N - 1) {
+            let pred = decodeStep(refGen[i], pos); pos += 1
+            if pred == Int(refGen[i + 1]) { match += 1 }
+        }
+        let streamSecs = Double(DispatchTime.now().uptimeNanoseconds - tStream0) / 1e9
+        let streamTokps = Double(N - 1) / streamSecs
+        let gpuMsPerTok = gpuMsAccum / Double(N - 1)
+        let preadMsPerTok = Double(LayerExpertCache.preadNanos) / 1e6 / Double(N - 1)
+        let cpuMsPerTok = streamSecs / Double(N - 1) * 1000 - gpuMsPerTok - preadMsPerTok
+        let missPerTok = Double(missAccum) / Double(N - 1)
+        let matchable = N
+        let ok = match >= matchable
+        return String(format: """
+            [fix-2 raw-stream-decode-inline] inline demand-load(各層1回 dispatch, resume 無し)(C=%d, T=%d, gen N=%d)
+              lossless(streaming argmax vs resident greedy): %d/%d 一致
+              streaming(C=%d, expert SSD)=%.1f tok/s(%.1f ms/tok, 41 CB/tok 固定, miss=%.1f/tok)
+                内訳/tok: GPU-exec=%.1fms + pread=%.1fms + CPU bookkeeping=%.1fms
+              resident(全 expert 常駐)=%.1f tok/s(%.1f ms/tok, 1 CB/tok)
+                → streaming/resident=%.2fx
+              %@
+            """, C, prompt.count, N, match, matchable,
+            C, streamTokps, streamSecs / Double(N - 1) * 1000, missPerTok,
+            gpuMsPerTok, preadMsPerTok, cpuMsPerTok,
+            refTokps, refSecs / Double(N) * 1000,
+            streamTokps / refTokps,
+            ok ? "✅ lossless 一致(inline 配線 OK)" : "❌ argmax 乖離")
+    }
 }
