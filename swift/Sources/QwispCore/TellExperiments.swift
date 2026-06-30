@@ -1582,6 +1582,16 @@ extension Tell {
         // ★ profile: IO(pread)/sync(per-layer drain) を全 C で切り分け
         LayerExpertCache.preadNanos = 0; LayerExpertCache.ensureNanos = 0; LayerExpertCache.missTotal = 0
         StreamingMoEBlock.syncNanos = 0
+        // ★ C<256 sync drain 削減: verify を no-sync whole-token + escalate(lossless)で回す(QWISP_VERIFY_PREFETCH)
+        let verifyPrefetch = Tell.envFlag("QWISP_VERIFY_PREFETCH")
+        var priorInds: [[Int]]? = nil
+        var escSum = 0
+        func distinctL(_ a: MLXArray?) -> [Int] {
+            guard let a = a else { return [] }
+            var seen = Set<Int>(); var u: [Int] = []
+            for e in a.asArray(Int32.self) { let i = Int(e); if seen.insert(i).inserted { u.append(i) } }
+            return u
+        }
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
@@ -1614,7 +1624,18 @@ extension Tell {
             let seq = MLX.concatenated([uArr, draftToks], axis: 1)        // [1,D+1]
             if prof { MLX.eval([seq] + [mtpKV.keys, mtpKV.values].compactMap { $0 }); tDraft += now() - ts; ts = now() }
             let snaps = mc.map { $0.snapshot() }
-            let (H, lg) = try model.forwardHidden(seq, caches: mc)        // ★batched f32-full exact verify
+            // ★ C<256 sync drain 削減: verify を whole-token no-sync + escalate-from-first-miss(lossless)で回す。
+            //   priorInds(前 step 実 routing)を prefetch hint に→早層 hit→escalate は late first-miss から=drain 2eval。
+            //   QWISP_VERIFY_PREFETCH=1 で有効(既定 off=従来 exact forwardHidden)。
+            let H: MLXArray, lg: MLXArray
+            if verifyPrefetch {
+                let (h2, l2, e2) = try model.forwardHiddenPrefetchWhole(seq, caches: mc, priorInds: priorInds, isLin: isLin)
+                H = h2; lg = l2; escSum += e2
+                priorInds = (0 ..< model.layerCount).map { distinctL(model.expertCaches[$0].lastInds) }   // 次 step hint
+            } else {
+                let (h2, l2) = try model.forwardHidden(seq, caches: mc)    // ★batched f32-full exact verify
+                H = h2; lg = l2
+            }
             let evals = MLX.argMax(lg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }  // ← 主 forward を materialize
             if prof { tVerifyFwd += now() - ts }                          // 主 batched verify forward(残=reject 再forward+mtpKV)
             let dArrI = draftToks.asArray(Int32.self).map { Int($0) }
@@ -1653,10 +1674,10 @@ extension Tell {
             let ensureMs = Double(LayerExpertCache.ensureNanos) / 1e6
             let syncMs = Double(StreamingMoEBlock.syncNanos) / 1e6
             FileHandle.standardError.write(String(format:
-                "[MTPSpec-PROF] C=%d depth=%d no-sync=%@ steps=%d accept/step=%.2f reject=%d miss=%d\n" +
+                "[MTPSpec-PROF] C=%d depth=%d no-sync=%@ vprefetch=%@ steps=%d accept/step=%.2f reject=%d miss=%d escLayers=%d\n" +
                 "  /step(ms): draft=%.1f verify=%.1f [主fwd=%.1f reject再fwd+他=%.1f]\n" +
                 "  /token(ms): total=%.1f | pread(IO)=%.1f ensure=%.1f sync(drain)=%.1f\n",
-                C, depth, (noSyncVerify ? "Y" : "N"), steps, Double(acc)/s, nReject, LayerExpertCache.missTotal,
+                C, depth, (noSyncVerify ? "Y" : "N"), (verifyPrefetch ? "Y" : "N"), steps, Double(acc)/s, nReject, LayerExpertCache.missTotal, escSum,
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(tVerifyFwd)/s/1e6, Double(tVerify - tVerifyFwd)/s/1e6,
                 secs/tok*1000, preadMs/tok, ensureMs/tok, syncMs/tok).data(using: .utf8)!)
         }
