@@ -87,6 +87,7 @@ if CommandLine.arguments.contains("stream") {
         ("predict-h0",            { try StreamingDecode.runPredictH0(modelDir: $0, refPath: $1) }),
         ("chunked",               { try StreamingDecode.runChunked(modelDir: $0, refPath: $1) }),
         ("raw-stream-gather",     { md, _ in try StreamingMoEValidation.runRawStreamGather(modelDir: md) }),
+        ("raw-gather-bench",      { _, _ in RawMetalForward.gatherBench() }),
         ("raw-stream-layer",      { md, _ in try StreamingMoEValidation.runRawStreamLayer(modelDir: md) }),
         ("raw-stream-miss",       { md, _ in try StreamingMoEValidation.runRawStreamMissDetect(modelDir: md) }),
         ("raw-stream-fused",      { md, _ in try StreamingMoEValidation.runRawStreamFused(modelDir: md) }),

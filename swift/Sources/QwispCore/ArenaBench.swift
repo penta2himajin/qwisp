@@ -7,10 +7,11 @@ import Metal
 /// Python の streaming は毎層 concat(~16-25ms)を払うが、Swift arena は払わない（M3 実証）。
 /// ここでは MoE compute floor（pipeline, sync/concat 無し）を測り、~29tok/s 試算の土台を確認。
 public enum ArenaBench {
-    public static func run(layers: Int = 40, T: Int = 2, K: Int = 8, B: Int = 64, reps: Int = 50)
+    public static func run(layers: Int = 40, T: Int = 2, K: Int = 8, Bdefault: Int = 64, reps: Int = 50)
         -> String
     {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
+        let B = Int(ProcessInfo.processInfo.environment["QWISP_ARENA_B"] ?? "") ?? Bdefault   // ★ arena slot 数(=C)を env で振る
         let IN = 2048, I = 512
 
         func quantProj(_ outd: Int, _ ind: Int) -> [String: MLXArray] {

@@ -1091,6 +1091,56 @@ public enum RawMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: Ktop * N)), [Ktop, N])
     }
 
+    /// ★ 診断(QWISP_RUN=raw-gather-bench): raw gqmm4 の arena slot 数 B(=C)依存を **永続 buffer 再利用**で測る
+    ///   (per-call copy を除外＝純 kernel コスト)。MLX gatherQuantizedMatmul は B 比例で遅化(ArenaBench 20→50ms)
+    ///   するが、raw gqmm4 は inds で 8 行だけ index ゆえ C 独立のはず=larger-C-slower の fix 検証。
+    public static func gatherBench() -> String {
+        guard let (device, queue) = ensure() else { return "[gatherBench] no device" }
+        let N = 512, K = 2048, Ktop = 8, reps = 300
+        // pipeline compile（一度 gatherQmm を呼ぶ）
+        let w0 = MLXRandom.randInt(0 ..< 255, [64, N, K/8]).asType(.uint32)
+        let s0 = (MLXRandom.normal([64, N, K/64]) * 0.02).asType(.float16)
+        let b0 = (MLXRandom.normal([64, N, K/64]) * 0.02).asType(.float16)
+        let x0 = (MLXRandom.normal([1, K]) * 0.1).asType(.float16)
+        let i0 = MLXArray((0 ..< Ktop).map { Int32($0) })
+        MLX.eval(w0, s0, b0, x0, i0)
+        _ = gatherQmm(x0, w0, scales: s0, biases: b0, inds: i0, Ktop: Ktop, K: K, N: N)   // compile _gqmmPipeline
+        guard let qp = _gqmmPipeline else { return "[gatherBench] gqmm4 未compile" }
+        var out = "[gatherBench] raw gqmm4 (N=\(N) K=\(K) Ktop=\(Ktop), 永続buffer reps=\(reps)) — arena C 依存:\n"
+        func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+        for B in [64, 128, 192, 256] {
+            let w = MLXRandom.randInt(0 ..< 255, [B, N, K/8]).asType(.uint32)
+            let s = (MLXRandom.normal([B, N, K/64]) * 0.02).asType(.float16)
+            let bi = (MLXRandom.normal([B, N, K/64]) * 0.02).asType(.float16)
+            MLX.eval(w, s, bi)
+            guard let bwq = w.asMTLBuffer(device: device, noCopy: true),
+                  let bsc = s.asMTLBuffer(device: device, noCopy: true),
+                  let bbi = bi.asMTLBuffer(device: device, noCopy: true),
+                  let bx = x0.asMTLBuffer(device: device, noCopy: false) else { continue }
+            var inds = (0 ..< Ktop).map { Int32($0 * (B / Ktop)) }   // B 全域に散らした index
+            let bin = device.makeBuffer(bytes: &inds, length: Ktop * 4, options: .storageModeShared)!
+            let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
+            func disp() {
+                let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                enc.setComputePipelineState(qp)
+                enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+                enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+                enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
+                var kk = Int32(K), nn = Int32(N), lhs = UInt32(0)
+                enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&lhs, length: 4, index: 8)
+                bindStop(enc, 9)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            }
+            for _ in 0 ..< 20 { disp() }
+            let t0 = now(); for _ in 0 ..< reps { disp() }
+            let us = Double(now() - t0) / 1e3 / Double(reps)
+            out += String(format: "  B=%d: %.1f µs/gather\n", B, us)
+        }
+        out += "  → B に依らず一定なら raw gqmm4 は C 独立(MLX gather の C 依存 fix が可能)。"
+        return out
+    }
+
     /// ★ gate+up gather+swiglu 融合 kernel: x を 1 回ロード(ld16)し gate/up 両方の qdot → swiglu → h 直書き。
     /// gather_g + gather_u + swiglu(3 dispatch + g/u 中間 buffer)を 1 dispatch に。x 読みも 2→1。bit-exact 維持
     /// (各 result を (half)化してから swiglu＝分離版と同一)。grid=(1, N/8, Ktop), group=(32,2,1)。
