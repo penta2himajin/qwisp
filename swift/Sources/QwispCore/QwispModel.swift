@@ -866,7 +866,9 @@ public final class QwispModel {
         var out = "[batch-scale] MLX batched forward throughput（C=256 resident, cold [B,1]）\n"
         out += "  B    ms/forward   tok/s(=B/ms)   vs B=1 throughput\n"
         var base1 = 0.0
-        for B in [1, 2, 4, 8, 16, 32] {
+        // ★ B リストは env で可変(QWISP_BATCH_BS="1,2,...")。combining(B-spec の large M)の saturation knee 探索用。
+        let bList = (ProcessInfo.processInfo.environment["QWISP_BATCH_BS"]).map { $0.split(separator: ",").compactMap { Int($0) } } ?? [1, 2, 4, 8, 16, 32]
+        for B in bList {
             let ids = MLXArray((0 ..< B).map { Int32(($0 * 131 + 7) % 100000) }, [B, 1])
             for _ in 0..<3 { model(ids).eval() }
             let reps = 15; let t0 = now()
