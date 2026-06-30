@@ -1120,22 +1120,29 @@ public enum RawMetalForward {
             var inds = (0 ..< Ktop).map { Int32($0 * (B / Ktop)) }   // B 全域に散らした index
             let bin = device.makeBuffer(bytes: &inds, length: Ktop * 4, options: .storageModeShared)!
             let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
-            func disp() {
+            var kk = Int32(K), nn = Int32(N), lhs = UInt32(0)
+            // ★ 全 reps を単一 CB に encode→GPU timestamp で純 kernel 時間(per-call CB overhead 除外)。
+            func runCB(_ count: Int) -> Double {
                 let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-                enc.setComputePipelineState(qp)
-                enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
-                enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
-                enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
-                var kk = Int32(K), nn = Int32(N), lhs = UInt32(0)
-                enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&lhs, length: 4, index: 8)
-                bindStop(enc, 9)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                for _ in 0 ..< count {
+                    enc.setComputePipelineState(qp)
+                    enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+                    enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+                    enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
+                    enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&lhs, length: 4, index: 8)
+                    bindStop(enc, 9)
+                    enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: Ktop), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                }
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                return (cb.gpuEndTime - cb.gpuStartTime) * 1e6   // µs(GPU 実行時間)
             }
-            for _ in 0 ..< 20 { disp() }
-            let t0 = now(); for _ in 0 ..< reps { disp() }
-            let us = Double(now() - t0) / 1e3 / Double(reps)
-            out += String(format: "  B=%d: %.1f µs/gather\n", B, us)
+            _ = runCB(20)
+            let gpuUsTot = runCB(reps)
+            let us = gpuUsTot / Double(reps)
+            // bytes: 1 gather = 8 expert × (4bit weight N*K/2 + scales/biases f16 N*K/64*2*2)
+            let bytes = Double(Ktop) * (Double(N*K)/2.0 + Double(N) * Double(K/64) * 2.0 * 2.0)
+            let gbs = bytes / (us * 1e-6) / 1e9
+            out += String(format: "  B=%d: %.1f µs/gather (GPU)  %.0f GB/s (%.0f%% of 400)\n", B, us, gbs, gbs/400*100)
         }
         out += "  → B に依らず一定なら raw gqmm4 は C 独立(MLX gather の C 依存 fix が可能)。"
         return out
