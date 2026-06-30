@@ -125,9 +125,15 @@ def net_for(by_prompt, budget_bytes, D, hot_by_layer, mixed, base_tps, flash_bw,
     t_compute = acc / (base_tps * MULT[D]) * (compute_penalty if mixed else 1.0)
     miss_bytes_pv, n_layers = sim_bytes(by_prompt, budget_bytes, D, hot_by_layer, mixed)
     t_flash = miss_bytes_pv / flash_bw
-    # ★ hideable_budget: draft窓 + verify内 cross-layer overlap（sync は差引かない）
+    # ★ hideable_budget: draft窓 + verify内 cross-layer overlap（sync は差引かない）。
+    #   ★単調性の要請: hidden IO は compute 時間を超えて隠せない（h ≤ t_compute）。T_draft は MULT に
+    #   既に含まれる draft コストの一部＝t_compute の外に加算すると h>t_comp となり cutoff>ideal の非物理。
+    #   よって hideable = T_draft + overlap_eff·(t_compute − T_draft) で t_compute を上限に保つ
+    #   (draft 窓は完全 overlap 可、残り verify compute は overlap_eff で overlap)。
     t_draft = t_draft_frac * t_compute if D >= 1 else 0.0       # D0 は MTP draft 窓を持たない
-    hideable = t_draft + overlap_eff * t_compute
+    hideable = min(t_compute, t_draft + overlap_eff * (t_compute - t_draft))
+
+    budget_phi = float("inf") if t_flash <= 0 else hideable / t_flash   # 時間予算で隠せる上限(coverage 無視)
 
     def cutoff(phi_max):                                        # φ は coverage(φ_max)と時間予算の両制約
         phi = phi_max if t_flash <= 0 else min(phi_max, hideable / t_flash)
@@ -135,7 +141,7 @@ def net_for(by_prompt, budget_bytes, D, hot_by_layer, mixed, base_tps, flash_bw,
     net_prev, phi_prev = cutoff(cov_prev)
     net_xl, phi_xl = cutoff(cov_xlayer)
     return {
-        "D": D, "acc": acc, "t_compute": t_compute, "t_flash": t_flash,
+        "D": D, "acc": acc, "t_compute": t_compute, "t_flash": t_flash, "budget_phi": budget_phi,
         "net_serial": acc / (t_compute + t_flash),
         "net_overlap": acc / max(t_compute, t_flash),                 # ideal 上限(φ=1)
         "net_cutoff_prev": net_prev, "phi_prev": phi_prev,            # prev-token prefetch(φmax=0.66)
@@ -207,21 +213,55 @@ def main():
                       f"{r['net_cutoff_xl']:>6.1f} {r['phi_xl']:>4.2f} {tag:>13}")
             print()
 
-    # ★ Step 5: mixed+MTP(best D≥1) vs all4-D0 を bracket 別に。cutoff は prev/xlayer 2ケース分離。
-    print("[mtp-mix] === Step5: mixed+MTP が all4-noMTP(D0) を超える tier（bracket 別）===", file=sys.stderr)
-    def best_mtp(rows, key):   # D>=1 の最良
-        cand = [r for r in rows if r["D"] >= 1]
-        return max(cand, key=lambda r: r[key])
+    # ★ 単調性 self-check: 同一 row で φ=0(serial) ≤ φp(.66) ≤ φx(.77) ≤ φ=1(ideal) ゆえ
+    #   net は serial ≤ cutP ≤ cutXL ≤ ideal でなければ T_cycle 実装バグ。
+    viol = []
+    for (gb, cfg), rows in grid.items():
+        for r in rows:
+            seq = [r["net_serial"], r["net_cutoff_prev"], r["net_cutoff_xl"], r["net_overlap"]]
+            if any(seq[i] > seq[i + 1] + 1e-6 for i in range(3)):
+                viol.append(f"{cfg}{gb:.0f}GB D{r['D']}: {[round(x,1) for x in seq]}")
+    print(f"\n[mtp-mix] 単調性 self-check(per-row serial≤cutP≤cutXL≤ideal): "
+          f"{'PASS（T_cycle 健全）' if not viol else 'FAIL: ' + '; '.join(viol)}", file=sys.stderr)
+
+    # ★(a) overlap の純価値: mixed 構成・固定 depth で serial/cutoff/ideal と Δ=cutoff−serial。
+    #   depth argmax も分母 ratio も介さず、overlap だけの寄与を tier 別に見る。
+    fixed_d = 1   # MTP D1（本命）。depth 最適化はこの外側の別問題。
+    print(f"\n[mtp-mix] (a) overlap 純価値（mixed, D{fixed_d} 固定, 同一 miss バイト）:", file=sys.stderr)
+    print(f"  {'GB':>4} {'Tflash':>7} {'serial':>6} {'cutP':>6}(Δ) {'cutXL':>6}(Δ) {'ideal':>6}(Δ)", file=sys.stderr)
+    for gb in budgets:
+        r = next(x for x in grid[(gb, "mixed")] if x["D"] == fixed_d)
+        s = r["net_serial"]
+        print(f"  {gb:>4.0f} {r['t_flash']*1000:>6.1f}ms {s:>6.1f} "
+              f"{r['net_cutoff_prev']:>6.1f}(+{r['net_cutoff_prev']-s:.1f}) "
+              f"{r['net_cutoff_xl']:>6.1f}(+{r['net_cutoff_xl']-s:.1f}) "
+              f"{r['net_overlap']:>6.1f}(+{r['net_overlap']-s:.1f})", file=sys.stderr)
+
+    # ★(b) φ_max 到達度: φ が coverage cap(.66/.77)に達したか、draft窓/時間予算で頭打ちか。
+    print(f"\n[mtp-mix] (b) φ 到達度（mixed/all4, D{fixed_d}）: budget_phi=hideable/Tflash(時間上限)、"
+          f"φ=min(φmax,budget_phi)。budget<φmax なら draft窓律速:", file=sys.stderr)
+    for cfg in ("mixed", "all4"):
+        for gb in budgets:
+            r = next(x for x in grid[(gb, cfg)] if x["D"] == fixed_d)
+            bp = r["budget_phi"]   # =hideable/t_flash。hideable=t_draft+overlap_eff·(t_comp−t_draft)
+            capP = "cov" if bp >= 0.66 else "予算"   # 予算律速=時間(overlap_eff低なら draft窓主体)で頭打ち
+            capX = "cov" if bp >= 0.77 else "予算"
+            print(f"  {cfg:5} {gb:>4.0f}GB: budget_phi={bp:>5.2f}  φp={r['phi_prev']:.2f}({capP}) "
+                  f"φx={r['phi_xl']:.2f}({capX})", file=sys.stderr)
+
+    # ★ Step5（depth 固定 D1 で比較。分母 all4-D0 も同 bracket overlap を受ける点を明記）
+    print(f"\n[mtp-mix] === Step5: mixed+MTP(D{fixed_d}) vs all4-noMTP(D0)（同 bracket）===", file=sys.stderr)
+    print("  ※比率は分母 all4-D0 も同 bracket の overlap を受ける（D0 は IO 律速強→overlap 利得大）"
+          "ため、cutoff/ideal で比率が serial より縮むのは正常（T_cycle は単調）。", file=sys.stderr)
     for label, key in (("serial", "net_serial"), ("ideal上限", "net_overlap"),
-                       ("cutoff-prev(φm.66)", "net_cutoff_prev"), ("cutoff-xlayer(φm.77)", "net_cutoff_xl")):
+                       ("cutoff-prev(.66)", "net_cutoff_prev"), ("cutoff-xlayer(.77)", "net_cutoff_xl")):
         wins = []
         for gb in budgets:
             a0 = next(r for r in grid[(gb, "all4")] if r["D"] == 0)[key]
-            mb = best_mtp(grid[(gb, "mixed")], key)
-            ratio = mb[key] / a0 if a0 else 0
-            mark = "✓" if mb[key] > a0 else "✗"
-            wins.append(f"{gb:.0f}GB:{mark}D{mb['D']}({mb[key]:.1f}/{a0:.1f}={ratio:.2f}x)")
-        print(f"  {label:22}: " + "  ".join(wins), file=sys.stderr)
+            md = next(r for r in grid[(gb, "mixed")] if r["D"] == fixed_d)[key]
+            ratio = md / a0 if a0 else 0
+            wins.append(f"{gb:.0f}GB:{'✓' if md > a0 else '✗'}{ratio:.2f}x")
+        print(f"  {label:18}: " + "  ".join(wins), file=sys.stderr)
 
 
 if __name__ == "__main__":
