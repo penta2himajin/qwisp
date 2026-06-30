@@ -525,11 +525,66 @@ public enum StreamingMoEValidation {
                                    unionSmall ? "small" : "large", M, ms, gflops, gbps, union))
             }
         }
+        // ★ dispatch 集約 de-risk: gate gather を P=M*topK 行の grouped 形で sorted(=expert 連続) vs
+        //   unsorted で比較。sorted で matrix-units が token をグループ GEMM 化できれば GFLOP/s 急増の見込み。
+        var sortRows: [String] = []
+        for M in [24, 48] {
+            let P = M * topK
+            let xg = (MLXRandom.normal([P, 1, H]) * 0.1).asType(.float16)
+            // unsorted: 行 p → expert (p%E) を散在。sorted: 同じ multiset を昇順に並べ替え(expert 連続)。
+            let unsortedE = (0 ..< P).map { Int32(($0 * 7) % E) }
+            let sortedE = unsortedE.sorted()
+            let idxU = MLXArray(unsortedE, [P, 1]).asType(.uint32)
+            let idxS = MLXArray(sortedE, [P, 1]).asType(.uint32)
+            MLX.eval(xg, idxU, idxS)
+            func benchGate(_ idx: MLXArray, _ sorted: Bool) -> Double {
+                func g() -> MLXArray {
+                    MLX.gatherQuantizedMatmul(xg, wg, scales: sg, biases: bg, rhsIndices: idx,
+                                              transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: sorted)
+                }
+                for _ in 0 ..< 5 { g().eval() }
+                let t = DispatchTime.now().uptimeNanoseconds
+                for _ in 0 ..< reps { g().eval() }
+                return Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6 / Double(reps)
+            }
+            let flopG = Double(P) * Double(I) * Double(H) * 2.0
+            for (lbl, idx, sorted) in [("unsorted", idxU, false), ("sorted  ", idxS, true)] {
+                let ms = benchGate(idx, sorted)
+                sortRows.append(String(format: "  gate gather P=%4d(M=%d) %@: %6.3f ms  %7.1f GFLOP/s",
+                                       P, M, lbl, ms, flopG / (ms / 1e3) / 1e9))
+            }
+        }
+        // ★ matrix-unit ceiling: dense quantizedMatmul(gather 無し、単一 expert を P 行へ)。
+        //   gather の GFLOP/s がこれに大きく劣るなら、token を expert-group 化→dense GEMM で勝てる(GO)。
+        //   同程度なら INT4 matmul 自体が天井=grouping 無益(NO-GO)。
+        var denseRows: [String] = []
+        for P in [192, 384] {
+            let xd = (MLXRandom.normal([P, H]) * 0.1).asType(.float16)
+            let w0 = wg[0], s0 = sg[0], b0 = bg[0]                  // expert 0 の gate 重み[I, H]
+            MLX.eval(xd, w0, s0, b0)
+            func dense() -> MLXArray {
+                MLX.quantizedMatmul(xd, w0, scales: s0, biases: b0, transpose: true, groupSize: 64, bits: 4)
+            }
+            for _ in 0 ..< 5 { dense().eval() }
+            let t = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< reps { dense().eval() }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6 / Double(reps)
+            let flop = Double(P) * Double(I) * Double(H) * 2.0
+            denseRows.append(String(format: "  dense qmm [%4d×%d]×[%d,%d]: %6.3f ms  %7.1f GFLOP/s",
+                                    P, H, I, H, ms, flop / (ms / 1e3) / 1e9))
+        }
         return "[task#4 StepB verify-gather-bench] MLX gatherQuantizedMatmul(M=B verify gather, 実 layer0, H=\(H) I=\(I))\n"
             + rows.joined(separator: "\n")
             + "\n  M1 Max 概算 peak: ~10 TFLOP/s(FP32系) / ~200-400 GB/s。"
             + "\n  → small union M=48 が高 GFLOP/s(peak 近傍)=matrix-units 飽和→LUT-GEMM 超えられず NO-GO。"
             + "\n     低 GFLOP/s かつ低 GB/s=overhead 律速→MAC 削減無効。large union=memory-bound→LUT 無効。"
+            + "\n[dispatch 集約 de-risk] sorted(grouped GEMM) vs unsorted gather:\n"
+            + sortRows.joined(separator: "\n")
+            + "\n[matrix-unit ceiling] dense quantizedMatmul(gather 無し=純 INT4 GEMM):\n"
+            + denseRows.joined(separator: "\n")
+            + "\n  ★罠: dense は P=192/384 とも ~0.4ms=固定 dispatch overhead 床(compute はその下)。実 MoE は"
+            + "\n     expert 毎に重み別=1個の巨大 dense にできず、per-expert 分割は union×0.4ms 床が乗る。MLX 自身の"
+            + "\n     grouped(sortedIndices)も 350 止まり。∴ dense 1968 は単一 expert 限定の蜃気楼、[M,8] gather(443)が実用天井=grouping NO-GO。"
     }
 
     /// ★ issue#7 style A milestone A2: raw streaming 1層 forward（mixer raw + MoE が arena cache 経由）。
