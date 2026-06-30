@@ -1499,7 +1499,12 @@ extension Tell {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MTPSpecVerify] skip" }
-        let C = Tell.envInt("QWISP_CACHE_C", 64)
+        // ★ C は device 別 auto-config(SuffixSpec と同じ calibration layer): 8→64/16→128/24→192/32→256。
+        //   QWISP_CACHE_C で上書き可。QWISP_DEVICE_RAM=<GB> で他 tier を模擬。
+        let C = Tell.envInt("QWISP_CACHE_C", DeviceCalibration.defaultC())
+        if ProcessInfo.processInfo.environment["QWISP_CACHE_C"] == nil {
+            print("[calibration] " + DeviceCalibration.recommend().summary)
+        }
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -1582,8 +1587,9 @@ extension Tell {
         // ★ profile: IO(pread)/sync(per-layer drain) を全 C で切り分け
         LayerExpertCache.preadNanos = 0; LayerExpertCache.ensureNanos = 0; LayerExpertCache.missTotal = 0
         StreamingMoEBlock.syncNanos = 0
-        // ★ C<256 sync drain 削減: verify を no-sync whole-token + escalate(lossless)で回す(QWISP_VERIFY_PREFETCH)
-        let verifyPrefetch = Tell.envFlag("QWISP_VERIFY_PREFETCH")
+        // ★ C<256 sync drain 削減: verify を no-sync whole-token + escalate(lossless)で回す。
+        //   既定 C<256 で on(per-layer drain 半減・lossless 実証)、C>=256 は noSyncVerify が担うので off。QWISP_VERIFY_PREFETCH で上書き。
+        let verifyPrefetch = (ProcessInfo.processInfo.environment["QWISP_VERIFY_PREFETCH"].map { $0 == "1" }) ?? (C < 256)
         var priorInds: [[Int]]? = nil
         var escSum = 0
         func distinctL(_ a: MLXArray?) -> [Int] {
