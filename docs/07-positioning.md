@@ -257,6 +257,7 @@ mlx_lm ネイティブ KV 量子化（`kv_bits=4`）を 64K で実測：
 | cross-layer 予測器（う） | trained 0.54 < cache 0.85 | 割に合わず |
 | mixed-precision（A） | proxy 発散・大工事・quick de-risk 不可 | 高リスク低 ROI |
 | KV 量子化 | 64K -1GB のみ（hybrid が KV を解決済） | 見送り |
+| prefetch overlap（SP-MoE cutoff） | sim: draft 窓律速、純価値 ≈0（[[prefetch-overlap-eval]] docs/11） | 不発・speed 天井不変 |
 
 **v0.2 = shippable 到達点**：35B-A3B が exact・8GB17/12GB26 tok/s・64K/16GB・full と bit 一致。「極限まで高められた実用性能」を実機達成。
 
