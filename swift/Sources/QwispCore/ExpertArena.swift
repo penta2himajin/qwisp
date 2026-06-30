@@ -1207,7 +1207,8 @@ public enum StreamingMoEValidation {
         let H = model.embed(MLXArray([Int32(0)], [1, 1])).dim(-1)
         let nLayers = model.numLayers
         guard model.buildGPULayers(MLXArray([Int32(1)], [1, 1]), H) != nil else { return "[fix-2] build 失敗" }
-        guard let residentLayers = model.gpuLayers else { return "[fix-2] gpuLayers 未構築" }
+        guard model.gpuLayers != nil else { return "[fix-2] gpuLayers 未構築" }
+        var residentLayers: [RawMetalForward.GPULayer]! = model.gpuLayers   // ★ step② 後に解放するため var
 
         var prompt: [Int32] = [1, 2, 3, 4, 5, 6, 7, 8]
         if let r = try? loadArrays(url: URL(fileURLWithPath: refPath)), let pa = r["spec_prompt"] {
@@ -1242,6 +1243,12 @@ public enum StreamingMoEValidation {
             streamLayers.append(RawMetalForward.GPULayer(nw: R.nw, gdn: R.gdn, attn: R.attn,
                                                          moe: sMoE, gate: R.gate, sharedGate: R.sharedGate))
         }
+        // ★ 二重確保解消(harness バグ修正): resident 参照(step①)は終了。resident の routed expert 全重み(~18GB,
+        //   C=256 で arena と重複)を解放。streamLayers は nw/gdn/attn/gate/sharedGate(小) + sMoE(arena routed +
+        //   resident.sh* shared を retain 済)を保持するので安全。これで step③(計測)は arena のみ=二重確保なし。
+        residentLayers = nil
+        model.gpuLayers = nil
+        model.moeBufCache.removeAll()
         guard let sc = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8),
               let hb = RawMetalForward.makeResidentBuffer(H * 2) else { return "[fix-2] scratch/hBuf 失敗" }
         var slotTableBufs: [MTLBuffer] = []
