@@ -184,13 +184,27 @@ public enum Tell {
             }
             return result
         }
+        // ★ accept-gated 適応 maxK: 直近の受理長で draft 窓を調整。低 accept(nl)→maxK 縮小(≈greedy)で
+        //   resident の f32 長 verify 過剰コスト回避(nl maxK96=55 → maxK≈1=63 回復)、高 accept(mix)→full maxK。
+        //   混在ストリーム(散文↔コード)も accept が自動追従。既定 on@resident(C>=nE、streaming は nl penalty 無で中立)。
+        let adaptiveK = (ProcessInfo.processInfo.environment["QWISP_ADAPTIVE_K"].map { $0 == "1" }) ?? (C >= nE)
+        let adaptWin = Tell.envInt("QWISP_ADAPT_WINDOW", 8)
+        let adaptGrace = Tell.envInt("QWISP_ADAPT_GRACE", 2)
+        var accWindow: [Int] = []                                // 直近 step の受理長 p(D==0 は 0)
+        func effMaxK() -> Int {
+            if !adaptiveK || accWindow.isEmpty { return maxK }
+            let mean = Double(accWindow.reduce(0, +)) / Double(accWindow.count)
+            return Swift.max(1, Swift.min(maxK, Int(mean.rounded()) + adaptGrace))
+        }
+        func recordAccept(_ p: Int) { accWindow.append(p); if accWindow.count > adaptWin { accWindow.removeFirst() } }
+        if adaptiveK { print("[SuffixSpec] accept-gated 適応 maxK ON(window=\(adaptWin) grace=\(adaptGrace), maxK≤\(maxK))") }
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
             let u = uArr.item(Int.self)
             var ts = now()
-            let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: maxK, minMatch: minMatch)
+            let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: effMaxK(), minMatch: minMatch)
             let D = drafts.count
             draftTot += D
             if prof { tDraft += now() - ts; ts = now() }
@@ -199,6 +213,7 @@ public enum Tell {
                 out.append(u); hist.append(u)
                 uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                recordAccept(0)                                  // draft 不発も「speculation 非生産」として窓へ
                 if prof { tVerify += now() - ts }
                 continue
             }
@@ -212,6 +227,7 @@ public enum Tell {
             out.append(u); hist.append(u)
             for i in 0 ..< p { out.append(drafts[i]); hist.append(drafts[i]) }
             accTok += p
+            recordAccept(p)                                      // ★ 適応 maxK 用に受理長を記録
             if p == D {
                 uArr = MLXArray([Int32(evals[D])], [1, 1])
                 setVerifyMode(false)
