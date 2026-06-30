@@ -1564,7 +1564,11 @@ extension Tell {
         let mc = model.makeCaches()
         let mtpKV = KVCache()
         let P = ids.dim(-1)
-        StreamingMoEBlock.probeNoSync = false
+        // ★ issue#9 突破口: C≥256(全常駐)では verify を no-sync 化(ミス無し→no-sync が exact)。
+        //   per-layer drain を排除＝SuffixSpec の no-sync-pure と同速 path。batched 発散は f32-2op で吸収=軽い lossless verify。
+        //   QWISP_VERIFY_NOSYNC=1 で強制、=0 で無効。既定 C≥256 で on。
+        let noSyncVerify = (ProcessInfo.processInfo.environment["QWISP_VERIFY_NOSYNC"].map { $0 == "1" }) ?? (C >= 256)
+        StreamingMoEBlock.probeNoSync = noSyncVerify
         let (Hf, lgf) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lgf[0..., (lgf.dim(1) - 1)...], axis: -1)
         var lastH = Hf[0..., (P - 1)...]
