@@ -121,6 +121,10 @@ public enum Tell {
         let escalMin = Tell.envInt("QWISP_NOSYNC_MIN", nE)   // 既定 nE=band 空=production は pure/sync のみ
         let pureNoSync = nosyncEnv == "1" || (nosyncEnv != "0" && C >= nE)
         var escalateActive = nosyncEnv != "0" && !pureNoSync && C >= escalMin
+        // ★ no-sync+escalate を verify(batched M=D+1)にも適用する実験 flag。mix は draft が similar→union 小→
+        //   C 内に収まれば no-sync exact(per-layer sync 税を消し ~resident 天井へ)、超過時のみ escalate 再計算で
+        //   lossless。streaming mix の 130→276 gap を狙う。QWISP_VERIFY_ESCALATE=1 + QWISP_NOSYNC_MIN=<=C で有効。
+        let verifyEscalate = Tell.envFlag("QWISP_VERIFY_ESCALATE")
         if pureNoSync { print("[SuffixSpec] no-sync pure ON (C=\(C)>=\(nE) 全 resident, 無条件 lossless ~1.7x)") }
         else if escalateActive { print("[SuffixSpec] no-sync+escalation ON (C=\(C) in [\(escalMin),\(nE)), exact, 率監視 fallback)") }
         var hist = ids.asArray(Int32.self).map { Int($0) }     // 履歴（prompt + commit token）
@@ -220,7 +224,7 @@ public enum Tell {
             setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
             let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1, D+1]
-            let vlg = try decodeForward(seq, rows: D + 1, escalate: false)
+            let vlg = try decodeForward(seq, rows: D + 1, escalate: verifyEscalate)
             let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
