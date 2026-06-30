@@ -43,6 +43,8 @@
 | **Mixtral-Offloading** | LRU expert キャッシュ + 混合量子化 + 投機 prefetch | (Eliseev & Mazur 2023) |
 | **MoE-Infinity** | シーケンス単位の活性認識 prefetch + LFU | (Xue et al. 2024) |
 | **PowerInfer-2** | スマホでの高速 LLM 推論（hot/cold split + フラッシュ offload） | (Xue et al. 2024) |
+| **SP-MoE** (2025-10) | draft 段の投機 prefetch + cutoff-layer 解析モデルで just-in-time ロード。Qwisp D1 では draft 窓律速で overlap 不発（[[prefetch-overlap-eval]] docs/11） | arXiv:2510.10302 |
+| **SpecMD** (2026-02) | MoE キャッシュ方策ベンチ（eviction/prefetch/miss）。Least-Stale は per-layer cache では半分 N/A、drop/subst は lossy＝lossless bar 外 | arXiv:2602.03921 |
 
 盗める共通テク：
 
@@ -52,6 +54,8 @@
 4. **混合精度 expert**：hot は高 bit 常駐、cold は低 bit フラッシュ。
 
 ただし **HOBBIT の留保**：ロードコストが計算コストを大きく上回る場面では prefetch の利得は限定的。フラッシュ 1GB/s 域はまさにそれ。→ **prefetch 単独では救われず、ヒット率 + 量子化 + skip の合わせ技が要る。**
+
+これら 3 本（SP-MoE 2510.10302 / SpecMD 2602.03921 + 既収録 MoE-SpeQ 2511.14102, [[verify-forward]] docs/09）を Qwisp の streaming tier で評価した結果は [[prefetch-overlap-eval]]（docs/11）。**結論＝prefetch overlap は speed 天井を動かさず（draft 窓律速）、reach は mixed-precision が本命。**
 
 ## D. IFP 路線（モデル再学習を厭わない場合のみ）
 
