@@ -1948,7 +1948,9 @@ extension Tell {
             let s = UInt64(ru.ru_stime.tv_sec) * 1_000_000_000 + UInt64(ru.ru_stime.tv_usec) * 1000
             return u + s
         }
-        let seq = MLXArray([Int32(100)], [1, 1])                                  // L=1 ダミー decode
+        // ★ task#4 Step 0: M=B batched verify profile 用に seq 長を env 制御(QWISP_PROF_M、既定 1=decode)。
+        let profM = Tell.envInt("QWISP_PROF_M", 1)
+        let seq = MLXArray((0 ..< profM).map { Int32(100 + $0) }, [1, profM])      // L=profM(M=B) 疑似 verify 入力
         // 各 K 用に独立した cache 群（データ依存なし）を prefill しておく
         let maxK = Ks.max() ?? 1
         var bcs: [[LayerCache]] = []
@@ -2025,7 +2027,7 @@ extension Tell {
             S.tGdnInproj = 0; S.tGdnConv = 0; S.tGdnKernel = 0; S.tGdnOut = 0
             for _ in 0 ..< reps {
                 let (h, _) = try model.forwardHidden(seq, caches: bcs[0]); MLX.eval([h])
-                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: 1) }
+                for (i, c) in bcs[0].enumerated() { c.restore(snapss[0][i], isLinear: isLin[i], trim: profM) }
             }
             StreamingMoEBlock.profileLayers = false; StreamingMoEBlock.probeNoSync = false
             let parts: [(String, UInt64)] = [
@@ -2038,7 +2040,7 @@ extension Tell {
             let gline = String(format: "  └GDN内訳: in_proj %.0f%% / conv %.0f%% / recurrent-kernel %.0f%% / out %.0f%%",
                                Double(S.tGdnInproj) / Swift.max(1, gdnTot) * 100, Double(S.tGdnConv) / Swift.max(1, gdnTot) * 100,
                                Double(S.tGdnKernel) / Swift.max(1, gdnTot) * 100, Double(S.tGdnOut) / Swift.max(1, gdnTot) * 100)
-            return "[GpuBusy SUBPROF no-sync C=\(C), barrier計時=相対share用] issue#5 融合ターゲット\n"
+            return "[GpuBusy SUBPROF no-sync C=\(C), M=\(profM)(batched verify), barrier計時=相対share用] task#4 Step0\n"
                 + plines.joined(separator: "\n") + "\n" + gline
                 + "\n  → share 最大のサブレイヤが mega-fusion の第一候補（op 数多＝encode 寄与大）"
         }
