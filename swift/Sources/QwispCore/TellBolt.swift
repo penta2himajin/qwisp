@@ -90,7 +90,15 @@ extension Tell {
             // leave f32-full ON — bolt's own verify uses it too (stability, see above).
         }
 
-        // phase 2: top-C hot-pin + buddy table (cold -> most co-activated hot slot).
+        // phase 3a: EXACT prefill — the prompt context must be exact; buddy prefill corrupts every
+        // downstream token (so even 100% decode escalation cannot reach strict). One-time, off timer.
+        let mc = model.makeCaches()
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        let (_, lg) = try model.prefillChunked(ids, caches: mc)
+        var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
+        MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+
+        // phase 3b: top-C hot-pin + buddy table AFTER prefill (so arena = hot set, buddyTable valid).
         for (mi, ec) in model.expertCaches.enumerated() {
             _ = ec.ensure(Array(counts[mi].enumerated()
                 .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
@@ -98,13 +106,9 @@ extension Tell {
             ec.buildBuddyTable(coact: coact[mi], numExperts: nE)
         }
 
-        // phase 3: buddy no-sync SuffixSpec (draft=free suffix lookup, verify=buddy no-sync).
-        let mc = model.makeCaches()
+        // phase 3c: buddy no-sync decode (draft=free suffix lookup, verify=buddy no-sync).
         StreamingMoEBlock.probeNoSync = true      // buddy remap path (no CPU ensure/pread => io=0)
         StreamingMoEBlock.skipMode = 3            // cold -> buddy slot
-        let (_, lg) = try model.prefillChunked(ids, caches: mc)
-        var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
-        MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
         var hist = ids.asArray(Int32.self).map { Int($0) }
 
         // --- margin-gated escalation variant (QWISP_BOLT_MARGIN>0): per-token buddy greedy,
