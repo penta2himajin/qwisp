@@ -211,9 +211,15 @@ public enum Tell {
         let adaptiveK = (ProcessInfo.processInfo.environment["QWISP_ADAPTIVE_K"].map { $0 == "1" }) ?? (C >= nE)
         let adaptWin = Tell.envInt("QWISP_ADAPT_WINDOW", 8)
         let adaptGrace = Tell.envInt("QWISP_ADAPT_GRACE", 2)
+        // ★ cold-start draft 上限。初手は accept 履歴が無く、既定ではフル maxK の長 draft を引くが、
+        //   nl/novel では初手の長 suffix match が f32 長 verify を浪費し reject される(実測 C=256:
+        //   K=96→4 で nl 56→66 tok/s)。高 accept(mix/code)は自然 draft 長 ~maxK ゆえ cold cap を
+        //   その付近に置けば中立。QWISP_ADAPT_COLD で調整可(既定=maxK=現状維持)。
+        let adaptCold = Tell.envInt("QWISP_ADAPT_COLD", maxK)
         var accWindow: [Int] = []                                // 直近 step の受理長 p(D==0 は 0)
         func effMaxK() -> Int {
-            if !adaptiveK || accWindow.isEmpty { return maxK }
+            if !adaptiveK { return maxK }
+            if accWindow.isEmpty { return Swift.max(1, Swift.min(maxK, adaptCold)) }
             let mean = Double(accWindow.reduce(0, +)) / Double(accWindow.count)
             return Swift.max(1, Swift.min(maxK, Int(mean.rounded()) + adaptGrace))
         }
