@@ -228,6 +228,7 @@ public enum Tell {
         let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 60)))  // safe-union 目標 %（★tune: 80→60=overflow 回避で re-verify 減, C128 mix +29%）
         var missAccumDbg = 0, missStepsDbg = 0, missRoutedDbg = 0
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0, overflowCount = 0
+        ExpertSource.resetAcct()                                 // decode 区間の streaming IO を計測
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
@@ -338,9 +339,17 @@ public enum Tell {
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(draftTot)/s, steps).data(using: .utf8)!)
         }
         let ovTag = overflowCount > 0 ? "  [union-overflow guard: \(overflowCount) step 安全 fallback]" : ""
+        var ioTag = ""
+        if ExpertSource.acct {
+            let mb = Double(ExpertSource.acctBytes) / 1_048_576.0
+            let effBW = ExpertSource.acctNanos > 0 ? Double(ExpertSource.acctBytes) / (Double(ExpertSource.acctNanos) / 1e9) / 1e9 : 0
+            ioTag = String(format: "  [SSD-IO: %.0fMB/%d reads = %.2fMB/tok, 実効pread=%.2fGB/s, throttle=%@]",
+                           mb, ExpertSource.acctReads, mb / Double(N),
+                           effBW, ExpertSource.throttleGBs > 0 ? String(format: "%.1fGB/s", ExpertSource.throttleGBs) : "off")
+        }
         return String(format: """
-            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@%@
-            """, maxK, C, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag)
+            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@%@%@
+            """, maxK, C, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag, ioTag)
     }
 
     /// suffix lookup draft: seq 末尾の m token(minMatch..maxMatch の最長)が seq 内の earlier 位置に
