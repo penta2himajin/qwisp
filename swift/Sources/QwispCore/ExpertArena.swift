@@ -376,9 +376,18 @@ public final class StreamingMoEBlock {
         let store: ExpertArena
         var remapVals = [Int32](repeating: 0, count: flat.count)
         if let c = cache {
-            let slotOf = c.ensure(U)                                   // hit は pread 省略
-            for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slotOf[Int(e32)]!) }
-            store = c.arena
+            if StreamingMoEBlock.skipMode == 3, let bt = c.buddyTable {
+                // deterministic buddy (io=0): remap cold->buddy hot slot via buddyTable, NO ensure/pread.
+                // The inds.asArray above is the per-layer CPU sync barrier, so this is deterministic
+                // (unlike probeNoSync no-sync, which races across layers). bolt uses this path.
+                let btA = bt.asArray(Int32.self)
+                for (j, e32) in flat.enumerated() { let e = Int(e32); remapVals[j] = e < btA.count ? btA[e] : 0 }
+                store = c.arena
+            } else {
+                let slotOf = c.ensure(U)                               // hit は pread 省略
+                for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slotOf[Int(e32)]!) }
+                store = c.arena
+            }
         } else {
             var slot: [Int: Int] = [:]
             for (i, e) in U.enumerated() { slot[e] = i }

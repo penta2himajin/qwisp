@@ -106,9 +106,11 @@ extension Tell {
             ec.buildBuddyTable(coact: coact[mi], numExperts: nE)
         }
 
-        // phase 3c: buddy no-sync decode (draft=free suffix lookup, verify=buddy no-sync).
-        StreamingMoEBlock.probeNoSync = true      // buddy remap path (no CPU ensure/pread => io=0)
-        StreamingMoEBlock.skipMode = 3            // cold -> buddy slot
+        // phase 3c: DETERMINISTIC buddy decode. probeNoSync=false keeps the per-layer CPU sync
+        // barrier (deterministic, no cross-layer race); skipMode=3 remaps cold->buddy slot in the
+        // synced path with NO pread => io=0. This replaces the racy no-sync buddy path.
+        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.skipMode = 3            // cold -> buddy slot (deterministic synced remap)
         var hist = ids.asArray(Int32.self).map { Int($0) }
 
         // --- margin-gated escalation variant (QWISP_BOLT_MARGIN>0): per-token buddy greedy,
