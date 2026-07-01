@@ -97,26 +97,32 @@ SSD-IO; **buddy removes that IO**, so `buddy + speculation` finally pays. Estima
 `amort=0.6`, accept rates from SuffixSpec, `fuse=0.8`; tok/s from the roofline, quality from the
 buddy anchor + `est`):
 
-| method | quality % | tok/s | × strict | × buddy |
+`amort` was MEASURED (`forward-cost`, hot-pinned = io excluded, 4-bit 35B-A3B, this dev machine,
+2 runs): marginal compute `b ≈ 5.2 ms/token` (rock-stable across runs), fixed/dispatch `a`
+dominates ⇒ **`amort ≈ 0.85` on dev (dispatch-bound), Neo est. ≈ 0.75**. Also measured: a
+**small-batch penalty** — amortization only engages at **K ≥ 8** (per-token 40→27→9.6→5.2 for
+K=2,4,8,24), so speculation needs draft depth ≥8, and low-accept nl (can't fill K≥8) gains nothing.
+
+| method (Neo, amort=0.75, K≥8) | quality % | tok/s | × strict | × buddy |
 |---|---|---|---|---|
 | strict L1 | 100 | 6.6 | 1.0 | 0.4 |
 | buddy-substitute | 98 | 14.8 | 2.2 | 1.0 |
 | **B. buddy + kernel-fusion (LOSSLESS)** | **98** | **18.5** | 2.8 | **1.25** |
-| A. buddy + spec [code, acc3.5/K4] | 98 | 23.5 | 3.6 | 1.6 |
-| A. buddy + spec [nl, acc1.6/K2] | 98 | 16.9 | 2.6 | 1.1 |
-| A+B. buddy + spec + fusion [code] | 98 | 29.4 | 4.5 | 2.0 |
-| A+B+C. + 3-bit [code] | 95 | 33.6 | 5.1 | 2.3 |
-| aggressive: + 2-bit spec [agentic acc5/K6] | 83 | 41.1 | 6.2 | 2.8 |
+| **A. buddy + spec [code, acc6/K8]** | **98** | **32.3** | **4.9** | **2.2** |
+| A. buddy + spec [nl, acc1.8/K8] | 98 | 9.7 | 1.5 | 0.7 (spec *hurts* nl → keep buddy) |
+| A+B. buddy + spec + fusion [code] | 98 | 40.3 | 6.1 | 2.7 |
+| A+B+C. + 3-bit [code] | 95 | 46.1 | 7.0 | 3.1 |
+| aggressive: + 2-bit spec [agentic acc7/K8] | 83 | 62.8 | 9.5 | 4.2 |
 
-**Findings.**
-1. **Speculation is the way past buddy** — but only *after* buddy zeroes the IO. Code/agentic:
-   ~23.5 tok/s (1.6× buddy) at the same ~98 %; with fusion+3-bit up to ~30–34 tok/s.
-   **nl barely moves** (~17, accept≈1.6) — the hard regime stays hard.
-2. **Kernel-fusion is a free (lossless) ~1.25×** on top of buddy — no quality cost, stacks with all.
-3. `specTokps_le` (proven): speculative throughput ≤ `K/(cf·amort)`. The headroom rides entirely
-   on `amort` (how well a batched Neo verify amortizes the resident weight-read across K drafts):
-   K=4 → 59–99 tok/s ceiling, K=8 → 118–197. **`amort` is the one thing to MEASURE** (Neo
-   batched-forward K-scaling) — it decides whether buddy+spec lands near 24 or near 59 tok/s.
+**Findings (post-measurement).**
+1. **buddy + speculation is the way past buddy — and measured `amort≈0.85`/(Neo est 0.75) puts it
+   near the optimistic end**: code/agentic ~32 tok/s at 98 % (**2.2× buddy, 4.9× strict**);
+   +fusion+3-bit ~40–46; aggressive 2-bit ~63 (83 %).
+2. **Speculation needs K ≥ 8** (measured small-batch penalty). **nl cannot fill K≥8, so spec
+   *hurts* it** (9.7 < 14.8) — nl should stay at buddy. The hard regime stays hard.
+3. **Kernel-fusion is a free (lossless) ~1.25×** on buddy — no quality cost, stacks with all.
+4. `specTokps_le` (proven): throughput ≤ `K/(cf·amort)`. With measured `amort`, the headroom is
+   real for high-accept code/agentic and absent for nl.
 
 ## Build / reproduce
 

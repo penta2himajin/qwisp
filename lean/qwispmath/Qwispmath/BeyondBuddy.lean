@@ -18,9 +18,17 @@ one token per forward. Candidates (all *estimates* / 試算 — assumptions labe
 * **C. buddy + low-bit experts.** `cf` bandwidth-part scales `bits/4` (`QualitySpeed`).
 * **D. stack A+B+C.**
 
-Key unknown = `amort`: the fraction of a Neo forward that is amortized across batched verify
-positions (dispatch + resident weight-read). The whole speculation upside rides on it — it
-should be MEASURED (Neo batched-forward K-scaling). Here `amort = 0.6` (assumption).
+Key unknown was `amort`: the fraction of a forward amortized across batched verify positions.
+**MEASURED** (2026-07-01, `QWISP_RUN=forward-cost`, hot-pinned = io excluded, 4-bit 35B-A3B,
+this dev machine, 2 runs): marginal compute `b ≈ 5.2 ms/token` (rock-stable: L=24 per-token
+= 5.19 & 5.17 across runs), fixed/dispatch cost `a ≈ 28–66 ms` (dominates; load-sensitive;
+50 ms historically on M1 Max). ⇒ **`amort = a/(a+b) ≈ 0.85`** (dispatch-bound forward,
+batching amortizes ≥84%). Neo estimate `≈ 0.75` (weaker A18 GPU ⇒ larger marginal `b`).
+
+**Also measured (reproducible): a small-batch penalty.** Per-token barely improves at K=2
+(~40 ms) / K=4 (~27 ms); amortization only engages at **K ≥ 8** (per-token → 9.6 → 5.2). So
+speculation must use draft depth K ≥ 8 to pay off — small-K spec ≈ greedy. This is exactly why
+low-accept **nl (can't fill K≥8) gets ~nothing** from spec, while high-accept code/agentic does.
 -/
 
 namespace Qwisp.BeyondBuddy
@@ -55,7 +63,7 @@ end Bound
 def cf0 : Float := 67.6         -- ms, routing+compute floor (4-bit), from measured decomposition
 def strict : Float := 6.6       -- tok/s strict-lossless
 def buddy : Float := 14.8       -- tok/s buddy-substitute (io→0, ≈98% quality)
-def amort : Float := 0.6        -- ASSUMPTION: amortized fraction of forward under batched verify
+def amort : Float := 0.75       -- Neo estimate (dev MEASURED ≈0.85; weaker A18 GPU ⇒ ~0.75)
 def cfBwFrac : Float := 0.5     -- share of cf that is bandwidth-bound (low-bit lever)
 def fuse : Float := 0.8         -- kernel-fusion cf multiplier (lossless)
 
@@ -75,16 +83,17 @@ structure Method where
   tokps : Float
 deriving Repr, Inhabited
 
-/-- accept≈3.5 @K=4 (code/agentic, SuffixSpec), accept≈1.6 @K=2 (nl). -/
+/-- K≥8 required (measured small-batch penalty). code/agentic sustain K=8 (accept≈6);
+nl (accept≈1.8) cannot fill K≥8 ⇒ sits in the small-batch zone ⇒ spec ≈ buddy (no gain). -/
 def methods : List Method :=
   [ { name := "strict L1 (baseline)",                  qualityPct := 100.0, tokps := strict },
     { name := "buddy-substitute (io->0)",              qualityPct := 98.0,  tokps := buddy },
     { name := "B: buddy + fusion (LOSSLESS cf cut)",   qualityPct := 98.0,  tokps := 1000.0 / cfMs 4.0 true },
-    { name := "A: buddy + spec [code, acc3.5/K4]",     qualityPct := 98.0,  tokps := specT 4.0 false 3.5 4.0 },
-    { name := "A: buddy + spec [nl, acc1.6/K2]",       qualityPct := 98.0,  tokps := specT 4.0 false 1.6 2.0 },
-    { name := "A+B: buddy + spec + fusion [code]",     qualityPct := 98.0,  tokps := specT 4.0 true 3.5 4.0 },
-    { name := "A+B+C: +3-bit [code]",                  qualityPct := 95.0,  tokps := specT 3.0 true 3.5 4.0 },
-    { name := "aggressive: +2-bit spec [agentic acc5/K6]", qualityPct := 83.0, tokps := specT 2.0 true 5.0 6.0 } ]
+    { name := "A: buddy + spec [code, acc6/K8]",       qualityPct := 98.0,  tokps := specT 4.0 false 6.0 8.0 },
+    { name := "A: buddy + spec [nl, acc1.8/K8 -> penalty]", qualityPct := 98.0, tokps := specT 4.0 false 1.8 8.0 },
+    { name := "A+B: buddy + spec + fusion [code]",     qualityPct := 98.0,  tokps := specT 4.0 true 6.0 8.0 },
+    { name := "A+B+C: +3-bit [code]",                  qualityPct := 95.0,  tokps := specT 3.0 true 6.0 8.0 },
+    { name := "aggressive: +2-bit spec [agentic acc7/K8]", qualityPct := 83.0, tokps := specT 2.0 true 7.0 8.0 } ]
 
 -- (name, quality%, tok/s, × over strict, × over buddy)
 #eval methods.map (fun m =>
