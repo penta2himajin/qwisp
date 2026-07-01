@@ -225,6 +225,7 @@ public enum Tell {
         if adaptiveK { print("[SuffixSpec] accept-gated 適応 maxK ON(window=\(adaptWin) grace=\(adaptGrace), maxK≤\(maxK))") }
         let missDbg = Tell.envFlag("QWISP_VERIFY_MISS_DBG")
         let ofDbg = Tell.envFlag("QWISP_OVERFLOW_DBG")
+        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 80)))  // safe-union 目標 %（既定80）
         var missAccumDbg = 0, missStepsDbg = 0, missRoutedDbg = 0
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0, overflowCount = 0
         let t0 = DispatchTime.now()
@@ -247,60 +248,70 @@ public enum Tell {
             }
             setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
-            let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1, D+1]
-            // ★ no-sync verify miss 診断: この verify で routed-not-cached が何個か(全 MoE 層累積)。
-            if missDbg { StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil }
-            // ★ union-overflow guard(C<nE): batched verify の per-layer expert union が per-layer cache C を
-            //   超えると sync ensure が evict しきれず wrong-slot=silent garbage(hotMiss 非検出)で誤受理する。
-            //   実測: C=64 code は maxK=C×3/8=24 でも 3/4 rep 非lossless(clamp は worst-case 過楽観)。
-            //   検出は ensure に渡る CPU 側 [Int] の distinct 数で行う(GPU sync 不要=安価。lastInds materialize は 19x 遅)。
-            //   overflow 時は batched 結果(garbage)を破棄し safeMaxK を半減(次 draft 短縮で収束)、当 step は安全な
-            //   single-token(union≤top8≤C)へ fallback→全 C・全内容で strict-lossless 保証。
+            // ★ union-overflow guard(C<nE)+ safe-prefix re-verify: batched verify の per-layer expert union が
+            //   C を超えると sync ensure が evict しきれず wrong-slot=silent garbage(hotMiss 非検出)で誤受理する。
+            //   実測: C=64 code は maxK=C×3/8 でも 3/4 rep 非lossless(clamp は worst-case 過楽観, union~2×C)。
+            //   検出は ensure に渡る CPU 側 [Int] の distinct 数(GPU sync 不要=安価。lastInds materialize は 19x 遅)。
+            //   overflow なら draft を「union≤C に収まる最長 prefix」へ縮小して RE-VERIFY(single-token でなく
+            //   複数 accept を回収)。比例縮小で 1-2 回で収束、prefix<1 でのみ safe single-token。strict-lossless 保証。
             let unionGuard = C < nE
-            if unionGuard { LayerExpertCache.overflowCheck = true; LayerExpertCache.overflowMaxUnion = 0 }
-            let vlg = try decodeForward(seq, rows: D + 1, escalate: verifyEscalate)
-            if missDbg {
-                let ma = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0)); MLX.eval([vlg, ma])
-                missAccumDbg += Int(ma.item(Int32.self)); missStepsDbg += 1
-                missRoutedDbg += (D + 1) * nMoE * 8   // 分母: 全 MoE 層 × (D+1)token × top8
-                StreamingMoEBlock.countHotMiss = false
-            }
-            if unionGuard {
+            var curDrafts = drafts
+            var vlg: MLXArray = uArr                              // placeholder（loop で必ず上書き）
+            var singleFallback = false
+            while true {
+                let dd = curDrafts.count
+                let seq = MLX.concatenated([uArr, MLXArray(curDrafts.map { Int32($0) }, [1, dd])], axis: 1)  // [1, dd+1]
+                if missDbg { StreamingMoEBlock.countHotMiss = true; StreamingMoEBlock.hotMissAccum = nil }
+                if unionGuard { LayerExpertCache.overflowCheck = true; LayerExpertCache.overflowMaxUnion = 0 }
+                vlg = try decodeForward(seq, rows: dd + 1, escalate: verifyEscalate)
+                if missDbg {
+                    let ma = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0)); MLX.eval([vlg, ma])
+                    missAccumDbg += Int(ma.item(Int32.self)); missStepsDbg += 1
+                    missRoutedDbg += (dd + 1) * nMoE * 8
+                    StreamingMoEBlock.countHotMiss = false
+                }
+                if !unionGuard { break }
                 LayerExpertCache.overflowCheck = false
                 let maxU = LayerExpertCache.overflowMaxUnion
-                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(D) maxU=\(maxU) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
-                // ★ 比例コントローラ: union は draft 長 D に対し概ね線形(実際は concave)ゆえ観測 (D, maxU) から
-                //   「union≈C に収まる最長 draft」を推定し safeMaxK を追従。80% 余裕で推定ノイズ由来の再 overflow を抑制。
-                //   収束後は overflow=0 で最長安全 draft を維持(restricted 環境で accept を最大化=実用性能を担保)。
-                if maxU > C {                                    // union>C=garbage → 破棄し収まる長さへ縮小, 安全 1-token
-                    safeMaxK = Swift.max(1, D * (C * 80 / 100) / maxU)
-                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
-                    let glg = try decodeForward(uArr, rows: 1, escalate: true)
-                    out.append(u); hist.append(u)
-                    uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
-                    setVerifyMode(false)
-                    MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
-                    overflowCount += 1                            // ★ recordAccept は呼ばない: overflow は
-                    if prof { tVerify += now() - ts }            //   「容量不足」で「speculation 非生産」でない。
-                    continue                                     //   0 を窓に入れると adaptive maxK が誤縮小し accept を潰す。
-                } else if maxU > 0 && maxU * 100 < C * 80 && safeMaxK < maxK {
+                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(dd) maxU=\(maxU) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
+                if maxU > C {                                    // overflow → 収まる最長 prefix へ縮小し re-verify
+                    let target = Swift.max(1, dd * (C * ofMargin / 100) / maxU)   // union≈線形 in D の保守推定
+                    safeMaxK = Swift.min(safeMaxK, target)
+                    overflowCount += 1
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: dd + 1) }
+                    let newLen = Swift.min(dd - 1, target)
+                    if newLen < 1 { singleFallback = true; break }
+                    curDrafts = Array(curDrafts.prefix(newLen))
+                    continue
+                } else if maxU > 0 && maxU * 100 < C * ofMargin && safeMaxK < maxK {
                     safeMaxK = Swift.min(maxK, safeMaxK + Swift.max(2, safeMaxK / 6))  // 余裕十分→成長
                 }
+                break                                            // union≤C=fit → accept へ
             }
-            let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            if singleFallback {                                  // 安全 prefix が 1 未満 → single-token(union≤top8≤C)
+                let glg = try decodeForward(uArr, rows: 1, escalate: true)
+                out.append(u); hist.append(u)
+                uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
+                setVerifyMode(false)
+                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })   // recordAccept は呼ばない(容量不足≠非生産)
+                if prof { tVerify += now() - ts }
+                continue
+            }
+            let D2 = curDrafts.count
+            let evals = MLX.argMax(vlg[0, 0 ..< (D2 + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             var p = 0
-            while p < D && drafts[p] == evals[p] { p += 1 }
+            while p < D2 && curDrafts[p] == evals[p] { p += 1 }
             out.append(u); hist.append(u)
-            for i in 0 ..< p { out.append(drafts[i]); hist.append(drafts[i]) }
+            for i in 0 ..< p { out.append(curDrafts[i]); hist.append(curDrafts[i]) }
             accTok += p
             recordAccept(p)                                      // ★ 適応 maxK 用に受理長を記録
-            if p == D {
-                uArr = MLXArray([Int32(evals[D])], [1, 1])
+            if p == D2 {
+                uArr = MLXArray([Int32(evals[D2])], [1, 1])
                 setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             } else {
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
-                let acc = [u] + Array(drafts.prefix(p))
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D2 + 1) }
+                let acc = [u] + Array(curDrafts.prefix(p))
                 _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
                 setVerifyMode(false)
                 uArr = MLXArray([Int32(evals[p])], [1, 1])

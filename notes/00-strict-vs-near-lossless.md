@@ -149,7 +149,7 @@ m2(){ QWISP_RUN=cross-layer-predict ... ; }   # 同様
 
 **f16 batched は ~7e-4 drift だが SuffixSpec は reject 自己訂正ゆえ実用上 lossless**（誤受理は draft[i] と真 argmax の precise near-tie のみ・保証なし）。f32-full は near-tie でも bit-exact ゆえ**保証付き**。
 
-**maxK 上限の真因は精度でなく per-layer cache 容量**: D+1 トークン verify で 1 層が同時に要するユニーク expert 数が C 超で wrong-slot=silent garbage(クラッシュせず誤受理→品質崩壊)。実測安全境界 **C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8**。`maxK = min(QWISP_DRAFT_K, C×3/8)` でクランプ(超過時ログ)。
+**maxK 上限の真因は精度でなく per-layer cache 容量**: D+1 トークン verify で 1 層が同時に要するユニーク expert 数が C 超で wrong-slot=silent garbage(クラッシュせず誤受理→品質崩壊)。~~実測安全境界 C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8~~。★**訂正(2026-07-01): C×3/8 は安全でない**。diverse routing で union は ~2×C まで膨張し C×3/8 でも overflow=silent garbage、argmax 偶然生存 run のみ 100%=**lossless-by-luck**(C=64 code 3/4 rep 非lossless 実測)。真の strict-lossless は **union-overflow guard**: `LayerExpertCache.ensure` に渡る実 routing の distinct 数で per-layer union を観測(GPU sync 不要)、union>C の step は overflow prefix を「union≤C に収まる最長 prefix」へ縮小して re-verify(比例縮小で 1-2 回収束、prefix<1 のみ safe single-token)。honest 値: C=64 code 34/mix 43/nl 21, C=128 code 148/mix 62, C=192+ ほぼ full, C=256 従来通り。`maxK = min(QWISP_DRAFT_K, C×3/8)` は初期上限だが実効上限は guard が動的決定。commit de44e69+re-verify, branch suffixspec-union-overflow-guard。
 
 実測 vs Swift-greedy **全て 100% lossless**（mix=反復code / nl=自然文）:
 
