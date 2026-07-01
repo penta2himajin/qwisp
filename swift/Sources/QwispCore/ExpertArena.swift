@@ -86,6 +86,11 @@ public final class LayerExpertCache {
     nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
     // ★ issue#7 Step 0: per-layer all-resident 計測（ensure 前=no-sync が exact になる層か）。
     nonisolated(unsafe) public static var measureResident = false
+    // ★ union-overflow 検出(strict-lossless guard): batched verify で 1 層の routed distinct expert が C を
+    //   超えると sync ensure が evict しきれず wrong-slot=silent garbage で誤受理する。ensure に渡る CPU 側
+    //   [Int] の distinct 数で検出(GPU sync 不要=安価)。overflowCheck=true の間だけ判定。
+    nonisolated(unsafe) public static var overflowCheck = false
+    nonisolated(unsafe) public static var overflowMaxUnion = 0   // overflowCheck 中の per-layer distinct routed の最大
     nonisolated(unsafe) public static var residAllHit: [Int: Int] = [:]   // 層→(top-8 全常駐だった token 数)
     nonisolated(unsafe) public static var residTotal: [Int: Int] = [:]    // 層→(計測 token 数)
     nonisolated(unsafe) public static var residMissSum: [Int: Int] = [:]  // 層→(miss expert 数の累積)
@@ -189,6 +194,11 @@ public final class LayerExpertCache {
         defer { LayerExpertCache.ensureNanos += DispatchTime.now().uptimeNanoseconds - t0 }
         var result: [Int: Int] = [:]
         var missList: [(e: Int, slot: Int)] = []
+        // ★ union-overflow guard: distinct routed > C なら C slot に同時常駐できず gather が garbage。
+        if LayerExpertCache.overflowCheck {
+            let u = Set(experts).count
+            if u > LayerExpertCache.overflowMaxUnion { LayerExpertCache.overflowMaxUnion = u }
+        }
         // ★ issue#7 Step 0: ensure 前(=この token のロード前)の per-layer 残留を計測。
         //   全 distinct expert が既に常駐なら、この層は no-sync gather が exact になる。cold-start で自然蓄積。
         if LayerExpertCache.measureResident {
