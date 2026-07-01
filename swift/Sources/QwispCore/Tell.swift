@@ -52,13 +52,13 @@ public enum Tell {
         if maxK < maxKReq {
             print("[SuffixSpec] maxK \(maxKReq)→\(maxK) にクランプ(C=\(C) の arena 容量制約 C×3/8, |U|>C 回避)")
         }
-        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 2)
+        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)   // ★tune: 2→4(2-3 token 偶然一致の無駄 draft を回避, 全 C×task で非負)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
         // ★ union-overflow guard: maxK=C×3/8 は真の安全境界でない。diverse routing で per-layer expert
         //   union は ~2×C まで膨張し、C<nE では sync ensure が evict しきれず silent garbage=lossless-by-luck。
         //   実 routing の union を観測し overflow prefix を re-verify して strict-lossless 化。詳細 notes/00。
         let ofDbg = Tell.envFlag("QWISP_OVERFLOW_DBG")
-        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 80)))  // safe-union 目標 %（既定80）
+        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 60)))  // safe-union 目標 %（★tune: 80→60=overflow 回避で re-verify 減, C128 mix +29%）
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
         AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
