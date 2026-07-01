@@ -51,7 +51,7 @@ public enum Tell {
         if maxK < maxKReq {
             print("[SuffixSpec] maxK \(maxKReq)→\(maxK) にクランプ(C=\(C) の arena 容量制約 C×3/8, |U|>C 回避)")
         }
-        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 2)
+        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)   // ★tune: 2→4(2-3 token 偶然一致の無駄 draft を回避, 全 C×task で非負)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
@@ -225,7 +225,7 @@ public enum Tell {
         if adaptiveK { print("[SuffixSpec] accept-gated 適応 maxK ON(window=\(adaptWin) grace=\(adaptGrace), maxK≤\(maxK))") }
         let missDbg = Tell.envFlag("QWISP_VERIFY_MISS_DBG")
         let ofDbg = Tell.envFlag("QWISP_OVERFLOW_DBG")
-        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 80)))  // safe-union 目標 %（既定80）
+        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 60)))  // safe-union 目標 %（★tune: 80→60=overflow 回避で re-verify 減, C128 mix +29%）
         var missAccumDbg = 0, missStepsDbg = 0, missRoutedDbg = 0
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0, overflowCount = 0
         let t0 = DispatchTime.now()
