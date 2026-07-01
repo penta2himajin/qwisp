@@ -58,6 +58,37 @@ compute/dispatch-bound, so expert-skipping buys ≈**1.0×**. A second, quality-
 low-bit experts (4→3→2 bit) — could stack on Neo to a (optimistic, compute-fully-BW-bound)
 ≈19.7 / 29.6 tok/s, but that shrinks the compute floor, not the IO, and trades more quality.
 
+## Quality ↔ speed trade-off — `Qwispmath/QualitySpeed.lean`
+
+If we spend accuracy for speed on Neo, **how much tok/s per % of quality lost?** tok/s is the
+proven roofline; `qualityPct` (token-match vs strict-L1 4-bit greedy) is one measured anchor
+(buddy-substitute ≈ 98 %, M-series) plus literature estimates (marked `est`). The Neo ladder:
+
+| operating point | quality % | tok/s | speedup | tok/s per %-lost |
+|---|---|---|---|---|
+| strict L1 (4-bit, all 8) | 100 | 6.6 | 1.00× | — |
+| top-7 (drop smallest) *est* | 99.5 | 7.1 | 1.1× | 1.0 |
+| top-6 *est* | 98 | 7.7 | 1.2× | 0.5 |
+| top-4 *est* | 93 | 9.1 | 1.4× | 0.4 |
+| top-2 *est* | 80 | 11.3 | 1.7× | 0.2 |
+| **buddy-substitute (io→0)** *measured* | **98** | **14.8** | **2.24×** | **4.1** |
+| buddy + 3-bit *est* | 95 | 16.9 | 2.6× | 2.1 |
+| buddy + 2-bit *est* | 83 | 19.7 | 3.0× | 0.8 |
+
+**Findings.**
+1. **Buddy-substitution strictly dominates naive expert-dropping.** Same ~98 % quality, but
+   2.24× vs 1.2× — because it *substitutes* a cached expert (io→0) instead of discarding gate
+   mass. Top-m skipping is Pareto-dominated at every point.
+2. **Sharp diminishing returns.** The first ~2 % of quality buys **4.1 tok/s per %** (the
+   buddy point); the next 3 % (→3-bit) buys 2.1/%; the next 12 % (→2-bit) only 0.8/%.
+3. **Sweet spot = buddy at −2 % → 2.24×** (≈14.8 tok/s). Low-bit beyond that trades quality
+   fast for modest extra speed, and is capped by Neo's routing+compute floor. Under the
+   optimistic "cf fully bandwidth-bound" assumption the buddy+3/2-bit points rise to
+   ≈19.7 / 29.6 tok/s (upper bound; real is lower because dispatch does not shrink with bits).
+
+Other tiers (fast-SSD / 16–32 GB) are already compute/dispatch-bound, so trading quality on
+the expert-IO axis buys ≈1.0× — the whole trade-off only pays off on the slow-NAND Neo tier.
+
 ## Build / reproduce
 
 Toolchain is managed by [mise](https://mise.jdx.dev) (`mise.toml` pins `elan`).
