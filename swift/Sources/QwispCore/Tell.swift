@@ -47,9 +47,21 @@ public enum Tell {
         // ★既定は C 安全上限(=最速。長 draft は反復で accept↑、novel では suffix が短く返すので中立)。
         let maxKSafe = Swift.max(4, C * 3 / 8)
         let maxKReq = Tell.envInt("QWISP_DRAFT_K", maxKSafe)
-        let maxK = Swift.min(maxKReq, maxKSafe)
+        var maxK = Swift.min(maxKReq, maxKSafe)
         if maxK < maxKReq {
             print("[SuffixSpec] maxK \(maxKReq)→\(maxK) にクランプ(C=\(C) の arena 容量制約 C×3/8, |U|>C 回避)")
+        }
+        // ★ slow-NAND mitigation(MacBook Neo / legacy M1-M2 8GB 256GB 単一NAND ~1.5GB/s tier）:
+        //   streaming(C≤64)で低速 SSD だと batched verify の大 union が cache thrash→IO 律速。maxK を小さく抑えると
+        //   verify union が縮み IO/tok↓(実測 mix 199→126MB, @1.5GB/s 5.7→7.7 tok/s +35%)。verify は exact ゆえ strict-lossless。
+        //   device SSD BW = throttle(emulation) or QWISP_SSD_GBS(実機 device-probe 実測値, 未設定=fast)。閾値/上限は env 可変。
+        let devSSDGBs = ExpertSource.throttleGBs > 0 ? ExpertSource.throttleGBs
+                        : (Double(ProcessInfo.processInfo.environment["QWISP_SSD_GBS"] ?? "") ?? 99.0)
+        let slowThresh = Tell.envFloat("QWISP_SLOW_NAND_GBS", 2.5)
+        if C <= 64 && devSSDGBs < Double(slowThresh) {
+            let slowMaxK = Swift.min(maxK, Tell.envInt("QWISP_SLOW_MAXK", 4))
+            print("[SuffixSpec] slow-NAND(SSD~\(String(format: "%.1f", devSSDGBs))GB/s, C=\(C)) → maxK \(maxK)→\(slowMaxK)(verify union 縮小で IO/thrash 削減, strict-lossless)")
+            maxK = slowMaxK
         }
         let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)   // ★tune: 2→4(2-3 token 偶然一致の無駄 draft を回避, 全 C×task で非負)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
