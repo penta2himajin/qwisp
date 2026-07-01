@@ -1,0 +1,2 @@
+[tools]
+"ubi:leanprover/elan" = { version = "latest", exe = "elan" }
