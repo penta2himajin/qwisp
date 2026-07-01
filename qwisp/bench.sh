@@ -8,7 +8,10 @@
 #
 # Usage: qwisp/bench.sh [C] [GEN] [throttle_GBs] [methods]
 #   C           per-layer cache slots (8GB=64, 16GB=128, 24GB=192).  default 64
-#   GEN         tokens to generate per regime.                        default 128
+#   GEN         tokens to generate per regime.                        default 48
+#               (kept short: token-match quality is only meaningful before free-running greedy
+#                paths diverge — even lossless strict scores ~62% at GEN=128 due to greedy chaos;
+#                at GEN<=48 lossless=100%. Use a larger GEN only for tok/s, not for quality.)
 #   throttle    SSD BW GB/s to emulate (0=fast-SSD, 1.5=slow-NAND).   default 0
 #   methods     space-list of runners.                                default "suffix-spec bolt"
 # Env overrides: QWISP_BENCH_MODEL, QWISP_BENCH_BIN, QWISP_BENCH_REFS.
@@ -17,7 +20,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${QWISP_BENCH_BIN:-$REPO/swift/.xcode-build-rel/Build/Products/Release/qwisp-poc}"
 MODEL="${QWISP_BENCH_MODEL:-$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16}"
 REFS="${QWISP_BENCH_REFS:-$REPO/refs}"
-C="${1:-64}"; GEN="${2:-128}"; THR="${3:-0}"; METHODS="${4:-suffix-spec bolt}"
+C="${1:-64}"; GEN="${2:-48}"; THR="${3:-0}"; METHODS="${4:-suffix-spec bolt}"
 REGIMES="code agentic longctx shortnl"
 
 [ -x "$BIN" ] || { echo "ERROR: binary not found: $BIN (build swift first)"; exit 1; }
