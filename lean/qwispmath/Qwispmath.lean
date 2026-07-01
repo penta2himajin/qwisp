@@ -1,4 +1,5 @@
 import Mathlib
+import Qwispmath.NearLossless
 
 /-!
 # Qwisp — formal certification of lossless math-acceleration limits
