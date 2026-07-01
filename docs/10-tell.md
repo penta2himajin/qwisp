@@ -3,7 +3,10 @@
 > **⚠️ 2026-06-28 更新（最新の正典は `notes/01-speedup-investigation.md`）**：
 > - **標準手法 = `suffix-spec`(SuffixSpec, Tell.swift)**。SuffixDecoding draft + **batched f32-full exact verify**(lossless)。
 >   既定実行(QWISP_RUN 無指定)はこれ。全領域で SpecK/Fast 以上の **Pareto 最適**（nl 18.8/mix 76+ vs SpecK 16.6/21）。
->   既定 maxK=C×3/8(最速安全上限)。実測 8GB C=64 mix 88 / 16GB C=128 mix 132 tok/s(@maxK24-48)。
+>   既定 maxK=C×3/8。★但し C×3/8 は真の安全境界でない(2026-07-01): diverse routing で per-layer
+>   expert union は ~2×C まで膨張し silent garbage=**lossless-by-luck** だった。**union-overflow guard**(実 union を
+>   ensure で観測、overflow prefix を re-verify)で strict-lossless 化。honest 値: 8GB C=64 code 21/mix 43/nl 20,
+>   16GB C=128 code 110/mix 64/nl ~20, C=192+ ほぼ full, C=256 mix 282。旧「mix 88/132 @100%」は運の数字。
 > - 旧 `spec-verify`(SpecK)・`buddy-no-sync`(Fast) は **TellExperiments.swift へ移管**(QWISP_RUN で利用可、比較基準)。
 > - **lossless 単流高速化の探索は出尽くし**: compile/MoE 3bit/A3 融合/tree draft は全て実証否定、nl は batch=1 床(~20 tok/s)。詳細 notes/01。
 > - 以下 2026-06-27 の記述(SpecK 基準)は履歴として残置。

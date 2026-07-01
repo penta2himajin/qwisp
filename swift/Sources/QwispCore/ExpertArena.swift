@@ -84,6 +84,11 @@ public final class LayerExpertCache {
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
     nonisolated(unsafe) public static var preadNanos: UInt64 = 0    // loadMany(pread IO) のみ
     nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
+    // ★ union-overflow 検出(strict-lossless guard): batched verify で 1 層の routed distinct expert が C を
+    //   超えると sync ensure が evict しきれず wrong-slot=silent garbage で誤受理する。ensure に渡る CPU 側
+    //   [Int] の distinct 数で検出(GPU sync 不要=安価)。overflowCheck=true の間だけ判定。
+    nonisolated(unsafe) public static var overflowCheck = false
+    nonisolated(unsafe) public static var overflowMaxUnion = 0      // overflowCheck 中の per-layer distinct routed の最大
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
@@ -184,6 +189,11 @@ public final class LayerExpertCache {
         defer { LayerExpertCache.ensureNanos += DispatchTime.now().uptimeNanoseconds - t0 }
         var result: [Int: Int] = [:]
         var missList: [(e: Int, slot: Int)] = []
+        // ★ union-overflow guard: distinct routed > C なら C slot に同時常駐できず gather が garbage。
+        if LayerExpertCache.overflowCheck {
+            let u = Set(experts).count
+            if u > LayerExpertCache.overflowMaxUnion { LayerExpertCache.overflowMaxUnion = u }
+        }
         for e in experts {
             clock += 1
             if let s = slotOf[e] { tick[s] = clock; hits += 1; result[e] = s; continue }
