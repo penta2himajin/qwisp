@@ -113,49 +113,6 @@ extension Tell {
         StreamingMoEBlock.skipMode = 3            // cold -> buddy slot (deterministic synced remap)
         var hist = ids.asArray(Int32.self).map { Int($0) }
 
-        // --- margin-gated escalation variant (QWISP_BOLT_MARGIN>0): per-token buddy greedy,
-        // escalate ONLY low-margin tokens (top1-top2 < thresh) to exact. Clean f32-full state
-        // mgmt: snapshot -> buddy forward -> if low margin, restore + exact forward. Tests the
-        // entropy-flip hypothesis: near-lossless should need escalation only on low-margin tokens. ---
-        let marginThresh = Tell.envFloat("QWISP_BOLT_MARGIN", 0)
-        if marginThresh > 0 {
-            var gout: [Int] = []; var esc = 0; var uG = uArr.item(Int.self)
-            let tg0 = DispatchTime.now()
-            while gout.count < N {
-                gout.append(uG); hist.append(uG)
-                let seq1 = MLXArray([Int32(uG)], [1, 1])
-                let snap = mc.map { $0.snapshot() }
-                StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.skipMode = 3
-                let (_, blg) = try model.forwardHidden(seq1, caches: mc)
-                let logits = blg[0, 0]
-                let sv = MLX.sorted(logits); let V = logits.dim(0)
-                let margin = (sv[V - 1] - sv[V - 2]).item(Float.self)
-                if margin < Float(marginThresh) {              // uncertain -> buddy may flip argmax: escalate exact
-                    for (i, c) in mc.enumerated() { c.restore(snap[i], isLinear: isLin[i], trim: 1) }
-                    StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
-                    let (_, elg) = try model.forwardHidden(seq1, caches: mc)
-                    uG = MLX.argMax(elg[0, 0], axis: -1).item(Int.self); esc += 1
-                    MLX.eval([elg] + mc.flatMap { $0.stateArrays })
-                    StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.skipMode = 3
-                } else {
-                    uG = MLX.argMax(logits, axis: -1).item(Int.self)
-                    MLX.eval([blg] + mc.flatMap { $0.stateArrays })
-                }
-            }
-            let gsecs = Double(DispatchTime.now().uptimeNanoseconds - tg0.uptimeNanoseconds) / 1e9
-            let gN = Array(gout.prefix(N))
-            let qStrict = gSwift.isEmpty ? -1 : zip(gN, gSwift).filter { $0 == $1 }.count
-            if Tell.envFlag("QWISP_DUMP_TOKENS") {
-                print("PROMPT_TOKENS:" + ids.asArray(Int32.self).map { String($0) }.joined(separator: ","))
-                print("BOLT_TOKENS:" + gN.map { String($0) }.joined(separator: ","))
-                if !gSwift.isEmpty { print("STRICT_TOKENS:" + gSwift.map { String($0) }.joined(separator: ",")) }
-            }
-            let qTag = qStrict < 0 ? "" : String(format: "  ★vs strict-4bit greedy %d/%d=%.1f%%", qStrict, N, Double(qStrict) / Double(N) * 100)
-            return String(format: """
-                [Bolt L3 margin-gate≥%.1f] C=%d: %.1f tok/s  escalate=%d/%d=%.0f%%%@
-                """, marginThresh, C, Double(N) / gsecs, esc, N, Double(esc) / Double(N) * 100, qTag)
-        }
-
         var out: [Int] = []; var steps = 0, accTok = 0, draftSteps = 0
         let t0 = DispatchTime.now()
         while out.count < N {
