@@ -89,6 +89,35 @@ proven roofline; `qualityPct` (token-match vs strict-L1 4-bit greedy) is one mea
 Other tiers (fast-SSD / 16–32 GB) are already compute/dispatch-bound, so trading quality on
 the expert-IO axis buys ≈1.0× — the whole trade-off only pays off on the slow-NAND Neo tier.
 
+## Beyond buddy on Neo — can we go faster than 14.8 tok/s? `Qwispmath/BeyondBuddy.lean`
+
+Buddy sits at the compute-bound ceiling (`io→0`). To beat it, attack `cf` or emit >1 token per
+forward. The unlock: speculation was neutral on Neo only because the expert-union grew → more
+SSD-IO; **buddy removes that IO**, so `buddy + speculation` finally pays. Estimates (试算 —
+`amort=0.6`, accept rates from SuffixSpec, `fuse=0.8`; tok/s from the roofline, quality from the
+buddy anchor + `est`):
+
+| method | quality % | tok/s | × strict | × buddy |
+|---|---|---|---|---|
+| strict L1 | 100 | 6.6 | 1.0 | 0.4 |
+| buddy-substitute | 98 | 14.8 | 2.2 | 1.0 |
+| **B. buddy + kernel-fusion (LOSSLESS)** | **98** | **18.5** | 2.8 | **1.25** |
+| A. buddy + spec [code, acc3.5/K4] | 98 | 23.5 | 3.6 | 1.6 |
+| A. buddy + spec [nl, acc1.6/K2] | 98 | 16.9 | 2.6 | 1.1 |
+| A+B. buddy + spec + fusion [code] | 98 | 29.4 | 4.5 | 2.0 |
+| A+B+C. + 3-bit [code] | 95 | 33.6 | 5.1 | 2.3 |
+| aggressive: + 2-bit spec [agentic acc5/K6] | 83 | 41.1 | 6.2 | 2.8 |
+
+**Findings.**
+1. **Speculation is the way past buddy** — but only *after* buddy zeroes the IO. Code/agentic:
+   ~23.5 tok/s (1.6× buddy) at the same ~98 %; with fusion+3-bit up to ~30–34 tok/s.
+   **nl barely moves** (~17, accept≈1.6) — the hard regime stays hard.
+2. **Kernel-fusion is a free (lossless) ~1.25×** on top of buddy — no quality cost, stacks with all.
+3. `specTokps_le` (proven): speculative throughput ≤ `K/(cf·amort)`. The headroom rides entirely
+   on `amort` (how well a batched Neo verify amortizes the resident weight-read across K drafts):
+   K=4 → 59–99 tok/s ceiling, K=8 → 118–197. **`amort` is the one thing to MEASURE** (Neo
+   batched-forward K-scaling) — it decides whether buddy+spec lands near 24 or near 59 tok/s.
+
 ## Build / reproduce
 
 Toolchain is managed by [mise](https://mise.jdx.dev) (`mise.toml` pins `elan`).
