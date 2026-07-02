@@ -951,6 +951,7 @@ extension Tell {
         StreamingMoEBlock.captureInds = false
         StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
         LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
+        LayerExpertCache.overflowSafeRows = Int.max
         defer {
             StreamingMoEBlock.skipMode = 0; StreamingMoEBlock.probeNoSync = false
             StreamingMoEBlock.captureInds = false

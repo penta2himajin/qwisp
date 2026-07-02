@@ -89,6 +89,12 @@ public final class LayerExpertCache {
     //   [Int] の distinct 数で検出(GPU sync 不要=安価)。overflowCheck=true の間だけ判定。
     nonisolated(unsafe) public static var overflowCheck = false
     nonisolated(unsafe) public static var overflowMaxUnion = 0      // overflowCheck 中の per-layer distinct routed の最大
+    // ★ exact safe-prefix: overflowCheck 中、flat routed list([rows × K=topK], row t の experts が
+    //   t*K..<t*K+K)を row 単位で走査し「distinct ≤ C を満たす最大 complete-row prefix」を層ごとに
+    //   計測、全層の MIN を保持(row 0 = u を含む row 数)。guard の縮小則が推定でなく厳密になる。
+    //   計測箇所は StreamingMoEBlock sync 経路の dedup pass（ensure に渡る U は dedup 済で row 情報が
+    //   失われているため、重複込み flat を持つ呼び出し側で共有 1 pass 計測）。
+    nonisolated(unsafe) public static var overflowSafeRows = Int.max
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
@@ -200,7 +206,7 @@ public final class LayerExpertCache {
     /// ★ T1 batch bench: プロセス fresh 相当へ static 状態を戻す（accounting + overflow guard）。
     public static func resetGlobals() {
         ensureNanos = 0; preadNanos = 0; missTotal = 0
-        overflowCheck = false; overflowMaxUnion = 0
+        overflowCheck = false; overflowMaxUnion = 0; overflowSafeRows = Int.max
     }
 
     /// lastInds(直近 fast forward の routing)の distinct expert を prefetch（cross-layer 予測の駆動）。
@@ -219,6 +225,9 @@ public final class LayerExpertCache {
         var result: [Int: Int] = [:]
         var missList: [(e: Int, slot: Int)] = []
         // ★ union-overflow guard: distinct routed > C なら C slot に同時常駐できず gather が garbage。
+        //   sync 経路からは dedup 済 U が渡るが、pin/refresh は重複あり得るため Set で distinct を数える。
+        //   exact safe-prefix(overflowSafeRows)の row 走査は、row-major・重複込みの flat list を持つ
+        //   StreamingMoEBlock sync 経路（dedup pass に相乗り）で行う。ここでは union のみ。
         if LayerExpertCache.overflowCheck {
             let u = Set(experts).count
             if u > LayerExpertCache.overflowMaxUnion { LayerExpertCache.overflowMaxUnion = u }
@@ -413,7 +422,22 @@ public final class StreamingMoEBlock {
         let flat = inds.asType(.int32).asArray(Int32.self)
         StreamingMoEBlock.syncNanos += DispatchTime.now().uptimeNanoseconds - ts
         var seen = Set<Int>(); var U: [Int] = []
-        for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
+        if LayerExpertCache.overflowCheck, let cCap = cache?.C {
+            // ★ union-overflow guard の exact safe-prefix: flat は row-major [rows×topK]（重複込み）。
+            //   既存 dedup pass に row 境界追跡を相乗りし「distinct ≤ C を満たす最大 complete-row
+            //   prefix」を計測して overflowSafeRows へ MIN（追加 pass ゼロ）。distinct は row 単調増加
+            //   ゆえ最初の超過 row 以降 safeRows は更新されない。
+            //   不変量: この層の union(=最終 seen.count) ≤ C なら safeRows = 全 row 数（縮小は
+            //   overflow した層でのみ効く）。
+            var safeRows = 0
+            for (j, e32) in flat.enumerated() {
+                let e = Int(e32); if seen.insert(e).inserted { U.append(e) }
+                if (j + 1) % topK == 0 && seen.count <= cCap { safeRows = (j + 1) / topK }
+            }
+            if safeRows < LayerExpertCache.overflowSafeRows { LayerExpertCache.overflowSafeRows = safeRows }
+        } else {
+            for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
+        }
 
         let store: ExpertArena
         var remapVals = [Int32](repeating: 0, count: flat.count)

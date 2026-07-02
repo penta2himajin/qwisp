@@ -15,8 +15,8 @@ extension Tell {
     /// **bolt-mode L3 (opt-in, near-lossless)**: buddy no-sync draft/verify SuffixSpec.
     /// output = buddy-greedy (deterministic); headline quality = token-match vs strict-4bit
     /// **f32-full** greedy (the canonical L1 reference), computed in-run when QWISP_SWIFT_REF=1.
-    /// env: QWISP_BOLT=1 or QWISP_RUN=bolt / QWISP_CACHE_C / QWISP_DRAFT_K / QWISP_CALIB /
-    ///      QWISP_SUFFIX_MIN / QWISP_SUFFIX_MATCH / QWISP_SWIFT_REF / QWISP_GEN / QWISP_FUSE_GDN(stage2)
+    /// env: QWISP_BOLT=1 or QWISP_RUN=bolt / QWISP_CACHE_C / QWISP_DRAFT_K(debug-only override) /
+    ///      QWISP_CALIB / QWISP_SWIFT_REF / QWISP_GEN / QWISP_FUSE_GDN(stage2)
     public static func runBolt(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
@@ -41,9 +41,9 @@ extension Tell {
         // C·3/8 は容量制約としては不要だが、**default 値としては最良動作点**（実測 2026-07-02:
         // C=64 で 48 に上げると mean −13%。realistic mix は accept が短く長 draft は verify の無駄 row）。
         // hard clamp は撤去済み＝QWISP_DRAFT_K で自由に超過可（高 accept ワークロード向け）。
-        let maxK = Tell.envInt("QWISP_DRAFT_K", Swift.max(4, C * 3 / 8))
-        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)
-        let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
+        let maxK = Tell.envInt("QWISP_DRAFT_K", Swift.max(4, C * 3 / 8))   // debug-only override
+        let minMatch = 4    // OAT-tuned(9b157d9): 最適近傍で鈍感
+        let maxMatch = 32   // OAT-tuned(9b157d9): 最適近傍で鈍感
         // bolt uses f32-full verify (same as strict SuffixSpec) for accept/reject STABILITY:
         // f16 batched-verify diverges from the sequential reject re-run (spec-gdn-incompat),
         // which corrupts cache state on partial-reject/fallback and cascades to garbage. The
@@ -58,6 +58,7 @@ extension Tell {
         StreamingMoEBlock.captureInds = false
         StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
         LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
+        LayerExpertCache.overflowSafeRows = Int.max
         defer {
             StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
             StreamingMoEBlock.captureInds = false; GatedDeltaNetLayer.fuseGDN = false

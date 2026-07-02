@@ -20,8 +20,8 @@ public enum Tell {
     /// - 速度: code/agentic の反復で高 accept→高 token/step。free-form(high-entropy)では accept 低下。
     ///   実測 8GB C=64: mix 88 tok/s @maxK24 / 16GB C=128: mix 133 tok/s @maxK24-48（vs Swift-greedy 100%）。
     /// - 研究: SuffixDecoding (arXiv:2411.04975), Prompt-Lookup Decoding
-    /// - env: QWISP_RUN=suffix-spec / QWISP_CACHE_C / QWISP_DRAFT_K(最大draft長,既定=C×3/8=最速安全上限) /
-    ///   QWISP_SUFFIX_MIN(最小一致) / QWISP_SUFFIX_MATCH(最大一致) / QWISP_SWIFT_REF / QWISP_SPECK_PROF /
+    /// - env: QWISP_RUN=suffix-spec / QWISP_CACHE_C / QWISP_DRAFT_K(debug 専用 override, 既定=C×3/8 容量式;
+    ///   per-step 長は α·p + guard で機械的) / QWISP_SWIFT_REF / QWISP_SPECK_PROF /
     ///   QWISP_F32_ATTN・QWISP_F32_CONV(既定1=f32-full, 0 で f16 batched) / QWISP_VERIFY_SEQ・QWISP_VERIFY_PQN(診断用逐次化)
     public static func runSuffixSpec(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
@@ -63,18 +63,18 @@ public enum Tell {
         //   実効上限は下記 union-overflow guard が実 routing を観測して動的決定(strict-lossless)。
         // ★既定は C 上限(反復で長 draft が accept↑、novel では suffix が短く返す)。overflow は guard が回収。
         let maxKSafe = Swift.max(4, C * 3 / 8)
-        let maxKReq = Tell.envInt("QWISP_DRAFT_K", maxKSafe)
+        let maxKReq = Tell.envInt("QWISP_DRAFT_K", maxKSafe)   // debug-only override（既定=C×3/8 容量式）
         let maxK = Swift.min(maxKReq, maxKSafe)
         if maxK < maxKReq {
             print("[SuffixSpec] maxK \(maxKReq)→\(maxK) にクランプ(C=\(C) の arena 容量制約 C×3/8, |U|>C 回避)")
         }
-        let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)   // ★tune: 2→4(2-3 token 偶然一致の無駄 draft を回避, 全 C×task で非負)
-        let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
+        let minMatch = 4    // OAT-tuned(9b157d9): 2→4 で偶然一致の無駄 draft 回避、最適近傍で鈍感
+        let maxMatch = 32   // OAT-tuned(9b157d9): 最適近傍で鈍感
         // ★ union-overflow guard: maxK=C×3/8 は真の安全境界でない。diverse routing で per-layer expert
         //   union は ~2×C まで膨張し、C<nE では sync ensure が evict しきれず silent garbage=lossless-by-luck。
         //   実 routing の union を観測し overflow prefix を re-verify して strict-lossless 化。詳細 notes/00。
+        //   制御則は exact safe-prefix(overflowSafeRows) + hysteresis（guard loop 内コメント参照）。
         let ofDbg = Tell.envFlag("QWISP_OVERFLOW_DBG")
-        let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 60)))  // safe-union 目標 %（★tune: 80→60=overflow 回避で re-verify 減, C128 mix +29%）
         // ★ entry で依存 static を全て明示 set（in-process 連続実行では前 run の leak が実バグになる）。
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
@@ -86,6 +86,7 @@ public enum Tell {
         StreamingMoEBlock.captureInds = false
         StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
         LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
+        LayerExpertCache.overflowSafeRows = Int.max
         defer {
             GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false
             GatedDeltaNetLayer.fuseGDN = false
@@ -216,6 +217,9 @@ public enum Tell {
             return result
         }
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0, overflowCount = 0
+        // margin-certified accept の telemetry: certStop event 数 / replay M=1 forward 総数 /
+        // commit token の内訳（margin-certified vs replay 産）
+        var certFallbacks = 0, certReplayFwd = 0, certCommitted = 0, replayCommitted = 0
         var safeMaxK = maxK   // overflow で縮む動的安全上限（union-overflow guard）
         ExpertSource.throttleActive = true   // T2: deferred throttle はここ（timed decode 開始）から有効
         let t0 = DispatchTime.now()
@@ -237,11 +241,14 @@ public enum Tell {
             }
             setVerifyMode(true)
             let snaps = mc.map { $0.snapshot() }
-            // ★ union-overflow guard(C<nE)+ safe-prefix re-verify: batched verify の per-layer expert union が
-            //   C を超えると sync ensure が evict しきれず wrong-slot=silent garbage(hotMiss 非検出)で誤受理する。
-            //   検出は ensure に渡る CPU 側 [Int] の distinct 数(GPU sync 不要=安価)。overflow なら draft を
-            //   「union≤C に収まる最長 prefix」へ縮小して RE-VERIFY(複数 accept を回収)。比例縮小で 1-2 回収束、
-            //   prefix<1 でのみ safe single-token。safeMaxK に学習し以後 overflow=0。strict-lossless 保証。
+            // ★ union-overflow guard(C<nE)+ EXACT safe-prefix + hysteresis: batched verify の per-layer
+            //   expert union が C を超えると sync ensure が evict しきれず wrong-slot=silent garbage
+            //   (hotMiss 非検出)で誤受理する。検出は ensure に渡る CPU 側 [Int] の distinct 数(GPU sync
+            //   不要=安価)。sync 経路の dedup pass が同時に「distinct≤C を満たす最大 complete-row prefix」を厳密計測
+            //   (overflowSafeRows=全層 MIN, row 0=u を含む)するため、overflow 時は drafts=safeRows-1 に
+            //   縮小すれば構成上 fit → re-verify は overflow event あたり厳密 1 回。safeMaxK に学習。
+            //   成長は hysteresis: union≤0.9·C で成長、(0.9C, C] は現状維持(dead band 無しの小 band)。
+            //   prefix<1 でのみ safe single-token。strict-lossless 保証。詳細 notes/00。
             let unionGuard = C < nE
             var curDrafts = drafts
             var vlg: MLXArray = uArr                              // placeholder（loop で必ず上書き）
@@ -249,23 +256,27 @@ public enum Tell {
             while true {
                 let dd = curDrafts.count
                 let seq = MLX.concatenated([uArr, MLXArray(curDrafts.map { Int32($0) }, [1, dd])], axis: 1)  // [1, dd+1]
-                if unionGuard { LayerExpertCache.overflowCheck = true; LayerExpertCache.overflowMaxUnion = 0 }
+                if unionGuard {
+                    LayerExpertCache.overflowCheck = true
+                    LayerExpertCache.overflowMaxUnion = 0
+                    LayerExpertCache.overflowSafeRows = Int.max
+                }
                 vlg = try decodeForward(seq, rows: dd + 1, escalate: false)
                 if !unionGuard { break }
                 LayerExpertCache.overflowCheck = false
                 let maxU = LayerExpertCache.overflowMaxUnion
-                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(dd) maxU=\(maxU) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
-                if maxU > C {                                    // overflow → 収まる最長 prefix へ縮小し re-verify
-                    let target = Swift.max(1, dd * (C * ofMargin / 100) / maxU)   // union≈線形 in D の保守推定
-                    safeMaxK = Swift.min(safeMaxK, target)
+                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(dd) maxU=\(maxU) safeRows=\(LayerExpertCache.overflowSafeRows) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
+                if maxU > C {                                    // overflow → exact safe-prefix へ縮小し re-verify(1 回で fit)
                     overflowCount += 1
                     for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: dd + 1) }
-                    let newLen = Swift.min(dd - 1, target)
+                    // safeRows は u row(row 0)を含む row 数 → drafts = safeRows - 1
+                    let newLen = Swift.min(dd - 1, LayerExpertCache.overflowSafeRows - 1)
+                    safeMaxK = Swift.max(1, newLen)
                     if newLen < 1 { singleFallback = true; break }
                     curDrafts = Array(curDrafts.prefix(newLen))
                     continue
-                } else if maxU > 0 && maxU * 100 < C * ofMargin && safeMaxK < maxK {
-                    safeMaxK = Swift.min(maxK, safeMaxK + Swift.max(2, safeMaxK / 6))  // 余裕十分→成長
+                } else if maxU > 0 && maxU * 10 <= C * 9 && safeMaxK < maxK {
+                    safeMaxK = Swift.min(maxK, safeMaxK + Swift.max(2, safeMaxK / 6))  // union≤0.9C=余裕十分→成長
                 }
                 break                                            // union≤C=fit → accept へ
             }
@@ -279,17 +290,50 @@ public enum Tell {
                 continue
             }
             let D2 = curDrafts.count
-            let evals = MLX.argMax(vlg[0, 0 ..< (D2 + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            // ★ margin-certified accept: batched verify logits は逐次 M=1 計算と order-stable でない
+            //   (MLX kernel の累積順が batch shape 依存、f32 でも微小 drift → near-tie で token flip)。
+            //   各 row の top1−top2 logit margin が certTau を超える token のみ batched 結果から commit、
+            //   低 margin の境界 token は M=1 逐次 replay で exact に確定する（strict-lossless）。
+            let vRows = vlg[0, 0 ..< (D2 + 1)]                    // [D2+1, V]
+            let evalsArr = MLX.argMax(vRows, axis: -1)
+            let vm1 = MLX.max(vRows, axis: -1, keepDims: true)
+            let vm2 = MLX.max(MLX.where(vRows .>= vm1, MLXArray(-Float.infinity), vRows), axis: -1, keepDims: true)
+            let marginsArr = (vm1 - vm2).reshaped([D2 + 1])
+            MLX.eval([evalsArr, marginsArr])                      // evals と同一 sync point で margins も評価
+            let evals = evalsArr.asArray(Int32.self).map { Int($0) }
+            let margins = marginsArr.asArray(Float.self)
             var p = 0
-            while p < D2 && curDrafts[p] == evals[p] { p += 1 }
+            while p < D2 && curDrafts[p] == evals[p] && margins[p] > certTau { p += 1 }
+            // commit する境界 token は常に row p 由来（draft 低 margin 停止・mismatch reject・bonus row
+            //   の全ケース共通）→ margins[p] ≤ τ なら未認定 = sequential replay で確定。
+            let certStop = margins[p] <= certTau
             out.append(u); hist.append(u)
             for i in 0 ..< p { out.append(curDrafts[i]); hist.append(curDrafts[i]) }
             accTok += p
-            if p == D2 {
+            certCommitted += p                                    // 受理 draft は margin-certified
+            if certStop {
+                // 未認定 → SEQUENTIAL REPLAY: snapshot 復元後 [u]+accepted を 1 token ずつ M=1 forward
+                //   （greedy branch と同じ通常 single-token mode）。状態も次 token も逐次 exact =
+                //   無条件 certified。p=0 なら single M=1 forward（低 accept regime の common case）。
+                certFallbacks += 1
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D2 + 1) }
+                setVerifyMode(false)                              // replay は verify mode 外（greedy branch と同様）
+                var rlg = vlg                                     // placeholder（replay ≥1 token で必ず上書き）
+                for t in [u] + Array(curDrafts.prefix(p)) {
+                    (_, rlg) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    MLX.eval([rlg] + mc.flatMap { $0.stateArrays })
+                    certReplayFwd += 1
+                }
+                uArr = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([uArr])
+                replayCommitted += 1
+            } else if p == D2 {
+                certCommitted += 1                                // bonus token evals[D2] も certified
                 uArr = MLXArray([Int32(evals[D2])], [1, 1])
                 setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             } else {
+                certCommitted += 1                                // reject 境界 token evals[p] は certified
                 for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D2 + 1) }
                 let acc = [u] + Array(curDrafts.prefix(p))
                 _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
@@ -315,34 +359,78 @@ public enum Tell {
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(draftTot)/s, steps).data(using: .utf8)!)
         }
         let ovTag = overflowCount > 0 ? "  [union-overflow guard: \(overflowCount) step re-verify/fallback]" : ""
+        let certTag = String(format: "  cert-fallback=%d(%d fwd) commit(cert=%d/replay=%d)",
+                             certFallbacks, certReplayFwd, certCommitted, replayCommitted)
         if Tell.envFlag("QWISP_DUMP_TOKENS") {   // bench correctness axis: prompt + method output
             print("PROMPT_TOKENS:" + ids.asArray(Int32.self).map { String($0) }.joined(separator: ","))
             print("OUT_TOKENS:" + outN.map { String($0) }.joined(separator: ","))
         }
         let tokps = Double(N) / secs
         let summary = String(format: """
-            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs ref=Swift正準greedy) %d/%d=%.0f%%%@%@
-            """, maxK, C, tokps, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag)
+            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs ref=Swift正準greedy) %d/%d=%.0f%%%@%@%@
+            """, maxK, C, tokps, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag, certTag)
         return (summary, tokps)
     }
 
-    /// suffix lookup draft: seq 末尾の m token(minMatch..maxMatch の最長)が seq 内の earlier 位置に
-    /// 出現した「直後の token 列」を draftK 個まで返す（最近・最長一致優先）。訓練不要・cost ~0。
+    /// α·p adaptive draft length（SuffixDecoding arXiv:2411.04975 の MAX_SPEC=α·p）:
+    /// 弱い一致(m=4)は draft≤16、強い一致(m=32)は caller の容量 cap まで。
+    static let suffixAlpha = 4
+
+    /// margin-certified accept の閾値 τ: batched verify logits は逐次 M=1 と order-stable でなく
+    /// (MLX kernel の累積順が batch shape 依存)、near-tie で commit token が flip し得る。
+    /// 経験的に flip した near-tie の logit gap は ≲~0.06 → τ=0.1 は余裕込みでカバー。
+    /// top1−top2 margin ≤ τ の境界 token は M=1 逐次 replay で確定（機械的 δ-calibration は将来 task）。
+    static let certTau: Float = 0.1
+
+    /// suffix lookup draft（SuffixDecoding-style, 訓練不要・cost ~0）:
+    /// 1) seq 末尾の m token(minMatch..maxMatch の最長一致)が seq 内の earlier 位置に出現する
+    ///    「全ての」出現位置を収集（旧: 最近 1 箇所のみ）。
+    /// 2) 頻度重み付き greedy 継続: token を 1 個ずつ、alive な出現位置（ここまでの draft と継続が
+    ///    一致している位置）が提案する次 token の多数決で伸長（同数 tie は最近位置の token=決定的）。
+    ///    不一致の位置は脱落。alive が尽きるか長さ cap で停止。
+    /// 3) 長さ cap = min(draftK, suffixAlpha·m)（draftK=caller の容量 cap: min(maxK, safeMaxK) 等）。
+    /// コスト: alive-set loop は O(出現数 × draft長)。最長 m での出現数は通常少なく、hist が大きい
+    /// 場合は既存の走査コストが支配的（既知・許容。longctx index は別 task）。
     static func suffixDraft(_ seq: [Int], maxMatch: Int, draftK: Int, minMatch: Int) -> [Int] {
         let n = seq.count
         if n < minMatch + 1 { return [] }
         var m = Swift.min(maxMatch, n - 1)
         while m >= minMatch {
             let patStart = n - m
+            var occ: [Int] = []          // 一致開始位置（最近→過去の順に収集）
             var i = patStart - 1
             while i >= 0 {
                 var ok = true
                 for j in 0 ..< m where seq[i + j] != seq[patStart + j] { ok = false; break }
-                if ok {
-                    let s = i + m, e = Swift.min(i + m + draftK, n)
-                    if s < e { return Array(seq[s ..< e]) }
-                }
+                if ok { occ.append(i) }
                 i -= 1
+            }
+            if !occ.isEmpty {
+                let cap = Swift.min(draftK, suffixAlpha * m)   // α·p length cap
+                var draft: [Int] = []
+                var alive = occ                                // draft と継続一致中の位置（最近順）
+                while draft.count < cap && !alive.isEmpty {
+                    var counts: [Int: Int] = [:]
+                    var next: [Int] = []                       // alive[k] の提案 token（-1=尽きた）
+                    for pos in alive {
+                        let idx = pos + m + draft.count
+                        if idx < n { let t = seq[idx]; next.append(t); counts[t, default: 0] += 1 }
+                        else { next.append(-1) }
+                    }
+                    // 多数決。同数 tie は「最も最近の alive 位置の token」が勝つ（alive は最近順、
+                    // strict > 比較で最初に最大 count に達した token=最近位置の提案が確定）。
+                    var best = -1, bestCnt = 0
+                    for k in 0 ..< alive.count {
+                        let t = next[k]
+                        if t >= 0, let c = counts[t], c > bestCnt { best = t; bestCnt = c }
+                    }
+                    if best < 0 { break }                      // 全 alive が末尾到達
+                    draft.append(best)
+                    var kept: [Int] = []
+                    for k in 0 ..< alive.count where next[k] == best { kept.append(alive[k]) }
+                    alive = kept
+                }
+                return draft
             }
             m -= 1
         }

@@ -197,7 +197,7 @@ public final class StreamingQwispModel {
     /// チャンク分割 prefill。1 forward の |U| が cache slot C を超えると in-place arena が
     /// 破綻するため、chunk≤C/topK で分割（chunk 毎に eval して arena 上書き前に materialize）。
     /// ※ union-overflow guard は spec verify loop 専用で prefill には効かないため、この上限は hard cap。
-    /// chunk 省略時は **C 非依存の定数 8**（env QWISP_PREFILL_CHUNK で override）:
+    /// chunk 省略時は **C 非依存の定数 8**（`chunk:` 引数はテスト用に残す）:
     ///   ★prefill の batched kernel は chunk 形状に数値依存（order-stable でない）ため、chunk を
     ///   C 依存にすると「同 prompt でも RAM tier ごとに出力が変わる」= L1 の cross-C 一貫性を毀損する
     ///   （2026-07-02 実測: C 依存 chunk で code free-run が正準 ref から 28-73% に分岐）。
@@ -211,8 +211,7 @@ public final class StreamingQwispModel {
         throws -> (hidden: MLXArray, logits: MLXArray) {
         let topK = layers.first?.mlp.topK ?? 8
         let cap = expertCaches.first?.C ?? arena.N          // per-layer arena capacity
-        let chDefault = Tell.envInt("QWISP_PREFILL_CHUNK", 8)
-        let ch = Swift.min(chunk ?? chDefault, Swift.max(1, cap / topK))  // capacity hard cap
+        let ch = Swift.min(chunk ?? 8, Swift.max(1, cap / topK))  // capacity hard cap
         let P = ids.dim(1)
         var hiddens: [MLXArray] = []
         var lastLogits = MLXArray.zeros([1, 1, 1])
