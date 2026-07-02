@@ -1014,6 +1014,7 @@ extension Tell {
         record(0, v)
         MLX.eval([v] + caches.flatMap { $0.stateArrays })
         for i in 0 ..< (N - 1) {
+            if buddyMode { LayerExpertCache.boltFetchBudgetLeft = i < 24 ? 2 : 0 }   // B3 warmup-then-freeze（production bolt と同条件）
             let inp = MLXArray([Int32(gR[i])], [1, 1])   // teacher-forced: reference token を強制入力
             (_, lg) = try model.forwardHidden(inp, caches: caches)
             v = lg[0, 0]

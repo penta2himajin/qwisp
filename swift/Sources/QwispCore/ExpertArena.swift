@@ -120,6 +120,30 @@ public final class LayerExpertCache {
     var hotMaskArr: MLXArray?          // GPU hot/cached マスク [numExperts]（1=cached）
     var hotMaskVer = -1
     public var buddyTable: MLXArray?   // BuddyMoE: cold expert → 最類似 hot expert の slot（slot-0 garbage 回避）
+    // ★B3 budget-IO fetch-and-keep: bolt decode 中に idle な SSD で「持続的に cold routed される
+    //   常習犯 expert」を毎 step ≤budget 個だけ ensure(=fetch & LRU keep)し hot set をオンライン適応。
+    //   決定性: routing/カウント/閾値/tie-break(最小 id)が全て決定的 → fetch 系列も決定的。
+    //   exact フェーズ(calib/prefill/SWIFT_REF)は skipMode==0 なので構造的に非対象。
+    public var buddyExpertCPU: [Int32] = []   // expert → build 時に選んだ buddy EXPERT id（hot は自身）
+    public var buddyTableCPU: [Int32] = []    // expert → slot（synced remap はこの CPU 表を直接使用=per-forward bt.asArray 廃止）
+    var coldCount: [Int: Int] = [:]           // expert → cold で routed された累計（fetch 候補選定）
+    nonisolated(unsafe) public static var boltFetchBudgetLeft = 0   // runner が step 毎に 2 へ reset
+    nonisolated(unsafe) public static var boltFetchTotal = 0       // telemetry（累計 fetch 数）
+    static let boltFetchThreshold = 3         // 常習犯判定: cold hit がこの回数以上で fetch 候補
+
+    /// B3: fetch/evict 後に CPU buddy 表を slotOf + buddyExpertCPU から再構築。
+    /// fetch された expert は自 slot へ、evict された expert は自分の buddy(の現 slot)へ自動降格。
+    func rebuildBuddyCPU(numExperts: Int) {
+        guard buddyExpertCPU.count == numExperts else { return }
+        var t = [Int32](repeating: 0, count: numExperts)
+        for x in 0 ..< numExperts {
+            if let s = slotOf[x] { t[x] = Int32(s) }
+            else if case let b = Int(buddyExpertCPU[x]), b >= 0, let bs = slotOf[b] { t[x] = Int32(bs) }
+            else { t[x] = 0 }
+        }
+        buddyTableCPU = t
+        // GPU buddyTable は build 時の値のまま（読むのは非 production の no-sync 分岐のみ。synced 経路は CPU 表）。
+    }
     public var slotMap: [Int: Int] { slotOf }   // output-sim buddy 構築用（expert→slot）
     public func gpuSlotTable(numExperts: Int) -> MLXArray {
         if slotTableDirty || slotTableGPU == nil {
@@ -162,15 +186,20 @@ public final class LayerExpertCache {
         // 走査開始位置を回転（(i+e) % n）＝決定的かつ乱択同様に同点勝者を hot 集合へ分散。
         let hot = slotOf.keys.sorted()
         var bmap = [Int32](repeating: 0, count: numExperts)
+        var bexp = [Int32](repeating: -1, count: numExperts)   // B3: buddy expert id を保持（fetch/evict 時の表再構築用）
         for e in 0 ..< numExperts {
-            if let s = slotOf[e] { bmap[e] = Int32(s); continue }    // hot: 自身
+            if let s = slotOf[e] { bmap[e] = Int32(s); bexp[e] = Int32(e); continue }    // hot: 自身
             var bestH = -1, bestC = -1
             let n = hot.count
             for i in 0 ..< n { let h = hot[(i + e) % n]; let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
-            bmap[e] = (bestH >= 0 && bestC > 0) ? Int32(slotOf[bestH]!) : 0   // cold: buddy slot
+            if bestH >= 0 && bestC > 0 { bmap[e] = Int32(slotOf[bestH]!); bexp[e] = Int32(bestH) }
+            else { bmap[e] = 0 }   // co-activation 無し: slot-0 fallback（buddy expert 無し）
         }
         let arr = MLXArray(bmap, [numExperts]); arr.eval()
         buddyTable = arr
+        buddyExpertCPU = bexp
+        buddyTableCPU = bmap
+        coldCount.removeAll()
     }
 
     /// experts を常駐ロードし、その slot を pinned に登録（以後 LRU 退避されない）。
@@ -201,12 +230,14 @@ public final class LayerExpertCache {
         pinnedSlots.removeAll()
         hotMaskArr = nil; hotMaskVer = -1
         buddyTable = nil
+        buddyExpertCPU = []; buddyTableCPU = []; coldCount.removeAll()   // B3
     }
 
     /// ★ T1 batch bench: プロセス fresh 相当へ static 状態を戻す（accounting + overflow guard）。
     public static func resetGlobals() {
         ensureNanos = 0; preadNanos = 0; missTotal = 0
         overflowCheck = false; overflowMaxUnion = 0; overflowSafeRows = Int.max
+        boltFetchBudgetLeft = 0; boltFetchTotal = 0   // B3
     }
 
     /// lastInds(直近 fast forward の routing)の distinct expert を prefetch（cross-layer 予測の駆動）。
@@ -442,11 +473,39 @@ public final class StreamingMoEBlock {
         let store: ExpertArena
         var remapVals = [Int32](repeating: 0, count: flat.count)
         if let c = cache {
-            if StreamingMoEBlock.skipMode == 3, let bt = c.buddyTable {
-                // deterministic buddy (io=0): remap cold->buddy hot slot via buddyTable, NO ensure/pread.
+            if StreamingMoEBlock.skipMode == 3, !c.buddyTableCPU.isEmpty {
+                // deterministic buddy (io≈0): remap cold->buddy hot slot via CPU 表, 原則 ensure/pread 無し。
                 // The inds.asArray above is the per-layer CPU sync barrier, so this is deterministic
                 // (unlike probeNoSync no-sync, which races across layers). bolt uses this path.
-                let btA = bt.asArray(Int32.self)
+                // ★B3 fetch-and-keep: cold 常習犯（coldCount≥threshold）を step budget 内で ensure し
+                //   hot set をオンライン適応（fetch は exact 化 + 以後常駐、evict は buddy 降格）。
+                if LayerExpertCache.boltFetchBudgetLeft > 0 {
+                    var best = -1, bestCnt = 0
+                    var seenCold = Set<Int>()
+                    for e32 in flat {
+                        let e = Int(e32)
+                        if c.slotMap[e] == nil, seenCold.insert(e).inserted {
+                            let n = (c.coldCount[e] ?? 0) + 1
+                            c.coldCount[e] = n
+                            if n >= LayerExpertCache.boltFetchThreshold,
+                               n > bestCnt || (n == bestCnt && e < best) { best = e; bestCnt = n }
+                        }
+                    }
+                    if best >= 0 {
+                        _ = c.ensure([best])                       // LRU が 1 slot evict（bolt は pin 無し）
+                        c.coldCount[best] = 0
+                        c.rebuildBuddyCPU(numExperts: numExperts)  // fetch=自 slot / evict=buddy 降格
+                        LayerExpertCache.boltFetchBudgetLeft -= 1
+                        LayerExpertCache.boltFetchTotal += 1
+                    }
+                } else {
+                    var seenCold = Set<Int>()
+                    for e32 in flat {
+                        let e = Int(e32)
+                        if c.slotMap[e] == nil, seenCold.insert(e).inserted { c.coldCount[e] = (c.coldCount[e] ?? 0) + 1 }
+                    }
+                }
+                let btA = c.buddyTableCPU
                 for (j, e32) in flat.enumerated() { let e = Int(e32); remapVals[j] = e < btA.count ? btA[e] : 0 }
                 store = c.arena
             } else {

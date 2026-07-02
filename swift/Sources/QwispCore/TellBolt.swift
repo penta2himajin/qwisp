@@ -156,8 +156,14 @@ extension Tell {
         var a3Fused = 0, flushes = 0
         ExpertSource.throttleActive = true   // T2: deferred throttle はここ（phase-3c timed decode 開始）から有効
         let t0 = DispatchTime.now()
+        let b3Fetch0 = LayerExpertCache.boltFetchTotal
         while out.count < N {
             steps += 1
+            // B3 warmup-then-freeze: fetch は最初の 24 step のみ（calib 陳腐化の解消は生成初期で完了させ、
+            // 以後 table を凍結して有効モデルを固定＝suffix draft の自己整合性を保つ。常時適応は
+            // shortnl で縮退反復を誘発した: fid 76.6→74.2 + correctness FAIL, 2026-07-02 実測）。
+            LayerExpertCache.boltFetchBudgetLeft = steps <= 24 ? 2 : 0
+
             let u = uArr.item(Int.self)
             let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: maxK, minMatch: minMatch)
             let D = drafts.count
@@ -232,9 +238,9 @@ extension Tell {
         let tokps = Double(N) / secs
         let summary = String(format: """
             [Bolt L3] buddy no-sync draft(maxK=%d)+buddy verify(C=%d, skipMode=3): %.1f tok/s  \
-            accept/step=%.2f  spec-steps=%d/%d  %@  a3-fused=%d flush=%d
+            accept/step=%.2f  spec-steps=%d/%d  %@  a3-fused=%d flush=%d b3-fetch=%d
             """, maxK, C, tokps, Double(accTok) / Double(Swift.max(1, draftSteps)), draftSteps, steps, headline,
-                             a3Fused, flushes)
+                             a3Fused, flushes, LayerExpertCache.boltFetchTotal - b3Fetch0)
         return (summary, tokps)
     }
 }
