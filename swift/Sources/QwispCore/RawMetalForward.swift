@@ -3710,4 +3710,80 @@ public enum RawMetalForward {
         guard let v = ProcessInfo.processInfo.environment[k], let i = Int(v) else { return d }
         return i
     }
+
+    // ── D1: M-row (batched, order-stable) kernel APIs — RED stubs ─────────
+    // Real implementations live here once the GREEN phase is complete.
+    // Each function returns nil so that RawVerifyTests tests fail with
+    // "not implemented" — keeping the RED phase clean.
+
+    /// D1-1: M-row dense qmm4. x[M,K] × w[N,K] → y[M,N].
+    /// Real impl: weight-tiled kernel amortising dequant across M rows
+    /// (bit-exact row-by-row vs M=1 loop).
+    public static func qmmRows(_ x: MLXArray, _ wq: MLXArray,
+                                scales: MLXArray, biases: MLXArray,
+                                M: Int, K: Int, N: Int,
+                                bits: Int = 4, gs: Int = 64) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-2: M-row gather qmm4. x[M,K], inds[M*Ktop] row-major,
+    /// wq[E,N,K/8] → y[M*Ktop,N].
+    /// Per-row inds mirrors verify's MoE shape: row m routes to
+    /// inds[m*Ktop ..< (m+1)*Ktop].
+    public static func gatherQmmRows(_ x: MLXArray, _ wq: MLXArray,
+                                      scales: MLXArray, biases: MLXArray,
+                                      inds: MLXArray,
+                                      M: Int, Ktop: Int, K: Int, N: Int,
+                                      gs: Int = 64) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-3: M-row SDPA decode. q[M*H,D], k[KV,L0+M-1,D], v[KV,L0+M-1,D]
+    /// → y[M*H,D].
+    /// Row m (heads m*H ..< (m+1)*H) attends to the first baseLen+m keys
+    /// (strictly causal ordering matching batched verify).
+    public static func sdpaRows(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+                                 H: Int, KV: Int, D: Int,
+                                 baseLen: Int, M: Int, scale: Float) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-4: M-row conv1d+silu. windows[M,K,C] → y[M,C].
+    /// Each row m applies the K-frame causal window at position m.
+    public static func conv1dSiluRows(_ windows: MLXArray, _ w: MLXArray,
+                                       M: Int, K: Int, C: Int) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-5: M-position GDN recurrent step. Processes M tokens in strict
+    /// causal order, threading state.
+    /// q/k: [B,M,Hk,Dk], v: [B,M,Hv,Dv], g/beta: [B,M,Hv],
+    /// state: [B,Hv,Dv,Dk]
+    /// → (y[B,M,Hv,Dv], final_state[B,Hv,Dv,Dk]).
+    public static func gatedDeltaStepRows(_ q: MLXArray, _ k: MLXArray,
+                                           _ v: MLXArray,
+                                           g: MLXArray, beta: MLXArray,
+                                           state: MLXArray,
+                                           M: Int, B: Int,
+                                           Hk: Int, Dk: Int,
+                                           Hv: Int, Dv: Int) -> (MLXArray, MLXArray)? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-6: M-position RoPE. x[M*numHeads,HD] → y[M*numHeads,HD].
+    /// Head group m (rows m*numHeads ..< (m+1)*numHeads) applies position
+    /// offset startOffset+m.
+    public static func ropeRows(_ x: MLXArray,
+                                 headDim HD: Int, ropeDim rd: Int,
+                                 base: Float, startOffset: Int,
+                                 M: Int, numHeads: Int) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
+
+    /// D1-7: M-row RMSNorm. x[M,D] → y[M,D].
+    /// Identical per-row semantics to the existing M=1 rmsNorm kernel.
+    public static func rmsNormRows(_ x: MLXArray, _ weight: MLXArray?,
+                                    M: Int, eps: Float, D: Int) -> MLXArray? {
+        return nil  // NOT IMPLEMENTED (D1 GREEN)
+    }
 }
