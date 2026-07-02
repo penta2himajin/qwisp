@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXFast
 import MLXRandom
+import Metal
 
 /// D1 TDD RED phase — M-row (batched, order-stable) kernel scaffolding.
 ///
@@ -375,5 +376,112 @@ public enum RawVerifyTests {
 
         // ── Summary ───────────────────────────────────────────────────────
         return lines.joined(separator: "\n") + "\nRAWTESTS \(passed)/\(total)"
+    }
+
+    /// D1 perf probe: per-row(qmv-style)M-row kernel の重み再読コストの実測。
+    /// 問い=「M 行が同じ weight を読む時、SLC/L2 がどれだけ吸収するか」。
+    /// t(M)/t(1)≈M なら再読が丸コスト(→tiled ピボット検討)、≪M なら吸収(→このまま統合へ)。
+    /// GPU 時間は 1 command buffer に reps 回 encode して gpuEnd-gpuStart/reps で計測(dispatch 償却)。
+    public static func runPerfProbe() -> String {
+        guard let (device, queue) = RawMetalForward.ensure() else { return "no device" }
+        MLXRandom.seed(UInt64(7))
+        var lines: [String] = []
+        func gpuMs(_ reps: Int, _ encode: (MTLComputeCommandEncoder) -> Void) -> Double {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            for _ in 0 ..< reps { encode(enc) }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 / Double(reps)
+        }
+
+        // ── A: dense qmm4 (qmv per-row) ──
+        for N in [2048, 8192] {
+            let K = 2048
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return "bi nil" }
+            let xAll = MLXRandom.normal([25, K]).asType(.float16)
+            MLX.eval([wq, sc, bi, xAll])
+            // warm compile
+            _ = RawMetalForward.qmm(xAll[0 ..< 1], wq, scales: sc, biases: bi, M: 1, K: K, N: N)
+            guard let bx = xAll.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+                  let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+                  let bsc = sc.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+                  let bbi = bi.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return "buf nil" }
+            let outBuf = device.makeBuffer(length: 25 * N * 2, options: .storageModeShared)!
+            var t1 = 0.0
+            var row = "[raw-perf] qmm4 N=\(N) K=\(K):"
+            for M in [1, 5, 9, 13, 17, 25] {
+                let ms = gpuMs(50) { enc in
+                    enc.setComputePipelineState(RawMetalForward._qmmPipeline!)
+                    enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+                    enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+                    enc.setBuffer(outBuf, offset: 0, index: 4)
+                    var kk = Int32(K), nn = Int32(N)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+                    RawMetalForward.bindStop(enc, 16)
+                    enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                }
+                if M == 1 { t1 = ms }
+                row += String(format: " M%d=%.3fms(x%.1f)", M, ms, ms / t1)
+            }
+            lines.append(row)
+            // MLX 参照(壁時計, warm): batched quantizedMatmul
+            var mlxRow = "[raw-perf] MLX qmm N=\(N):"
+            for M in [1, 9, 17, 25] {
+                let xm = xAll[0 ..< M]
+                let warm = MLX.quantizedMatmul(xm, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4, mode: .affine); warm.eval()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                for _ in 0 ..< 30 {
+                    let y = MLX.quantizedMatmul(xm, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+                    y.eval()
+                }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 30e6
+                mlxRow += String(format: " M%d=%.3fms", M, ms)
+            }
+            lines.append(mlxRow + "  (wall, graph込み)")
+        }
+
+        // ── B: gather gqmm4_rows(MoE 形状, per-(row,expert)再読の worst 側)──
+        do {
+            let E = 64, K = 2048, N = 512, Ktop = 8
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return "bi nil" }
+            let xAll = MLXRandom.normal([25, K]).asType(.float16)
+            let pool: [Int32] = (0 ..< 200).map { Int32(($0 * 13) % E) }   // 行ごとに異なる expert 集合(重なりは現実的に発生)
+            let indsAll = MLXArray((0 ..< 25 * Ktop).map { pool[$0 % pool.count] }, [25 * Ktop])
+            MLX.eval([wq, sc, bi, xAll, indsAll])
+            _ = RawMetalForward.gatherQmmRows(xAll[0 ..< 1], wq, scales: sc, biases: bi,
+                                              inds: indsAll[0 ..< Ktop], M: 1, Ktop: Ktop, K: K, N: N)   // warm compile
+            guard let bx = xAll.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+                  let bwq = wq.asMTLBuffer(device: device, noCopy: false),
+                  let bsc = sc.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+                  let bbi = bi.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+                  let bin = indsAll.asType(.int32).asMTLBuffer(device: device, noCopy: false) else { return "buf nil" }
+            let outBuf = device.makeBuffer(length: 25 * Ktop * N * 2, options: .storageModeShared)!
+            var t1 = 0.0
+            var row = "[raw-perf] gqmm4_rows E=\(E) N=\(N) Ktop=\(Ktop):"
+            for M in [1, 5, 9, 13, 17, 25] {
+                let ms = gpuMs(50) { enc in
+                    enc.setComputePipelineState(RawMetalForward._gqmmRowsPipeline!)
+                    enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+                    enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+                    enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
+                    var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+                    enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7)
+                    enc.setBytes(&kt, length: 4, index: 8)
+                    RawMetalForward.bindStop(enc, 9)
+                    enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                             threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                }
+                if M == 1 { t1 = ms }
+                row += String(format: " M%d=%.3fms(x%.1f)", M, ms, ms / t1)
+            }
+            lines.append(row)
+        }
+        lines.append("[raw-perf] 判定基準: x(M)≪M なら SLC 吸収=per-row 方式続行 / x(M)≈M なら tiled ピボット検討")
+        return lines.joined(separator: "\n")
     }
 }
