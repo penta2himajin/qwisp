@@ -2852,7 +2852,7 @@ extension Tell {
         let fpn = fp / norm
         let sim = MLX.matmul(fpn, fpn.transposed()); sim.eval()      // [E, E] cosine
         let simArr = sim.asArray(Float.self)
-        let hot = Array(slotOf.keys)
+        let hot = slotOf.keys.sorted()   // 決定化（buildBuddyTable と同じ Dictionary 走査順問題の hygiene）
         var bmap = [Int32](repeating: 0, count: numExperts)
         for e in 0 ..< numExperts {
             if let s = slotOf[e] { bmap[e] = Int32(s); continue }

@@ -149,12 +149,18 @@ public final class LayerExpertCache {
     /// hot は現在 slotOf にいる expert。coact[e][h] = calib で e と h が同 token で共 routed した回数。
     /// 各 cold e → argmax_h(coact[e][h]) の slot（co-activation 無ければ slot-0 fallback）。
     public func buildBuddyTable(coact: [[Int]], numExperts: Int) {
-        let hot = Array(slotOf.keys)
+        // 決定化: Dictionary iteration はプロセス毎に乱択（hash seed）で、coact の同点 buddy が
+        // 走査順で決まると run 毎に table が変わる（C=64 fidelity ±2-5pt の非決定性の原因）。
+        // 同点 tie-break は「最小 expert id 固定」だと全 cold の同点が同一低 id hot に集中し
+        // 品質が乱択帯を系統的に下回る（C=64 実測 66-75% < 85-90%）ため、cold e ごとに
+        // 走査開始位置を回転（(i+e) % n）＝決定的かつ乱択同様に同点勝者を hot 集合へ分散。
+        let hot = slotOf.keys.sorted()
         var bmap = [Int32](repeating: 0, count: numExperts)
         for e in 0 ..< numExperts {
             if let s = slotOf[e] { bmap[e] = Int32(s); continue }    // hot: 自身
             var bestH = -1, bestC = -1
-            for h in hot { let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
+            let n = hot.count
+            for i in 0 ..< n { let h = hot[(i + e) % n]; let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
             bmap[e] = (bestH >= 0 && bestC > 0) ? Int32(slotOf[bestH]!) : 0   // cold: buddy slot
         }
         let arr = MLXArray(bmap, [numExperts]); arr.eval()
