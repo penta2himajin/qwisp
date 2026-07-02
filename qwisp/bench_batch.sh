@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Qwisp measurement bench: run the ref set (refs/*.safetensors) across regimes + methods and
-# report 3 axes per cell in one command:
-#   speed       free-running tok/s (production runner: suffix-spec / bolt)
-#   fidelity    teacher-forced per-token argmax agreement vs reference greedy (chaos-free)
-#   correctness task-level proxy on the free-run output (regime hooks: parse/json/needle/degen)
-# Faithful: invokes the REAL production runners + the teacher-forced mlx-fidelity path (no
-# re-implemented decode). Per cell = 2 model loads (speed + fidelity); correctness reuses the
-# speed run's dumped output. (An efficiency variant folding all axes into one load would need a
-# shared-decode refactor; deferred for faithfulness.)
+# Qwisp measurement bench — SINGLE-PROCESS batch variant (T1). Same CLI + same human-readable
+# output table/footer as qwisp/bench.sh, but ONE binary invocation total: the in-process batch
+# runner (QWISP_RUN=bench-batch, swift TellBench.swift) loops methods × regimes with a single
+# model load (vs 8-12 loads for bench.sh), resetting all engine state per cell (cold-start
+# equivalent; OS page-cache warmth is identical to the multi-process bench).
+# Post-processing of the runner's stdout per cell:
+#   speed        BENCH|method=..|regime=..|tokps=..
+#   fidelity     suffix-spec: T0 token compare (bench_tokcmp.py on OUT_TOKENS vs canonical ref);
+#                bolt: in-process teacher-forced pass -> BENCHFID|...|fid=X/Y=Z%
+#   correctness  bench_correctness.py on the cell's dumped PROMPT/OUT/BOLT token lines
 #
 # Refs are generated (reproducibly) by qwisp/bench_refs.py into <repo>/refs (gitignored).
-# Usage: qwisp/bench.sh [C] [GEN] [throttle_GBs] [methods]
+# Usage: qwisp/bench_batch.sh [C] [GEN] [throttle_GBs] [methods]
 #   C=64 GEN=128 throttle=0 methods="suffix-spec bolt"  (defaults)
 # Env: QWISP_BENCH_MODEL, QWISP_BENCH_BIN, QWISP_BENCH_REFS, QWISP_BENCH_PY.
+#      QWISP_THROTTLE_DEFER=1 (T2) defers the SSD throttle to decode start (~2x faster slow-NAND runs).
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${QWISP_BENCH_BIN:-$REPO/swift/.xcode-build-rel/Build/Products/Release/qwisp-poc}"
@@ -27,18 +29,26 @@ REGIMES="code agentic longctx shortnl"
 
 echo "== Qwisp bench: C=$C GEN=$GEN throttle=${THR}GB/s ($([ "$THR" = 0 ] && echo fast-SSD || echo slow-NAND)) =="
 printf '  %-12s %-8s %10s %12s  %s\n' method regime "tok/s" "fidelity" "correctness"
+
+# --- single batch invocation (1 model load for ALL cells) ---
+RAW="$(mktemp)"
+QWISP_RUN=bench-batch QWISP_MODEL="$MODEL" QWISP_BENCH_REFS_DIR="$REFS" \
+  QWISP_BENCH_METHODS="$METHODS" QWISP_BENCH_REGIMES="$REGIMES" \
+  QWISP_CACHE_C="$C" QWISP_GEN="$GEN" QWISP_SSD_THROTTLE_GBS="$THR" \
+  QWISP_DUMP_TOKENS=1 "$BIN" stream > "$RAW" 2>/dev/null
+
 TMP="$(mktemp)"
 for m in $METHODS; do
-  skip=0; [ "$m" = bolt ] && skip=3          # mlx-fidelity buddy toggle
   for r in $REGIMES; do
     ref="$REFS/$r.safetensors"
     [ -f "$ref" ] || { echo "  (skip $m/$r: missing $ref)"; continue; }
-    # --- speed (free-run) + output dump for correctness ---
+    # slice this cell's lines out of the batch stdout (BENCHCELL delimiter to next BENCHCELL/EOF)
+    cell="$(awk -v tag="BENCHCELL|method=$m|regime=$r" \
+            '$0 == tag { on=1; next } on && index($0, "BENCHCELL|") == 1 { exit } on { print }' "$RAW")"
+    [ -n "$cell" ] || { echo "  (skip $m/$r: no cell output)"; continue; }
     dump="$(mktemp)"
-    out="$(QWISP_RUN=$m QWISP_MODEL="$MODEL" QWISP_MTP_REF="$ref" QWISP_CACHE_C="$C" QWISP_GEN="$GEN" \
-           QWISP_SSD_THROTTLE_GBS="$THR" QWISP_DUMP_TOKENS=1 "$BIN" stream 2>/dev/null)"
-    printf '%s\n' "$out" | grep -E 'PROMPT_TOKENS|OUT_TOKENS|BOLT_TOKENS' > "$dump"
-    tokps="$(printf '%s\n' "$out" | grep -oE '[0-9.]+ tok/s' | head -1 | grep -oE '[0-9.]+')"
+    printf '%s\n' "$cell" | grep -E 'PROMPT_TOKENS|OUT_TOKENS|BOLT_TOKENS' > "$dump"
+    tokps="$(printf '%s\n' "$cell" | grep '^BENCH|' | head -1 | sed 's/.*tokps=//')"
     # --- correctness (regime hook on the free-run output) ---
     corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
     [ -z "$corr" ] && corr="(checker error)"
@@ -49,16 +59,15 @@ for m in $METHODS; do
       # token-match is greedy-chaos, not the fidelity axis).
       fid="$("$PY" "$REPO/qwisp/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
     else
-      # teacher-forced, chaos-free; throttle-independent so run unthrottled
-      fout="$(QWISP_RUN=mlx-fidelity QWISP_MODEL="$MODEL" QWISP_MTP_REF="$ref" QWISP_CACHE_C="$C" \
-              QWISP_GEN="$GEN" QWISP_SKIPMODE="$skip" "$BIN" stream 2>/dev/null)"
-      fid="$(printf '%s\n' "$fout" | grep -oE 'fidelity vs gR: [0-9]+/[0-9]+=[0-9.]+%' | grep -oE '[0-9.]+%$')"
+      # teacher-forced, chaos-free; the batch runner ran it in-process (unthrottled) -> BENCHFID
+      fid="$(printf '%s\n' "$cell" | grep '^BENCHFID|' | head -1 | grep -oE '[0-9.]+%$')"
     fi
     rm -f "$dump"
     printf '  %-12s %-8s %9s  %11s  %s\n' "$m" "$r" "${tokps:-NA}" "${fid:-NA}" "$corr"
     printf '%s %s %s %s\n' "$m" "$r" "${tokps:-NA}" "${fid:-NA%}" >> "$TMP"
   done
 done
+rm -f "$RAW"
 echo "-- equal-weight aggregate (mean over regimes) --"
 awk '{ t[$1]+=$3; f[$1]+=($4+0); n[$1]++ }
      END { for (m in t) printf "  %-12s speed %.1f tok/s   fidelity %.1f%%  (mean of %d regimes)\n", m, t[m]/n[m], f[m]/n[m], n[m] }' "$TMP"

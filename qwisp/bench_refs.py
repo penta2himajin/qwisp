@@ -9,9 +9,13 @@ consume via QWISP_MTP_REF.
 spec_greedy provenance: the Python-4bit greedy written by the generate step is a BOOTSTRAP value
 only — Python runs f16 SDPA/conv while the Swift engine (and mlx-fidelity's teacher forcing) is
 f32-full, so near-tie argmax flips make strict fidelity read <100% against it (observed: longctx
-120/128, shortnl 126/128, all benign rank<=2 near-ties). The canonical reference is the Swift
-strict f32-full greedy; after generating, replace spec_greedy via --ingest-swift with a dump from
-either runner (both are the exact same computation, lossless-proven):
+120/128, shortnl 126/128, all benign rank<=2 near-ties). The CANONICAL reference is the Swift
+strict greedy with the PINNED canonical op configuration (2026-07-02 doctrine):
+  f32-full + fuseGDN OFF + prefill chunk=8 (C-independent constant) + M=1 sequential decode
+  + sync routing.
+Batched kernels are NOT order-stable across shapes (M, chunk, fused-vs-split), so any change to
+these computation shapes changes near-tie argmaxes => regenerate refs whenever they change.
+After generating, replace spec_greedy via --ingest-swift with a QWISP_SWIFT_REF dump:
   QWISP_RUN=suffix-spec QWISP_DUMP_TOKENS=1 ... qwisp-poc stream | grep OUT_TOKENS  > /tmp/code.toks
   (or QWISP_RUN=bolt QWISP_SWIFT_REF=1 QWISP_DUMP_TOKENS=1 ... | grep STRICT_TOKENS)
   PYTHONPATH=<repo> "$PY" -m qwisp.bench_refs --ingest-swift code /tmp/code.toks

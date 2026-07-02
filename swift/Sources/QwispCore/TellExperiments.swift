@@ -927,12 +927,6 @@ extension Tell {
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MLXFidelity] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
         let buddyMode = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"
-        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true   // f32-full (match strict/bolt verify)
-        defer {
-            StreamingMoEBlock.skipMode = 0; StreamingMoEBlock.probeNoSync = false
-            StreamingMoEBlock.captureInds = false
-            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
-        }
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -940,6 +934,28 @@ extension Tell {
         let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
+        return try mlxFidelityCore(model: model, ids: ids, gR: gR, C: C, buddy: buddyMode).summary
+    }
+
+    /// ★ T1: teacher-forced fidelity 本体 core。prebuilt model で measureMLXFidelity と
+    /// TellBench(batch bench, bolt fidelity 軸)の両方から呼ぶ。buddy=true が QWISP_SKIPMODE=3 相当。
+    /// in-process 連続実行を想定し、依存する global static は entry で全て明示 set、exit(defer)で reset
+    /// （fuseGDN=false は fresh-process の mlx-fidelity 呼びと同一条件を保つため明示）。
+    static func mlxFidelityCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int, buddy buddyMode: Bool)
+        throws -> (summary: String, match: Int, n: Int) {
+        // ★ entry で依存 static を全て明示 set（in-process 連続実行では前 run の leak が実バグになる）。
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true   // f32-full (match strict/bolt verify)
+        GatedDeltaNetLayer.fuseGDN = false
+        AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.captureInds = false
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
+        defer {
+            StreamingMoEBlock.skipMode = 0; StreamingMoEBlock.probeNoSync = false
+            StreamingMoEBlock.captureInds = false
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+        }
         let N = Swift.min(Tell.envInt("QWISP_GEN", 128), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
 
@@ -1009,10 +1025,11 @@ extension Tell {
         var diag = mism.prefix(8).map { String(format: "p%d:pred=%d ref=%d(rank%d,gap%.3f)", $0.pos, $0.pred, $0.ref, $0.refRank, $0.gap) }.joined(separator: " | ")
         if diag.isEmpty { diag = "(no mismatch)" }
         let mode = buddyMode ? "bolt(buddy)" : "exact(strict)"
-        return String(format: """
+        let summary = String(format: """
             [MLXFidelity/%@] teacher-forced per-token fidelity vs gR: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
               first mismatches: %@
             """, mode, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
+        return (summary, match, N)
     }
 
     /// **2-pass 自己予測 prefetch decode**

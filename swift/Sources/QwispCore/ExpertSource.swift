@@ -25,6 +25,12 @@ public final class ExpertSource {
     nonisolated(unsafe) public static var acctNanos: UInt64 = 0        // 実 pread 時間(throttle sleep 除く)
     nonisolated(unsafe) static var virtualClockNs: UInt64 = 0          // 単一 NAND が free になる時刻
     static let throttleLock = NSLock()
+    // ★ T2: throttle defer knob。QWISP_THROTTLE_DEFER=1 で「初期 ~18GB weight load / calib / prefill」を
+    //   throttle 対象外にし、runner が timed decode 直前に throttleActive=true を立てるまで不活性化
+    //   （steady-state decode tok/s の計測に load/prefill の throttle は無関係で計測が ~2x 遅いだけ）。
+    //   既定 OFF(throttleActive=true)=現行挙動と完全同一。batch runner は cell 毎に !throttleDefer へ reset。
+    public static let throttleDefer = ProcessInfo.processInfo.environment["QWISP_THROTTLE_DEFER"] == "1"
+    nonisolated(unsafe) public static var throttleActive = ProcessInfo.processInfo.environment["QWISP_THROTTLE_DEFER"] != "1"
     public static func resetAcct() { throttleLock.lock(); acctBytes = 0; acctReads = 0; acctNanos = 0; virtualClockNs = 0; throttleLock.unlock() }
 
     let dir: URL
@@ -155,7 +161,8 @@ public final class ExpertSource {
             ExpertSource.throttleLock.unlock()
         }
         // ★ leaky-bucket throttle: 単一 NAND を直列にモデル化。serveNs = stride / (GB/s)（GB=1e9, ns=s×1e9 相殺）。
-        if ExpertSource.throttleGBs > 0 {
+        //   throttleActive: T2 defer gate（既定 true=透過。QWISP_THROTTLE_DEFER=1 時のみ decode 開始まで false）。
+        if ExpertSource.throttleGBs > 0 && ExpertSource.throttleActive {
             let serveNs = UInt64(Double(stride) / ExpertSource.throttleGBs)
             ExpertSource.throttleLock.lock()
             let now = DispatchTime.now().uptimeNanoseconds

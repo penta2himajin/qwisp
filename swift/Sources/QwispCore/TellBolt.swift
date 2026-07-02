@@ -22,9 +22,26 @@ extension Tell {
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[Bolt] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", DeviceCalibration.defaultC())
+        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        return try boltCore(model: model, ids: ids, gR: gR, C: C).summary
+    }
+
+    /// ★ T1: bolt 本体 core。prebuilt model を受け取り、runBolt と TellBench(batch bench)の両方から呼ぶ。
+    /// in-process 連続実行を想定し、依存する global static は entry で全て明示 set、exit(defer)で reset。
+    /// timed decode(phase 3c)直前に ExpertSource.throttleActive を立てる（T2 defer gate）。
+    static func boltCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int)
+        throws -> (summary: String, tokps: Double) {
         let calibN = Tell.envInt("QWISP_CALIB", 48)
-        let maxKSafe = Swift.max(4, C * 3 / 8)
-        let maxK = Swift.min(Tell.envInt("QWISP_DRAFT_K", maxKSafe), maxKSafe)
+        // bolt decode は ensure を呼ばない（cold は buddyTable で常駐 slot へ remap）ため strict の
+        // C·3/8 は容量制約としては不要だが、**default 値としては最良動作点**（実測 2026-07-02:
+        // C=64 で 48 に上げると mean −13%。realistic mix は accept が短く長 draft は verify の無駄 row）。
+        // hard clamp は撤去済み＝QWISP_DRAFT_K で自由に超過可（高 accept ワークロード向け）。
+        let maxK = Tell.envInt("QWISP_DRAFT_K", Swift.max(4, C * 3 / 8))
         let minMatch = Tell.envInt("QWISP_SUFFIX_MIN", 4)
         let maxMatch = Tell.envInt("QWISP_SUFFIX_MATCH", 32)
         // bolt uses f32-full verify (same as strict SuffixSpec) for accept/reject STABILITY:
@@ -32,19 +49,23 @@ extension Tell {
         // which corrupts cache state on partial-reject/fallback and cascades to garbage. The
         // speedup comes from buddy (io=0) + spec, NOT from dropping f32-full (only 2 divergent
         // ops: attention SDPA + GDN conv1d; cheap). Buddy still provides the slow-NAND win.
+        // ★ entry で依存 static を全て明示 set（in-process 連続実行では前 run の leak が実バグになる）。
         GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true
-        GatedDeltaNetLayer.fuseGDN = Tell.envFlag("QWISP_FUSE_GDN")   // stage 2 (free, bit-preserving)
+        // B2: fusion は out軸 concat の bit-exact 変換で code/mix +8-14% 実測済み → default ON（QWISP_FUSE_GDN=0 で opt-out）
+        GatedDeltaNetLayer.fuseGDN = Tell.envStr("QWISP_FUSE_GDN", "1") != "0"
+        AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.captureInds = false
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
         defer {
             StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
             StreamingMoEBlock.captureInds = false; GatedDeltaNetLayer.fuseGDN = false
             GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+            AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+            StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+            LayerExpertCache.overflowCheck = false
         }
-        let store = try WeightStore(modelDir: modelDir); store.residentNonExperts()
-        let source = try ExpertSource(modelDir: modelDir); try source.warm()
-        let arena = try ExpertArena(device: device, source: source, N: 64)
-        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
-        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
-        let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
@@ -73,8 +94,15 @@ extension Tell {
         StreamingMoEBlock.captureInds = false
 
         // Canonical strict-4bit greedy reference (f32-full, exact routing) for losslessness classification.
+        // ★正準構成の固定(2026-07-02): canonical = f32-full + **fuseGDN OFF** + chunk-8 prefill +
+        //   M=1 sequential decode + sync routing。fusion は kernel 形状依存の微小 drift があり
+        //   (fuse-ON ref vs fuse-OFF strict が near-tie p33 で乖離した実測)、bolt の B2 default-ON を
+        //   ここに漏らすと ref が汚染される。gSwift ループ中のみ明示 OFF にし、終了後 bolt 設定へ復帰。
         var gSwift: [Int] = []
         if Tell.envFlag("QWISP_SWIFT_REF") {
+            let boltFuse = GatedDeltaNetLayer.fuseGDN
+            GatedDeltaNetLayer.fuseGDN = false
+            defer { GatedDeltaNetLayer.fuseGDN = boltFuse }
             GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true   // <- canonical L1 reference
             StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
             let cref = model.makeCaches()
@@ -114,6 +142,7 @@ extension Tell {
         var hist = ids.asArray(Int32.self).map { Int($0) }
 
         var out: [Int] = []; var steps = 0, accTok = 0, draftSteps = 0
+        ExpertSource.throttleActive = true   // T2: deferred throttle はここ（phase-3c timed decode 開始）から有効
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
@@ -154,11 +183,11 @@ extension Tell {
         // Headline near-lossless metric = vs strict-4bit f32-full greedy (Swift-greedy).
         let headline: String
         if gSwift.isEmpty {
-            headline = String(format: "品質(vs Python) %d/%d=%.0f%% [set QWISP_SWIFT_REF=1 for canonical]",
+            headline = String(format: "品質(vs ref=Swift正準greedy) %d/%d=%.0f%% [QWISP_SWIFT_REF=1 で in-run 再計算]",
                               matchPy, N, Double(matchPy) / Double(N) * 100)
         } else {
             let m = zip(outN, gSwift).filter { $0 == $1 }.count
-            headline = String(format: "★near-lossless(vs strict-4bit greedy) %d/%d=%.1f%%  (vs Python %d/%d)",
+            headline = String(format: "★near-lossless(vs strict-4bit greedy) %d/%d=%.1f%%  (vs ref %d/%d)",
                               m, N, Double(m) / Double(N) * 100, matchPy, N)
         }
         if Tell.envFlag("QWISP_DUMP_TOKENS") {
@@ -166,9 +195,11 @@ extension Tell {
             print("BOLT_TOKENS:" + outN.map { String($0) }.joined(separator: ","))
             if !gSwift.isEmpty { print("STRICT_TOKENS:" + gSwift.map { String($0) }.joined(separator: ",")) }
         }
-        return String(format: """
+        let tokps = Double(N) / secs
+        let summary = String(format: """
             [Bolt L3] buddy no-sync draft(maxK=%d)+buddy verify(C=%d, skipMode=3): %.1f tok/s  \
             accept/step=%.2f  spec-steps=%d/%d  %@
-            """, maxK, C, Double(N) / secs, Double(accTok) / Double(Swift.max(1, draftSteps)), draftSteps, steps, headline)
+            """, maxK, C, tokps, Double(accTok) / Double(Swift.max(1, draftSteps)), draftSteps, steps, headline)
+        return (summary, tokps)
     }
 }

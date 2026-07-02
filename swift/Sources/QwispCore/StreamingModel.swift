@@ -196,17 +196,40 @@ public final class StreamingQwispModel {
 
     /// チャンク分割 prefill。1 forward の |U| が cache slot C を超えると in-place arena が
     /// 破綻するため、chunk≤C/topK で分割（chunk 毎に eval して arena 上書き前に materialize）。
-    public func prefillChunked(_ ids: MLXArray, caches: [LayerCache], chunk: Int = 4)
+    /// ※ union-overflow guard は spec verify loop 専用で prefill には効かないため、この上限は hard cap。
+    /// chunk 省略時は **C 非依存の定数 8**（env QWISP_PREFILL_CHUNK で override）:
+    ///   ★prefill の batched kernel は chunk 形状に数値依存（order-stable でない）ため、chunk を
+    ///   C 依存にすると「同 prompt でも RAM tier ごとに出力が変わる」= L1 の cross-C 一貫性を毀損する
+    ///   （2026-07-02 実測: C 依存 chunk で code free-run が正準 ref から 28-73% に分岐）。
+    ///   8 は最小 tier C=64 の capacity 上限 C/topK=8 と一致し全 tier 安全・全 tier 同一計算。
+    ///   prefill schedule は「正準計算」の一部: これを変えたら refs 再生成が必須。
+    /// lm_head は最終 chunk の最終位置のみ計算（全 call site が last-position argmax のみ消費、
+    /// 非最終 chunk の full-vocab 射影 [chunk,248320]≈254MB 重み読みを省く。先頭 token も decode と
+    /// 同じ M=1 lm_head kernel になり一様）。
+    /// hidden は全 chunk の post-norm を concat して返す（MTP head が prompt 全 hidden を消費）。
+    public func prefillChunked(_ ids: MLXArray, caches: [LayerCache], chunk: Int? = nil)
         throws -> (hidden: MLXArray, logits: MLXArray) {
+        let topK = layers.first?.mlp.topK ?? 8
+        let cap = expertCaches.first?.C ?? arena.N          // per-layer arena capacity
+        let chDefault = Tell.envInt("QWISP_PREFILL_CHUNK", 8)
+        let ch = Swift.min(chunk ?? chDefault, Swift.max(1, cap / topK))  // capacity hard cap
         let P = ids.dim(1)
         var hiddens: [MLXArray] = []
         var lastLogits = MLXArray.zeros([1, 1, 1])
         var pos = 0
         while pos < P {
-            let end = Swift.min(pos + chunk, P)
-            let (h, lg) = try forwardHidden(ids[0..., pos ..< end], caches: caches)
-            MLX.eval([h, lg] + caches.flatMap { $0.stateArrays })  // arena 上書き前に確定
-            hiddens.append(h); lastLogits = lg
+            let end = Swift.min(pos + ch, P)
+            var h = embed(ids[0..., pos ..< end])
+            for (i, layer) in layers.enumerated() { h = try layer(h, cache: caches[i]) }
+            let hidden = finalNorm(h)
+            if end == P {                                   // 最終 chunk のみ lm_head（最終位置のみ）
+                let lg = logitsFromNorm(hidden[0..., (hidden.dim(1) - 1)...])
+                MLX.eval([hidden, lg] + caches.flatMap { $0.stateArrays })  // arena 上書き前に確定
+                lastLogits = lg
+            } else {                                        // headless: 層 + final norm のみ
+                MLX.eval([hidden] + caches.flatMap { $0.stateArrays })      // arena 上書き前に確定
+            }
+            hiddens.append(hidden)
             pos = end
         }
         return (MLX.concatenated(hiddens, axis: 1), lastLogits)

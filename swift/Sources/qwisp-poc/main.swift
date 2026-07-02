@@ -71,6 +71,7 @@ if CommandLine.arguments.contains("stream") {
         ("mmap-gather",           { try Tell.measureMmapGather(modelDir: $0, refPath: $1) }),
         ("mlx-fidelity",          { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) }),
         ("bolt",                  { try Tell.runBolt(modelDir: $0, refPath: $1) }),
+        ("bench-batch",           { md, _ in try Tell.runBenchBatch(modelDir: md) }),   // T1: 1 load で全 cell
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {

@@ -180,6 +180,29 @@ public final class LayerExpertCache {
         tick = [Int](repeating: 0, count: C)
     }
 
+    /// ★ T1 batch bench: cell 間 cold-start reset。fresh process の init 直後と同じ instance 状態へ戻す。
+    /// arena slot のバイト自体は残るが slotOf が空＝全 expert が miss 扱いで re-pread されるため
+    /// 意味的に cold（fresh process の zeros 初期化と等価。GPU table/mask/buddy は version bump + nil で再構築）。
+    public func reset() {
+        slotOf.removeAll()
+        expertAt = [Int](repeating: -1, count: C)
+        tick = [Int](repeating: 0, count: C)
+        clock = 0
+        hits = 0; misses = 0
+        lastInds = nil; lastGateInput = nil; preAttnInput = nil
+        lastMarginInds = nil; lastConf = nil
+        slotTableDirty = true; slotTableGPU = nil; slotVersion += 1   // bump: 派生 GPU 配列の再構築を強制
+        pinnedSlots.removeAll()
+        hotMaskArr = nil; hotMaskVer = -1
+        buddyTable = nil
+    }
+
+    /// ★ T1 batch bench: プロセス fresh 相当へ static 状態を戻す（accounting + overflow guard）。
+    public static func resetGlobals() {
+        ensureNanos = 0; preadNanos = 0; missTotal = 0
+        overflowCheck = false; overflowMaxUnion = 0
+    }
+
     /// lastInds(直近 fast forward の routing)の distinct expert を prefetch（cross-layer 予測の駆動）。
     public func prefetchLastInds() {
         guard let li = lastInds else { return }
@@ -262,6 +285,19 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var tGdnConv: UInt64 = 0
     nonisolated(unsafe) public static var tGdnKernel: UInt64 = 0
     nonisolated(unsafe) public static var tGdnOut: UInt64 = 0
+
+    /// ★ T1 batch bench: プロセス fresh 相当へ全 static mode flag / counter を戻す（in-process cell 連続実行用）。
+    public static func resetGlobals() {
+        syncNanos = 0
+        probeNoSync = false; predictOnly = false
+        captureGateInput = false; captureInds = false
+        syncLayers = nil; captureLayerInput = false
+        captureK = 0; marginK = 0
+        countHotMiss = false; skipMode = 0; hotMissAccum = nil
+        profileLayers = false
+        tGDN = 0; tAttn = 0; tMoEgather = 0; tMoEshared = 0; tNorm = 0
+        tGdnInproj = 0; tGdnConv = 0; tGdnKernel = 0; tGdnOut = 0
+    }
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,

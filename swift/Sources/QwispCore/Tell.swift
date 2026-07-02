@@ -33,6 +33,22 @@ public enum Tell {
         if ProcessInfo.processInfo.environment["QWISP_CACHE_C"] == nil {
             print("[calibration] " + DeviceCalibration.recommend().summary)
         }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let source = try ExpertSource(modelDir: modelDir); try source.warm()
+        let arena = try ExpertArena(device: device, source: source, N: 64)
+        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
+        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
+        let gR = gRef.asArray(Int32.self).map { Int($0) }
+        return try suffixSpecCore(model: model, ids: ids, gR: gR, C: C).summary
+    }
+
+    /// ★ T1: SuffixSpec 本体 core。prebuilt model を受け取り、runSuffixSpec と TellBench(batch bench)
+    /// の両方から呼ぶ。in-process 連続実行を想定し、依存する global static は process-fresh 既定を
+    /// 仮定せず entry で全て明示 set し、exit(defer)で reset する。timed decode 直前に
+    /// ExpertSource.throttleActive を立てる（T2: QWISP_THROTTLE_DEFER=1 時のみ意味を持つ）。
+    static func suffixSpecCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int)
+        throws -> (summary: String, tokps: Double) {
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         // ★ batched f32-full verify が既定(investigate C + batched 再評価で確定):
         //   verify forward の divergent op は attention SDPA(.causal/.none 経路差 ~7e-4)と GDN conv1d のみ。
@@ -59,20 +75,26 @@ public enum Tell {
         //   実 routing の union を観測し overflow prefix を re-verify して strict-lossless 化。詳細 notes/00。
         let ofDbg = Tell.envFlag("QWISP_OVERFLOW_DBG")
         let ofMargin = Swift.max(10, Swift.min(99, Tell.envInt("QWISP_OVERFLOW_MARGIN", 60)))  // safe-union 目標 %（★tune: 80→60=overflow 回避で re-verify 減, C128 mix +29%）
+        // ★ entry で依存 static を全て明示 set（in-process 連続実行では前 run の leak が実バグになる）。
         // 既定 f32-full(QWISP_F32_ATTN/CONV=0 で各々無効化可)。f16 batched を試すなら両方 0。
         GatedDeltaNetLayer.f32Conv = Tell.envStr("QWISP_F32_CONV", "1") != "0"
         AttentionLayer.f32SDPA = Tell.envStr("QWISP_F32_ATTN", "1") != "0"
+        // B2 試験 knob: GDN in_proj 融合(out軸 concat=bit-exact)。opt-in で A/B 計測(bolt は default ON)。
+        GatedDeltaNetLayer.fuseGDN = Tell.envFlag("QWISP_FUSE_GDN")
+        AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.captureInds = false
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
         defer {
             GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false; AttentionLayer.perQueryNone = false
-            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+            GatedDeltaNetLayer.fuseGDN = false
+            AttentionLayer.seqMultiToken = false
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+            StreamingMoEBlock.captureInds = false
+            StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+            LayerExpertCache.overflowCheck = false
         }
-        let store = try WeightStore(modelDir: modelDir)
-        store.residentNonExperts()
-        let source = try ExpertSource(modelDir: modelDir); try source.warm()
-        let arena = try ExpertArena(device: device, source: source, N: 64)
-        let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
-        let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
-        let gR = gRef.asArray(Int32.self).map { Int($0) }
         let isLin = model.isLinearFlags
         let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
@@ -135,9 +157,12 @@ public enum Tell {
         var (_, lg) = try model.prefillChunked(ids, caches: mc)
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
-        // verify 逐次化は既定 OFF(f32-full batched が代替)。診断用に明示時のみ有効化:
-        //   QWISP_VERIFY_SEQ=1 → seqMT(層丸ごと per-token), QWISP_VERIFY_PQN=1 → per-query .none(SDPA のみ)。
-        let vseq = Tell.envFlag("QWISP_VERIFY_SEQ")
+        // ★2026-07-02: VERIFY_SEQ を default ON に（strict-lossless 修正）。batched f32 verify は
+        //   order-stable でない（M=D+1 と M=1 で kernel 累積順が異なり微小 drift → near-tie の誤 accept。
+        //   agentic で C 非依存に 80/128=62% へ分岐する反例を確認。PQN=SDPA のみ逐次化では直らず、
+        //   seqMT=層丸ごと per-token で 128/128 回復）。コスト実測 agentic −5%/longctx −0%。
+        //   QWISP_VERIFY_SEQ=0 で旧 batched（near-tie 誤 accept の保証なし）に戻せる。
+        let vseq = Tell.envStr("QWISP_VERIFY_SEQ", "1") != "0"
         let vpqn = Tell.envFlag("QWISP_VERIFY_PQN")
         func setVerifyMode(_ on: Bool) {
             if vpqn { AttentionLayer.perQueryNone = on; AttentionLayer.seqMultiToken = false }
@@ -192,6 +217,7 @@ public enum Tell {
         }
         var out: [Int] = []; var steps = 0, accTok = 0, draftTot = 0, overflowCount = 0
         var safeMaxK = maxK   // overflow で縮む動的安全上限（union-overflow guard）
+        ExpertSource.throttleActive = true   // T2: deferred throttle はここ（timed decode 開始）から有効
         let t0 = DispatchTime.now()
         while out.count < N {
             steps += 1
@@ -293,9 +319,11 @@ public enum Tell {
             print("PROMPT_TOKENS:" + ids.asArray(Int32.self).map { String($0) }.joined(separator: ","))
             print("OUT_TOKENS:" + outN.map { String($0) }.joined(separator: ","))
         }
-        return String(format: """
-            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs Python) %d/%d=%.0f%%%@%@
-            """, maxK, C, Double(N) / secs, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag)
+        let tokps = Double(N) / secs
+        let summary = String(format: """
+            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs ref=Swift正準greedy) %d/%d=%.0f%%%@%@
+            """, maxK, C, tokps, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag)
+        return (summary, tokps)
     }
 
     /// suffix lookup draft: seq 末尾の m token(minMatch..maxMatch の最長)が seq 内の earlier 位置に
