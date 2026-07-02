@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 11
+        let total = 12
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -445,6 +445,51 @@ public enum RawVerifyTests {
             else { return (false, "qmmTiled returned nil") }
             MLX.eval([a, b])
             return bitEqual(a, b)
+        }
+
+
+        // Test 12 (U1a): attention 層 × M 行 — rows ≡ M=1 ループ(出力 + KV cache 終状態とも bit 一致)
+        run("attn_layer_rows_bitexact") {
+            let H = 2048, numHeads = 16, numKV = 2, headDim = 256, baseLen = 16
+            func quant(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (qW, qS, qB) = quant(numHeads * 2 * headDim, H)
+            let (kW, kS, kB) = quant(numKV * headDim, H)
+            let (vW, vS, vB) = quant(numKV * headDim, H)
+            let (oW, oS, oB) = quant(H, numHeads * headDim)
+            let qN = MLXRandom.normal([headDim]).asType(.float16)
+            let kN = MLXRandom.normal([headDim]).asType(.float16)
+            let w = RawVerifyForward.AttnLayerW(qWq: qW, qSc: qS, qBi: qB, kWq: kW, kSc: kS, kBi: kB,
+                                                vWq: vW, vSc: vS, vBi: vB, oWq: oW, oSc: oS, oBi: oB,
+                                                qNorm: qN, kNorm: kN)
+            let kC0 = MLXRandom.normal([numKV, baseLen, headDim]).asType(.float16)
+            let vC0 = MLXRandom.normal([numKV, baseLen, headDim]).asType(.float16)
+            MLX.eval([kC0, vC0])
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                var k1 = kC0, v1 = vC0
+                guard let got = RawVerifyForward.attnLayerRows(x, w, kCache: &k1, vCache: &v1, M: M)
+                else { return (false, "rows nil M=\(M)") }
+                got.eval()
+                var k2 = kC0, v2 = vC0
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    guard let r = RawVerifyForward.attnLayerRows(x[m ..< m+1], w, kCache: &k2, vCache: &v2, M: 1)
+                    else { return (false, "ref nil M=\(M) m=\(m)") }
+                    r.eval(); refParts.append(r)
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok1, d1) = bitEqual(got, ref)
+                if !ok1 { return (false, "out M=\(M): \(d1)") }
+                let (ok2, d2) = bitEqual(k1, k2)
+                if !ok2 { return (false, "kCache M=\(M): \(d2)") }
+                let (ok3, d3) = bitEqual(v1, v2)
+                if !ok3 { return (false, "vCache M=\(M): \(d3)") }
+            }
+            return (true, "ok")
         }
 
         // ── Summary ───────────────────────────────────────────────────────
