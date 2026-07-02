@@ -4150,7 +4150,7 @@ public enum RawMetalForward {
     /// D1-7: M-row RMSNorm. x[M,D] → y[M,D].
     /// Delegates to existing rmsNorm which already handles M>1 via gid row indexing.
     public static func rmsNormRows(_ x: MLXArray, _ weight: MLXArray?,
-                                    M: Int, eps: Float, D: Int) -> MLXArray? {
-        return rmsNorm(x, weight, eps: eps, D: D)
+                                    M: Int, eps: Float, D: Int, promoteF32: Bool = false) -> MLXArray? {
+        return rmsNorm(x, weight, eps: eps, D: D, promoteF32: promoteF32)
     }
 }

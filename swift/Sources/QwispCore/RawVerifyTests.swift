@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 12
+        let total = 13
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -488,6 +488,56 @@ public enum RawVerifyTests {
                 if !ok2 { return (false, "kCache M=\(M): \(d2)") }
                 let (ok3, d3) = bitEqual(v1, v2)
                 if !ok3 { return (false, "vCache M=\(M): \(d3)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 13 (U1b): GDN 層 × M 行 — rows ≡ M=1 ループ(出力 + conv/rec state とも bit 一致)
+        run("gdn_layer_rows_bitexact") {
+            let H = 2048, Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            func quant(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (qkvW, qkvS, qkvB) = quant(convDim, H)
+            let (zW, zS, zB) = quant(Hv * Dv, H)
+            let (bW, bS, bB) = quant(Hv, H)
+            let (aW, aS, aB) = quant(Hv, H)
+            let (oW, oS, oB) = quant(H, Hv * Dv)
+            let convW = MLXRandom.normal([convDim, cK]).asType(.float16)
+            let normW = MLXRandom.normal([Dv]).asType(.float16)
+            let aLog = MLXRandom.normal([Hv]).asType(.float32)
+            let dtB = MLXRandom.normal([Hv]).asType(.float32)
+            let w = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                                               zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB,
+                                               aWq: aW, aSc: aS, aBi: aB, outWq: oW, outSc: oS, outBi: oB,
+                                               conv1dW: convW, normWeight: normW, aLog: aLog, dtBias: dtB)
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            MLX.eval([cs0, rs0, convW, normW, aLog, dtB])
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                var c1 = cs0, r1 = rs0
+                guard let got = RawVerifyForward.gdnLayerRows(x, w, convState: &c1, recState: &r1, M: M)
+                else { return (false, "rows nil M=\(M)") }
+                got.eval()
+                var c2 = cs0, r2 = rs0
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    guard let r = RawVerifyForward.gdnLayerRows(x[m ..< m+1], w, convState: &c2, recState: &r2, M: 1)
+                    else { return (false, "ref nil M=\(M) m=\(m)") }
+                    r.eval(); refParts.append(r)
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok1, d1) = bitEqual(got, ref)
+                if !ok1 { return (false, "out M=\(M): \(d1)") }
+                let (ok2, d2) = bitEqual(c1, c2)
+                if !ok2 { return (false, "convState M=\(M): \(d2)") }
+                let (ok3, d3) = bitEqual(r1, r2)
+                if !ok3 { return (false, "recState M=\(M): \(d3)") }
             }
             return (true, "ok")
         }

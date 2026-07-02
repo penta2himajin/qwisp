@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import Metal
+import MLXNN
 
 /// D1 U1: M-row verify 合成層。RawMetalForward の M-row kernel 群(全て rows≡M=1ループ bit一致検証済み)を
 /// 実 decoder 層の op 列どおりに合成する。参照実装は attnLayerRaw / gdnLayerRaw / runMoeBlockTest の
@@ -75,5 +76,87 @@ public enum RawVerifyForward {
         let outR = attnOut.reshaped([M, numHeads * headDim]).asType(.float16)
         let gated = outR * MLX.sigmoid(gate)
         return RawMetalForward.qmmRows(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: M, K: numHeads * headDim, N: H)
+    }
+
+    /// GDN 層重み(qwen3.5: in_proj 4分割, grouped conv, gated-delta recurrence, RMSNormGated)。
+    public struct GDNLayerW {
+        let qkvWq: MLXArray, qkvSc: MLXArray, qkvBi: MLXArray   // [convDim, H]
+        let zWq: MLXArray, zSc: MLXArray, zBi: MLXArray         // [valueDim, H]
+        let bWq: MLXArray, bSc: MLXArray, bBi: MLXArray         // [numVHeads, H]
+        let aWq: MLXArray, aSc: MLXArray, aBi: MLXArray         // [numVHeads, H]
+        let outWq: MLXArray, outSc: MLXArray, outBi: MLXArray   // [H, valueDim]
+        let conv1dW: MLXArray                                    // [convDim, K]
+        let normWeight: MLXArray                                 // [headVDim] (f16 or f32)
+        let aLog: MLXArray, dtBias: MLXArray                     // [numVHeads] f32
+        public init(qkvWq: MLXArray, qkvSc: MLXArray, qkvBi: MLXArray,
+                    zWq: MLXArray, zSc: MLXArray, zBi: MLXArray,
+                    bWq: MLXArray, bSc: MLXArray, bBi: MLXArray,
+                    aWq: MLXArray, aSc: MLXArray, aBi: MLXArray,
+                    outWq: MLXArray, outSc: MLXArray, outBi: MLXArray,
+                    conv1dW: MLXArray, normWeight: MLXArray, aLog: MLXArray, dtBias: MLXArray) {
+            self.qkvWq = qkvWq; self.qkvSc = qkvSc; self.qkvBi = qkvBi
+            self.zWq = zWq; self.zSc = zSc; self.zBi = zBi
+            self.bWq = bWq; self.bSc = bSc; self.bBi = bBi
+            self.aWq = aWq; self.aSc = aSc; self.aBi = aBi
+            self.outWq = outWq; self.outSc = outSc; self.outBi = outBi
+            self.conv1dW = conv1dW; self.normWeight = normWeight
+            self.aLog = aLog; self.dtBias = dtBias
+        }
+    }
+
+    /// GDN 層 × M 行。gdnLayerRaw(M=1)の op 列を Rows wrapper で M 行化。
+    /// convState [K-1, convDim] f16 / recState [1, Hv, Dv, Dk] f32 を inout で更新(逐次 threading と bit 一致)。
+    public static func gdnLayerRows(_ x: MLXArray, _ w: GDNLayerW,
+                                    convState: inout MLXArray, recState: inout MLXArray,
+                                    M: Int,
+                                    numKHeads: Int = 16, numVHeads: Int = 32,
+                                    headKDim: Int = 128, headVDim: Int = 128,
+                                    convKernel: Int = 4, eps: Float = 1e-6) -> MLXArray? {
+        let H = x.dim(-1)
+        let keyDim = headKDim * numKHeads
+        let valueDim = headVDim * numVHeads
+        let convDim = keyDim * 2 + valueDim
+        // ① in_proj ×4(per-row order-stable)
+        guard let qkv = RawMetalForward.qmmRows(x, w.qkvWq, scales: w.qkvSc, biases: w.qkvBi, M: M, K: H, N: convDim),
+              let z   = RawMetalForward.qmmRows(x, w.zWq,   scales: w.zSc,   biases: w.zBi,   M: M, K: H, N: valueDim),
+              let bP  = RawMetalForward.qmmRows(x, w.bWq,   scales: w.bSc,   biases: w.bBi,   M: M, K: H, N: numVHeads),
+              let aP  = RawMetalForward.qmmRows(x, w.aWq,   scales: w.aSc,   biases: w.aBi,   M: M, K: H, N: numVHeads)
+        else { return nil }
+        // ② conv 窓構築(データ移動のみ): convInput = [convState; qkv] → 行 m の窓 = convInput[m .. m+K-1]
+        let convInput = MLX.concatenated([convState, qkv.asType(.float16)], axis: 0)   // [K-1+M, convDim]
+        var windowParts: [MLXArray] = []
+        for m in 0 ..< M { windowParts.append(convInput[m ..< m + convKernel]) }       // 各 [K, convDim]
+        let windows = MLX.stacked(windowParts, axis: 0)                                 // [M, K, convDim]
+        MLX.eval([windows])
+        guard let convOut = RawMetalForward.conv1dSiluRows(windows, w.conv1dW, M: M, K: convKernel, C: convDim)
+        else { return nil }                                                             // [M, convDim]
+        convState = convInput[M ..< M + convKernel - 1]; convState.eval()               // 窓の残り = 新 conv state
+        // ③ split → q,k,v(行毎)
+        let q1 = convOut[0..., 0 ..< keyDim].reshaped([M * numKHeads, headKDim])
+        let k1 = convOut[0..., keyDim ..< 2 * keyDim].reshaped([M * numKHeads, headKDim])
+        let v1 = convOut[0..., (2 * keyDim)...].reshaped([1, M, numVHeads, headVDim])
+        // ④ qk-norm(no-weight)+ scalar scale(elementwise)
+        let invScale = Float(pow(Double(headKDim), -0.5))
+        guard let qn0 = RawMetalForward.rmsNormRows(q1, nil, M: M * numKHeads, eps: eps, D: headKDim),
+              let kn0 = RawMetalForward.rmsNormRows(k1, nil, M: M * numKHeads, eps: eps, D: headKDim) else { return nil }
+        let qN = ((invScale * invScale) * qn0).reshaped([1, M, numKHeads, headKDim])
+        let kN = (invScale * kn0).reshaped([1, M, numKHeads, headKDim])
+        // ⑤ recurrence: in-kernel T=M 逐次(chained T=1 と bit 一致は kernel テスト済み)
+        let g = GatedDelta.computeG(w.aLog, aP.reshaped([1, M, numVHeads]), w.dtBias)
+        let beta = MLX.sigmoid(bP.reshaped([1, M, numVHeads]))
+        guard let (coreOut, stOut) = RawMetalForward.gatedDeltaStepRows(qN, kN, v1, g: g, beta: beta, state: recState,
+                                                                        M: M, B: 1, Hk: numKHeads, Dk: headKDim,
+                                                                        Hv: numVHeads, Dv: headVDim) else { return nil }
+        recState = stOut; recState.eval()
+        // ⑥ RMSNormGated(per-row)
+        let promoteRMS = (w.normWeight.dtype == .float32)
+        guard let normed = RawMetalForward.rmsNormRows(coreOut.reshaped([M * numVHeads, headVDim]), w.normWeight,
+                                                       M: M * numVHeads, eps: eps, D: headVDim, promoteF32: promoteRMS)
+        else { return nil }
+        let zr = z.reshaped([M * numVHeads, headVDim])
+        let gated = (MLXNN.silu(zr.asType(.float32)) * normed.asType(.float32)).asType(.float16)
+        let outV = gated.reshaped([M, valueDim])
+        // ⑦ out_proj
+        return RawMetalForward.qmmRows(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: M, K: valueDim, N: H)
     }
 }
