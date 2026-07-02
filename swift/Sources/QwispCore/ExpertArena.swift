@@ -84,11 +84,22 @@ public final class LayerExpertCache {
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
     nonisolated(unsafe) public static var preadNanos: UInt64 = 0    // loadMany(pread IO) のみ
     nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
-    // ★ issue#7 Step 0: per-layer all-resident 計測（ensure 前=no-sync が exact になる層か）。
+    // ★ issue#7 Step 0: per-layer all-resident 計測（ensure 前=no-sync が exact になる層か）。raw 作業用診断。
     nonisolated(unsafe) public static var measureResident = false
     nonisolated(unsafe) public static var residAllHit: [Int: Int] = [:]   // 層→(top-8 全常駐だった token 数)
     nonisolated(unsafe) public static var residTotal: [Int: Int] = [:]    // 層→(計測 token 数)
     nonisolated(unsafe) public static var residMissSum: [Int: Int] = [:]  // 層→(miss expert 数の累積)
+    // ★ union-overflow 検出(strict-lossless guard): batched verify で 1 層の routed distinct expert が C を
+    //   超えると sync ensure が evict しきれず wrong-slot=silent garbage で誤受理する。ensure に渡る CPU 側
+    //   [Int] の distinct 数で検出(GPU sync 不要=安価)。overflowCheck=true の間だけ判定。
+    nonisolated(unsafe) public static var overflowCheck = false
+    nonisolated(unsafe) public static var overflowMaxUnion = 0      // overflowCheck 中の per-layer distinct routed の最大
+    // ★ exact safe-prefix: overflowCheck 中、flat routed list([rows × K=topK], row t の experts が
+    //   t*K..<t*K+K)を row 単位で走査し「distinct ≤ C を満たす最大 complete-row prefix」を層ごとに
+    //   計測、全層の MIN を保持(row 0 = u を含む row 数)。guard の縮小則が推定でなく厳密になる。
+    //   計測箇所は StreamingMoEBlock sync 経路の dedup pass（ensure に渡る U は dedup 済で row 情報が
+    //   失われているため、重複込み flat を持つ呼び出し側で共有 1 pass 計測）。
+    nonisolated(unsafe) public static var overflowSafeRows = Int.max
 
     // adaptive fast: 直近 fast forward の inds（miss 検出用、eval 済を読む）
     var lastInds: MLXArray?
@@ -114,6 +125,30 @@ public final class LayerExpertCache {
     var hotMaskArr: MLXArray?          // GPU hot/cached マスク [numExperts]（1=cached）
     var hotMaskVer = -1
     public var buddyTable: MLXArray?   // BuddyMoE: cold expert → 最類似 hot expert の slot（slot-0 garbage 回避）
+    // ★B3 budget-IO fetch-and-keep: bolt decode 中に idle な SSD で「持続的に cold routed される
+    //   常習犯 expert」を毎 step ≤budget 個だけ ensure(=fetch & LRU keep)し hot set をオンライン適応。
+    //   決定性: routing/カウント/閾値/tie-break(最小 id)が全て決定的 → fetch 系列も決定的。
+    //   exact フェーズ(calib/prefill/SWIFT_REF)は skipMode==0 なので構造的に非対象。
+    public var buddyExpertCPU: [Int32] = []   // expert → build 時に選んだ buddy EXPERT id（hot は自身）
+    public var buddyTableCPU: [Int32] = []    // expert → slot（synced remap はこの CPU 表を直接使用=per-forward bt.asArray 廃止）
+    var coldCount: [Int: Int] = [:]           // expert → cold で routed された累計（fetch 候補選定）
+    nonisolated(unsafe) public static var boltFetchBudgetLeft = 0   // runner が step 毎に 2 へ reset
+    nonisolated(unsafe) public static var boltFetchTotal = 0       // telemetry（累計 fetch 数）
+    static let boltFetchThreshold = 3         // 常習犯判定: cold hit がこの回数以上で fetch 候補
+
+    /// B3: fetch/evict 後に CPU buddy 表を slotOf + buddyExpertCPU から再構築。
+    /// fetch された expert は自 slot へ、evict された expert は自分の buddy(の現 slot)へ自動降格。
+    func rebuildBuddyCPU(numExperts: Int) {
+        guard buddyExpertCPU.count == numExperts else { return }
+        var t = [Int32](repeating: 0, count: numExperts)
+        for x in 0 ..< numExperts {
+            if let s = slotOf[x] { t[x] = Int32(s) }
+            else if case let b = Int(buddyExpertCPU[x]), b >= 0, let bs = slotOf[b] { t[x] = Int32(bs) }
+            else { t[x] = 0 }
+        }
+        buddyTableCPU = t
+        // GPU buddyTable は build 時の値のまま（読むのは非 production の no-sync 分岐のみ。synced 経路は CPU 表）。
+    }
     public var slotMap: [Int: Int] { slotOf }   // output-sim buddy 構築用（expert→slot）
     public func gpuSlotTable(numExperts: Int) -> MLXArray {
         if slotTableDirty || slotTableGPU == nil {
@@ -149,16 +184,27 @@ public final class LayerExpertCache {
     /// hot は現在 slotOf にいる expert。coact[e][h] = calib で e と h が同 token で共 routed した回数。
     /// 各 cold e → argmax_h(coact[e][h]) の slot（co-activation 無ければ slot-0 fallback）。
     public func buildBuddyTable(coact: [[Int]], numExperts: Int) {
-        let hot = Array(slotOf.keys)
+        // 決定化: Dictionary iteration はプロセス毎に乱択（hash seed）で、coact の同点 buddy が
+        // 走査順で決まると run 毎に table が変わる（C=64 fidelity ±2-5pt の非決定性の原因）。
+        // 同点 tie-break は「最小 expert id 固定」だと全 cold の同点が同一低 id hot に集中し
+        // 品質が乱択帯を系統的に下回る（C=64 実測 66-75% < 85-90%）ため、cold e ごとに
+        // 走査開始位置を回転（(i+e) % n）＝決定的かつ乱択同様に同点勝者を hot 集合へ分散。
+        let hot = slotOf.keys.sorted()
         var bmap = [Int32](repeating: 0, count: numExperts)
+        var bexp = [Int32](repeating: -1, count: numExperts)   // B3: buddy expert id を保持（fetch/evict 時の表再構築用）
         for e in 0 ..< numExperts {
-            if let s = slotOf[e] { bmap[e] = Int32(s); continue }    // hot: 自身
+            if let s = slotOf[e] { bmap[e] = Int32(s); bexp[e] = Int32(e); continue }    // hot: 自身
             var bestH = -1, bestC = -1
-            for h in hot { let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
-            bmap[e] = (bestH >= 0 && bestC > 0) ? Int32(slotOf[bestH]!) : 0   // cold: buddy slot
+            let n = hot.count
+            for i in 0 ..< n { let h = hot[(i + e) % n]; let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
+            if bestH >= 0 && bestC > 0 { bmap[e] = Int32(slotOf[bestH]!); bexp[e] = Int32(bestH) }
+            else { bmap[e] = 0 }   // co-activation 無し: slot-0 fallback（buddy expert 無し）
         }
         let arr = MLXArray(bmap, [numExperts]); arr.eval()
         buddyTable = arr
+        buddyExpertCPU = bexp
+        buddyTableCPU = bmap
+        coldCount.removeAll()
     }
 
     /// experts を常駐ロードし、その slot を pinned に登録（以後 LRU 退避されない）。
@@ -172,6 +218,31 @@ public final class LayerExpertCache {
         self.layer = layer; self.C = C
         expertAt = [Int](repeating: -1, count: C)
         tick = [Int](repeating: 0, count: C)
+    }
+
+    /// ★ T1 batch bench: cell 間 cold-start reset。fresh process の init 直後と同じ instance 状態へ戻す。
+    /// arena slot のバイト自体は残るが slotOf が空＝全 expert が miss 扱いで re-pread されるため
+    /// 意味的に cold（fresh process の zeros 初期化と等価。GPU table/mask/buddy は version bump + nil で再構築）。
+    public func reset() {
+        slotOf.removeAll()
+        expertAt = [Int](repeating: -1, count: C)
+        tick = [Int](repeating: 0, count: C)
+        clock = 0
+        hits = 0; misses = 0
+        lastInds = nil; lastGateInput = nil; preAttnInput = nil
+        lastMarginInds = nil; lastConf = nil
+        slotTableDirty = true; slotTableGPU = nil; slotVersion += 1   // bump: 派生 GPU 配列の再構築を強制
+        pinnedSlots.removeAll()
+        hotMaskArr = nil; hotMaskVer = -1
+        buddyTable = nil
+        buddyExpertCPU = []; buddyTableCPU = []; coldCount.removeAll()   // B3
+    }
+
+    /// ★ T1 batch bench: プロセス fresh 相当へ static 状態を戻す（accounting + overflow guard）。
+    public static func resetGlobals() {
+        ensureNanos = 0; preadNanos = 0; missTotal = 0
+        overflowCheck = false; overflowMaxUnion = 0; overflowSafeRows = Int.max
+        boltFetchBudgetLeft = 0; boltFetchTotal = 0   // B3
     }
 
     /// lastInds(直近 fast forward の routing)の distinct expert を prefetch（cross-layer 予測の駆動）。
@@ -197,6 +268,14 @@ public final class LayerExpertCache {
             LayerExpertCache.residMissSum[layer, default: 0] += missCnt
             if missCnt == 0 { LayerExpertCache.residAllHit[layer, default: 0] += 1 }
         }
+        // ★ union-overflow guard: distinct routed > C なら C slot に同時常駐できず gather が garbage。
+        //   sync 経路からは dedup 済 U が渡るが、pin/refresh は重複あり得るため Set で distinct を数える。
+        //   exact safe-prefix(overflowSafeRows)の row 走査は、row-major・重複込みの flat list を持つ
+        //   StreamingMoEBlock sync 経路（dedup pass に相乗り）で行う。ここでは union のみ。
+        if LayerExpertCache.overflowCheck {
+            let u = Set(experts).count
+            if u > LayerExpertCache.overflowMaxUnion { LayerExpertCache.overflowMaxUnion = u }
+        }
         for e in experts {
             clock += 1
             if let s = slotOf[e] { tick[s] = clock; hits += 1; result[e] = s; continue }
@@ -205,6 +284,12 @@ public final class LayerExpertCache {
             for s in 0 ..< C where expertAt[s] == -1 { slot = s; break }
             if slot == -1 {
                 // LRU 退避: pinned slot は対象外（hot を保護）
+                // ★same-call 不変量(A5 実験で学習, 2026-07-02): 同一 ensure call 内で触れた slot（hit/新規
+                //   割当）を同 call 中に退避すると同 forward の 2 expert が slot を共有し wrong-slot garbage
+                //   （U≤C なら guard も非検出）。LRU は「touch=最新 tick」でこれを暗黙に満たしている。
+                //   eviction policy を差し替える場合は touched-slot の明示除外 + U>C(overflow 進行中=guard が
+                //   巻戻す局面)での最古 tick フォールバックが必須（LFU 初実装は fidelity 2-27% に崩壊した）。
+                //   なお decayed-LFU 自体は実測で LRU と同速(slow 4.6 vs 4.7)= NO-GO 済み。
                 var oldest = -1
                 for s in 0 ..< C where !pinnedSlots.contains(s) {
                     if oldest == -1 || tick[s] < tick[oldest] { oldest = s }
@@ -259,6 +344,19 @@ public final class StreamingMoEBlock {
     nonisolated(unsafe) public static var tGdnConv: UInt64 = 0
     nonisolated(unsafe) public static var tGdnKernel: UInt64 = 0
     nonisolated(unsafe) public static var tGdnOut: UInt64 = 0
+
+    /// ★ T1 batch bench: プロセス fresh 相当へ全 static mode flag / counter を戻す（in-process cell 連続実行用）。
+    public static func resetGlobals() {
+        syncNanos = 0
+        probeNoSync = false; predictOnly = false
+        captureGateInput = false; captureInds = false
+        syncLayers = nil; captureLayerInput = false
+        captureK = 0; marginK = 0
+        countHotMiss = false; skipMode = 0; hotMissAccum = nil
+        profileLayers = false
+        tGDN = 0; tAttn = 0; tMoEgather = 0; tMoEshared = 0; tNorm = 0
+        tGdnInproj = 0; tGdnConv = 0; tGdnKernel = 0; tGdnOut = 0
+    }
 
     public init(topK: Int, numExperts: Int, normTopk: Bool, expertBits: Int, layer: Int,
                 gate: Proj, shGate: Proj, shUp: Proj, shDown: Proj, sharedGate: Proj,
@@ -374,14 +472,66 @@ public final class StreamingMoEBlock {
         let flat = inds.asType(.int32).asArray(Int32.self)
         StreamingMoEBlock.syncNanos += DispatchTime.now().uptimeNanoseconds - ts
         var seen = Set<Int>(); var U: [Int] = []
-        for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
+        if LayerExpertCache.overflowCheck, let cCap = cache?.C {
+            // ★ union-overflow guard の exact safe-prefix: flat は row-major [rows×topK]（重複込み）。
+            //   既存 dedup pass に row 境界追跡を相乗りし「distinct ≤ C を満たす最大 complete-row
+            //   prefix」を計測して overflowSafeRows へ MIN（追加 pass ゼロ）。distinct は row 単調増加
+            //   ゆえ最初の超過 row 以降 safeRows は更新されない。
+            //   不変量: この層の union(=最終 seen.count) ≤ C なら safeRows = 全 row 数（縮小は
+            //   overflow した層でのみ効く）。
+            var safeRows = 0
+            for (j, e32) in flat.enumerated() {
+                let e = Int(e32); if seen.insert(e).inserted { U.append(e) }
+                if (j + 1) % topK == 0 && seen.count <= cCap { safeRows = (j + 1) / topK }
+            }
+            if safeRows < LayerExpertCache.overflowSafeRows { LayerExpertCache.overflowSafeRows = safeRows }
+        } else {
+            for e32 in flat { let e = Int(e32); if seen.insert(e).inserted { U.append(e) } }
+        }
 
         let store: ExpertArena
         var remapVals = [Int32](repeating: 0, count: flat.count)
         if let c = cache {
-            let slotOf = c.ensure(U)                                   // hit は pread 省略
-            for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slotOf[Int(e32)]!) }
-            store = c.arena
+            if StreamingMoEBlock.skipMode == 3, !c.buddyTableCPU.isEmpty {
+                // deterministic buddy (io≈0): remap cold->buddy hot slot via CPU 表, 原則 ensure/pread 無し。
+                // The inds.asArray above is the per-layer CPU sync barrier, so this is deterministic
+                // (unlike probeNoSync no-sync, which races across layers). bolt uses this path.
+                // ★B3 fetch-and-keep: cold 常習犯（coldCount≥threshold）を step budget 内で ensure し
+                //   hot set をオンライン適応（fetch は exact 化 + 以後常駐、evict は buddy 降格）。
+                if LayerExpertCache.boltFetchBudgetLeft > 0 {
+                    var best = -1, bestCnt = 0
+                    var seenCold = Set<Int>()
+                    for e32 in flat {
+                        let e = Int(e32)
+                        if c.slotMap[e] == nil, seenCold.insert(e).inserted {
+                            let n = (c.coldCount[e] ?? 0) + 1
+                            c.coldCount[e] = n
+                            if n >= LayerExpertCache.boltFetchThreshold,
+                               n > bestCnt || (n == bestCnt && e < best) { best = e; bestCnt = n }
+                        }
+                    }
+                    if best >= 0 {
+                        _ = c.ensure([best])                       // LRU が 1 slot evict（bolt は pin 無し）
+                        c.coldCount[best] = 0
+                        c.rebuildBuddyCPU(numExperts: numExperts)  // fetch=自 slot / evict=buddy 降格
+                        LayerExpertCache.boltFetchBudgetLeft -= 1
+                        LayerExpertCache.boltFetchTotal += 1
+                    }
+                } else {
+                    var seenCold = Set<Int>()
+                    for e32 in flat {
+                        let e = Int(e32)
+                        if c.slotMap[e] == nil, seenCold.insert(e).inserted { c.coldCount[e] = (c.coldCount[e] ?? 0) + 1 }
+                    }
+                }
+                let btA = c.buddyTableCPU
+                for (j, e32) in flat.enumerated() { let e = Int(e32); remapVals[j] = e < btA.count ? btA[e] : 0 }
+                store = c.arena
+            } else {
+                let slotOf = c.ensure(U)                               // hit は pread 省略
+                for (j, e32) in flat.enumerated() { remapVals[j] = Int32(slotOf[Int(e32)]!) }
+                store = c.arena
+            }
         } else {
             var slot: [Int: Int] = [:]
             for (i, e) in U.enumerated() { slot[e] = i }

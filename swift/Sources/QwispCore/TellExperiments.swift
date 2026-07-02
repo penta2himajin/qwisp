@@ -917,11 +917,16 @@ extension Tell {
     /// - 結果: hard 100% / long 98.4%（不一致は f16 near-tie のみ）＝エンジンは MLX 準拠
     /// - env: QWISP_TFORCE
     /// - 旧名: TeacherForced / runTeacherForced（git 2516e30）。詳細 notes/00
+    /// teacher-forced per-token argmax fidelity (chaos-free): feed the reference sequence gR one
+    /// token at a time and check the method's argmax vs gR's next token. exact (skipMode=0) ≈ 100%
+    /// (lossless sanity); QWISP_SKIPMODE=3 measures BOLT's buddy per-token fidelity (calib + buddy
+    /// table + synced-buddy). near-tie diag splits f16 rank≤2 flips (benign) from real divergence.
     public static func measureMLXFidelity(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
         guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else { return "[MLXFidelity] skip" }
         let C = Tell.envInt("QWISP_CACHE_C", 64)
+        let buddyMode = ProcessInfo.processInfo.environment["QWISP_SKIPMODE"] == "3"
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
         let source = try ExpertSource(modelDir: modelDir); try source.warm()
@@ -929,9 +934,65 @@ extension Tell {
         let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
+        return try mlxFidelityCore(model: model, ids: ids, gR: gR, C: C, buddy: buddyMode).summary
+    }
+
+    /// ★ T1: teacher-forced fidelity 本体 core。prebuilt model で measureMLXFidelity と
+    /// TellBench(batch bench, bolt fidelity 軸)の両方から呼ぶ。buddy=true が QWISP_SKIPMODE=3 相当。
+    /// in-process 連続実行を想定し、依存する global static は entry で全て明示 set、exit(defer)で reset
+    /// （fuseGDN=false は fresh-process の mlx-fidelity 呼びと同一条件を保つため明示）。
+    static func mlxFidelityCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int, buddy buddyMode: Bool)
+        throws -> (summary: String, match: Int, n: Int) {
+        // ★ entry で依存 static を全て明示 set（in-process 連続実行では前 run の leak が実バグになる）。
+        GatedDeltaNetLayer.f32Conv = true; AttentionLayer.f32SDPA = true   // f32-full (match strict/bolt verify)
+        GatedDeltaNetLayer.fuseGDN = false
+        AttentionLayer.seqMultiToken = false; AttentionLayer.perQueryNone = false
+        StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0
+        StreamingMoEBlock.captureInds = false
+        StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.hotMissAccum = nil
+        LayerExpertCache.overflowCheck = false; LayerExpertCache.overflowMaxUnion = 0
+        LayerExpertCache.overflowSafeRows = Int.max
+        defer {
+            StreamingMoEBlock.skipMode = 0; StreamingMoEBlock.probeNoSync = false
+            StreamingMoEBlock.captureInds = false
+            GatedDeltaNetLayer.f32Conv = false; AttentionLayer.f32SDPA = false
+        }
         let N = Swift.min(Tell.envInt("QWISP_GEN", 128), gR.count)
+        let nE = 256, nMoE = model.expertCaches.count
+
+        if buddyMode {
+            // calib (exact, teacher-forced over gR): frequency + co-activation -> buddy table.
+            let calibN = Swift.max(1, Swift.min(Tell.envInt("QWISP_CALIB", 48), N - 1))
+            var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
+            var coact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE), count: nMoE)
+            let cc = model.makeCaches()
+            StreamingMoEBlock.probeNoSync = false; StreamingMoEBlock.skipMode = 0; StreamingMoEBlock.captureInds = true
+            var (_, clg) = try model.prefillChunked(ids, caches: cc)
+            MLX.eval([clg] + cc.flatMap { $0.stateArrays }); _ = clg
+            for i in 0 ..< calibN {
+                (_, clg) = try model.forwardHidden(MLXArray([Int32(gR[i])], [1, 1]), caches: cc)
+                MLX.eval([clg] + cc.flatMap { $0.stateArrays } + model.expertCaches.compactMap { $0.lastInds })
+                for (mi, ec) in model.expertCaches.enumerated() {
+                    if let li = ec.lastInds {
+                        let es = li.asArray(Int32.self).map { Int($0) }
+                        for e in es { counts[mi][e] += 1 }
+                        for a in 0 ..< es.count { for b in (a + 1) ..< es.count {
+                            coact[mi][es[a]][es[b]] += 1; coact[mi][es[b]][es[a]] += 1 } }
+                    }
+                }
+            }
+            StreamingMoEBlock.captureInds = false
+            for (mi, ec) in model.expertCaches.enumerated() {
+                _ = ec.ensure(Array(counts[mi].enumerated()
+                    .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                    .prefix(C).map { $0.offset }))
+                ec.buildBuddyTable(coact: coact[mi], numExperts: nE)
+            }
+        }
+
         let caches = model.makeCaches()
-        StreamingMoEBlock.probeNoSync = false   // exact gather（demand-load）
+        StreamingMoEBlock.probeNoSync = false
+        StreamingMoEBlock.skipMode = buddyMode ? 3 : 0   // buddy remap (synced) for bolt fidelity
 
         // prefill → 位置0の予測（gR[0] のはず）
         var (_, lg) = try model.prefillChunked(ids, caches: caches)
@@ -953,6 +1014,7 @@ extension Tell {
         record(0, v)
         MLX.eval([v] + caches.flatMap { $0.stateArrays })
         for i in 0 ..< (N - 1) {
+            if buddyMode { LayerExpertCache.boltFetchBudgetLeft = i < 24 ? 2 : 0 }   // B3 warmup-then-freeze（production bolt と同条件）
             let inp = MLXArray([Int32(gR[i])], [1, 1])   // teacher-forced: reference token を強制入力
             (_, lg) = try model.forwardHidden(inp, caches: caches)
             v = lg[0, 0]
@@ -964,10 +1026,12 @@ extension Tell {
         let nearTie = mism.filter { $0.refRank <= 2 }.count
         var diag = mism.prefix(8).map { String(format: "p%d:pred=%d ref=%d(rank%d,gap%.3f)", $0.pos, $0.pred, $0.ref, $0.refRank, $0.gap) }.joined(separator: " | ")
         if diag.isEmpty { diag = "(no mismatch)" }
-        return String(format: """
-            [MLXFidelity] mlx-swift exact vs mlx_lm(gR) per-token: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
+        let mode = buddyMode ? "bolt(buddy)" : "exact(strict)"
+        let summary = String(format: """
+            [MLXFidelity/%@] teacher-forced per-token fidelity vs gR: %d/%d=%.1f%%  mismatch=%d (near-tie rank≤2: %d)
               first mismatches: %@
-            """, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
+            """, mode, match, N, Double(match) / Double(N) * 100, mism.count, nearTie, diag)
+        return (summary, match, N)
     }
 
     /// **2-pass 自己予測 prefetch decode**
@@ -2942,7 +3006,7 @@ extension Tell {
         let fpn = fp / norm
         let sim = MLX.matmul(fpn, fpn.transposed()); sim.eval()      // [E, E] cosine
         let simArr = sim.asArray(Float.self)
-        let hot = Array(slotOf.keys)
+        let hot = slotOf.keys.sorted()   // 決定化（buildBuddyTable と同じ Dictionary 走査順問題の hygiene）
         var bmap = [Int32](repeating: 0, count: numExperts)
         for e in 0 ..< numExperts {
             if let s = slotOf[e] { bmap[e] = Int32(s); continue }

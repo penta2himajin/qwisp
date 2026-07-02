@@ -14,6 +14,25 @@ public final class ExpertSource {
 
     struct TensorMeta { let dtype: String; let shape: [Int]; let begin: Int; let end: Int }
 
+    // ★ SSD 帯域エミュレーション (slow-NAND=Neo の C/D 評価): preadInto を単一 chokepoint とした
+    //   leaky-bucket active throttle。QWISP_SSD_THROTTLE_GBS=目標 BW(GB/s, 0=無効)。単一 NAND の直列性を
+    //   lock+virtualClock で模擬し、fast pread 後に modeled 完了時刻まで nanosleep → engine の実 prefetch/
+    //   overlap が自然応答=faithful。QWISP_SSD_ACCT=1 で bytes/reads/実 nanos 累積(cross-check)。既定 off。
+    nonisolated(unsafe) public static var throttleGBs: Double = Double(ProcessInfo.processInfo.environment["QWISP_SSD_THROTTLE_GBS"] ?? "") ?? 0
+    nonisolated(unsafe) public static var acct = ProcessInfo.processInfo.environment["QWISP_SSD_ACCT"] == "1"
+    nonisolated(unsafe) public static var acctBytes = 0
+    nonisolated(unsafe) public static var acctReads = 0
+    nonisolated(unsafe) public static var acctNanos: UInt64 = 0        // 実 pread 時間(throttle sleep 除く)
+    nonisolated(unsafe) static var virtualClockNs: UInt64 = 0          // 単一 NAND が free になる時刻
+    static let throttleLock = NSLock()
+    // ★ T2: throttle defer knob。QWISP_THROTTLE_DEFER=1 で「初期 ~18GB weight load / calib / prefill」を
+    //   throttle 対象外にし、runner が timed decode 直前に throttleActive=true を立てるまで不活性化
+    //   （steady-state decode tok/s の計測に load/prefill の throttle は無関係で計測が ~2x 遅いだけ）。
+    //   既定 OFF(throttleActive=true)=現行挙動と完全同一。batch runner は cell 毎に !throttleDefer へ reset。
+    public static let throttleDefer = ProcessInfo.processInfo.environment["QWISP_THROTTLE_DEFER"] == "1"
+    nonisolated(unsafe) public static var throttleActive = ProcessInfo.processInfo.environment["QWISP_THROTTLE_DEFER"] != "1"
+    public static func resetAcct() { throttleLock.lock(); acctBytes = 0; acctReads = 0; acctNanos = 0; virtualClockNs = 0; throttleLock.unlock() }
+
     let dir: URL
     let wm: [String: String]                          // tensor name -> shard
     var headers: [String: (meta: [String: TensorMeta], dataStart: Int)] = [:]
@@ -132,8 +151,32 @@ public final class ExpertSource {
         let (_, dataStart) = try header(shard)
         let stride = (t.end - t.begin) / t.shape[0]
         let offset = dataStart + t.begin + e * stride
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let n = pread(fd(shard), buf, stride, off_t(offset))
         if n != stride { throw NSError(domain: "ExpertSource", code: 3) }
+        let dt = DispatchTime.now().uptimeNanoseconds - t0
+        if ExpertSource.acct {
+            ExpertSource.throttleLock.lock()
+            ExpertSource.acctBytes += stride; ExpertSource.acctReads += 1; ExpertSource.acctNanos += dt
+            ExpertSource.throttleLock.unlock()
+        }
+        // ★ leaky-bucket throttle: 単一 NAND を直列にモデル化。serveNs = stride / (GB/s)（GB=1e9, ns=s×1e9 相殺）。
+        //   throttleActive: T2 defer gate（既定 true=透過。QWISP_THROTTLE_DEFER=1 時のみ decode 開始まで false）。
+        if ExpertSource.throttleGBs > 0 && ExpertSource.throttleActive {
+            let serveNs = UInt64(Double(stride) / ExpertSource.throttleGBs)
+            ExpertSource.throttleLock.lock()
+            let now = DispatchTime.now().uptimeNanoseconds
+            let start = Swift.max(now, ExpertSource.virtualClockNs)
+            let end = start &+ serveNs
+            ExpertSource.virtualClockNs = end
+            ExpertSource.throttleLock.unlock()
+            let after = DispatchTime.now().uptimeNanoseconds
+            if end > after {
+                let s = end - after
+                var ts = timespec(tv_sec: Int(s / 1_000_000_000), tv_nsec: Int(s % 1_000_000_000))
+                nanosleep(&ts, nil)
+            }
+        }
     }
 
     /// expert e の (layer,proj,part) スライスを [1, rest...] の MLXArray で返す（pread, 自前 buffer 所有）。

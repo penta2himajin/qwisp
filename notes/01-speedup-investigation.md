@@ -32,8 +32,11 @@ softmax / GDN updateKernel は全て order-stable(rel=0)**。drift 源は **atte
 ### 1-3. maxK 上限を C 比例で解放（commit 677ef28）
 旧 maxK=4 上限は f16 運頼み回避の保護。f32-full は bit-exact ゆえ撤廃。**真の上限は精度でなく
 per-layer cache 容量**: D+1 トークン verify で 1 層が同時に要するユニーク expert 数が C 超で
-wrong-slot=silent garbage。実測安全境界 **C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8**。
-`maxK=min(QWISP_DRAFT_K, C×3/8)` でクランプ(超過時ログ)。
+wrong-slot=silent garbage。~~実測安全境界 C=64→maxK24 / C=128→maxK48 = maxK ≤ C×3/8~~。
+★**訂正(2026-07-01): C×3/8 は安全でない**=diverse routing で union ~2×C まで膨張し lossless-by-luck
+(C=64 code 3/4 rep 非lossless 実測)。真の strict-lossless は **union-overflow guard**(実 union 観測+
+overflow prefix re-verify)。honest 値 C=64 code21/mix43/nl20, C=128 code110/mix64。詳細 notes/00。
+`maxK=min(QWISP_DRAFT_K, C×3/8)` は初期上限、実効は guard が動的決定。
 
 ### 1-4. 実測（vs Swift-greedy 100% lossless, commit e79bef7）
 | | 8GB C=64 | 16GB C=128 |

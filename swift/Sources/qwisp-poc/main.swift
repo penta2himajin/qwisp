@@ -114,6 +114,8 @@ if CommandLine.arguments.contains("stream") {
         ("predictor-recall",      { try Tell.measurePredictorRecall(modelDir: $0, refPath: $1) }),
         ("mmap-gather",           { try Tell.measureMmapGather(modelDir: $0, refPath: $1) }),
         ("mlx-fidelity",          { try Tell.measureMLXFidelity(modelDir: $0, refPath: $1) }),
+        ("bolt",                  { try Tell.runBolt(modelDir: $0, refPath: $1) }),
+        ("bench-batch",           { md, _ in try Tell.runBenchBatch(modelDir: md) }),   // T1: 1 load で全 cell
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {
@@ -124,9 +126,15 @@ if CommandLine.arguments.contains("stream") {
         exit(0)
     }
 
-    // 既定: 標準手法 SuffixSpec（batched f32-full verify, lossless, Pareto 最適）。
+    // 既定: 標準手法 SuffixSpec（batched f32-full verify, strict-L1, Pareto 最適）。
+    // QWISP_BOLT=1 で opt-in L3 bolt-mode（slow-NAND 向け near-lossless）。unset なら strict のまま。
     // 旧 2 系統(SpecK/Fast)は QWISP_RUN=spec-verify / buddy-no-sync で利用可。
-    do { print(try Tell.runSuffixSpec(modelDir: md, refPath: mtpRef)) } catch { print("[SuffixSpec] error: \(error)") }
+    let boltDefault = env["QWISP_BOLT"] == "1"
+    do {
+        print(try (boltDefault
+            ? Tell.runBolt(modelDir: md, refPath: mtpRef)
+            : Tell.runSuffixSpec(modelDir: md, refPath: mtpRef)))
+    } catch { print("[\(boltDefault ? "Bolt" : "SuffixSpec")] error: \(error)") }
     exit(0)
 }
 
