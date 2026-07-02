@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 9
+        let total = 11
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -372,6 +372,79 @@ public enum RawVerifyTests {
                 if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
+        }
+
+        // Test 10: qmm_tiled_m_invariant
+        // Property: for a fixed weight and input row, qmmTiled's per-row output is
+        // bit-identical regardless of how many other rows are batched in the same call (M-independence).
+        // Kernel proof: wdq[] is dequanted once before the M-loop; per-row k-accumulation
+        // uses stride=(lid→K, step tgs=256) then a 256-slot binary reduction tree —
+        // order depends only on K and tgs, not on M.
+        // Also checks: full M-row output == concat of M individual qmmTiled(M=1) calls.
+        // NOTE: we do NOT compare tiled against qmv/MLX — they legitimately differ
+        // (different reduction order); M-invariance of the tiled kernel itself is what we test.
+        run("qmm_tiled_m_invariant") {
+            let K = 2048, N = 2048, Mmax = 25
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            let xAll = MLXRandom.normal([Mmax, K]).asType(.float16)
+            MLX.eval([wq, sc, bi, xAll])
+
+            let Ms = [1, 2, 9, 17, 25]
+
+            // Step 1: collect row-0 output for each M; all must be bit-identical.
+            var row0Ref: MLXArray? = nil
+            for M in Ms {
+                let xM = xAll[0..<M]   // [M, K]
+                guard let out = RawMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+                else { return (false, "qmmTiled returned nil M=\(M)") }
+                out.eval()
+                let row0 = out[0..<1]   // [1, N]
+                row0.eval()
+                if let ref0 = row0Ref {
+                    let (ok, d) = bitEqual(row0, ref0)
+                    if !ok { return (false, "M-independence FAIL at M=\(M): \(d)") }
+                } else {
+                    row0Ref = row0
+                }
+            }
+
+            // Step 2: for each M, full output must equal concat of M individual M=1 calls.
+            for M in Ms {
+                let xM = xAll[0..<M]
+                guard let outM = RawMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+                else { return (false, "qmmTiled(M=\(M)) nil in concat-check") }
+                outM.eval()
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    let x1 = xAll[m..<m+1]   // [1, K]
+                    guard let r = RawMetalForward.qmmTiled(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)
+                    else { return (false, "qmmTiled(M=1) nil M=\(M) m=\(m)") }
+                    r.eval(); refParts.append(r)
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok, d) = bitEqual(outM, ref)
+                if !ok { return (false, "row-loop FAIL M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 11: qmm_tiled_selfconsistent
+        // Two identical qmmTiled(M=9) calls must produce bit-identical outputs
+        // (determinism under fixed safe-math compilation and fixed kernel reduction order).
+        run("qmm_tiled_selfconsistent") {
+            let K = 2048, N = 2048, M = 9
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            let x = MLXRandom.normal([M, K]).asType(.float16)
+            MLX.eval([wq, sc, bi, x])
+            guard let a = RawMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N),
+                  let b = RawMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+            else { return (false, "qmmTiled returned nil") }
+            MLX.eval([a, b])
+            return bitEqual(a, b)
         }
 
         // ── Summary ───────────────────────────────────────────────────────
