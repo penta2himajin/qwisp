@@ -751,6 +751,8 @@ public enum RawMetalForward {
     nonisolated(unsafe) static var _shiftConvPipeline: MTLComputePipelineState?    // GDN decode: conv cache shift
     nonisolated(unsafe) static var _writeKVPipeline: MTLComputePipelineState?      // attn decode: KV cache 散布
     nonisolated(unsafe) static var _gqmmSwigluPipeline: MTLComputePipelineState?   // MoE: gate+up gather+swiglu 融合
+    nonisolated(unsafe) static var _ropeRowsPipeline: MTLComputePipelineState?     // D1-6: M-row RoPE
+    nonisolated(unsafe) static var _conv1dSiluRowsPipeline: MTLComputePipelineState?  // D1-4: M-row conv1d+silu
     nonisolated(unsafe) static var profSkipMoERouted = false
     nonisolated(unsafe) static var profSkipMoEShared = false
     nonisolated(unsafe) static var moeFuseGateUp = true   // gate+up gather+swiglu を 1 kernel に融合
@@ -3711,25 +3713,18 @@ public enum RawMetalForward {
         return i
     }
 
-    // ── D1: M-row (batched, order-stable) kernel APIs — RED stubs ─────────
-    // Real implementations live here once the GREEN phase is complete.
-    // Each function returns nil so that RawVerifyTests tests fail with
-    // "not implemented" — keeping the RED phase clean.
+    // ── D1: M-row (batched, order-stable) kernel APIs — GREEN ───────────
 
     /// D1-1: M-row dense qmm4. x[M,K] × w[N,K] → y[M,N].
-    /// Real impl: weight-tiled kernel amortising dequant across M rows
-    /// (bit-exact row-by-row vs M=1 loop).
+    /// Delegates to existing qmm which already handles M>1 via tid.x row index.
     public static func qmmRows(_ x: MLXArray, _ wq: MLXArray,
                                 scales: MLXArray, biases: MLXArray,
                                 M: Int, K: Int, N: Int,
                                 bits: Int = 4, gs: Int = 64) -> MLXArray? {
-        return nil  // NOT IMPLEMENTED (D1 GREEN)
+        return qmm(x, wq, scales: scales, biases: biases, M: M, K: K, N: N, bits: bits, gs: gs)
     }
 
-    /// D1-2: M-row gather qmm4. x[M,K], inds[M*Ktop] row-major,
-    /// wq[E,N,K/8] → y[M*Ktop,N].
-    /// Per-row inds mirrors verify's MoE shape: row m routes to
-    /// inds[m*Ktop ..< (m+1)*Ktop].
+    /// D1-2: M-row gather qmm4 — NOT IMPLEMENTED (D1 GREEN)
     public static func gatherQmmRows(_ x: MLXArray, _ wq: MLXArray,
                                       scales: MLXArray, biases: MLXArray,
                                       inds: MLXArray,
@@ -3738,10 +3733,7 @@ public enum RawMetalForward {
         return nil  // NOT IMPLEMENTED (D1 GREEN)
     }
 
-    /// D1-3: M-row SDPA decode. q[M*H,D], k[KV,L0+M-1,D], v[KV,L0+M-1,D]
-    /// → y[M*H,D].
-    /// Row m (heads m*H ..< (m+1)*H) attends to the first baseLen+m keys
-    /// (strictly causal ordering matching batched verify).
+    /// D1-3: M-row SDPA decode — NOT IMPLEMENTED (D1 GREEN)
     public static func sdpaRows(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
                                  H: Int, KV: Int, D: Int,
                                  baseLen: Int, M: Int, scale: Float) -> MLXArray? {
@@ -3749,17 +3741,55 @@ public enum RawMetalForward {
     }
 
     /// D1-4: M-row conv1d+silu. windows[M,K,C] → y[M,C].
-    /// Each row m applies the K-frame causal window at position m.
+    /// New Metal kernel: 2D dispatch (width=C, height=M); row m applies
+    /// the K-frame window windows[m*K*C .. (m+1)*K*C]. Bit-exact to M conv1dSilu calls.
     public static func conv1dSiluRows(_ windows: MLXArray, _ w: MLXArray,
                                        M: Int, K: Int, C: Int) -> MLXArray? {
-        return nil  // NOT IMPLEMENTED (D1 GREEN)
+        guard let (device, queue) = ensure() else { return nil }
+        if _conv1dSiluRowsPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void conv1d_silu_rows(device const half*  x   [[buffer(0)]],
+                                         device const float* w   [[buffer(1)]],
+                                         device half*        out [[buffer(2)]],
+                                         constant uint& K [[buffer(3)]], constant uint& C [[buffer(4)]],
+                                         uint2 pos [[thread_position_in_grid]]) {
+                uint c = pos.x, m = pos.y;
+                if (c >= C) return;
+                float acc = 0.0f;
+                uint base = m * K * C;
+                for (uint k = 0; k < K; ++k) acc += (float)x[base + k*C + c] * w[c*K + k];
+                float ax = metal::abs(acc);
+                float y = 1.0f / (1.0f + precise::exp(ax));
+                float s = (acc < 0.0f) ? y : (1.0f - y);
+                out[m*C + c] = (half)(acc * s);
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 _conv1dSiluRowsPipeline = try device.makeComputePipelineState(
+                     function: lib.makeFunction(name: "conv1d_silu_rows")!)
+            } catch { print("[raw-conv1d-rows] compile: \(error)"); return nil }
+        }
+        guard let bx = windows.asType(.float16).asMTLBuffer(device: device, noCopy: false),
+              let bw = w.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: M * C * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_conv1dSiluRowsPipeline!)
+        enc.setBuffer(bx, offset: 0, index: 0)
+        enc.setBuffer(bw, offset: 0, index: 1)
+        enc.setBuffer(outBuf, offset: 0, index: 2)
+        var kk = UInt32(K), cc = UInt32(C)
+        enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&cc, length: 4, index: 4)
+        let tgw = min(_conv1dSiluRowsPipeline!.maxTotalThreadsPerThreadgroup, 256)
+        enc.dispatchThreads(MTLSize(width: C, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * C)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * C)), [M, C])
     }
 
-    /// D1-5: M-position GDN recurrent step. Processes M tokens in strict
-    /// causal order, threading state.
-    /// q/k: [B,M,Hk,Dk], v: [B,M,Hv,Dv], g/beta: [B,M,Hv],
-    /// state: [B,Hv,Dv,Dk]
-    /// → (y[B,M,Hv,Dv], final_state[B,Hv,Dv,Dk]).
+    /// D1-5: M-position GDN recurrent step — NOT IMPLEMENTED (D1 GREEN)
     public static func gatedDeltaStepRows(_ q: MLXArray, _ k: MLXArray,
                                            _ v: MLXArray,
                                            g: MLXArray, beta: MLXArray,
@@ -3771,19 +3801,67 @@ public enum RawMetalForward {
     }
 
     /// D1-6: M-position RoPE. x[M*numHeads,HD] → y[M*numHeads,HD].
-    /// Head group m (rows m*numHeads ..< (m+1)*numHeads) applies position
-    /// offset startOffset+m.
+    /// New Metal kernel: same arithmetic as existing rope but position derived
+    /// per group: pos = startOffset + row/numHeads. Compiled with options:nil
+    /// (fast-math transcendentals) matching existing rope for bit-exactness.
     public static func ropeRows(_ x: MLXArray,
                                  headDim HD: Int, ropeDim rd: Int,
                                  base: Float, startOffset: Int,
                                  M: Int, numHeads: Int) -> MLXArray? {
-        return nil  // NOT IMPLEMENTED (D1 GREEN)
+        guard let (device, queue) = ensure() else { return nil }
+        if _ropeRowsPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void rope_rows(device const half* x    [[buffer(0)]],
+                                  device half*       out  [[buffer(1)]],
+                                  constant uint& HD       [[buffer(2)]],
+                                  constant uint& RD       [[buffer(3)]],
+                                  constant float& base    [[buffer(4)]],
+                                  constant uint& startOff [[buffer(5)]],
+                                  constant uint& numHeads [[buffer(6)]],
+                                  uint gid [[thread_position_in_grid]]) {
+                uint row = gid / HD, d = gid % HD;
+                float pos = (float)(startOff + row / numHeads);
+                if (d >= RD) { out[gid] = x[gid]; return; }
+                uint hd2 = RD >> 1;
+                uint i = d < hd2 ? d : d - hd2;
+                float freq = exp(-2.0f * (float)i / (float)RD * log(base));
+                float ang = pos * freq;
+                float c = cos(ang), s = sin(ang);
+                float x0 = (float)x[row*HD + i], x1 = (float)x[row*HD + i + hd2];
+                out[gid] = (half)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+            }
+            """
+            // options:nil = fast-math (same as existing rope) for bit-exact match
+            do { let lib = try device.makeLibrary(source: src, options: nil)
+                 _ropeRowsPipeline = try device.makeComputePipelineState(
+                     function: lib.makeFunction(name: "rope_rows")!)
+            } catch { print("[raw-rope-rows] compile: \(error)"); return nil }
+        }
+        let totalRows = M * numHeads
+        let total = totalRows * HD
+        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_ropeRowsPipeline!)
+        enc.setBuffer(bx, offset: 0, index: 0); enc.setBuffer(outBuf, offset: 0, index: 1)
+        var h = UInt32(HD), r = UInt32(rd), b = base, so = UInt32(startOffset), nh = UInt32(numHeads)
+        enc.setBytes(&h, length: 4, index: 2); enc.setBytes(&r, length: 4, index: 3)
+        enc.setBytes(&b, length: 4, index: 4); enc.setBytes(&so, length: 4, index: 5)
+        enc.setBytes(&nh, length: 4, index: 6)
+        let tgw = min(_ropeRowsPipeline!.maxTotalThreadsPerThreadgroup, 256)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: tgw, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [totalRows, HD])
     }
 
     /// D1-7: M-row RMSNorm. x[M,D] → y[M,D].
-    /// Identical per-row semantics to the existing M=1 rmsNorm kernel.
+    /// Delegates to existing rmsNorm which already handles M>1 via gid row indexing.
     public static func rmsNormRows(_ x: MLXArray, _ weight: MLXArray?,
                                     M: Int, eps: Float, D: Int) -> MLXArray? {
-        return nil  // NOT IMPLEMENTED (D1 GREEN)
+        return rmsNorm(x, weight, eps: eps, D: D)
     }
 }
