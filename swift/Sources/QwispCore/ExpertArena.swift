@@ -271,6 +271,12 @@ public final class LayerExpertCache {
             for s in 0 ..< C where expertAt[s] == -1 { slot = s; break }
             if slot == -1 {
                 // LRU 退避: pinned slot は対象外（hot を保護）
+                // ★same-call 不変量(A5 実験で学習, 2026-07-02): 同一 ensure call 内で触れた slot（hit/新規
+                //   割当）を同 call 中に退避すると同 forward の 2 expert が slot を共有し wrong-slot garbage
+                //   （U≤C なら guard も非検出）。LRU は「touch=最新 tick」でこれを暗黙に満たしている。
+                //   eviction policy を差し替える場合は touched-slot の明示除外 + U>C(overflow 進行中=guard が
+                //   巻戻す局面)での最古 tick フォールバックが必須（LFU 初実装は fidelity 2-27% に崩壊した）。
+                //   なお decayed-LFU 自体は実測で LRU と同速(slow 4.6 vs 4.7)= NO-GO 済み。
                 var oldest = -1
                 for s in 0 ..< C where !pinnedSlots.contains(s) {
                     if oldest == -1 || tick[s] < tick[oldest] { oldest = s }
