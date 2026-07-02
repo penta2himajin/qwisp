@@ -221,6 +221,123 @@ public enum Tell {
         // commit token の内訳（margin-certified vs replay 産）
         var certFallbacks = 0, certReplayFwd = 0, certCommitted = 0, replayCommitted = 0
         var safeMaxK = maxK   // overflow で縮む動的安全上限（union-overflow guard）
+        let unionGuard = C < nE
+        // ★ A3 "pending prefix": normal reject の rebuild forward（logits 不使用の cache 再構築 =
+        //   reject 1 回につき丸ごと 1 forward の無駄）を撤廃し、accepted prefix を「次の」verify に融合する。
+        //   pending = out/hist へ commit 済みだが cache に未実体化の token 列。次 step の verify 入力は
+        //   seq = pending + [u] + drafts（rows = pending.count + 1 + D）となり、decision row は
+        //   offset pending.count から始まる（先頭 pending 行の logits は commit 済み token の予測ゆえ無視）。
+        //   CORRECTNESS INVARIANT: KV/GDN cache は position-wise causal ゆえ、pre-pending 状態から
+        //   [pending, u, drafts] を 1 回の batched forward で流すのは、[pending] → [u, drafts] と
+        //   2 回の逐次 batched forward を流すのと数学的に同一の状態/logits を与える。但し fusion は
+        //   batch shape を変えるため kernel 累積順の微小 drift は起こり得る（cert が存在する理由その
+        //   もの）— decision row は全て margin-certified され、低 margin は逐次 replay に fallback
+        //   するため strict-lossless は保たれる。
+        var pending: [Int] = []
+        // 連続 reject で pending は非有界に成長し得る → cap 超過で flush し verify サイズ/guard 圧を有界化
+        let pendingCap = 24
+        var a3Fused = 0, flushes = 0
+        /// pending の cache 実体化のみを行う（logits 不使用 = 旧 rebuild-forward 相当のコストを edge case
+        /// でだけ払う）。C<nE では union guard 下で safe-prefix chunk に分割 forward（1 row の union は
+        /// ≤top8≤C ゆえ必ず前進 = 停止保証）。caller は verify mode（seqMT）を設定済みであること。
+        func flushPending() throws {
+            if pending.isEmpty { return }
+            flushes += 1
+            while !pending.isEmpty {
+                var chunk = pending
+                while true {
+                    if unionGuard {
+                        LayerExpertCache.overflowCheck = true
+                        LayerExpertCache.overflowMaxUnion = 0
+                        LayerExpertCache.overflowSafeRows = Int.max
+                    }
+                    let fsnaps = unionGuard ? mc.map { $0.snapshot() } : []
+                    _ = try decodeForward(MLXArray(chunk.map { Int32($0) }, [1, chunk.count]),
+                                          rows: chunk.count, escalate: false)
+                    if !unionGuard { break }
+                    LayerExpertCache.overflowCheck = false
+                    if LayerExpertCache.overflowMaxUnion > C && chunk.count > 1 {
+                        overflowCount += 1
+                        for (i, c) in mc.enumerated() { c.restore(fsnaps[i], isLinear: isLin[i], trim: chunk.count) }
+                        chunk = Array(chunk.prefix(Swift.max(1, Swift.min(chunk.count - 1,
+                                                                          LayerExpertCache.overflowSafeRows))))
+                        continue
+                    }
+                    break
+                }
+                MLX.eval(mc.flatMap { $0.stateArrays })
+                pending.removeFirst(chunk.count)
+            }
+        }
+        /// D==0 / singleFallback 共通: u を 1 token 進める。pending 非空なら fold（= pending+[u] を
+        /// 1 回の batched forward で実体化しつつ最終 row logits から次 token を得る = flush+forward より
+        /// 常に 1 forward 少ない）。fold の最終 row argmax は batched logits 由来の commit ゆえ既存の
+        /// cert パターン通り margin 認定し、≤τ は pre-pending snapshot からの M=1 逐次 replay で確定。
+        func advanceSingle(_ u: Int) throws {
+            if pending.isEmpty {                                  // 従来どおりの single-token greedy
+                setVerifyMode(false)
+                let glg = try decodeForward(uArr, rows: 1, escalate: true)
+                out.append(u); hist.append(u)
+                uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                return
+            }
+            let pk = pending.count
+            let snaps = mc.map { $0.snapshot() }                  // pre-pending 状態（前 step から不変）
+            setVerifyMode(true)
+            if unionGuard {
+                LayerExpertCache.overflowCheck = true
+                LayerExpertCache.overflowMaxUnion = 0
+                LayerExpertCache.overflowSafeRows = Int.max
+            }
+            let flg = try decodeForward(MLXArray((pending + [u]).map { Int32($0) }, [1, pk + 1]),
+                                        rows: pk + 1, escalate: false)
+            if unionGuard {
+                LayerExpertCache.overflowCheck = false
+                if LayerExpertCache.overflowMaxUnion > C {
+                    // pending+u すら容量 row に fit しない（稀）→ restore + chunked flush + 素の M=1 forward
+                    overflowCount += 1
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1) }
+                    try flushPending()
+                    setVerifyMode(false)
+                    let glg = try decodeForward(uArr, rows: 1, escalate: true)
+                    out.append(u); hist.append(u)
+                    uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
+                    MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                    return
+                }
+            }
+            let lastRow = flg[0, pk ..< (pk + 1)]                 // [1, V]: u 行 = 次 token の decision row
+            let evArr = MLX.argMax(lastRow, axis: -1)
+            let fm1 = MLX.max(lastRow, axis: -1, keepDims: true)
+            let fm2 = MLX.max(MLX.where(lastRow .>= fm1, MLXArray(-Float.infinity), lastRow),
+                              axis: -1, keepDims: true)
+            let fmg = (fm1 - fm2).reshaped([1])
+            MLX.eval([evArr, fmg])
+            out.append(u); hist.append(u)
+            if fmg.asArray(Float.self)[0] > certTau {             // certified → fold 成立（pending 実体化済み）
+                certCommitted += 1
+                uArr = MLXArray([evArr.asArray(Int32.self)[0]], [1, 1])
+                pending = []
+                setVerifyMode(false)
+                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+            } else {
+                // 未認定 → pre-pending snapshot から pending+[u] を M=1 逐次 replay（無条件 exact）
+                certFallbacks += 1
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1) }
+                setVerifyMode(false)
+                var rlg = flg
+                for t in pending + [u] {
+                    (_, rlg) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    MLX.eval([rlg] + mc.flatMap { $0.stateArrays })
+                    certReplayFwd += 1
+                }
+                uArr = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
+                MLX.eval([uArr])
+                replayCommitted += 1
+                pending = []
+            }
+        }
         ExpertSource.throttleActive = true   // T2: deferred throttle はここ（timed decode 開始）から有効
         let t0 = DispatchTime.now()
         while out.count < N {
@@ -231,15 +348,14 @@ public enum Tell {
             let D = drafts.count
             draftTot += D
             if prof { tDraft += now() - ts; ts = now() }
-            if D == 0 {                                          // 一致なし → 通常 greedy 1 step
-                let glg = try decodeForward(uArr, rows: 1, escalate: true)
-                out.append(u); hist.append(u)
-                uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
-                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+            if D == 0 {                                          // 一致なし → 通常 greedy 1 step（pending は fold）
+                try advanceSingle(u)
                 if prof { tVerify += now() - ts }
                 continue
             }
             setVerifyMode(true)
+            // pending 非空時、この snapshot は前 step から不変の pre-pending 状態のスナップ（restore で
+            // pre-pending へ戻り、新 pending = pending + [u] + accepted の連結になる）。
             let snaps = mc.map { $0.snapshot() }
             // ★ union-overflow guard(C<nE)+ EXACT safe-prefix + hysteresis: batched verify の per-layer
             //   expert union が C を超えると sync ensure が evict しきれず wrong-slot=silent garbage
@@ -249,28 +365,32 @@ public enum Tell {
             //   縮小すれば構成上 fit → re-verify は overflow event あたり厳密 1 回。safeMaxK に学習。
             //   成長は hysteresis: union≤0.9·C で成長、(0.9C, C] は現状維持(dead band 無しの小 band)。
             //   prefix<1 でのみ safe single-token。strict-lossless 保証。詳細 notes/00。
-            let unionGuard = C < nE
+            let pk = pending.count
             var curDrafts = drafts
             var vlg: MLXArray = uArr                              // placeholder（loop で必ず上書き）
             var singleFallback = false
             while true {
                 let dd = curDrafts.count
-                let seq = MLX.concatenated([uArr, MLXArray(curDrafts.map { Int32($0) }, [1, dd])], axis: 1)  // [1, dd+1]
+                let rows = pk + 1 + dd
+                // ★A3: verify 入力の先頭に pending を融合（実体化を兼ねる）。decision row offset = pk。
+                let seq = MLXArray((pending + [u] + curDrafts).map { Int32($0) }, [1, rows])
                 if unionGuard {
                     LayerExpertCache.overflowCheck = true
                     LayerExpertCache.overflowMaxUnion = 0
                     LayerExpertCache.overflowSafeRows = Int.max
                 }
-                vlg = try decodeForward(seq, rows: dd + 1, escalate: false)
+                vlg = try decodeForward(seq, rows: rows, escalate: false)
                 if !unionGuard { break }
                 LayerExpertCache.overflowCheck = false
                 let maxU = LayerExpertCache.overflowMaxUnion
-                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(dd) maxU=\(maxU) safeRows=\(LayerExpertCache.overflowSafeRows) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
+                if ofDbg { FileHandle.standardError.write("OFDBG C=\(C) D=\(dd) pk=\(pk) maxU=\(maxU) safeRows=\(LayerExpertCache.overflowSafeRows) safeMaxK=\(safeMaxK)\n".data(using: .utf8)!) }
                 if maxU > C {                                    // overflow → exact safe-prefix へ縮小し re-verify(1 回で fit)
                     overflowCount += 1
-                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: dd + 1) }
-                    // safeRows は u row(row 0)を含む row 数 → drafts = safeRows - 1
-                    let newLen = Swift.min(dd - 1, LayerExpertCache.overflowSafeRows - 1)
+                    for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: rows) }
+                    // safeRows は pending 行と u row を含む row 数 → drafts へ割ける行 = safeRows - 1 - pk。
+                    // safe prefix は pending+u prefix を決して侵食しない: 侵食が必要（newLen<1）なら draft は
+                    // 一切 fit しない → singleFallback へ（advanceSingle が pending の fold/flush を処理）。
+                    let newLen = Swift.min(dd - 1, LayerExpertCache.overflowSafeRows - 1 - pk)
                     safeMaxK = Swift.max(1, newLen)
                     if newLen < 1 { singleFallback = true; break }
                     curDrafts = Array(curDrafts.prefix(newLen))
@@ -280,12 +400,8 @@ public enum Tell {
                 }
                 break                                            // union≤C=fit → accept へ
             }
-            if singleFallback {                                  // 安全 prefix が 1 未満 → single-token(union≤top8≤C)
-                let glg = try decodeForward(uArr, rows: 1, escalate: true)
-                out.append(u); hist.append(u)
-                uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
-                setVerifyMode(false)
-                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+            if singleFallback {                                  // 安全 prefix が 1 未満 → single-token（pending は fold）
+                try advanceSingle(u)
                 if prof { tVerify += now() - ts }
                 continue
             }
@@ -294,7 +410,9 @@ public enum Tell {
             //   (MLX kernel の累積順が batch shape 依存、f32 でも微小 drift → near-tie で token flip)。
             //   各 row の top1−top2 logit margin が certTau を超える token のみ batched 結果から commit、
             //   低 margin の境界 token は M=1 逐次 replay で exact に確定する（strict-lossless）。
-            let vRows = vlg[0, 0 ..< (D2 + 1)]                    // [D2+1, V]
+            // ★A3: decision rows は offset pk から。row pk-1 以前（pending 行）の logits は commit 済み
+            //   token の予測ゆえ無視。row pk（u 行）が d0 を予測する最初の decision row。
+            let vRows = vlg[0, pk ..< (pk + D2 + 1)]              // [D2+1, V]
             let evalsArr = MLX.argMax(vRows, axis: -1)
             let vm1 = MLX.max(vRows, axis: -1, keepDims: true)
             let vm2 = MLX.max(MLX.where(vRows .>= vm1, MLXArray(-Float.infinity), vRows), axis: -1, keepDims: true)
@@ -312,14 +430,14 @@ public enum Tell {
             accTok += p
             certCommitted += p                                    // 受理 draft は margin-certified
             if certStop {
-                // 未認定 → SEQUENTIAL REPLAY: snapshot 復元後 [u]+accepted を 1 token ずつ M=1 forward
-                //   （greedy branch と同じ通常 single-token mode）。状態も次 token も逐次 exact =
-                //   無条件 certified。p=0 なら single M=1 forward（低 accept regime の common case）。
+                // 未認定 → SEQUENTIAL REPLAY: snapshot 復元後 pending+[u]+accepted を 1 token ずつ M=1
+                //   forward（greedy branch と同じ通常 single-token mode）。状態も次 token も逐次 exact =
+                //   無条件 certified。replay は pending も丸ごと実体化する → pending=[]。
                 certFallbacks += 1
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D2 + 1) }
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1 + D2) }
                 setVerifyMode(false)                              // replay は verify mode 外（greedy branch と同様）
                 var rlg = vlg                                     // placeholder（replay ≥1 token で必ず上書き）
-                for t in [u] + Array(curDrafts.prefix(p)) {
+                for t in pending + [u] + Array(curDrafts.prefix(p)) {
                     (_, rlg) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
                     MLX.eval([rlg] + mc.flatMap { $0.stateArrays })
                     certReplayFwd += 1
@@ -327,16 +445,21 @@ public enum Tell {
                 uArr = MLX.argMax(rlg[0, 0], axis: -1).reshaped([1, 1])
                 MLX.eval([uArr])
                 replayCommitted += 1
+                pending = []
             } else if p == D2 {
                 certCommitted += 1                                // bonus token evals[D2] も certified
                 uArr = MLXArray([Int32(evals[D2])], [1, 1])
+                pending = []                                      // fused forward が pending ごと実体化済み
                 setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             } else {
                 certCommitted += 1                                // reject 境界 token evals[p] は certified
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D2 + 1) }
-                let acc = [u] + Array(curDrafts.prefix(p))
-                _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1 + D2) }
+                // ★A3 fused reject: 旧 rebuild forward（logits 不使用の cache 再構築）を SKIP し、
+                //   [u]+accepted を pending に積んで次 verify に融合（連続 reject では連結で成長）。
+                pending += [u] + Array(curDrafts.prefix(p))
+                a3Fused += 1
+                if pending.count > pendingCap { try flushPending() }   // 非有界成長の cap（verify mode はまだ true）
                 setVerifyMode(false)
                 uArr = MLXArray([Int32(evals[p])], [1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
@@ -361,14 +484,16 @@ public enum Tell {
         let ovTag = overflowCount > 0 ? "  [union-overflow guard: \(overflowCount) step re-verify/fallback]" : ""
         let certTag = String(format: "  cert-fallback=%d(%d fwd) commit(cert=%d/replay=%d)",
                              certFallbacks, certReplayFwd, certCommitted, replayCommitted)
+        // A3 telemetry: fused-reject 数 = 節約した rebuild forward 数 / flush = edge-case で払った実体化
+        let a3Tag = String(format: "  a3-fused=%d flush=%d", a3Fused, flushes)
         if Tell.envFlag("QWISP_DUMP_TOKENS") {   // bench correctness axis: prompt + method output
             print("PROMPT_TOKENS:" + ids.asArray(Int32.self).map { String($0) }.joined(separator: ","))
             print("OUT_TOKENS:" + outN.map { String($0) }.joined(separator: ","))
         }
         let tokps = Double(N) / secs
         let summary = String(format: """
-            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs ref=Swift正準greedy) %d/%d=%.0f%%%@%@%@
-            """, maxK, C, tokps, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag, certTag)
+            [SuffixSpec] suffix draft(maxK=%d) + clean exact verify(C=%d): %.1f tok/s  accept/step=%.2f  品質(vs ref=Swift正準greedy) %d/%d=%.0f%%%@%@%@%@
+            """, maxK, C, tokps, Double(accTok) / Double(steps), match, N, Double(match) / Double(N) * 100, swiftTag, ovTag, certTag, a3Tag)
         return (summary, tokps)
     }
 

@@ -143,6 +143,17 @@ extension Tell {
         var hist = ids.asArray(Int32.self).map { Int($0) }
 
         var out: [Int] = []; var steps = 0, accTok = 0, draftSteps = 0
+        // ★A3 "pending prefix"（bolt 版）: normal reject の rebuild forward（logits 不使用の cache 再構築）
+        //   を撤廃し、[u]+accepted を次 verify の先頭に融合。
+        //   CORRECTNESS INVARIANT: KV/GDN cache は position-wise causal ゆえ、pre-pending 状態から
+        //   [pending, u, drafts] の 1 回 batched forward は [pending] → [u, drafts] の 2 回逐次 forward と
+        //   数学的に同一の状態/logits。fusion は batch shape を変えるため kernel 累積順の微小 drift は
+        //   あり得るが、bolt は near-lossless L3（cert 無し・buddy verify そのものが品質軸）ゆえ許容。
+        //   bolt の verify は buddy-synced（ensure 無し）＝capacity guard/flush 不要。cap 超過時のみ
+        //   plain forward で実体化し verify サイズを有界化。
+        var pending: [Int] = []
+        let pendingCap = 24
+        var a3Fused = 0, flushes = 0
         ExpertSource.throttleActive = true   // T2: deferred throttle はここ（phase-3c timed decode 開始）から有効
         let t0 = DispatchTime.now()
         while out.count < N {
@@ -151,29 +162,51 @@ extension Tell {
             let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: maxK, minMatch: minMatch)
             let D = drafts.count
             if D == 0 {                              // nl / novel: single buddy no-sync greedy (fallback)
-                let (_, glg) = try model.forwardHidden(uArr, caches: mc)
-                out.append(u); hist.append(u)
-                uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
-                MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                if pending.isEmpty {
+                    let (_, glg) = try model.forwardHidden(uArr, caches: mc)
+                    out.append(u); hist.append(u)
+                    uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
+                    MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                } else {
+                    // A3 D==0 fold: pending+[u] を 1 回の batched forward で実体化しつつ最終 row（u 行）
+                    // の argmax から次 token（bolt は cert 無し = margin 認定不要）。
+                    let pk = pending.count
+                    let seq = MLXArray((pending + [u]).map { Int32($0) }, [1, pk + 1])
+                    let (_, glg) = try model.forwardHidden(seq, caches: mc)
+                    out.append(u); hist.append(u)
+                    uArr = MLX.argMax(glg[0, pk], axis: -1).reshaped([1, 1])
+                    MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                    pending = []
+                }
                 continue
             }
             draftSteps += 1
+            let pk = pending.count
+            // pending 非空時、この snapshot は前 step から不変の pre-pending 状態のスナップ。
             let snaps = mc.map { $0.snapshot() }
-            let seq = MLX.concatenated([uArr, MLXArray(drafts.map { Int32($0) }, [1, D])], axis: 1)  // [1,D+1]
+            // ★A3: verify 入力の先頭に pending を融合（実体化を兼ねる）。decision row offset = pk。
+            let seq = MLXArray((pending + [u] + drafts).map { Int32($0) }, [1, pk + 1 + D])
             let (_, vlg) = try model.forwardHidden(seq, caches: mc)   // buddy no-sync batched verify
-            let evals = MLX.argMax(vlg[0, 0 ..< (D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
+            let evals = MLX.argMax(vlg[0, pk ..< (pk + D + 1)], axis: -1).asArray(Int32.self).map { Int($0) }
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
             out.append(u); hist.append(u)
             for i in 0 ..< p { out.append(drafts[i]); hist.append(drafts[i]) }
             accTok += p
-            if p == D {                              // full accept: state already advanced D+1
+            if p == D {                              // full accept: state already advanced pk+D+1
                 uArr = MLXArray([Int32(evals[D])], [1, 1])
+                pending = []                         // fused forward が pending ごと実体化済み
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
-            } else {                                 // partial: restore + re-run buddy prefix to sync state
-                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: D + 1) }
-                let acc = [u] + Array(drafts.prefix(p))
-                _ = try model.forwardHidden(MLXArray(acc.map { Int32($0) }, [1, acc.count]), caches: mc)
+            } else {                                 // partial: restore + accepted prefix を pending へ（re-forward SKIP）
+                for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1 + D) }
+                pending += [u] + Array(drafts.prefix(p))
+                a3Fused += 1
+                if pending.count > pendingCap {      // 連続 reject の非有界成長 cap: plain forward で実体化
+                    flushes += 1
+                    _ = try model.forwardHidden(MLXArray(pending.map { Int32($0) }, [1, pending.count]), caches: mc)
+                    MLX.eval(mc.flatMap { $0.stateArrays })
+                    pending = []
+                }
                 uArr = MLXArray([Int32(evals[p])], [1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
             }
@@ -199,8 +232,9 @@ extension Tell {
         let tokps = Double(N) / secs
         let summary = String(format: """
             [Bolt L3] buddy no-sync draft(maxK=%d)+buddy verify(C=%d, skipMode=3): %.1f tok/s  \
-            accept/step=%.2f  spec-steps=%d/%d  %@
-            """, maxK, C, tokps, Double(accTok) / Double(Swift.max(1, draftSteps)), draftSteps, steps, headline)
+            accept/step=%.2f  spec-steps=%d/%d  %@  a3-fused=%d flush=%d
+            """, maxK, C, tokps, Double(accTok) / Double(Swift.max(1, draftSteps)), draftSteps, steps, headline,
+                             a3Fused, flushes)
         return (summary, tokps)
     }
 }
