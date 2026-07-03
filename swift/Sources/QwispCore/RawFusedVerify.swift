@@ -28,6 +28,53 @@ public enum RawFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
+    /// gqmm4_rows を encode-only で提供(cb/readback 無し)。inds/x/w/s/b/out 全て MTLBuffer 常駐。
+    /// _gqmmRowsPipeline(gatherQmmRows と共有)。lhsPer: down_proj(x を mk 行で index)は true。
+    static func encodeGatherQmmRows(_ enc: MTLComputeCommandEncoder,
+                                    w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                                    x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
+                                    M: Int, Ktop: Int, K: Int, N: Int, lhsPer: Bool) {
+        enc.setComputePipelineState(RawMetalForward._gqmmRowsPipeline!)
+        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
+        RawMetalForward.bindStop(enc, 9)
+        var lp = UInt32(lhsPer ? 1 : 0); enc.setBytes(&lp, length: 4, index: 10)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    /// P3 テスト支援: gate(lhsPer=false, x[M,K]共有 → g[M*Ktop,I])→ down(lhsPer=true, g → out[M*Ktop,K2])を
+    /// 単一 CB + 常駐中間で実行。gatherQmmRows 2 回と bit 一致すれば gather の CB 融合が順序保存であることの証明。
+    public static func fusedGatherChain(_ x: MLXArray, inds: MLXArray,
+                                        w1: (MLXArray, MLXArray, MLXArray), I: Int,
+                                        w2: (MLXArray, MLXArray, MLXArray), K2: Int,
+                                        M: Int, Ktop: Int, K: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        _ = RawMetalForward.gatherQmmRows(x[0 ..< 1], w1.0, scales: w1.1, biases: w1.2,
+                                          inds: inds[0 ..< Ktop], M: 1, Ktop: Ktop, K: K, N: I)   // warm compile
+        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bin = RawMetalForward.mtlBuf(inds.asType(.int32), device),
+              let bw1 = RawMetalForward.mtlBuf(w1.0, device),
+              let bs1 = RawMetalForward.mtlBuf(w1.1.asType(.float16), device),
+              let bb1 = RawMetalForward.mtlBuf(w1.2.asType(.float16), device),
+              let bw2 = RawMetalForward.mtlBuf(w2.0, device),
+              let bs2 = RawMetalForward.mtlBuf(w2.1.asType(.float16), device),
+              let bb2 = RawMetalForward.mtlBuf(w2.2.asType(.float16), device) else { return nil }
+        let midBuf = device.makeBuffer(length: M * Ktop * I * 2, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: M * Ktop * K2 * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGatherQmmRows(enc, w: bw1, scales: bs1, biases: bb1, x: bx, inds: bin, out: midBuf,
+                            M: M, Ktop: Ktop, K: K, N: I, lhsPer: false)
+        encodeGatherQmmRows(enc, w: bw2, scales: bs2, biases: bb2, x: midBuf, inds: bin, out: outBuf,
+                            M: M, Ktop: Ktop, K: I, N: K2, lhsPer: true)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * K2)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * K2)), [M * Ktop, K2])
+    }
+
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
     /// M-row route_top8: 各 threadgroup が 1 token の top-8 を独立に選ぶ(route_top8 と同一の
     /// per-token reduction — precise::exp softmax + 決定的 K 回 argmax)。grid.x=M でトークン offset

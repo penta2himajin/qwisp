@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 18
+        let total = 19
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -762,6 +762,37 @@ public enum RawVerifyTests {
                     r.eval(); refParts.append(r)
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 19 (P3): gather の単一CB常駐チェーン(gate→down 形)≡ per-op gatherQmmRows 2回
+        run("fused_chain_gather_bitexact") {
+            let E = 64, K = 2048, I = 512, K2 = 2048, Ktop = 8
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let w1 = q4e(E, I, K), w2 = q4e(E, K2, I)
+            let pool: [Int32] = (0..<200).map { Int32(($0 * 13) % E) }
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let inds = MLXArray((0..<M*Ktop).map { pool[$0 % pool.count] }, [M * Ktop])
+                MLX.eval([x, inds])
+                // reference: gatherQmmRows 2回(mid = gate lhsPer=false, out = down lhsPer=true)
+                guard let mid = RawMetalForward.gatherQmmRows(x, w1.0, scales: w1.1, biases: w1.2,
+                                                             inds: inds, M: M, Ktop: Ktop, K: K, N: I),
+                      let ref = RawMetalForward.gatherQmmRows(mid, w2.0, scales: w2.1, biases: w2.2,
+                                                             inds: inds, M: M, Ktop: Ktop, K: I, N: K2, lhsPerExpert: true)
+                else { return (false, "ref nil M=\(M)") }
+                ref.eval()
+                guard let got = RawFusedVerify.fusedGatherChain(x, inds: inds, w1: w1, I: I, w2: w2, K2: K2,
+                                                                M: M, Ktop: Ktop, K: K)
+                else { return (false, "fused nil M=\(M)") }
+                got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
             }
