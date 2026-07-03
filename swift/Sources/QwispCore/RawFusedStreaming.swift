@@ -15,6 +15,65 @@ public protocol RawFusedExpertProvider: AnyObject {
     func ensure(_ experts: [Int]) -> [Int: Int]
 }
 
+/// 本番 provider: LayerExpertCache(per-layer LRU + ExpertSource pread)を fused engine に接続。
+/// gatherBuffers: arena の 9 MLXArray を MTLBuffer に wrap し、キャッシュして返す。
+/// ensure: cache.ensure(experts) をそのまま委譲。
+/// noCopy buffer の寿命規約: arena arrays は ExpertArena の persistent slot であり class member だが、
+/// 安全のため retainedArrays にも保持する(noCopy lifetime は retain に依存)。
+public final class ArenaExpertProvider: RawFusedExpertProvider {
+    public let cache: LayerExpertCache
+    public var C: Int { cache.C }
+
+    // gatherBuffers のキャッシュ(初回のみ構築)
+    private var cachedBuffers: [MTLBuffer]? = nil
+    // noCopy lifetime 保持
+    private var retainedArrays: [MLXArray] = []
+
+    public init(cache: LayerExpertCache) {
+        self.cache = cache
+    }
+
+    public func gatherBuffers(device: MTLDevice) -> [MTLBuffer]? {
+        if let cached = cachedBuffers { return cached }
+
+        // 順序: gW,gS,gB, uW,uS,uB, dW,dS,dB
+        // ExpertSource.projs = ["gate_proj","up_proj","down_proj"]
+        // ExpertSource.parts = ["weight","scales","biases"]
+        var bufs: [MTLBuffer] = []
+        var arrays: [MLXArray] = []
+        for proj in ExpertSource.projs {
+            for part in ExpertSource.parts {
+                let arr = cache.arena.arr(proj, part)
+                // サニティチェック: scales/biases は f16 でなければならない(raw kernels は half を読む)
+                if part != "weight" && bufs.isEmpty && arrays.isEmpty {
+                    // 初回 scales チェック(最初の scales は gate_proj.scales)
+                }
+                arrays.append(arr)
+                guard let buf = RawMetalForward.mtlBuf(arr, device) else {
+                    print("[ArenaExpertProvider] ERROR: mtlBuf failed for \(proj).\(part)")
+                    return nil
+                }
+                bufs.append(buf)
+            }
+        }
+
+        // scales dtype サニティチェック(gate_proj.scales = bufs[1], dtype of arrays[1])
+        let scalesArr = arrays[1]   // gate_proj.scales
+        if scalesArr.dtype != .float16 {
+            print("[ArenaExpertProvider] ERROR: scales dtype=\(scalesArr.dtype), expected .float16 — raw kernels will read garbage")
+            return nil
+        }
+
+        retainedArrays = arrays
+        cachedBuffers = bufs
+        return bufs
+    }
+
+    public func ensure(_ experts: [Int]) -> [Int: Int] {
+        cache.ensure(experts)
+    }
+}
+
 /// テスト用 synthetic provider。
 /// 全エキスパートの量子化重みを保持し、arena([C, ...])へ CPU memcpy でロード。
 /// LRU eviction。noCopy MTLBuffer の寿命規約を retained で担保。

@@ -1422,6 +1422,9 @@ public enum RawFusedVerify {
         var slotTables: [MTLBuffer] = []
         /// 直近 step の最大 chunk 数/層(strict モードのテスト検証用)。
         public private(set) var lastStepChunks: Int = 0
+        /// bolt calib: strict モードで層毎の routing(expert id)を観測する(readback は既に行われる=無料)。
+        /// (layerIndex, inds[M*Ktop]) — nil の間は呼び出しコスト無し。
+        public var indsCaptureHook: ((Int, [Int32]) -> Void)? = nil
 
         public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
@@ -1663,6 +1666,7 @@ public enum RawFusedVerify {
                 let indsCount = M * L.Ktop
                 let indsRaw = moeSc.inds.contents().bindMemory(to: Int32.self, capacity: indsCount)
                 let inds = Array(UnsafeBufferPointer(start: indsRaw, count: indsCount))
+                indsCaptureHook?(li, inds)
                 let chunks = partitionChunks(inds, M: M, Ktop: L.Ktop, C: provider.C)
                 maxChunks = max(maxChunks, chunks.count)
 

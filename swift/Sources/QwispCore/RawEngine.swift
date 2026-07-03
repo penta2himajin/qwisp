@@ -183,6 +183,52 @@ public struct RawEngine {
 
     // ── fused (single-CB) forward path — P3 speed plumbing ────────────────
 
+    /// streaming fused engine: per-layer C-slot LRU arena + strict segmented forward。
+    /// caller は store.residentNonExperts() を済ませておくこと(switch_mlp は mmap-lazy のまま)。
+    /// Returns (forward, fnBuf, providers). providers は bolt calib 用に expose。
+    public func makeFusedStreaming(modelDir: String, maxM: Int, maxSeqLen: Int, C: Int,
+                                   existingProviders: [ArenaExpertProvider]? = nil)
+        -> (RawFusedVerify.RawFusedForward, MTLBuffer, [ArenaExpertProvider])? {
+        guard let (device, _) = RawMetalForward.ensure() else { return nil }
+
+        let providers: [ArenaExpertProvider]
+        if let ep = existingProviders {
+            // 既存 provider を再利用(arena/LRU 状態を継続): bolt phase 2 でフレッシュ forward を作る際
+            providers = ep
+        } else {
+            // 新規 provider 構築
+            guard let source = try? ExpertSource(modelDir: modelDir) else {
+                print("[makeFusedStreaming] ERROR: ExpertSource init failed")
+                return nil
+            }
+            do { try source.warm() } catch {
+                print("[makeFusedStreaming] ERROR: ExpertSource.warm() failed: \(error)")
+                return nil
+            }
+            var ps: [ArenaExpertProvider] = []
+            for i in 0 ..< Self.numLayers {
+                guard let cache = try? LayerExpertCache(device: device, source: source, layer: i, C: C) else {
+                    print("[makeFusedStreaming] ERROR: LayerExpertCache init failed at layer \(i)")
+                    return nil
+                }
+                ps.append(ArenaExpertProvider(cache: cache))
+            }
+            providers = ps
+        }
+
+        guard let fwd = RawFusedVerify.RawFusedForward(
+            layers: layers, caches: freshCaches(),
+            maxM: maxM, H: Self.H, maxSeqLen: maxSeqLen,
+            providers: providers) else { return nil }
+
+        let fnA = fnW.asType(.float16)
+        fwd.retainedArrays.append(fnA)
+        guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
+        _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
+                           lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
+        return (fwd, fnBuf, providers)
+    }
+
     /// 全層 1-CB fused forward(cache 常駐)を cold cache で構築。final norm buffer も返す。
     /// forwardRows(x, M, finalNormW: fnBuf) で「40層+final norm」が 1 CB になる。
     public func makeFused(maxM: Int, maxSeqLen: Int) -> (RawFusedVerify.RawFusedForward, MTLBuffer)? {
