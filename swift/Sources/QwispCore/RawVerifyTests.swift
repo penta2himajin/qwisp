@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 15
+        let total = 16
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -671,6 +671,32 @@ public enum RawVerifyTests {
                     let (ok, d) = bitEqual(aa, bb)
                     if !ok { return (false, "\(nm) M=\(M): \(d)") }
                 }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 16 (P2a): 単一CB + 常駐中間 buffer での 2-qmm チェーン ≡ per-op qmmRows 2回(順序保存の礎石)
+        run("fused_chain_qmm_bitexact") {
+            let K = 2048, N1 = 512, N2 = 2048
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let w1 = q4(N1, K), w2 = q4(N2, N1)
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
+                // reference: per-op qmmRows 2回(個別CB + readback)
+                guard let mid = RawMetalForward.qmmRows(x, w1.0, scales: w1.1, biases: w1.2, M: M, K: K, N: N1),
+                      let ref = RawMetalForward.qmmRows(mid, w2.0, scales: w2.1, biases: w2.2, M: M, K: N1, N: N2)
+                else { return (false, "ref nil M=\(M)") }
+                ref.eval()
+                // fused: 単一CB + 常駐 midBuf
+                guard let got = RawFusedVerify.fusedTwoQmm(x, w1: w1, N1: N1, w2: w2, N2: N2, M: M, K: K)
+                else { return (false, "fused nil M=\(M)") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
         }
