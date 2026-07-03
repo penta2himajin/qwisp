@@ -14,21 +14,35 @@ public enum RawSpecRunner {
 
     /// spec ループが必要とする engine 操作の抽象(composed / fused の 2 実装)。
     /// forward: tokens → 最終 norm 済み hidden [M, H]。
-    /// snapshot/rollback: 直後の forward「1 回だけ」を取り消す(partial reject 用)。
+    /// stepArgmax: tokens → 行毎 greedy argmax(cache も前進)。1-CB 実装が無ければ
+    /// forward+logits+MLX argMax で合成される(makeStepArgmax)。
+    /// snapshot/rollback: 直後の forward/stepArgmax「1 回だけ」を取り消す(partial reject 用)。
     struct SpecBackend {
         let forward: ([Int32]) -> MLXArray?
+        let stepArgmax: ([Int32]) -> [Int]?
         let snapshot: () -> Any
         let rollback: (Any) -> Void
+    }
+
+    /// forward+lm_head+MLX argMax による stepArgmax 合成(composed 用 fallback)。
+    static func makeStepArgmax(engine: RawEngine, forward: @escaping ([Int32]) -> MLXArray?) -> ([Int32]) -> [Int]? {
+        return { tokens in
+            guard let n = forward(tokens), let l = engine.logits(n, M: tokens.count) else { return nil }
+            MLX.eval([l])
+            return (0 ..< tokens.count).map { MLX.argMax(l[$0], axis: -1).item(Int.self) }
+        }
     }
 
     /// composed backend(per-op CB、MLX cache 参照 snapshot)。
     static func composedBackend(engine: RawEngine) -> SpecBackend {
         let caches = engine.freshCaches()
+        let fwd: ([Int32]) -> MLXArray? = { tokens in
+            let x = engine.embed(tokens: tokens)
+            return engine.forwardRows(x, caches: caches, M: tokens.count)
+        }
         return SpecBackend(
-            forward: { tokens in
-                let x = engine.embed(tokens: tokens)
-                return engine.forwardRows(x, caches: caches, M: tokens.count)
-            },
+            forward: fwd,
+            stepArgmax: makeStepArgmax(engine: engine, forward: fwd),
             snapshot: { caches.map { $0.copyState() } },
             rollback: { snap in
                 guard let snaps = snap as? [RawVerifyForward.LayerCaches] else { return }
@@ -39,14 +53,23 @@ public enum RawSpecRunner {
             })
     }
 
-    /// fused backend(全層+final norm 1 CB、cache GPU 常駐、rollback は len 巻き戻し+ping-pong swap)。
+    /// fused backend(1-CB step: embed→40層→final norm→lm_head→argmax、readback は token id のみ。
+    /// rollback は KV len 巻き戻し+ping-pong swap)。
     static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
         guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
+        let forward: ([Int32]) -> MLXArray? = { tokens in
+            let x = engine.embed(tokens: tokens)
+            return fwd.forwardRows(x, M: tokens.count, finalNormW: fnBuf)
+        }
+        let step: ([Int32]) -> [Int]?
+        if fwd.head != nil {
+            step = { tokens in fwd.stepArgmax(tokens) }
+        } else {
+            step = makeStepArgmax(engine: engine, forward: forward)
+        }
         return SpecBackend(
-            forward: { tokens in
-                let x = engine.embed(tokens: tokens)
-                return fwd.forwardRows(x, M: tokens.count, finalNormW: fnBuf)
-            },
+            forward: forward,
+            stepArgmax: step,
             snapshot: { fwd.snapshot() },
             rollback: { snap in
                 guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
@@ -136,14 +159,11 @@ public enum RawSpecRunner {
             let snap = backend.snapshot()
 
             if D == 0 {
-                // No draft available: single M=1 forward.
-                guard let nS = backend.forward([Int32(u)])
-                else { return "[raw-spec] ERROR: forward(D=0) nil" }
-                guard let lS = engine.logits(nS, M: 1)
-                else { return "[raw-spec] ERROR: logits(D=0) nil" }
-                MLX.eval([lS])
+                // No draft available: single M=1 step(1-CB: forward+lm_head+argmax)。
+                guard let evals = backend.stepArgmax([Int32(u)])
+                else { return "[raw-spec] ERROR: step(D=0) nil" }
                 out.append(u); hist.append(u)
-                u = MLX.argMax(lS[0], axis: -1).item(Int.self)
+                u = evals[0]
                 steps += 1
                 continue
             }
@@ -151,16 +171,8 @@ public enum RawSpecRunner {
             // Batched verify: [u] + drafts[0..<D], total M = D+1 rows.
             // By raw-engine construction (order-stable, per-row kernels) batched == sequential.
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-            guard let nV = backend.forward(verifyTokens)
-            else { return "[raw-spec] ERROR: verify forwardRows nil" }
-            guard let lV = engine.logits(nV, M: D + 1)
-            else { return "[raw-spec] ERROR: verify logits nil" }
-            MLX.eval([lV])
-
-            // Per-row argmax on CPU.
-            let evals: [Int] = (0 ..< (D + 1)).map { i in
-                MLX.argMax(lV[i], axis: -1).item(Int.self)
-            }
+            guard let evals = backend.stepArgmax(verifyTokens)
+            else { return "[raw-spec] ERROR: verify step nil" }
 
             // Accept prefix p: longest i s.t. drafts[i] == evals[i] for all i < p.
             var p = 0
@@ -228,13 +240,10 @@ public enum RawSpecRunner {
 
         var greedyOut: [Int] = []
         while greedyOut.count < N {
-            guard let nG = backend2.forward([Int32(uG)])
-            else { return summary + "\n[RawSpec] self-check ERROR: greedy forward nil" }
-            guard let lG = engine.logits(nG, M: 1)
-            else { return summary + "\n[RawSpec] self-check ERROR: greedy logits nil" }
-            MLX.eval([lG])
+            guard let evals = backend2.stepArgmax([Int32(uG)])
+            else { return summary + "\n[RawSpec] self-check ERROR: greedy step nil" }
             greedyOut.append(uG)
-            uG = MLX.argMax(lG[0], axis: -1).item(Int.self)
+            uG = evals[0]
         }
 
         let specMatch = zip(outN, greedyOut.prefix(N)).filter { $0 == $1 }.count

@@ -187,6 +187,8 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _shiftConvRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _sliceRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _computeGBetaRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _embedRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _argmaxRowsPipeline: MTLComputePipelineState?
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
@@ -194,7 +196,8 @@ public enum RawFusedVerify {
         guard let (device, _) = RawMetalForward.ensure() else { return false }
         if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil
             && _convHistRowsPipeline != nil && _shiftConvRowsPipeline != nil
-            && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil { return true }
+            && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil
+            && _embedRowsPipeline != nil && _argmaxRowsPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -293,6 +296,48 @@ public enum RawFusedVerify {
             float sp = max(x, 0.0f) + precise::log(1.0f + precise::exp(-metal::abs(x)));
             g[i] = precise::exp(-precise::exp(aLog[hv]) * sp);
         }
+        // embed_rows_q4: token id → 4bit affine dequant 行(half 積和, per-element 独立=M 不変)。
+        kernel void embed_rows_q4(device const uint32_t* w [[buffer(0)]],   // [V, H/8]
+                                  device const half* scales [[buffer(1)]],  // [V, H/64]
+                                  device const half* biases [[buffer(2)]],
+                                  device const int* tokens [[buffer(3)]],   // [M]
+                                  device half* x [[buffer(4)]],             // [M, H]
+                                  constant uint& H [[buffer(5)]], constant uint& total [[buffer(6)]],
+                                  uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint m = i / H, h = i % H;
+            uint row = (uint)tokens[m];
+            uint pack = w[row * (H/8) + h/8];
+            half nib = (half)((pack >> (4*(h%8))) & 0xf);
+            uint g = h / 64;
+            x[i] = scales[row*(H/64)+g] * nib + biases[row*(H/64)+g];
+        }
+        // argmax_rows: 行毎 argmax(先頭一致 tie-break = MLX argMax と同一)。1 threadgroup/行。
+        kernel void argmax_rows(device const half* logits [[buffer(0)]],   // [M, V]
+                                device int* outIdx [[buffer(1)]],          // [M]
+                                constant uint& V [[buffer(2)]],
+                                uint m [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float red[256]; threadgroup int redi[256];
+            device const half* row = logits + (size_t)m * V;
+            float best = -INFINITY; int bi = 0x7fffffff;
+            for (uint v = tid; v < V; v += tgs) {
+                float lv = (float)row[v];
+                if (lv > best) { best = lv; bi = (int)v; }   // thread 内は v 昇順 → 先頭一致
+            }
+            red[tid] = best; redi[tid] = bi;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    if (red[tid+s] > red[tid] || (red[tid+s] == red[tid] && redi[tid+s] < redi[tid])) {
+                        red[tid] = red[tid+s]; redi[tid] = redi[tid+s];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) outIdx[m] = redi[0];
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
@@ -303,6 +348,8 @@ public enum RawFusedVerify {
             _shiftConvRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shift_conv_rows")!)
             _sliceRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "slice_rows")!)
             _computeGBetaRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_g_beta_rows")!)
+            _embedRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "embed_rows_q4")!)
+            _argmaxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_rows")!)
             return true
         } catch { print("[raw-fused-aux] compile: \(error)"); return false }
     }
@@ -366,6 +413,50 @@ public enum RawFusedVerify {
         enc.setBytes(&nn, length: 4, index: 4); enc.setBytes(&t, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// per-op wrapper(テスト用): embed_rows_q4 単発実行。tokens[M] → x[M,H] f16。
+    public static func embedRowsRaw(_ tokens: [Int32], w: MLXArray, scales: MLXArray, biases: MLXArray,
+                                    H: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        let M = tokens.count
+        let sc = scales.asType(.float16), bi = biases.asType(.float16)
+        guard let bw = RawMetalForward.mtlBuf(w, device),
+              let bs = RawMetalForward.mtlBuf(sc, device),
+              let bb = RawMetalForward.mtlBuf(bi, device),
+              let bt = device.makeBuffer(length: M * 4, options: .storageModeShared),
+              let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
+        bt.contents().bindMemory(to: Int32.self, capacity: M).update(from: tokens, count: M)
+        let p = _embedRowsPipeline!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bw, offset: 0, index: 0); enc.setBuffer(bs, offset: 0, index: 1)
+        enc.setBuffer(bb, offset: 0, index: 2); enc.setBuffer(bt, offset: 0, index: 3)
+        enc.setBuffer(outBuf, offset: 0, index: 4)
+        var hh = UInt32(H), tt = UInt32(M * H)
+        enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+    }
+
+    /// per-op wrapper(テスト用): argmax_rows 単発実行。logits[M,V] f16 → [M] int(先頭一致 tie)。
+    public static func argmaxRowsRaw(_ logits: MLXArray, M: Int, V: Int) -> [Int]? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * 4, options: .storageModeShared) else { return nil }
+        let p = _argmaxRowsPipeline!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(outBuf, offset: 0, index: 1)
+        var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Int32.self, capacity: M)
+        return (0 ..< M).map { Int(ptr[$0]) }
     }
 
     /// per-op wrapper: combine_rows(y[m,n]=Σ_k d·scores)を単発 CB で実行。composed が使うことで
@@ -1340,6 +1431,94 @@ public enum RawFusedVerify {
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        }
+
+        // ── head 同梱(1-CB step): embed → 40層 → final norm → lm_head(qmmTiled) → argmax ──
+        struct HeadBufs {
+            let embedW: MTLBuffer, embedS: MTLBuffer, embedB: MTLBuffer
+            let lmW: MTLBuffer, lmS: MTLBuffer, lmB: MTLBuffer
+            let fnW: MTLBuffer
+            let vocab: Int
+            let tokensIn: MTLBuffer      // [maxM] int32
+            let logits: MTLBuffer        // [maxM, vocab] f16
+            let tokensOut: MTLBuffer     // [maxM] int32
+            let retained: [MLXArray]
+        }
+        var head: HeadBufs? = nil
+
+        /// head(embed/lm_head/final norm)を常駐 buffer 化して 1-CB step を有効化する。
+        public func attachHead(embedW: MLXArray, embedS: MLXArray, embedB: MLXArray,
+                               lmW: MLXArray, lmS: MLXArray, lmB: MLXArray,
+                               fnW: MLXArray, vocab: Int) -> Bool {
+            if RawMetalForward._qmm4TiledPipeline == nil {                 // pipeline warm(compile)
+                let x = MLXRandom.normal([1, 512]).asType(.float16)
+                let wf = MLXRandom.normal([8, 512]).asType(.float16)
+                let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                MLX.eval([x, wq, s, b!])
+                _ = RawMetalForward.qmmTiled(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
+            }
+            guard RawMetalForward._qmm4TiledPipeline != nil else { return false }
+            var keep: [MLXArray] = []
+            let esA = embedS.asType(.float16), ebA = embedB.asType(.float16)
+            let lsA = lmS.asType(.float16), lbA = lmB.asType(.float16)
+            let fnA = fnW.asType(.float16)
+            keep.append(contentsOf: [embedW, esA, ebA, lmW, lsA, lbA, fnA])
+            guard let ew = RawMetalForward.mtlBuf(embedW, device),
+                  let es = RawMetalForward.mtlBuf(esA, device),
+                  let eb = RawMetalForward.mtlBuf(ebA, device),
+                  let lw = RawMetalForward.mtlBuf(lmW, device),
+                  let ls = RawMetalForward.mtlBuf(lsA, device),
+                  let lb = RawMetalForward.mtlBuf(lbA, device),
+                  let fn = RawMetalForward.mtlBuf(fnA, device),
+                  let ti = device.makeBuffer(length: maxM * 4, options: .storageModeShared),
+                  let lg = device.makeBuffer(length: maxM * vocab * 2, options: .storageModeShared),
+                  let to = device.makeBuffer(length: maxM * 4, options: .storageModeShared) else { return false }
+            head = HeadBufs(embedW: ew, embedS: es, embedB: eb, lmW: lw, lmS: ls, lmB: lb,
+                            fnW: fn, vocab: vocab, tokensIn: ti, logits: lg, tokensOut: to, retained: keep)
+            return true
+        }
+
+        /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
+        /// CB 1 本・readback は int32 [M] のみ(MLX op ゼロ)。cache は常駐更新。
+        public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
+            guard let hd = head, tokens.count <= maxM else { return nil }
+            let M = tokens.count
+            hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            // embed: tokens → hBuf [M, H]
+            let ep = RawFusedVerify._embedRowsPipeline!
+            enc.setComputePipelineState(ep)
+            enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
+            enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+            enc.setBuffer(hBuf, offset: 0, index: 4)
+            var hh = UInt32(H), tt = UInt32(M * H)
+            enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            // 40 層 + final norm
+            for L in layers { encodeLayer(enc, L, M: M) }
+            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
+            // lm_head(qmm4_tiled: 重み行を threadgroup に 1 回 dequant し M 行で共有)
+            let qp = RawMetalForward._qmm4TiledPipeline!
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+            enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
+            enc.setBuffer(hd.logits, offset: 0, index: 4)
+            var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
+            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            // 行毎 argmax(先頭一致 tie-break = MLX argMax と同一)
+            let ap = RawFusedVerify._argmaxRowsPipeline!
+            enc.setComputePipelineState(ap)
+            enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(hd.tokensOut, offset: 0, index: 1)
+            var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
+            enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
+            return (0 ..< M).map { Int(ptr[$0]) }
         }
 
         /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。

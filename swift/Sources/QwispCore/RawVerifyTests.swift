@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 23
+        let total = 24
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1030,6 +1030,37 @@ public enum RawVerifyTests {
                     let (ok, d) = bitEqual(aa, bb)
                     if !ok { return (false, "\(nm) plan=\(plan): \(d)") }
                 }
+            }
+            return (true, "ok")
+        }
+
+        // Test 24 (P3-E): head kernel 単体 — embed_rows_q4 ≡ MLX dequant-take / argmax_rows ≡ MLX argMax
+        run("head_step_kernels_bitexact") {
+            let V = 1024, H = 2048
+            let wf = MLXRandom.normal([V, H]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            MLX.eval([wq, sc, bi])
+            for M in [1, 2, 9] {
+                // embed: raw kernel vs MLX(dequantize→take)
+                let toks: [Int32] = (0 ..< M).map { Int32(($0 * 37 + 5) % V) }
+                let ids = MLXArray(toks)
+                let refE = ModelHead.embed(ids: ids, weight: wq, scales: sc, biases: bi, bits: 4)
+                    .reshaped([M, H]).asType(.float16)
+                refE.eval()
+                guard let gotE = RawFusedVerify.embedRowsRaw(toks, w: wq, scales: sc, biases: bi, H: H)
+                else { return (false, "embed nil M=\(M)") }
+                gotE.eval()
+                let (okE, dE) = bitEqual(gotE, refE)
+                if !okE { return (false, "embed M=\(M): \(dE)") }
+                // argmax: raw kernel vs MLX argMax(重複値で tie-break=先頭一致 も検証)
+                var lg = MLXRandom.normal([M, V]).asType(.float16)
+                lg[0..., 7] = lg[0..., 3]                       // 意図的 tie
+                lg.eval()
+                let refA: [Int] = (0 ..< M).map { MLX.argMax(lg[$0], axis: -1).item(Int.self) }
+                guard let gotA = RawFusedVerify.argmaxRowsRaw(lg, M: M, V: V)
+                else { return (false, "argmax nil M=\(M)") }
+                if gotA != refA { return (false, "argmax M=\(M): got=\(gotA) ref=\(refA)") }
             }
             return (true, "ok")
         }

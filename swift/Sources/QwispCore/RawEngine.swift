@@ -192,6 +192,9 @@ public struct RawEngine {
         let fnA = fnW.asType(.float16)
         fwd.retainedArrays.append(fnA)   // zero-copy buffer の寿命規約(変換一時 array の保持)
         guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
+        // head 同梱(embed→層→norm→lm_head→argmax の 1-CB step)。失敗しても forwardRows 経路は生きる。
+        _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
+                           lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
         return (fwd, fnBuf)
     }
 }
