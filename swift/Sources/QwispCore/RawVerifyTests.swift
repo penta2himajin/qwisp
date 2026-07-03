@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 16
+        let total = 17
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -697,6 +697,31 @@ public enum RawVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 17 (P2b): routeTop8Rows — 各行独立 top-8 が M不変(rows ≡ M=1ループ, inds+scores bit一致)
+        run("route_top8_rows_invariant") {
+            let N = 256, K = 8
+            for M in [1, 2, 9, 17, 25] {
+                let logits = MLXRandom.normal([M, N]).asType(.float16); logits.eval()
+                guard let (gi, gs) = RawFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
+                else { return (false, "rows nil M=\(M)") }
+                gi.eval(); gs.eval()
+                var iParts: [MLXArray] = [], sParts: [MLXArray] = []
+                for m in 0..<M {
+                    guard let (ri, rs) = RawFusedVerify.routeTop8Rows(logits[m ..< m+1], M: 1, N: N, K: K)
+                    else { return (false, "ref nil M=\(M) m=\(m)") }
+                    ri.eval(); rs.eval(); iParts.append(ri); sParts.append(rs)
+                }
+                let refI = MLX.concatenated(iParts, axis: 0); refI.eval()
+                let refS = MLX.concatenated(sParts, axis: 0); refS.eval()
+                let (oki, di) = bitEqual(gi.asType(.float32), refI.asType(.float32))
+                if !oki { return (false, "inds M=\(M): \(di)") }
+                let (oks, ds) = bitEqual(gs, refS)
+                if !oks { return (false, "scores M=\(M): \(ds)") }
             }
             return (true, "ok")
         }

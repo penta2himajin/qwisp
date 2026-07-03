@@ -28,6 +28,73 @@ public enum RawFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
+    nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
+    /// M-row route_top8: 各 threadgroup が 1 token の top-8 を独立に選ぶ(route_top8 と同一の
+    /// per-token reduction — precise::exp softmax + 決定的 K 回 argmax)。grid.x=M でトークン offset
+    /// するだけ → M 不変。MLX argPartition の sync 島を Metal に置換(routing の中間は argPartition と
+    /// 非一致だが、engine 自己整合(batched≡sequential)は保たれ、出力トークンが最重要=owner 方針)。
+    /// logits[M,N] f16 → inds[M,K] int32, scores[M,K] f16(row 毎 renorm 済)。
+    public static func routeTop8Rows(_ logits: MLXArray, M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        if _routeRowsPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void route_top8_rows(device const half* logits [[buffer(0)]],
+                                        device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                                        constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                                        uint tgid [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+                const device half* lgrow = logits + tgid * N;   // 行 tgid.x の logits
+                device int* indrow = inds + tgid * K;
+                device half* scrow = scores + tgid * K;
+                threadgroup float red[256]; threadgroup int redi[256];
+                threadgroup float gates[256]; threadgroup float work[256];
+                threadgroup float bcast[1];
+                float lg = (tid < N) ? (float)lgrow[tid] : -INFINITY;
+                red[tid] = lg; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+                float m = bcast[0];
+                float e = (tid < N) ? precise::exp(lg - m) : 0.0f;
+                red[tid] = e; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+                float Z = bcast[0];
+                if (tid < N) { gates[tid] = (float)(half)(e / Z); work[tid] = lg; }
+                else { work[tid] = -INFINITY; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint k = 0; k < K; k++) {
+                    red[tid] = work[tid]; redi[tid] = (int)tid; threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint s = tgs/2; s > 0; s >>= 1) {
+                        if (tid < s) { if (red[tid+s] > red[tid]) { red[tid] = red[tid+s]; redi[tid] = redi[tid+s]; } }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                    if (tid == 0) { int bi = redi[0]; indrow[k] = bi; scrow[k] = (half)gates[bi]; work[bi] = -INFINITY; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+                 _routeRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows")!)
+            } catch { print("[raw-route-rows] compile: \(error)"); return nil }
+        }
+        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        let bInds = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_routeRowsPipeline!)
+        enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1); enc.setBuffer(bScores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ip = bInds.contents().bindMemory(to: Int32.self, capacity: M * K)
+        let sp = bScores.contents().bindMemory(to: Float16.self, capacity: M * K)
+        return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: M * K)), [M, K]),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: M * K)), [M, K]))
+    }
+
     /// _qmmPipeline が未コンパイルなら小さな qmm 呼びで確実にコンパイルさせる(big qmm 関数を触らない)。
     static func ensureQmmPipeline() {
         if RawMetalForward._qmmPipeline != nil { return }
