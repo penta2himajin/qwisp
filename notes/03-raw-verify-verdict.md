@@ -142,3 +142,30 @@ bolt(L3 near-lossless):
 - 残課題: ① raw bolt の品質軸(teacher-forced fidelity)未計測(free-run 3-4% は greedy-chaos 指標で無意味、
   MLX bolt の TF ~88-97% に相当する測定が要る)② B3 in-decode fetch / A3 pending-prefix の移植(bolt 更なる上積み)
   ③ runner の THROTTLE_DEFER 対応(slow セルの wall 時間短縮のみ、数値不変)。
+
+---
+## ★追記(2026-07-03): raw bolt teacher-forced fidelity 計測完了 = streaming 品質軸確定
+
+streaming verdict の未完成部分(bolt TF fidelity)を計測(QWISP_RAW_TF=1: freeze 後 canonical ref を
+teacher-force し bolt argmax の一致率、chaos-free)。free-run 3-4% は greedy-chaos 指標で無意味。
+
+### raw bolt TF fidelity（vs strict-canonical, GEN=128, C=64）vs MLX bolt
+| regime | raw bolt | MLX bolt(C64) | 判定 |
+|--|--|--|--|
+| code | 88.3% | 85.9 | +2.4 ✅ |
+| agentic | 94.5% | 93.8 | +0.7 ✅ |
+| longctx | 78.9% | 94.5 | cache容量律速(下記) |
+| shortnl | 79.7% | 75.0 | +4.7 ✅ |
+
+### longctx = cache 容量律速(良性, buddy バグでない)
+| longctx | C=64 | C=128 | C=192 |
+|--|--|--|--|
+| TF fid | 78.9% | 90.6% | 96.9% |
+
+長文脈は多様 expert を使い buddy 置換が C 小で増える → C↑ で単調に fidelity 回復(MLX bolt の
+C 単調増加 87/95/97 と同傾向)。C=192 で 96.9%（MLX bolt 94.5% 超）。
+
+### bolt streaming 最終判定
+**raw bolt = MLX bolt 同等の TF fidelity（3/4 regime で at-or-above、longctx は C≥128 で高fidelity）
+かつ io=0 で 1.7-3.5x 高速 → slow-NAND tier の default 候補として品質・速度とも確定。**
+残 refinement（verdict 非依存）: ②B3 fetch移植 ③A3 pending-prefix ④THROTTLE_DEFER（[[raw-streaming-handoff-next]]）。

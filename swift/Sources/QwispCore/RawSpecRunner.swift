@@ -521,6 +521,37 @@ public enum RawSpecRunner {
         print("[RawSpec] NOTE: bolt is L3 near-lossless (buddy remap, not strict). Quality vs ref is informational.")
 
         // ── SELF-CHECK (bolt): spec vs bolt greedy (same frozen tables = self-consistent) ──
+        // ── TEACHER-FORCED FIDELITY (bolt vs strict canonical): QWISP_RAW_TF=1 ──
+        // chaos-free 品質軸。canonical ref(spec_greedy)を 1 個ずつ teacher-force し、bolt の
+        // argmax が次の canonical トークンと一致する率を数える(MLX bolt TF ~88-97% に相当)。
+        // free-run の 3-4% は greedy-chaos で無意味([[bench-harness]])→ これが bolt 品質の正指標。
+        if Tell.envFlag("QWISP_RAW_TF") {
+            print("[raw-spec bolt] teacher-forced fidelity: feeding canonical ref, counting argmax match ...")
+            if let (backendTF, fwdTF, _) = streamingBackend(
+                engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
+                existingProviders: providers) {
+                fwdTF.setBoltTables(tables)   // same frozen bolt tables
+                if let lastNormedTF = prefill(promptIds: promptIds, backend: backendTF),
+                   let lg0TF = engine.logits(lastNormedTF, M: 1) {
+                    MLX.eval([lg0TF])
+                    var predTF = MLX.argMax(lg0TF[0], axis: -1).item(Int.self)   // position 0 の予測
+                    var tfMatch = 0, tfTotal = 0
+                    let nTF = Swift.min(N, gRefIds.count)
+                    for i in 0 ..< (nTF - 1) {
+                        if predTF == gRefIds[i] { tfMatch += 1 }   // 位置 i の予測 vs canonical[i]
+                        tfTotal += 1
+                        // teacher-force: canonical トークン gRefIds[i] を入力して次位置の予測を得る
+                        guard let ev = backendTF.stepArgmax([Int32(gRefIds[i])]) else { break }
+                        predTF = ev[0]
+                    }
+                    if predTF == gRefIds[nTF - 1] { tfMatch += 1 }; tfTotal += 1
+                    let tfPct = Double(tfMatch) / Double(Swift.max(tfTotal, 1)) * 100
+                    print(String(format: "[RawSpec] bolt TF fidelity vs strict-canonical: %d/%d=%.1f%% (chaos-free)",
+                                 tfMatch, tfTotal, tfPct))
+                }
+            }
+        }
+
         // QWISP_RAWSPEC_CHECK=1: rebuild backend #3 reusing providers+tables, run greedy.
         guard Tell.envFlag("QWISP_RAWSPEC_CHECK") else { return summary }
 
