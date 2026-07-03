@@ -65,8 +65,14 @@ public enum RawVerifyForward {
         // cache append: [M*numKV, headDim] → [M, numKV, headDim] → [numKV, M, headDim] → concat(L 軸)
         let kNew = kRot.reshaped([M, numKV, headDim]).transposed(1, 0, 2)
         let vNew = vOut.reshaped([M, numKV, headDim]).transposed(1, 0, 2)
-        kCache = MLX.concatenated([kCache, kNew], axis: 1); kCache.eval()
-        vCache = MLX.concatenated([vCache, vNew], axis: 1); vCache.eval()
+        // baseLen==0 guard: MLX.concatenated with an empty 0-dim array may error on some versions.
+        if baseLen == 0 {
+            kCache = kNew; kCache.eval()
+            vCache = vNew; vCache.eval()
+        } else {
+            kCache = MLX.concatenated([kCache, kNew], axis: 1); kCache.eval()
+            vCache = MLX.concatenated([vCache, vNew], axis: 1); vCache.eval()
+        }
         // SDPA: 行 m は先頭 baseLen+m+1 key(自身含む)を見る → sdpaRows の baseN = baseLen+1
         guard let attnOut = RawMetalForward.sdpaRows(qRot, kCache, vCache,
                                                      H: numHeads, KV: numKV, D: headDim,
