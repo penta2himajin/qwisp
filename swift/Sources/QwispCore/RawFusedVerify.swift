@@ -1323,6 +1323,9 @@ public enum RawFusedVerify {
         public var retainedArrays: [MLXArray] = []
         /// profile: 直近 stepArgmax の GPU-exec(gpuEnd-gpuStart)ms。wall と比較して CPU overhead を分離。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
+        /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
+        nonisolated(unsafe) public static var lmHeadQmv =
+            ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
 
         public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
@@ -1502,16 +1505,23 @@ public enum RawFusedVerify {
             // 40 層 + final norm
             for L in layers { encodeLayer(enc, L, M: M) }
             RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
-            // lm_head(qmm4_tiled: 重み行を threadgroup に 1 回 dequant し M 行で共有)
-            let qp = RawMetalForward._qmm4TiledPipeline!
-            enc.setComputePipelineState(qp)
-            enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
-            enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
-            enc.setBuffer(hd.logits, offset: 0, index: 4)
-            var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
-            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
-            enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            // lm_head。既定=qmm4_tiled(重み行を threadgroup に 1 回 dequant し M 行で共有=verify M>1 で有利)。
+            // QWISP_LMHEAD_QMV=1: qmm4(per-row qmv, threadgroup dequant 無し=高 occupancy)= M=1 decode で有利。
+            // 両者とも M 不変(test 済)ゆえ flag を run 中固定なら decode≡verify(self-consistent)。速度トレードオフのみ。
+            if RawFusedForward.lmHeadQmv {
+                RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                             x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
+            } else {
+                let qp = RawMetalForward._qmm4TiledPipeline!
+                enc.setComputePipelineState(qp)
+                enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+                enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
+                enc.setBuffer(hd.logits, offset: 0, index: 4)
+                var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
+                enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
             // 行毎 argmax(先頭一致 tie-break = MLX argMax と同一)
             let ap = RawFusedVerify._argmaxRowsPipeline!
             enc.setComputePipelineState(ap)
