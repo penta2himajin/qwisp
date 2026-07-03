@@ -72,3 +72,25 @@ QWISP_RUN=raw-spec QWISP_RAW_FUSED=1 QWISP_GEN=128 QWISP_RAWSPEC_CHECK=1 \
   QWISP_MTP_REF=refs/code.safetensors \
   swift/.xcode-build-rel/Build/Products/Release/qwisp-poc stream
 ```
+
+---
+## ★追記(2026-07-03 続き, commit 5d2ca73): qmv lm_head で U4 判定が覆る
+
+profile(raw-fused-prof)で M=1 decode の 40% が lm_head と判明 → lm_head を qmm4_tiled から
+**qmm4(per-row qmv, 高 occupancy)** に変更(既定 ON, QWISP_LMHEAD_QMV=0 で戻せる)。tiled の 8KB
+threadgroup 低 occupancy が weight 再利用の利を上回り、**全 M で qmv が速い無条件改善**(M=1 step
+21.2→14.0ms, M=17 139→96ms)。qmv も M 不変(既存テスト)ゆえ decode≡verify=self-consistent 維持。
+
+### 更新後 A/B(raw fused+qmv vs campaign 済み MLX strict, GEN=128)
+| regime | raw fused+qmv | MLX strict | 倍率 | 品質 |
+|--|--|--|--|--|
+| code | **67.6** | 56.3 | **1.20x** | refs 128/128 token-exact + self LOSSLESS |
+| agentic | **59.5** | 46.2 | **1.29x** | refs 128/128 token-exact + self LOSSLESS |
+| longctx | **112.5** | 44.1 | **2.55x** | raw 固有正準(near-tie 別軌道)・self LOSSLESS |
+| shortnl | **70.2** | 56.0 | **1.25x** | raw 固有正準・self LOSSLESS |
+
+### 更新後の判定
+**raw fused engine(qmv lm_head)は全 regime で MLX strict を上回り(1.2-2.55x)、かつ構造保証 lossless
+(cert/guard/VSEQ 不要)。code/agentic は MLX 正準と token-exact。→ default 昇格候補。**
+残: ①longctx/shortnl の fidelity 軸 100% 化 = U3(raw 正準で refs 再生成)②全 RAM tier(streaming)検証
+③本番配線(Tell default backend 切替の是非は owner 判断, auto-commit 禁止)。RAWTESTS 24/24 green。
