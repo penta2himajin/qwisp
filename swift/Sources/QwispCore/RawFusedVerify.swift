@@ -50,6 +50,27 @@ public enum RawFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
+    /// gqmm4_swiglu_rows を encode-only で提供。grid/threads は gather-g+gather-u 2 dispatch と同一 shape。
+    /// x を 1 回読み(gate/up 共有)、g/u を register 内で swiglu → h 直接書き。3 dispatch+中間 g/u を 1 dispatch に。
+    static func encodeGatherQmmSwigluRows(_ enc: MTLComputeCommandEncoder,
+                                          wG: MTLBuffer, sG: MTLBuffer, bG: MTLBuffer,
+                                          wU: MTLBuffer, sU: MTLBuffer, bU: MTLBuffer,
+                                          x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
+                                          M: Int, Ktop: Int, K: Int, N: Int,
+                                          xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
+        enc.setComputePipelineState(RawMetalForward._gqmmSwigluRowsPipeline!)
+        enc.setBuffer(wG, offset: 0, index: 0); enc.setBuffer(sG, offset: 0, index: 1); enc.setBuffer(bG, offset: 0, index: 2)
+        enc.setBuffer(wU, offset: 0, index: 3); enc.setBuffer(sU, offset: 0, index: 4); enc.setBuffer(bU, offset: 0, index: 5)
+        enc.setBuffer(x,  offset: xByteOffset, index: 6)
+        enc.setBuffer(inds, offset: indsOffset, index: 7)
+        enc.setBuffer(out, offset: outByteOffset, index: 8)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 9); enc.setBytes(&nn, length: 4, index: 10); enc.setBytes(&kt, length: 4, index: 11)
+        RawMetalForward.bindStop(enc, 12)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
     /// P3 テスト支援: gate(lhsPer=false, x[M,K]共有 → g[M*Ktop,I])→ down(lhsPer=true, g → out[M*Ktop,K2])を
     /// 単一 CB + 常駐中間で実行。gatherQmmRows 2 回と bit 一致すれば gather の CB 融合が順序保存であることの証明。
     public static func fusedGatherChain(_ x: MLXArray, inds: MLXArray,
@@ -616,17 +637,26 @@ public enum RawFusedVerify {
             RawMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
                                                 table: st, count: Mc * Ktop)
         }
-        // gather g/u(行共有 lhs)
-        encodeGatherQmmRows(enc, w: w.swGW, scales: w.swGS, biases: w.swGB,
-                            x: x, inds: sc.inds, out: sc.g,
-                            M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
-                            xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
-        encodeGatherQmmRows(enc, w: w.swUW, scales: w.swUS, biases: w.swUB,
-                            x: x, inds: sc.inds, out: sc.u,
-                            M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
-                            xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
-        // swiglu
-        encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: Mc * Ktop * I, byteOffset: guOff)
+        // gather g/u + swiglu: flag-on で 1-dispatch 融合、flag-off で既存 3-kernel 連鎖(byte 不変)
+        if RawFusedForward.fuseGU {
+            encodeGatherQmmSwigluRows(enc, wG: w.swGW, sG: w.swGS, bG: w.swGB,
+                                      wU: w.swUW, sU: w.swUS, bU: w.swUB,
+                                      x: x, inds: sc.inds, out: sc.h,
+                                      M: Mc, Ktop: Ktop, K: H, N: I,
+                                      xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+        } else {
+            // gather g/u(行共有 lhs)
+            encodeGatherQmmRows(enc, w: w.swGW, scales: w.swGS, biases: w.swGB,
+                                x: x, inds: sc.inds, out: sc.g,
+                                M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
+                                xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+            encodeGatherQmmRows(enc, w: w.swUW, scales: w.swUS, biases: w.swUB,
+                                x: x, inds: sc.inds, out: sc.u,
+                                M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
+                                xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+            // swiglu
+            encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: Mc * Ktop * I, byteOffset: guOff)
+        }
         // gather d(per-mk lhs, x=sc.h)
         encodeGatherQmmRows(enc, w: w.swDW, scales: w.swDS, biases: w.swDB,
                             x: sc.h, inds: sc.inds, out: sc.d,
@@ -680,7 +710,10 @@ public enum RawFusedVerify {
             MLX.eval([x, wq, s, b!, inds])
             _ = RawMetalForward.gatherQmmRows(x, wq, scales: s, biases: b!, inds: inds, M: 1, Ktop: 1, K: 512, N: 8)
         }
-        return _routeRowsPipeline != nil && RawMetalForward._gqmmRowsPipeline != nil
+        if RawMetalForward._gqmmSwigluRowsPipeline == nil {
+            _ = RawMetalForward.compileGqmmSwigluRows()
+        }
+        return _routeRowsPipeline != nil && RawMetalForward._gqmmRowsPipeline != nil && RawMetalForward._gqmmSwigluRowsPipeline != nil
     }
 
     /// debug: fused MoE block の全中間 buffer を読み出して返す(段階別バイセクト用)。
@@ -1412,6 +1445,10 @@ public enum RawFusedVerify {
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
+        /// gate+up gather+swiglu 融合(1 dispatch)へ分岐。既定 off。QWISP_FUSE_GU=1 で on。
+        /// flag-on でも演算順同一なので bit-exact(G2 gate)。flag-off で byte 不変(G3 gate)。
+        nonisolated(unsafe) public static var fuseGU =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_GU"] == "1"
 
         // ── streaming mode ─────────────────────────────────────────────────────────────
         public enum RawStreamMode { case resident, strict, bolt }
@@ -1846,5 +1883,58 @@ public enum RawFusedVerify {
             if let kv = L.kvCache { let (k, v) = RawFusedVerify.readKVCache(kv); return (k, v) }
             return (nil, nil)
         }
+    }
+
+    // ── G1 gate: gqmm4_swiglu_rows stub (notes/06-fusion-poc-spec.md §4) ──────────────
+    //
+    // Implementer (GLM-5.2): add the encode-level dispatch below, matching encodeGatherQmmRows
+    // style exactly (same buffer indices, same lhsPer=false for g+u shared-x semantics).
+    // Signature contract (copy verbatim, then fill body):
+    //
+    //   static func encodeGatherQmmSwigluRows(_ enc: MTLComputeCommandEncoder,
+    //                                         wG: MTLBuffer, sG: MTLBuffer, bG: MTLBuffer,
+    //                                         wU: MTLBuffer, sU: MTLBuffer, bU: MTLBuffer,
+    //                                         x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
+    //                                         M: Int, Ktop: Int, K: Int, N: Int,
+    //                                         xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0)
+    //
+    // Kernel: gqmm4_swiglu_rows — grid (1, N/8, M·Ktop), threads (32,2,1). Each threadgroup
+    // computes 8 output cols of one mk row for gate and up (shared x load via ld16), applies
+    // swiglu in-register, writes h[mk*N + out_col] directly (no g/u intermediate buffers).
+    // Operand order must reproduce the existing 3-kernel chain (gqmm4_rows×2 + swigluRaw) bit-exactly:
+    //   gv = (half)simd_sum(g_acc),  uv = (half)simd_sum(u_acc)   [cast to half before swiglu]
+    //   y = (gv*sigmoid(gv))*uv                                    [stable sigmoid as in existing swiglu]
+    // (This matches the existing gqmm4_swiglu kernel at RawMetalForward.swift ~1298-1337.)
+    //
+    // Note: integration-level flag QWISP_FUSE_GU (encodeMoEGatherRowsRange branch) is gated
+    // separately by G2 real-weight identity and does NOT depend on these unit tests.
+
+    /// Test-entry wrapper: drives gqmm4_swiglu_rows in a self-contained command buffer.
+    /// x[M,K] f16, inds[M*Ktop] int32, wG/wU [E,N,K/2] 4-bit, sG/sU/bG/bU [E,N,K/64] f16.
+    /// Returns h[M*Ktop, N] f16 — bit-identical to gatherQmmRows(g)+gatherQmmRows(u)+swigluRaw.
+    public static func gatherQmmSwigluRows(x: MLXArray, inds: MLXArray,
+                                           wG: MLXArray, sG: MLXArray, bG: MLXArray,
+                                           wU: MLXArray, sU: MLXArray, bU: MLXArray,
+                                           M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0 else { print("[raw-gqmm-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil }
+        _ = RawMetalForward.compileGqmmSwigluRows()
+        guard let bx  = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bin = RawMetalForward.mtlBuf(inds.asType(.int32), device),
+              let bwG = RawMetalForward.mtlBuf(wG, device),
+              let bsG = RawMetalForward.mtlBuf(sG.asType(.float16), device),
+              let bbG = RawMetalForward.mtlBuf(bG.asType(.float16), device),
+              let bwU = RawMetalForward.mtlBuf(wU, device),
+              let bsU = RawMetalForward.mtlBuf(sU.asType(.float16), device),
+              let bbU = RawMetalForward.mtlBuf(bU.asType(.float16), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGatherQmmSwigluRows(enc, wG: bwG, sG: bsG, bG: bbG,
+                                  wU: bwU, sU: bsU, bU: bbU,
+                                  x: bx, inds: bin, out: outBuf,
+                                  M: M, Ktop: Ktop, K: K, N: N)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
     }
 }

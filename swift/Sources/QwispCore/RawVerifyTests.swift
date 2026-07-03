@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 31
+        let total = 33
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1593,6 +1593,110 @@ public enum RawVerifyTests {
             let (ok31, d31) = bitEqual(flushOutC, refOutC)
             if !ok31 { return (false, "flush boundary: \(d31)") }
             return (true, "ok")
+        }
+
+        // ── G1 gate: fuse_gu tests (32-33) — notes/06-fusion-poc-spec.md §4 ─────────────
+        //
+        // WRITE-LOCKED: Haiku (implementer) MUST NOT modify these tests.
+        // Reference is computed via existing production kernels only (gatherQmmRows × 2 +
+        // swigluRaw) — never via MLX or CPU reimplementation, so bit-identity with the
+        // current 3-kernel chain is the sole correctness contract.
+        //
+        // Note: integration-level flag QWISP_FUSE_GU (encodeMoEGatherRowsRange branch) is
+        // gated separately by G2 real-weight identity; these unit tests do NOT cover it.
+
+        // Test 32 (G1-bitexact): gatherQmmSwigluRows output ≡ gatherQmmRows×2+swigluRaw.
+        // Sweeps M∈{1,8,17} × Ktop∈{1,8} × N∈{512,1536}, K=2048, E=16, gs=64.
+        run("fuse_gu_bitexact") {
+            let E = 16, K = 2048
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            // Deterministic expert index pool (fixed seed carried from suite)
+            let pool: [Int32] = (0..<200).map { Int32(($0 * 13 + 3) % E) }
+            for N in [512, 1536] {
+                let (wGq, wGS, wGB) = q4e(E, N, K)
+                let (wUq, wUS, wUB) = q4e(E, N, K)
+                MLX.eval([wGq, wGS, wGB, wUq, wUS, wUB])
+                for M in [1, 8, 17] {
+                    for Ktop in [1, 8] {
+                        let x = MLXRandom.normal([M, K]).asType(.float16)
+                        let indsFlat = (0..<M*Ktop).map { pool[$0 % pool.count] }
+                        let inds = MLXArray(indsFlat, [M * Ktop])
+                        MLX.eval([x, inds])
+                        // Reference: existing 3-kernel chain (production kernels only — no MLX/CPU reimpl)
+                        guard let g = RawMetalForward.gatherQmmRows(x, wGq, scales: wGS, biases: wGB,
+                                                                     inds: inds, M: M, Ktop: Ktop, K: K, N: N),
+                              let u = RawMetalForward.gatherQmmRows(x, wUq, scales: wUS, biases: wUB,
+                                                                     inds: inds, M: M, Ktop: Ktop, K: K, N: N)
+                        else { return (false, "ref gather nil M=\(M) Ktop=\(Ktop) N=\(N)") }
+                        g.eval(); u.eval()
+                        guard let hRef = RawMetalForward.swigluRaw(g, u)
+                        else { return (false, "ref swiglu nil M=\(M) Ktop=\(Ktop) N=\(N)") }
+                        hRef.eval()
+                        // Stub under test
+                        guard let hGot = RawFusedVerify.gatherQmmSwigluRows(
+                            x: x, inds: inds,
+                            wG: wGq, sG: wGS, bG: wGB,
+                            wU: wUq, sU: wUS, bU: wUB,
+                            M: M, Ktop: Ktop, K: K, N: N)
+                        else { return (false, "not implemented (M=\(M) Ktop=\(Ktop) N=\(N))") }
+                        hGot.eval()
+                        let (ok, d) = bitEqual(hGot, hRef)
+                        if !ok { return (false, "M=\(M) Ktop=\(Ktop) N=\(N): \(d)") }
+                    }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 33 (G1-m_invariance): fused kernel batched (M=8,Ktop=8) ≡ M=1 per-row loop.
+        // Verifies M-independence of the fused kernel (same idiom as existing gather tests).
+        run("fuse_gu_m_invariance") {
+            let E = 16, K = 2048, N = 512, M = 8, Ktop = 8
+            let wGq: MLXArray, wGS: MLXArray, wGB: MLXArray
+            let wUq: MLXArray, wUS: MLXArray, wUB: MLXArray
+            do {
+                let wgf = MLXRandom.normal([E, N, K]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wgf, groupSize: 64, bits: 4, mode: .affine)
+                (wGq, wGS, wGB) = (q, s, b!)
+            }
+            do {
+                let wuf = MLXRandom.normal([E, N, K]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wuf, groupSize: 64, bits: 4, mode: .affine)
+                (wUq, wUS, wUB) = (q, s, b!)
+            }
+            let pool: [Int32] = (0..<200).map { Int32(($0 * 7 + 5) % E) }
+            let x = MLXRandom.normal([M, K]).asType(.float16)
+            let indsFlat = (0..<M*Ktop).map { pool[$0 % pool.count] }
+            let inds = MLXArray(indsFlat, [M * Ktop])
+            MLX.eval([wGq, wGS, wGB, wUq, wUS, wUB, x, inds])
+            // Batched call M=8
+            guard let hBatch = RawFusedVerify.gatherQmmSwigluRows(
+                x: x, inds: inds,
+                wG: wGq, sG: wGS, bG: wGB,
+                wU: wUq, sU: wUS, bU: wUB,
+                M: M, Ktop: Ktop, K: K, N: N)
+            else { return (false, "not implemented (M=\(M))") }
+            hBatch.eval()
+            // Per-row M=1 loop of the same fused kernel
+            var refParts: [MLXArray] = []
+            for m in 0..<M {
+                let xm = x[m ..< m+1]
+                let rowInds = MLXArray(Array(indsFlat[m*Ktop ..< (m+1)*Ktop]), [Ktop])
+                xm.eval(); rowInds.eval()
+                guard let hm = RawFusedVerify.gatherQmmSwigluRows(
+                    x: xm, inds: rowInds,
+                    wG: wGq, sG: wGS, bG: wGB,
+                    wU: wUq, sU: wUS, bU: wUB,
+                    M: 1, Ktop: Ktop, K: K, N: N)
+                else { return (false, "not implemented (M=1 m=\(m))") }
+                hm.eval(); refParts.append(hm)
+            }
+            let hLoop = MLX.concatenated(refParts, axis: 0); hLoop.eval()
+            return bitEqual(hBatch, hLoop)
         }
 
         // ── Summary ───────────────────────────────────────────────────────

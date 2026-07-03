@@ -60,6 +60,7 @@ if CommandLine.arguments.contains("stream") {
         ("pipeline-exact",        { try Tell.runPipelineExact(modelDir: $0, refPath: $1) }),
         ("icb-bench",             { _, _ in MetalICBBench.run() }),
         ("raw-fused-prof",        { md, rp in try RawFusedProf.run(modelDir: md, refPath: rp) }),
+        ("raw-dispatch-bench",    { _, _ in RawDispatchBench.run() }),   // fusion physics smoke: µs/dispatch
         ("raw-qmm-test",          { _, _ in RawMetalForward.runQmmTest() }),
         ("raw-ops-test",          { _, _ in RawMetalForward.runOpsTest() }),
         ("raw-chain-test",        { _, _ in RawMetalForward.runChainTest() }),

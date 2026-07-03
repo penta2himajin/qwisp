@@ -1342,6 +1342,79 @@ public enum RawMetalForward {
         } catch { print("[raw-gqmm-swiglu] compile: \(error)"); return false }
     }
 
+    nonisolated(unsafe) static var _gqmmSwigluRowsPipeline: MTLComputePipelineState?
+    /// gqmm4_swiglu の M-row 拡張(gqmm4_rows が gqmm4 を拡張したのと同一構造)。tid.z = mk = m*Ktop+ki。
+    /// x は行 m=mk/ktop で offset(lhsPer=false gate/up gather と同一)。h は mk 行へ直書き。
+    /// 演算列(ld16/qd4/simd_sum → half cast → stable sigmoid → (gv*s)*uv)は gqmm4_swiglu と完全同一 →
+    /// 既存 3-kernel 連鎖(gqmm4_rows×2 + swiglu)と bit-exact。safe-math コンパイル必須。
+    static func compileGqmmSwigluRows() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _gqmmSwigluRowsPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) { sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+                xt[i]=x[i]; xt[i+1]=x[i+1]/16.0f; xt[i+2]=x[i+2]/256.0f; xt[i+3]=x[i+3]/4096.0f; }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f; const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]*(float)(ws[i]&0x000f) + xt[4*i+1]*(float)(ws[i]&0x00f0) +
+                          xt[4*i+2]*(float)(ws[i]&0x0f00) + xt[4*i+3]*(float)(ws[i]&0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void gqmm4_swiglu_rows(device const uint32_t* gw [[buffer(0)]], device const half* gsc [[buffer(1)]], device const half* gbi [[buffer(2)]],
+                                      device const uint32_t* uw [[buffer(3)]], device const half* usc [[buffer(4)]], device const half* ubi [[buffer(5)]],
+                                      device const half* x [[buffer(6)]], device const int* inds [[buffer(7)]], device half* h [[buffer(8)]],
+                                      constant int& in_vec_size [[buffer(9)]], constant int& out_vec_size [[buffer(10)]],
+                                      constant int& ktop [[buffer(11)]],
+                                      device const int* stopFlag [[buffer(12)]],
+                                      uint3 tid [[threadgroup_position_in_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;
+            constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+            constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+            constexpr int block_size = 512, scale_step_per_thread = 4;
+            const device uint8_t* gws = (const device uint8_t*)gw;
+            const device uint8_t* uws = (const device uint8_t*)uw;
+            typedef float U;
+            thread U x_thread[16]; thread U gres[4] = {0}, ures[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            uint mk = tid.z; uint e = (uint)inds[mk];
+            size_t eOffW = (size_t)e * out_vec_size * in_vec_size_w, eOffG = (size_t)e * out_vec_size * in_vec_size_g;
+            gws += eOffW; uws += eOffW; gsc += eOffG; gbi += eOffG; usc += eOffG; ubi += eOffG;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+            uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+            gsc += out_row*in_vec_size_g + simd_lid/scale_step_per_thread; gbi += out_row*in_vec_size_g + simd_lid/scale_step_per_thread;
+            usc += out_row*in_vec_size_g + simd_lid/scale_step_per_thread; ubi += out_row*in_vec_size_g + simd_lid/scale_step_per_thread;
+            x += (size_t)(mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+            h += (size_t)mk * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16(x, x_thread);   // ★ x ロードは 1 回（gate/up で共有）
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    gres[row] += qd4((const device uint8_t*)(gws + row*in_vec_size_w), x_thread, gsc[row*in_vec_size_g], gbi[row*in_vec_size_g], sum);
+                    ures[row] += qd4((const device uint8_t*)(uws + row*in_vec_size_w), x_thread, usc[row*in_vec_size_g], ubi[row*in_vec_size_g], sum);
+                }
+                gws += block_size*bytes_per_pack/pack_factor; uws += block_size*bytes_per_pack/pack_factor;
+                gsc += block_size/64; gbi += block_size/64; usc += block_size/64; ubi += block_size/64; x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                half gv = (half)simd_sum(gres[row]); half uv = (half)simd_sum(ures[row]);
+                if (simd_lid == 0) { half y = (half)1/((half)1+exp(metal::abs(gv))); half s = (gv<(half)0)?y:((half)1-y); h[row] = (gv*s)*uv; }
+            }
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _gqmmSwigluRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4_swiglu_rows")!)
+             return true
+        } catch { print("[raw-gqmm-swiglu-rows] compile: \(error)"); return false }
+    }
+
     /// raw-Metal SDPA(decode L=1, GQA, flash/online softmax, f32)。
     /// q[H,D], K/V[KV,S,D] → out[H,D]。head h は kv=h/(H/KV)。MLXFast.scaledDotProductAttention(f32,.none) と照合。
     static func sdpaDecode(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
