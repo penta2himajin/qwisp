@@ -7,16 +7,58 @@ import MLXFast
 /// Batched verify == sequential by construction (proven by raw-smoke U2a) => strict lossless.
 ///
 /// QWISP_RUN=raw-spec  QWISP_GEN=48  QWISP_DRAFT_K=96
+/// QWISP_RAW_FUSED=1       — P3 fused backend(全層+final norm を 1 CB、cache GPU 常駐)
 /// QWISP_RAWSPEC_CHECK=1   — also run pure sequential raw greedy and report spec-vs-greedy k/N
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
 public enum RawSpecRunner {
 
+    /// spec ループが必要とする engine 操作の抽象(composed / fused の 2 実装)。
+    /// forward: tokens → 最終 norm 済み hidden [M, H]。
+    /// snapshot/rollback: 直後の forward「1 回だけ」を取り消す(partial reject 用)。
+    struct SpecBackend {
+        let forward: ([Int32]) -> MLXArray?
+        let snapshot: () -> Any
+        let rollback: (Any) -> Void
+    }
+
+    /// composed backend(per-op CB、MLX cache 参照 snapshot)。
+    static func composedBackend(engine: RawEngine) -> SpecBackend {
+        let caches = engine.freshCaches()
+        return SpecBackend(
+            forward: { tokens in
+                let x = engine.embed(tokens: tokens)
+                return engine.forwardRows(x, caches: caches, M: tokens.count)
+            },
+            snapshot: { caches.map { $0.copyState() } },
+            rollback: { snap in
+                guard let snaps = snap as? [RawVerifyForward.LayerCaches] else { return }
+                for (i, s) in snaps.enumerated() {
+                    caches[i].kCache = s.kCache; caches[i].vCache = s.vCache
+                    caches[i].convState = s.convState; caches[i].recState = s.recState
+                }
+            })
+    }
+
+    /// fused backend(全層+final norm 1 CB、cache GPU 常駐、rollback は len 巻き戻し+ping-pong swap)。
+    static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
+        guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
+        return SpecBackend(
+            forward: { tokens in
+                let x = engine.embed(tokens: tokens)
+                return fwd.forwardRows(x, M: tokens.count, finalNormW: fnBuf)
+            },
+            snapshot: { fwd.snapshot() },
+            rollback: { snap in
+                guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
+                fwd.rollbackOneStep(s)
+            })
+    }
+
     // ── Prefill helper ────────────────────────────────────────────────────
 
-    /// Chunked prefill: runs all prompt tokens through the engine, chunk=64.
+    /// Chunked prefill: runs all prompt tokens through the backend, chunk=64.
     /// Returns normed hidden of the very last position [1, H], or nil on error.
-    static func prefill(promptIds: [Int32], engine: RawEngine,
-                        caches: [RawVerifyForward.LayerCaches]) -> MLXArray? {
+    static func prefill(promptIds: [Int32], backend: SpecBackend) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         let chunkSize = 64
@@ -25,12 +67,9 @@ public enum RawSpecRunner {
         while pos < pLen {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
-            let M     = chunk.count
-            let x     = engine.embed(tokens: chunk)          // [M, H]
-            guard let normed = engine.forwardRows(x, caches: caches, M: M)
-            else { return nil }
+            guard let normed = backend.forward(chunk) else { return nil }
             // Keep last row [H] — will be overwritten each chunk until the final one.
-            lastNormed = normed[M - 1]    // [H]
+            lastNormed = normed[chunk.count - 1]    // [H]
             pos = end
         }
         return lastNormed.map { $0.reshaped([1, RawEngine.H]) }   // [1, H]
@@ -57,11 +96,21 @@ public enum RawSpecRunner {
         let gRefIds:   [Int]   = gRefArr.asType(.int32).asArray(Int32.self).map { Int($0) }
         let N    = Swift.min(Tell.envInt("QWISP_GEN", 48), gRefIds.count)
         let maxK = Tell.envInt("QWISP_DRAFT_K", 96)          // resident default; alpha*p cap from suffixDraft
-        print("[raw-spec] promptLen=\(promptIds.count) N=\(N) maxK=\(maxK)")
+        let useFused = Tell.envFlag("QWISP_RAW_FUSED")
+        print("[raw-spec] promptLen=\(promptIds.count) N=\(N) maxK=\(maxK) fused=\(useFused)")
+
+        // backend 構築(fused: maxM=verify 最大行数, maxSeqLen=prompt+生成+draft+margin)
+        let maxM = Swift.max(maxK + 1, 64)
+        let maxSeqLen = promptIds.count + N + maxK + 64
+        let mkBackend: () -> SpecBackend? = {
+            useFused ? fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
+                     : composedBackend(engine: engine)
+        }
+        guard let backend = mkBackend()
+        else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused))" }
 
         // ── PREFILL ───────────────────────────────────────────────────────
-        let caches = engine.freshCaches()
-        guard let lastNormed = prefill(promptIds: promptIds, engine: engine, caches: caches)
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend)
         else { return "[raw-spec] ERROR: prefill returned nil" }
 
         // First token: argmax of logits at the last prompt position.
@@ -83,16 +132,12 @@ public enum RawSpecRunner {
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
 
-            // Snapshot all caches before the batched verify.
-            // LayerCaches is a final class; copyState() copies the four MLXArray references.
-            // Because MLXArray values are immutable (new ops create new arrays), the snapshot
-            // retains the pre-verify tensors even after verifyForwardRows stores new ones.
-            let snaps = caches.map { $0.copyState() }
+            // Snapshot before the batched verify (backend-specific representation).
+            let snap = backend.snapshot()
 
             if D == 0 {
                 // No draft available: single M=1 forward.
-                let xS = engine.embed(tokens: [Int32(u)])
-                guard let nS = engine.forwardRows(xS, caches: caches, M: 1)
+                guard let nS = backend.forward([Int32(u)])
                 else { return "[raw-spec] ERROR: forward(D=0) nil" }
                 guard let lS = engine.logits(nS, M: 1)
                 else { return "[raw-spec] ERROR: logits(D=0) nil" }
@@ -106,8 +151,7 @@ public enum RawSpecRunner {
             // Batched verify: [u] + drafts[0..<D], total M = D+1 rows.
             // By raw-engine construction (order-stable, per-row kernels) batched == sequential.
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-            let xV = engine.embed(tokens: verifyTokens)                      // [D+1, H]
-            guard let nV = engine.forwardRows(xV, caches: caches, M: D + 1)
+            guard let nV = backend.forward(verifyTokens)
             else { return "[raw-spec] ERROR: verify forwardRows nil" }
             guard let lV = engine.logits(nV, M: D + 1)
             else { return "[raw-spec] ERROR: verify logits nil" }
@@ -133,13 +177,8 @@ public enum RawSpecRunner {
                 u = evals[D]
             } else {
                 // ── partial reject ────────────────────────────────────────
-                // 1. Rollback caches to pre-verify snapshot.
-                for (i, snap) in snaps.enumerated() {
-                    caches[i].kCache    = snap.kCache
-                    caches[i].vCache    = snap.vCache
-                    caches[i].convState = snap.convState
-                    caches[i].recState  = snap.recState
-                }
+                // 1. Rollback caches to the pre-verify snapshot(直前 1 forward の取り消し)。
+                backend.rollback(snap)
                 // 2. Commit u + accepted drafts[0..<p].
                 out.append(u); hist.append(u)
                 for d in drafts.prefix(p) { out.append(d); hist.append(d) }
@@ -149,8 +188,7 @@ public enum RawSpecRunner {
                 //    We do NOT call logits here — evals[p] from the batched verify is
                 //    bit-identical (same order-stable engine).
                 let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
-                let xR = engine.embed(tokens: rebuildTokens)
-                guard let _ = engine.forwardRows(xR, caches: caches, M: p + 1)
+                guard let _ = backend.forward(rebuildTokens)
                 else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
                 u = evals[p]
             }
@@ -178,8 +216,9 @@ public enum RawSpecRunner {
         guard Tell.envFlag("QWISP_RAWSPEC_CHECK") else { return summary }
 
         print("[raw-spec] self-check: running raw greedy (M=1) for \(N) tokens ...")
-        let caches2 = engine.freshCaches()
-        guard let lastNormed2 = prefill(promptIds: promptIds, engine: engine, caches: caches2)
+        guard let backend2 = mkBackend()
+        else { return summary + "\n[RawSpec] self-check ERROR: backend nil" }
+        guard let lastNormed2 = prefill(promptIds: promptIds, backend: backend2)
         else { return summary + "\n[RawSpec] self-check ERROR: prefill nil" }
 
         guard let lg00 = engine.logits(lastNormed2, M: 1)
@@ -189,8 +228,7 @@ public enum RawSpecRunner {
 
         var greedyOut: [Int] = []
         while greedyOut.count < N {
-            let xG = engine.embed(tokens: [Int32(uG)])
-            guard let nG = engine.forwardRows(xG, caches: caches2, M: 1)
+            guard let nG = backend2.forward([Int32(uG)])
             else { return summary + "\n[RawSpec] self-check ERROR: greedy forward nil" }
             guard let lG = engine.logits(nG, M: 1)
             else { return summary + "\n[RawSpec] self-check ERROR: greedy logits nil" }

@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXFast
+import Metal
 
 /// Reusable raw inference engine for the resident tier (C=256 semantics).
 /// Full expert tensors from the store, no arena/guard/cert/VSEQ.
@@ -178,5 +179,19 @@ public struct RawEngine {
     /// qmmTiled lm_head. Input normed [M, H]; returns logits [M, vocab] or nil.
     public func logits(_ normed: MLXArray, M: Int) -> MLXArray? {
         RawMetalForward.qmmTiled(normed, lmW, scales: lmS, biases: lmB, M: M, K: Self.H, N: vocab)
+    }
+
+    // ── fused (single-CB) forward path — P3 speed plumbing ────────────────
+
+    /// 全層 1-CB fused forward(cache 常駐)を cold cache で構築。final norm buffer も返す。
+    /// forwardRows(x, M, finalNormW: fnBuf) で「40層+final norm」が 1 CB になる。
+    public func makeFused(maxM: Int, maxSeqLen: Int) -> (RawFusedVerify.RawFusedForward, MTLBuffer)? {
+        guard let (device, _) = RawMetalForward.ensure(),
+              let fwd = RawFusedVerify.RawFusedForward(layers: layers, caches: freshCaches(),
+                                                       maxM: maxM, H: Self.H, maxSeqLen: maxSeqLen) else { return nil }
+        let fnA = fnW.asType(.float16)
+        fwd.retainedArrays.append(fnA)   // zero-copy buffer の寿命規約(変換一時 array の保持)
+        guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
+        return (fwd, fnBuf)
     }
 }

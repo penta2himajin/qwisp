@@ -255,16 +255,17 @@ public enum RawFusedVerify {
             float s = (acc < 0.0f) ? y : (1.0f - y);
             outp[m*C + c] = (half)(acc * s);
         }
-        // shift_conv_rows: hist ← concat(hist,qkv)[M .. M+K-2](composed の convState 更新と同値)。
-        // thread=列 c、j 昇順で src=M+j>j ゆえ in-place race-free。
-        kernel void shift_conv_rows(device half* hist [[buffer(0)]], device const half* qkv [[buffer(1)]],
-                                    constant uint& K [[buffer(2)]], constant uint& C [[buffer(3)]],
-                                    constant uint& M [[buffer(4)]],
+        // shift_conv_rows: histOut ← concat(histIn,qkv)[M .. M+K-2](composed の convState 更新と同値)。
+        // ping-pong(histIn 不変)= 1-step rollback を swap 戻しで実現(spec の partial reject 用)。
+        kernel void shift_conv_rows(device half* histOut [[buffer(0)]], device const half* histIn [[buffer(1)]],
+                                    device const half* qkv [[buffer(2)]],
+                                    constant uint& K [[buffer(3)]], constant uint& C [[buffer(4)]],
+                                    constant uint& M [[buffer(5)]],
                                     uint c [[thread_position_in_grid]]) {
             if (c >= C) return;
             for (uint j = 0; j + 1 < K; ++j) {
                 uint src = M + j;
-                hist[j*C + c] = (src < K - 1) ? hist[src*C + c] : qkv[(src - (K-1))*C + c];
+                histOut[j*C + c] = (src < K - 1) ? histIn[src*C + c] : qkv[(src - (K-1))*C + c];
             }
         }
         // slice_rows: 行毎 strided 抽出(純コピー)。out[m*W+j] = in[m*stride + off + j]。
@@ -407,13 +408,19 @@ public enum RawFusedVerify {
         let shUW: MTLBuffer, shUS: MTLBuffer, shUB: MTLBuffer
         let shDW: MTLBuffer, shDS: MTLBuffer, shDB: MTLBuffer
         let sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer
+        // ★ zero-copy(bytesNoCopy)buffer の裏 MLXArray を保持。asType 変換が生む一時 array の
+        //   buffer が解放→MLX allocator 再利用で clobber されるのを防ぐ(mlx-swift asMTLBuffer の寿命規約)。
+        let retained: [MLXArray]
     }
 
     static func prepareMoEBlockBufs(_ w: RawVerifyForward.MoEBlockW, _ device: MTLDevice) -> MoEBlockBufs? {
+        var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
+            let sc = s.asType(.float16), bc = b.asType(.float16)
+            keep.append(contentsOf: [q, sc, bc])
             guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(s.asType(.float16), device),
-                  let bb = RawMetalForward.mtlBuf(b.asType(.float16), device) else { return nil }
+                  let bs = RawMetalForward.mtlBuf(sc, device),
+                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
         guard let g = trio(w.gateWq, w.gateSc, w.gateBi),
@@ -429,7 +436,8 @@ public enum RawFusedVerify {
                             shGW: shG.0, shGS: shG.1, shGB: shG.2,
                             shUW: shU.0, shUS: shU.1, shUB: shU.2,
                             shDW: shD.0, shDS: shD.1, shDB: shD.2,
-                            sgW: sg.0, sgS: sg.1, sgB: sg.2)
+                            sgW: sg.0, sgS: sg.1, sgB: sg.2,
+                            retained: keep)
     }
 
     /// MoE block × M 行の全段(routing→routed experts→combine→shared→final)を **既存 encoder に
@@ -662,22 +670,28 @@ public enum RawFusedVerify {
         let vW: MTLBuffer, vS: MTLBuffer, vB: MTLBuffer
         let oW: MTLBuffer, oS: MTLBuffer, oB: MTLBuffer
         let qNorm: MTLBuffer, kNorm: MTLBuffer
+        let retained: [MLXArray]   // zero-copy buffer の裏 array 保持(寿命規約)
     }
 
     static func prepareAttnLayerBufs(_ w: RawVerifyForward.AttnLayerW, _ device: MTLDevice) -> AttnLayerBufs? {
+        var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
+            let sc = s.asType(.float16), bc = b.asType(.float16)
+            keep.append(contentsOf: [q, sc, bc])
             guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(s.asType(.float16), device),
-                  let bb = RawMetalForward.mtlBuf(b.asType(.float16), device) else { return nil }
+                  let bs = RawMetalForward.mtlBuf(sc, device),
+                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
+        let qnA = w.qNorm.asType(.float16), knA = w.kNorm.asType(.float16)
+        keep.append(contentsOf: [qnA, knA])
         guard let q = trio(w.qWq, w.qSc, w.qBi), let k = trio(w.kWq, w.kSc, w.kBi),
               let v = trio(w.vWq, w.vSc, w.vBi), let o = trio(w.oWq, w.oSc, w.oBi),
-              let qn = RawMetalForward.mtlBuf(w.qNorm.asType(.float16), device),
-              let kn = RawMetalForward.mtlBuf(w.kNorm.asType(.float16), device) else { return nil }
+              let qn = RawMetalForward.mtlBuf(qnA, device),
+              let kn = RawMetalForward.mtlBuf(knA, device) else { return nil }
         return AttnLayerBufs(qW: q.0, qS: q.1, qB: q.2, kW: k.0, kS: k.1, kB: k.2,
                              vW: v.0, vS: v.1, vB: v.2, oW: o.0, oS: o.1, oB: o.2,
-                             qNorm: qn, kNorm: kn)
+                             qNorm: qn, kNorm: kn, retained: keep)
     }
 
     /// attention 層の常駐 scratch(fused 中間)。
@@ -852,13 +866,14 @@ public enum RawFusedVerify {
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 
-    static func encodeShiftConvRows(_ enc: MTLComputeCommandEncoder, hist: MTLBuffer, qkv: MTLBuffer,
-                                    K: Int, C: Int, M: Int) {
+    static func encodeShiftConvRows(_ enc: MTLComputeCommandEncoder, histOut: MTLBuffer, histIn: MTLBuffer,
+                                    qkv: MTLBuffer, K: Int, C: Int, M: Int) {
         let p = _shiftConvRowsPipeline!
         enc.setComputePipelineState(p)
-        enc.setBuffer(hist, offset: 0, index: 0); enc.setBuffer(qkv, offset: 0, index: 1)
+        enc.setBuffer(histOut, offset: 0, index: 0); enc.setBuffer(histIn, offset: 0, index: 1)
+        enc.setBuffer(qkv, offset: 0, index: 2)
         var kk = UInt32(K), cc = UInt32(C), mm = UInt32(M)
-        enc.setBytes(&kk, length: 4, index: 2); enc.setBytes(&cc, length: 4, index: 3); enc.setBytes(&mm, length: 4, index: 4)
+        enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&cc, length: 4, index: 4); enc.setBytes(&mm, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: C, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
@@ -974,62 +989,81 @@ public enum RawFusedVerify {
         let promoteRMS: Bool
         let aLog: MTLBuffer, dtBias: MTLBuffer   // f32 [Hv]
         let onesDk: MTLBuffer           // f16 ones [Dk](qk-norm no-weight 用)
+        let retained: [MLXArray]        // zero-copy buffer の裏 array 保持(寿命規約)
     }
 
     static func prepareGdnLayerBufs(_ w: RawVerifyForward.GDNLayerW, Dk: Int, _ device: MTLDevice) -> GdnLayerBufs? {
+        var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
+            let sc = s.asType(.float16), bc = b.asType(.float16)
+            keep.append(contentsOf: [q, sc, bc])
             guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(s.asType(.float16), device),
-                  let bb = RawMetalForward.mtlBuf(b.asType(.float16), device) else { return nil }
+                  let bs = RawMetalForward.mtlBuf(sc, device),
+                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
         let promote = (w.normWeight.dtype == .float32)
         let ones = MLXArray.ones([Dk]).asType(.float16); ones.eval()
+        let cwA = w.conv1dW.asType(.float32)
+        let nwA = w.normWeight.asType(promote ? .float32 : .float16)
+        let alA = w.aLog.asType(.float32), dtA = w.dtBias.asType(.float32)
+        keep.append(contentsOf: [ones, cwA, nwA, alA, dtA])
         guard let qkv = trio(w.qkvWq, w.qkvSc, w.qkvBi), let z = trio(w.zWq, w.zSc, w.zBi),
               let b = trio(w.bWq, w.bSc, w.bBi), let a = trio(w.aWq, w.aSc, w.aBi),
               let o = trio(w.outWq, w.outSc, w.outBi),
-              let cw = RawMetalForward.mtlBuf(w.conv1dW.asType(.float32), device),
-              let nw = RawMetalForward.mtlBuf(w.normWeight.asType(promote ? .float32 : .float16), device),
-              let al = RawMetalForward.mtlBuf(w.aLog.asType(.float32), device),
-              let dt = RawMetalForward.mtlBuf(w.dtBias.asType(.float32), device),
+              let cw = RawMetalForward.mtlBuf(cwA, device),
+              let nw = RawMetalForward.mtlBuf(nwA, device),
+              let al = RawMetalForward.mtlBuf(alA, device),
+              let dt = RawMetalForward.mtlBuf(dtA, device),
               let od = RawMetalForward.mtlBuf(ones, device) else { return nil }
         return GdnLayerBufs(qkvW: qkv.0, qkvS: qkv.1, qkvB: qkv.2, zW: z.0, zS: z.1, zB: z.2,
                             bW: b.0, bS: b.1, bB: b.2, aW: a.0, aS: a.1, aB: a.2,
                             outW: o.0, outS: o.1, outB: o.2,
-                            conv1dW: cw, normWeight: nw, promoteRMS: promote, aLog: al, dtBias: dt, onesDk: od)
+                            conv1dW: cw, normWeight: nw, promoteRMS: promote, aLog: al, dtBias: dt, onesDk: od,
+                            retained: keep)
     }
 
-    /// GDN 層の常駐 cache(conv hist [K-1,C] f16 + rec state [1,Hv,Dv,Dk] f32 ping-pong)。
+    /// GDN 層の常駐 cache(conv hist [K-1,C] f16 と rec state [1,Hv,Dv,Dk] f32、両方 ping-pong)。
+    /// ping-pong = encode は In を読み Out に書く。encode 後 swap()。直前 1 step の rollback は
+    /// もう一度 swap()(裏面に pre-step 値が無傷で残る — spec の partial reject 用)。
     public final class GdnCacheBufs {
-        let convHist: MTLBuffer
-        var state: MTLBuffer       // 現在 state(encode 入力)
-        var stateOut: MTLBuffer    // encode 出力(encode 後に swap)
+        var convHist: MTLBuffer     // 現在(encode 入力)
+        var convHistOut: MTLBuffer  // encode 出力
+        var state: MTLBuffer        // 現在 state(encode 入力)
+        var stateOut: MTLBuffer     // encode 出力
         let K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int
-        init(convHist: MTLBuffer, state: MTLBuffer, stateOut: MTLBuffer, K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int) {
-            self.convHist = convHist; self.state = state; self.stateOut = stateOut
+        init(convHist: MTLBuffer, convHistOut: MTLBuffer, state: MTLBuffer, stateOut: MTLBuffer,
+             K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int) {
+            self.convHist = convHist; self.convHistOut = convHistOut
+            self.state = state; self.stateOut = stateOut
             self.K = K; self.C = C; self.Hv = Hv; self.Dv = Dv; self.Dk = Dk
         }
-        func swapState() { let t = state; state = stateOut; stateOut = t }
+        func swapState() {
+            let t = state; state = stateOut; stateOut = t
+            let c = convHist; convHist = convHistOut; convHistOut = c
+        }
     }
 
     static func makeGdnCacheBufs(_ device: MTLDevice, convInit: MLXArray?, recInit: MLXArray?,
                                  K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int) -> GdnCacheBufs? {
         guard let hist = device.makeBuffer(length: (K - 1) * C * 2, options: .storageModeShared),
+              let histOut = device.makeBuffer(length: (K - 1) * C * 2, options: .storageModeShared),
               let st = device.makeBuffer(length: Hv * Dv * Dk * 4, options: .storageModeShared),
               let stOut = device.makeBuffer(length: Hv * Dv * Dk * 4, options: .storageModeShared) else { return nil }
-        if let c0 = convInit {
+        if let c0 = convInit, c0.size > 0 {
             let cf = c0.asType(.float16).reshaped([-1]); cf.eval()
             let arr = cf.asArray(Float16.self)
             hist.contents().bindMemory(to: Float16.self, capacity: (K - 1) * C)
                 .update(from: arr, count: min(arr.count, (K - 1) * C))
         }
-        if let r0 = recInit {
+        if let r0 = recInit, r0.size > 0 {
             let rf = r0.asType(.float32).reshaped([-1]); rf.eval()
             let arr = rf.asArray(Float.self)
             st.contents().bindMemory(to: Float.self, capacity: Hv * Dv * Dk)
                 .update(from: arr, count: min(arr.count, Hv * Dv * Dk))
         }
-        return GdnCacheBufs(convHist: hist, state: st, stateOut: stOut, K: K, C: C, Hv: Hv, Dv: Dv, Dk: Dk)
+        return GdnCacheBufs(convHist: hist, convHistOut: histOut, state: st, stateOut: stOut,
+                            K: K, C: C, Hv: Hv, Dv: Dv, Dk: Dk)
     }
 
     static func readGdnCache(_ c: GdnCacheBufs) -> (MLXArray, MLXArray) {
@@ -1081,10 +1115,11 @@ public enum RawFusedVerify {
         encodeQmmRows(enc, w: w.zW, scales: w.zS, biases: w.zB, x: x, out: sc.z, M: M, K: H, N: valueDim)
         encodeQmmRows(enc, w: w.bW, scales: w.bS, biases: w.bB, x: x, out: sc.bP, M: M, K: H, N: numVHeads)
         encodeQmmRows(enc, w: w.aW, scales: w.aS, biases: w.aB, x: x, out: sc.aP, M: M, K: H, N: numVHeads)
-        // ② conv(hist 直読み)→ hist shift 更新(conv の後=旧 hist を読む)
+        // ② conv(hist 直読み)→ hist shift 更新(ping-pong: In を読み Out へ)
         encodeConvHistRows(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW, out: sc.convOut,
                            K: convKernel, C: convDim, M: M)
-        encodeShiftConvRows(enc, hist: cache.convHist, qkv: sc.qkv, K: convKernel, C: convDim, M: M)
+        encodeShiftConvRows(enc, histOut: cache.convHistOut, histIn: cache.convHist, qkv: sc.qkv,
+                            K: convKernel, C: convDim, M: M)
         // ③ split q/k/v(純コピー)
         encodeSliceRows(enc, input: sc.convOut, out: sc.q1, off: 0, W: keyDim, stride: convDim, M: M)
         encodeSliceRows(enc, input: sc.convOut, out: sc.k1, off: keyDim, W: keyDim, stride: convDim, M: M)
@@ -1193,6 +1228,8 @@ public enum RawFusedVerify {
         let hBuf: MTLBuffer, normed: MTLBuffer, mixerOut: MTLBuffer, postNorm: MTLBuffer, moeOut: MTLBuffer
         let attnSc: AttnScratch, gdnSc: GdnScratch, moeSc: MoEScratch
         let device: MTLDevice, queue: MTLCommandQueue
+        /// zero-copy buffer の裏 MLXArray 保持(asType 変換の一時 array を allocator 再利用から守る)
+        public var retainedArrays: [MLXArray] = []
 
         public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
@@ -1235,8 +1272,10 @@ public enum RawFusedVerify {
             attnSc = aSc; gdnSc = gSc; moeSc = mSc
             // 層別 weight/cache buffer 化
             for (i, s) in specs.enumerated() {
-                guard let ln = RawMetalForward.mtlBuf(s.inputLN.asType(.float16), device),
-                      let pn = RawMetalForward.mtlBuf(s.postLN.asType(.float16), device),
+                let lnA = s.inputLN.asType(.float16), pnA = s.postLN.asType(.float16)
+                retainedArrays.append(contentsOf: [lnA, pnA])
+                guard let ln = RawMetalForward.mtlBuf(lnA, device),
+                      let pn = RawMetalForward.mtlBuf(pnA, device),
                       let moe = RawFusedVerify.prepareMoEBlockBufs(s.moe, device) else { return nil }
                 var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
                 var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
@@ -1285,7 +1324,8 @@ public enum RawFusedVerify {
         }
 
         /// 全層 forward(単一 CB)。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
-        public func forwardRows(_ x: MLXArray, M: Int) -> MLXArray? {
+        /// finalNormW を渡すと最終 rmsNorm も同一 CB に同梱し normed [M,H] を返す。
+        public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
             guard M <= maxM else { return nil }
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
@@ -1293,9 +1333,25 @@ public enum RawFusedVerify {
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             for L in layers { encodeLayer(enc, L, M: M) }
+            if let fw = finalNormW {
+                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+            }
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            let ptr = hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+            let src = finalNormW != nil ? normed : hBuf
+            let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        }
+
+        /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。
+        /// KV は len の巻き戻し、GDN state/conv hist は ping-pong の swap 戻し(裏面に pre-step 値)。
+        public struct Snapshot { let kvLens: [Int] }
+        public func snapshot() -> Snapshot { Snapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }) }
+        /// snapshot 以降に forwardRows をちょうど 1 回だけ呼んだ状態から巻き戻す(2 回以上は不可)。
+        public func rollbackOneStep(_ s: Snapshot) {
+            for (i, L) in layers.enumerated() {
+                if let kv = L.kvCache { kv.len = s.kvLens[i] }
+                if let gc = L.gdnCache { gc.swapState() }
+            }
         }
 
         /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
