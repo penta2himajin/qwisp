@@ -231,4 +231,65 @@ public enum RawVerifyForward {
         let gateScale = MLX.sigmoid(sgl[0..., 0 ..< 1])                          // [M,1]
         return y + gateScale * sharedY
     }
+
+    /// decoder 層 1 枚の仕様(mixer 種別 + 重み + MoE)。
+    public struct LayerSpec {
+        let isLinear: Bool
+        let inputLN: MLXArray, postLN: MLXArray      // [H] f16
+        let gdn: GDNLayerW?
+        let attn: AttnLayerW?
+        let moe: MoEBlockW
+        let moeE: Int, moeI: Int, moeKtop: Int
+        public init(isLinear: Bool, inputLN: MLXArray, postLN: MLXArray,
+                    gdn: GDNLayerW?, attn: AttnLayerW?, moe: MoEBlockW,
+                    moeE: Int, moeI: Int, moeKtop: Int = 8) {
+            self.isLinear = isLinear; self.inputLN = inputLN; self.postLN = postLN
+            self.gdn = gdn; self.attn = attn; self.moe = moe
+            self.moeE = moeE; self.moeI = moeI; self.moeKtop = moeKtop
+        }
+    }
+
+    /// 層別 cache(GDN: conv+rec / attn: kv)。
+    public final class LayerCaches {
+        public var kCache: MLXArray?, vCache: MLXArray?
+        public var convState: MLXArray?, recState: MLXArray?
+        public init(kCache: MLXArray? = nil, vCache: MLXArray? = nil,
+                    convState: MLXArray? = nil, recState: MLXArray? = nil) {
+            self.kCache = kCache; self.vCache = vCache
+            self.convState = convState; self.recState = recState
+        }
+        public func copyState() -> LayerCaches {
+            LayerCaches(kCache: kCache, vCache: vCache, convState: convState, recState: recState)
+        }
+    }
+
+    /// U1d: decoder 層列 × M 行の verify forward 合成。
+    /// StreamingDecoderLayer と同一 op 列: inputLN → mixer → resid → postLN → MoE → resid。
+    /// 戻り値 [M, H](final norm/lm_head は呼び出し側)。caches は逐次 threading と bit 一致で更新。
+    public static func verifyForwardRows(_ x: MLXArray, layers: [LayerSpec], caches: [LayerCaches],
+                                         M: Int, eps: Float = 1e-6) -> MLXArray? {
+        let H = x.dim(-1)
+        var h = x
+        for (i, L) in layers.enumerated() {
+            guard let normed = RawMetalForward.rmsNormRows(h, L.inputLN, M: M, eps: eps, D: H) else { return nil }
+            let r: MLXArray?
+            if L.isLinear, let gw = L.gdn {
+                var cs = caches[i].convState!, rs = caches[i].recState!
+                r = gdnLayerRows(normed, gw, convState: &cs, recState: &rs, M: M, eps: eps)
+                caches[i].convState = cs; caches[i].recState = rs
+            } else if let aw = L.attn {
+                var kc = caches[i].kCache!, vc = caches[i].vCache!
+                r = attnLayerRows(normed, aw, kCache: &kc, vCache: &vc, M: M, eps: eps)
+                caches[i].kCache = kc; caches[i].vCache = vc
+            } else { return nil }
+            guard let rr = r else { return nil }
+            h = h + rr                                                            // residual(elementwise)
+            guard let postNorm = RawMetalForward.rmsNormRows(h, L.postLN, M: M, eps: eps, D: H) else { return nil }
+            guard let moeOut = moeBlockRows(postNorm, L.moe, M: M, E: L.moeE, I: L.moeI, Ktop: L.moeKtop)
+            else { return nil }
+            h = h + moeOut
+        }
+        h.eval()
+        return h
+    }
 }

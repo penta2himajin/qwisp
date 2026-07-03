@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 14
+        let total = 15
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -583,6 +583,94 @@ public enum RawVerifyTests {
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
                 let (ok1, d1) = bitEqual(got, ref)
                 if !ok1 { return (false, "M=\(M): \(d1)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 15 (U1d): 2 層(GDN+attn)合成 verifyForwardRows — rows ≡ M=1 ループ(hidden+全cache bit一致)
+        run("verify_forward_rows_bitexact") {
+            let H = 2048, E = 16, I = 512
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func mkMoE() -> RawVerifyForward.MoEBlockW {
+                let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+                let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+                let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+                return RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                    swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                    swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                    shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                    sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            }
+            // layer 0: GDN
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
+            let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
+            let gdnW = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
+                normWeight: MLXRandom.normal([Dv]).asType(.float16),
+                aLog: MLXRandom.normal([Hv]).asType(.float32), dtBias: MLXRandom.normal([Hv]).asType(.float32))
+            // layer 1: attn
+            let nH = 16, nKV = 2, hD = 256
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let attnW = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let layers = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
+            ]
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([cs0, rs0, kC0, vC0])
+            func freshCaches() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 RawVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            }
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                let c1 = freshCaches()
+                guard let got = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: c1, M: M)
+                else { return (false, "rows nil M=\(M)") }
+                let c2 = freshCaches()
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    guard let r = RawVerifyForward.verifyForwardRows(x[m ..< m+1], layers: layers, caches: c2, M: 1)
+                    else { return (false, "ref nil M=\(M) m=\(m)") }
+                    refParts.append(r)
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok1, d1) = bitEqual(got, ref)
+                if !ok1 { return (false, "hidden M=\(M): \(d1)") }
+                let pairs: [(MLXArray?, MLXArray?, String)] = [
+                    (c1[0].convState, c2[0].convState, "convState"), (c1[0].recState, c2[0].recState, "recState"),
+                    (c1[1].kCache, c2[1].kCache, "kCache"), (c1[1].vCache, c2[1].vCache, "vCache")]
+                for (a, b, nm) in pairs {
+                    guard let aa = a, let bb = b else { return (false, "\(nm) nil M=\(M)") }
+                    let (ok, d) = bitEqual(aa, bb)
+                    if !ok { return (false, "\(nm) M=\(M): \(d)") }
+                }
             }
             return (true, "ok")
         }
