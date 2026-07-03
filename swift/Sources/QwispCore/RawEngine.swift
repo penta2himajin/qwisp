@@ -23,6 +23,8 @@ public struct RawEngine {
     let fnW: MLXArray                       // final rmsNorm weight [H]
     let lmW, lmS, lmB: MLXArray            // lm_head weights
     public let vocab: Int
+    // ── lmhead2 (Round B): 2-bit copy + per-row error norms。QWISP_LMHEAD2=1 時のみ非 nil。
+    let lm2: (MLXArray, MLXArray, MLXArray, MLXArray)?
 
     // ── helpers ───────────────────────────────────────────────────────────
 
@@ -130,6 +132,21 @@ public struct RawEngine {
         let gateW0 = store.req("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight")
         let moeI   = gateW0.shape[1]
         let layers = (0 ..< numLayers).map { i in buildLayerSpec(i, store: store, moeI: moeI) }
+        let lmW = store.req("language_model.lm_head.weight")
+        let lmS = store.req("language_model.lm_head.scales")
+        let lmB = store.req("language_model.lm_head.biases")
+        let vocab = lmW.dim(0)
+        // §3.1: QWISP_LMHEAD2=1 時、4-bit lm_head を dequant→2-bit 再量子化し rowE を構築(build 一回)。
+        var lm2: (MLXArray, MLXArray, MLXArray, MLXArray)? = nil
+        if ProcessInfo.processInfo.environment["QWISP_LMHEAD2"] == "1" {
+            if let r = RawFusedVerify.buildLMHead2(w4: lmW, s4: lmS, b4: lmB, V: vocab, K: H) {
+                MLX.eval([r.w2, r.s2, r.b2, r.rowE])
+                lm2 = r
+                print("[raw-engine] lmhead2 built (2-bit copy + rowE, V=\(vocab))")
+            } else {
+                print("[raw-engine] lmhead2 build failed — feature off")
+            }
+        }
         return RawEngine(
             layers:  layers,
             moeI:    moeI,
@@ -137,10 +154,9 @@ public struct RawEngine {
             embedS:  store.req("language_model.model.embed_tokens.scales"),
             embedB:  store.req("language_model.model.embed_tokens.biases"),
             fnW:     store.req("language_model.model.norm.weight"),
-            lmW:     store.req("language_model.lm_head.weight"),
-            lmS:     store.req("language_model.lm_head.scales"),
-            lmB:     store.req("language_model.lm_head.biases"),
-            vocab:   store.req("language_model.lm_head.weight").dim(0))
+            lmW:     lmW, lmS: lmS, lmB: lmB,
+            vocab:   vocab,
+            lm2:     lm2)
     }
 
     // ── core operations ───────────────────────────────────────────────────
@@ -226,6 +242,7 @@ public struct RawEngine {
         guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
         _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
                            lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
+        if let lm2 = lm2, RawFusedVerify.RawFusedForward.lmHead2 { _ = fwd.attachHeadLMHead2(lm2) }
         return (fwd, fnBuf, providers)
     }
 
@@ -241,6 +258,7 @@ public struct RawEngine {
         // head 同梱(embed→層→norm→lm_head→argmax の 1-CB step)。失敗しても forwardRows 経路は生きる。
         _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
                            lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
+        if let lm2 = lm2, RawFusedVerify.RawFusedForward.lmHead2 { _ = fwd.attachHeadLMHead2(lm2) }
         return (fwd, fnBuf)
     }
 }
