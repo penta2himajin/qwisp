@@ -1321,6 +1321,8 @@ public enum RawFusedVerify {
         let device: MTLDevice, queue: MTLCommandQueue
         /// zero-copy buffer の裏 MLXArray 保持(asType 変換の一時 array を allocator 再利用から守る)
         public var retainedArrays: [MLXArray] = []
+        /// profile: 直近 stepArgmax の GPU-exec(gpuEnd-gpuStart)ms。wall と比較して CPU overhead を分離。
+        nonisolated(unsafe) public static var profLastGPUMs = 0.0
 
         public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
@@ -1428,6 +1430,7 @@ public enum RawFusedVerify {
                 RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
             }
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
@@ -1517,6 +1520,7 @@ public enum RawFusedVerify {
             enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
             let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
             return (0 ..< M).map { Int(ptr[$0]) }
         }
