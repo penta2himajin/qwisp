@@ -50,7 +50,6 @@ public enum RawVerifyForward {
         else { return nil }
         let qOutR = qOut.reshaped([M * numHeads, qd2])
         let queries = qOutR[0..., 0 ..< headDim]                                   // [M*numHeads, headDim]
-        let gate = qOutR[0..., headDim...].reshaped([M, numHeads * headDim])       // [M, numHeads*headDim]
         // qk-norm(f16 weight, per-row = per-head)
         guard let qN = RawMetalForward.rmsNormRows(queries, w.qNorm.asType(.float16), M: M * numHeads, eps: eps, D: headDim),
               let kN = RawMetalForward.rmsNormRows(kOut.reshaped([M * numKV, headDim]), w.kNorm.asType(.float16),
@@ -78,9 +77,10 @@ public enum RawVerifyForward {
                                                      H: numHeads, KV: numKV, D: headDim,
                                                      baseLen: baseLen + 1, M: M, scale: scale)
         else { return nil }
-        // sigmoid-gated output(f16 elementwise, per-row)→ o_proj
-        let outR = attnOut.reshaped([M, numHeads * headDim]).asType(.float16)
-        let gated = outR * MLX.sigmoid(gate)
+        // sigmoid-gated output — raw kernel(sigmoid_mul, gate は qOut から strided 読み)= fused と同一数値系
+        guard let gated0 = RawFusedVerify.sigmoidMulRaw(attnOut, qOut, headDim: headDim, qd2: qd2,
+                                                        total: M * numHeads * headDim) else { return nil }
+        let gated = gated0.reshaped([M, numHeads * headDim])
         return RawMetalForward.qmmRows(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: M, K: numHeads * headDim, N: H)
     }
 

@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 20
+        let total = 21
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -865,6 +865,41 @@ public enum RawVerifyTests {
                     }
                     return (false, "M=\(M) out-only: \(d)")
                 }
+            }
+            return (true, "ok")
+        }
+
+        // Test 21 (P3-B): fused attn 層(単一 encoder + 常駐 KV cache)≡ composed attnLayerRows(出力+cache)
+        run("fused_attn_layer_bitexact") {
+            let H = 2048, nH = 16, nKV = 2, hD = 256
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let w = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([kC0, vC0])
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                var kc = kC0, vc = vC0
+                guard let ref = RawVerifyForward.attnLayerRows(x, w, kCache: &kc, vCache: &vc, M: M)
+                else { return (false, "composed nil M=\(M)") }
+                ref.eval()
+                guard let (got, gk, gv) = RawFusedVerify.fusedAttnLayerRows(x, w, kInit: kC0, vInit: vC0,
+                                                                            maxLen: 64, M: M)
+                else { return (false, "fused nil M=\(M)") }
+                got.eval(); gk.eval(); gv.eval()
+                let (ok1, d1) = bitEqual(got, ref)
+                if !ok1 { return (false, "out M=\(M): \(d1)") }
+                let (ok2, d2) = bitEqual(gk, kc)
+                if !ok2 { return (false, "kCache M=\(M): \(d2)") }
+                let (ok3, d3) = bitEqual(gv, vc)
+                if !ok3 { return (false, "vCache M=\(M): \(d3)") }
             }
             return (true, "ok")
         }
