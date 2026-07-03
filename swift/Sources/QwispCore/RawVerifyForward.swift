@@ -281,7 +281,7 @@ public enum RawVerifyForward {
     /// StreamingDecoderLayer と同一 op 列: inputLN → mixer → resid → postLN → MoE → resid。
     /// 戻り値 [M, H](final norm/lm_head は呼び出し側)。caches は逐次 threading と bit 一致で更新。
     public static func verifyForwardRows(_ x: MLXArray, layers: [LayerSpec], caches: [LayerCaches],
-                                         M: Int, eps: Float = 1e-6) -> MLXArray? {
+                                         M: Int, eps: Float = 1e-6, metalRoute: Bool = false) -> MLXArray? {
         let H = x.dim(-1)
         var h = x
         for (i, L) in layers.enumerated() {
@@ -299,7 +299,7 @@ public enum RawVerifyForward {
             guard let rr = r else { return nil }
             h = h + rr                                                            // residual(elementwise)
             guard let postNorm = RawMetalForward.rmsNormRows(h, L.postLN, M: M, eps: eps, D: H) else { return nil }
-            guard let moeOut = moeBlockRows(postNorm, L.moe, M: M, E: L.moeE, I: L.moeI, Ktop: L.moeKtop)
+            guard let moeOut = moeBlockRows(postNorm, L.moe, M: M, E: L.moeE, I: L.moeI, Ktop: L.moeKtop, metalRoute: metalRoute)
             else { return nil }
             h = h + moeOut
         }

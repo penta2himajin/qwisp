@@ -169,7 +169,8 @@ public struct RawEngine {
     /// verifyForwardRows(x, ...) + final rmsNorm. Returns normed hidden [M, H] or nil.
     /// Caches are mutated in place (advancing the KV / recurrent state).
     public func forwardRows(_ x: MLXArray, caches: [RawVerifyForward.LayerCaches], M: Int) -> MLXArray? {
-        guard let h = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: caches, M: M)
+        let mr = ProcessInfo.processInfo.environment["QWISP_RAW_METAL_ROUTE"] == "1"
+        guard let h = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: caches, M: M, metalRoute: mr)
         else { return nil }
         return RawMetalForward.rmsNormRows(h, fnW, M: M, eps: Self.eps, D: Self.H)
     }
