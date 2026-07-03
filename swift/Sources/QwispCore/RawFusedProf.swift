@@ -57,6 +57,30 @@ public enum RawFusedProf {
         out += String(format: "\n  [segment M=1] 40層+norm GPU=%.2fms  full(=+embed+lm_head+argmax) GPU=%.2fms  → lm_head+head≈%.2fms",
                       lg, fg, fg - lg)
         out += "\n  読み: GPU-exec 支配→kernel 最適化。固定 per-forward コスト大→ M=1 で weight-read 非償却。lm_head+head が大なら qmm4_tiled(M=1)→qmv 切替候補"
+
+        // component 内訳(M=1, wall): 40層 12ms が MoE / attn / GDN のどこか。fused component 関数を単体計測。
+        // 実モデル層構成: 40層中 attn=10(index%4==3), gdn=30。全層に MoE。
+        let x1 = MLXRandom.normal([1, RawEngine.H]).asType(.float16); x1.eval()
+        func timeIt(_ n: Int, _ f: () -> Void) -> Double { for _ in 0..<3 { f() }; let s = nowMs(); for _ in 0..<n { f() }; return (nowMs()-s)/Double(n) }
+        // 代表 attn 層 / gdn 層 / MoE ブロックを 1 つずつ
+        var attnMs = 0.0, gdnMs = 0.0, moeMs = 0.0
+        if let al = engine.layers.first(where: { !$0.isLinear }), let aw = al.attn {
+            var kc = MLXRandom.normal([2, 16, 256]).asType(.float16), vc = MLXRandom.normal([2, 16, 256]).asType(.float16)
+            MLX.eval([kc, vc])
+            attnMs = timeIt(30) { var k = kc, v = vc; _ = RawVerifyForward.attnLayerRows(x1, aw, kCache: &k, vCache: &v, M: 1) }
+            _ = (kc, vc)
+        }
+        if let gl = engine.layers.first(where: { $0.isLinear }), let gw = gl.gdn {
+            let cs = MLXRandom.normal([3, 8192]).asType(.float16), rs = MLXRandom.normal([1, 32, 128, 128]).asType(.float32)
+            MLX.eval([cs, rs])
+            gdnMs = timeIt(30) { var c = cs, r = rs; _ = RawVerifyForward.gdnLayerRows(x1, gw, convState: &c, recState: &r, M: 1) }
+        }
+        if let ml = engine.layers.first {
+            moeMs = timeIt(30) { _ = RawVerifyForward.moeBlockRows(x1, ml.moe, M: 1, E: 256, I: engine.moeI, Ktop: 8, metalRoute: true) }
+        }
+        out += String(format: "\n  [component M=1 wall/回] attn層=%.2fms gdn層=%.2fms MoEブロック=%.2fms → forward概算=attn×10+gdn×30+MoE×40=%.1fms",
+                      attnMs, gdnMs, moeMs, attnMs*10 + gdnMs*30 + moeMs*40)
+        out += "\n  (注: これは per-op CB 版の wall で 1-CB より遅い。相対比で律速 component を特定する用)"
         return out
     }
 }
