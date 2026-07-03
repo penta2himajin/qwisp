@@ -135,7 +135,7 @@ public enum RawSpecRunner {
     /// SuffixSpec ループ本体(main run / self-check / stream-vs-resident check の 3 箇所で共用)。
     /// Returns out[0..<N] token ids.
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: RawEngine,
-                             N: Int, maxK: Int) -> [Int]? {
+                             N: Int, maxK: Int, useA3: Bool = false) -> [Int]? {
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
@@ -143,37 +143,87 @@ public enum RawSpecRunner {
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
+        var pending: [Int] = []  // A3: pending prefix tokens
+        let pendingCap = 24
 
         while out.count < N {
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
 
-            let snap = backend.snapshot()
+            var snap = backend.snapshot()
 
             if D == 0 {
-                guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
-                out.append(u); hist.append(u)
-                u = evals[0]
+                if useA3 && !pending.isEmpty {
+                    // A3 D==0: stepArgmax on [pending, u] (batched)—ONE forward to realize pending
+                    let pk = pending.count
+                    let stepTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)]
+                    guard let evals = backend.stepArgmax(stepTokens) else { return nil }
+                    out.append(u); hist.append(u)
+                    u = evals[pk]  // next token after pending+u (pk = position of u)
+                    pending = []
+                } else {
+                    guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
+                    out.append(u); hist.append(u)
+                    u = evals[0]
+                }
                 continue
             }
 
-            let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-            guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
+            if useA3 {
+                // A3: fuse pending + [u] + drafts into ONE verify batch (no flush-before-verify)
+                let pk = pending.count
+                let verifyTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)] + drafts.map { Int32($0) }
+                guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
 
-            var p = 0
-            while p < D && drafts[p] == evals[p] { p += 1 }
+                // Decision row offset: evals[pk] = prediction after u (row pk in fused batch).
+                // drafts[p] should equal evals[pk + p] (mirror of TellBolt's evals[p] after
+                // slicing vlg[0, pk ..< pk+D+1]).  The spec document wrote pk+1+p but that is
+                // an off-by-one: the u-row IS the comparison origin, not a skip.
+                var p = 0
+                while p < D && drafts[p] == evals[pk + p] { p += 1 }
 
-            if p == D {
-                out.append(u); hist.append(u)
-                for d in drafts { out.append(d); hist.append(d) }
-                u = evals[D]
+                if p == D {
+                    // A3 full accept: fused forward already advanced cache to B+pk+1+D
+                    out.append(u); hist.append(u)
+                    for d in drafts { out.append(d); hist.append(d) }
+                    pending = []
+                    u = evals[pk + D]
+                } else {
+                    // A3 partial reject: rollback to B (before pending was realized), re-add to pending
+                    backend.rollback(snap)
+                    out.append(u); hist.append(u)
+                    for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                    pending.append(u)
+                    for d in drafts.prefix(p) { pending.append(d) }
+                    u = evals[pk + p]
+
+                    // Cap flush: only if pending exceeds 24 (safety to bound M)
+                    if pending.count >= pendingCap {
+                        let pendingTokens: [Int32] = pending.map { Int32($0) }
+                        guard let _ = backend.forward(pendingTokens) else { return nil }
+                        pending = []
+                    }
+                }
             } else {
-                backend.rollback(snap)
-                out.append(u); hist.append(u)
-                for d in drafts.prefix(p) { out.append(d); hist.append(d) }
-                let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
-                guard let _ = backend.forward(rebuildTokens) else { return nil }
-                u = evals[p]
+                // Non-A3 path (unchanged)
+                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
+
+                var p = 0
+                while p < D && drafts[p] == evals[p] { p += 1 }
+
+                if p == D {
+                    out.append(u); hist.append(u)
+                    for d in drafts { out.append(d); hist.append(d) }
+                    u = evals[D]
+                } else {
+                    backend.rollback(snap)
+                    out.append(u); hist.append(u)
+                    for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                    let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                    guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    u = evals[p]
+                }
             }
         }
         return Array(out.prefix(N))
@@ -187,6 +237,7 @@ public enum RawSpecRunner {
         let isStreaming = rawC > 0 && rawC < 256
         let isBolt = isStreaming && Tell.envFlag("QWISP_RAW_BOLT")
         var useFused = Tell.envFlag("QWISP_RAW_FUSED")
+        let useA3 = Tell.envFlag("QWISP_RAW_A3")
         if isStreaming && !useFused {
             print("[raw-spec] QWISP_RAW_C=\(rawC) → streaming tier; enabling fused implicitly (set QWISP_RAW_FUSED=1 to suppress this note)")
             useFused = true
@@ -218,10 +269,12 @@ public enum RawSpecRunner {
         let maxK = isStreaming
             ? Tell.envInt("QWISP_DRAFT_K", Swift.max(4, rawC * 3 / 8))
             : Tell.envInt("QWISP_DRAFT_K", 96)
-        print("[raw-spec] promptLen=\(promptIds.count) N=\(N) maxK=\(maxK) fused=\(useFused) streaming=\(isStreaming) C=\(rawC) bolt=\(isBolt)")
+        print("[raw-spec] promptLen=\(promptIds.count) N=\(N) maxK=\(maxK) fused=\(useFused) streaming=\(isStreaming) C=\(rawC) bolt=\(isBolt) a3=\(useA3)")
 
         // backend 構築(fused: maxM=verify 最大行数, maxSeqLen=prompt+生成+draft+margin)
-        let maxM = Swift.max(maxK + 1, 64)
+        // A3: maxM must be at least pendingCap + maxK + 1 to fit fused batches
+        let pendingCap = 24
+        let maxM = Swift.max(pendingCap + maxK + 1, 64)
         let maxSeqLen = promptIds.count + N + maxK + 64
 
         // ── BOLT PATH ────────────────────────────────────────────────────
@@ -269,6 +322,8 @@ public enum RawSpecRunner {
         var out: [Int] = []
         var accTok = 0     // total accepted draft tokens (for accept/step)
         var steps  = 0
+        var pending: [Int] = []  // A3: tokens committed but not yet realized in cache
+        // pendingCap = 24 (already declared above for maxM computation)
 
         let t0 = DispatchTime.now()
 
@@ -277,53 +332,100 @@ public enum RawSpecRunner {
             let D      = drafts.count
 
             // Snapshot before the batched verify (backend-specific representation).
-            let snap = backend.snapshot()
+            var snap = backend.snapshot()
 
             if D == 0 {
-                // No draft available: single M=1 step(1-CB: forward+lm_head+argmax)。
-                guard let evals = backend.stepArgmax([Int32(u)])
-                else { return "[raw-spec] ERROR: step(D=0) nil" }
-                out.append(u); hist.append(u)
-                u = evals[0]
+                // No draft available
+                if useA3 && !pending.isEmpty {
+                    // A3 D==0 path: stepArgmax on [pending, u] (batched)
+                    let stepTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)]
+                    guard let evals = backend.stepArgmax(stepTokens)
+                    else { return "[raw-spec] ERROR: A3 step(D=0) nil" }
+                    out.append(u); hist.append(u)
+                    u = evals[pending.count]  // argmax at position pk (where u is)
+                    pending = []
+                } else {
+                    // Non-A3 or empty pending: simple single step
+                    guard let evals = backend.stepArgmax([Int32(u)])
+                    else { return "[raw-spec] ERROR: step(D=0) nil" }
+                    out.append(u); hist.append(u)
+                    u = evals[0]
+                }
                 steps += 1
                 continue
             }
 
-            // Batched verify: [u] + drafts[0..<D], total M = D+1 rows.
-            // By raw-engine construction (order-stable, per-row kernels) batched == sequential.
-            let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-            guard let evals = backend.stepArgmax(verifyTokens)
-            else { return "[raw-spec] ERROR: verify step nil" }
+            // Batched verify construction
+            if useA3 {
+                // A3: fuse pending + [u] + drafts into ONE verify batch (no flush-before-verify)
+                let pk = pending.count
+                let verifyTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)] + drafts.map { Int32($0) }
+                guard let evals = backend.stepArgmax(verifyTokens)
+                else { return "[raw-spec] ERROR: A3 verify step nil" }
 
-            // Accept prefix p: longest i s.t. drafts[i] == evals[i] for all i < p.
-            var p = 0
-            while p < D && drafts[p] == evals[p] { p += 1 }
+                // Decision row offset: evals[pk] = prediction after u (row pk in fused batch).
+                // drafts[p] should equal evals[pk + p] (mirror of TellBolt's evals[p] after
+                // slicing vlg[0, pk ..< pk+D+1]).  The spec document wrote pk+1+p but that is
+                // an off-by-one: the u-row IS the comparison origin, not a skip.
+                var p = 0
+                while p < D && drafts[p] == evals[pk + p] { p += 1 }
 
-            if p == D {
-                // ── full accept ───────────────────────────────────────────
-                // Committed: u + all D drafts (D+1 tokens).  Bonus: evals[D].
-                // Caches advanced by D+1 positions — exactly the committed tokens. ✓
-                out.append(u); hist.append(u)
-                for d in drafts { out.append(d); hist.append(d) }
-                accTok += D
-                steps  += 1
-                u = evals[D]
+                if p == D {
+                    // ── A3 full accept: fused forward already advanced cache ───
+                    out.append(u); hist.append(u)
+                    for d in drafts { out.append(d); hist.append(d) }
+                    accTok += D
+                    steps  += 1
+                    pending = []
+                    u = evals[pk + D]
+                } else {
+                    // ── A3 partial reject: rollback to B, re-add to pending ────
+                    backend.rollback(snap)
+                    out.append(u); hist.append(u)
+                    for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                    accTok += p
+                    steps  += 1
+                    // Add u + accepted drafts to pending
+                    pending.append(u)
+                    for d in drafts.prefix(p) { pending.append(d) }
+                    u = evals[pk + p]
+
+                    // Cap flush: only if pending exceeds 24 (safety to bound M)
+                    if pending.count >= pendingCap {
+                        let pendingTokens: [Int32] = pending.map { Int32($0) }
+                        guard let _ = backend.forward(pendingTokens)
+                        else { return "[raw-spec] ERROR: A3 pending flush nil" }
+                        pending = []
+                    }
+                }
             } else {
-                // ── partial reject ────────────────────────────────────────
-                // 1. Rollback caches to the pre-verify snapshot(直前 1 forward の取り消し)。
-                backend.rollback(snap)
-                // 2. Commit u + accepted drafts[0..<p].
-                out.append(u); hist.append(u)
-                for d in drafts.prefix(p) { out.append(d); hist.append(d) }
-                accTok += p
-                steps  += 1
-                // 3. Rebuild forward with the p+1 committed tokens to advance caches.
-                //    We do NOT call logits here — evals[p] from the batched verify is
-                //    bit-identical (same order-stable engine).
-                let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
-                guard let _ = backend.forward(rebuildTokens)
-                else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
-                u = evals[p]
+                // ── Non-A3 path (unchanged) ──────────────────────────────
+                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                guard let evals = backend.stepArgmax(verifyTokens)
+                else { return "[raw-spec] ERROR: verify step nil" }
+
+                var p = 0
+                while p < D && drafts[p] == evals[p] { p += 1 }
+
+                if p == D {
+                    // ── full accept ───────────────────────────────────────
+                    out.append(u); hist.append(u)
+                    for d in drafts { out.append(d); hist.append(d) }
+                    accTok += D
+                    steps  += 1
+                    u = evals[D]
+                } else {
+                    // ── partial reject ────────────────────────────────────
+                    backend.rollback(snap)
+                    out.append(u); hist.append(u)
+                    for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                    accTok += p
+                    steps  += 1
+                    let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                    guard let _ = backend.forward(rebuildTokens)
+                    else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
+                    u = evals[p]
+                }
             }
         }
 
@@ -623,8 +725,9 @@ public enum RawSpecRunner {
         else { return "\n[RawSpec] stream-vs-resident ERROR: resident backend nil" }
 
         print("[raw-spec] stream-vs-resident: running resident prefill + spec loop ...")
+        let useA3 = Tell.envFlag("QWISP_RAW_A3")
         guard let resOut = runSpecLoop(promptIds: promptIds, backend: residentBackend,
-                                        engine: engine, N: N, maxK: maxK)
+                                        engine: engine, N: N, maxK: maxK, useA3: useA3)
         else { return "\n[RawSpec] stream-vs-resident ERROR: resident spec loop nil" }
 
         let identical = zip(streamOut, resOut.prefix(N)).filter { $0 == $1 }.count

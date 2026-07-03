@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 28
+        let total = 31
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1335,6 +1335,263 @@ public enum RawVerifyTests {
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
             }
+            return (true, "ok")
+        }
+
+        // ── A3 acceptance gate tests (29-31) ────────────────────────────────────────
+        //
+        // WRITE-LOCKED: Haiku (implementer) MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/04-a3-pending-prefix-spec.md §6.
+        //
+        // All three use the same 2-layer mini-model geometry as tests 25–28 (stH/stE/stI/
+        // stMk* helpers defined above). The model has random weights — no real model load.
+        //
+        // Kernel status: the raw fused kernel is per-row order-stable (proven by test 23,
+        // fused_forward_rows_bitexact). Therefore tests 29 and 30 are GREEN by premise —
+        // they guard against future regressions and document the exact A3 index contract
+        // for the implementer. Test 31 validates the flush path specifically.
+        //
+        // RED gate before A3 is implemented: test_a3.sh (G2) — the shell script checks
+        // (a) QWISP_RAW_A3=1 is acknowledged by the binary (binary must log "A3" when active),
+        // (b) OUT_TOKENS byte-identical between A3=0 and A3=1, and
+        // (c) A3 self-check reports "128/128 LOSSLESS".
+        // Since the binary currently ignores QWISP_RAW_A3, check (a) fails → RED.
+
+        // Test 29 (T-A3-fuse): §4 invariant at kernel level.
+        // forwardRows(pending+[u]+drafts) decision rows evals[pk..] are BIT-IDENTICAL to
+        // forwardRows(pending) then forwardRows([u]+drafts), for pk ∈ {0,3,7,17} × D ∈ {1,4,8}.
+        //
+        // This is spec §4's "position-wise causal" invariant: row i output depends only
+        // on rows 0..i, so a batched call is order-stable with respect to sequential calls.
+        //
+        // GREEN by premise: per-row order-stability is proven by test 23 (fused_forward_rows_bitexact).
+        // This test specialises that property for the A3 pending-prefix shapes and serves as
+        // a regression guard. It does NOT require A3 implementation in RawSpecRunner.swift.
+        run("a3_fuse_invariant") {
+            let H = stH
+            let moe0a = stMkMoE(), moe1a = stMkMoE()
+            let gdnWa = stMkGdnW(), attnWa = stMkAttnW()
+            let csA = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rsA = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kcA = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)   // 8-position initial KV
+            let vcA = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([csA, rsA, kcA, vcA])
+            let iLN0a = MLXRandom.normal([H]).asType(.float16)
+            let pLN0a = MLXRandom.normal([H]).asType(.float16)
+            let iLN1a = MLXRandom.normal([H]).asType(.float16)
+            let pLN1a = MLXRandom.normal([H]).asType(.float16)
+            MLX.eval([iLN0a, pLN0a, iLN1a, pLN1a])
+            let layersA = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0a, postLN: pLN0a,
+                    gdn: gdnWa, attn: nil, moe: moe0a.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1a, postLN: pLN1a,
+                    gdn: nil, attn: attnWa, moe: moe1a.w, moeE: stE, moeI: stI),
+            ]
+            func freshCachesA() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: csA, recState: rsA),
+                 RawVerifyForward.LayerCaches(kCache: kcA, vCache: vcA)]
+            }
+            // spec §6 G1 matrix: pk ∈ {0,3,7,17} × D ∈ {1,4,8}
+            for pk in [0, 3, 7, 17] {
+                for D in [1, 4, 8] {
+                    let M = pk + 1 + D   // total rows in the batched call
+                    // maxSeqLen covers initial 8 + M + margin
+                    guard let fused = RawFusedVerify.RawFusedForward(
+                        layers: layersA, caches: freshCachesA(),
+                        maxM: M + 2, H: H, maxSeqLen: 8 + M + 8)
+                    else { return (false, "init nil pk=\(pk) D=\(D)") }
+                    let allX = MLXRandom.normal([M, H]).asType(.float16); allX.eval()
+                    // ── BATCHED PATH: forwardRows(all M rows) ──
+                    let snapA = fused.snapshot()
+                    guard let batchOut = fused.forwardRows(allX, M: M)
+                    else { return (false, "batch fwd nil pk=\(pk) D=\(D)") }
+                    batchOut.eval()
+                    // Decision rows: indices [pk .. M-1], shape [1+D, H]
+                    let decisionBatch = batchOut[pk ..< M]; decisionBatch.eval()
+                    // ── SEQUENTIAL PATH: rollback → forward(pending if pk>0) → forward([u]+drafts) ──
+                    fused.rollbackOneStep(snapA)
+                    if pk > 0 {
+                        guard let _ = fused.forwardRows(allX[0 ..< pk], M: pk)
+                        else { return (false, "pending fwd nil pk=\(pk) D=\(D)") }
+                    }
+                    guard let seqOut = fused.forwardRows(allX[pk ..< M], M: 1 + D)
+                    else { return (false, "seq fwd nil pk=\(pk) D=\(D)") }
+                    seqOut.eval()
+                    // ── ASSERT: decision rows bit-identical ──
+                    let (ok29, d29) = bitEqual(decisionBatch, seqOut)
+                    if !ok29 { return (false, "pk=\(pk) D=\(D): \(d29)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 30 (T-A3-reject-rollback): 1-step rollback regularity at kernel level.
+        // Simulates a partial reject at position p, then verifies the next iteration
+        // produces bit-identical hidden states whether:
+        //   non-A3 path: rollback → rebuild forward([u]+drafts.prefix(p)) [cache→B+pk] →
+        //                forward([u']+next_drafts) from state B+pk  → H_nonA3
+        //   A3 path proxy: rollback → skip rebuild [cache stays at B] →
+        //                  forwardRows(pending+[u']+next_drafts) from state B at rows [pk..] → H_A3
+        //   Assert H_nonA3 == H_A3  (by §4 invariant)
+        //
+        // Fixed parameters: D=4 (step-1 drafts), p=2 (reject position), pk=p+1=3 (pending count),
+        // D2=3 (step-2 drafts). This concretises the spec §3 reject→pending scenario.
+        //
+        // GREEN by premise: this is the §4 invariant applied to a 2-step sequence with a reject
+        // in between. Additional value: verifies rollbackOneStep correctly undoes a multi-row
+        // (M=D+1=5) batched forward, which is the per-reject rollback pattern in the A3 loop.
+        run("a3_reject_rollback_equiv") {
+            let H = stH
+            let D   = 4       // drafts in step 1
+            let p   = 2       // reject position: first p drafts accepted
+            let pk  = p + 1   // pending count: [u]+drafts.prefix(p) = 3 tokens
+            let D2  = 3       // drafts in step 2 (next verify after reject)
+            let M1  = D + 1         // step-1 batched rows = 5
+            let M2  = pk + D2 + 1   // step-2 A3 batched rows = pending+[u']+next_drafts = 7
+            let moe0b = stMkMoE(), moe1b = stMkMoE()
+            let gdnWb = stMkGdnW(), attnWb = stMkAttnW()
+            let csB = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rsB = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kcB = MLXRandom.normal([stNkv, 4, stHd]).asType(.float16)
+            let vcB = MLXRandom.normal([stNkv, 4, stHd]).asType(.float16)
+            MLX.eval([csB, rsB, kcB, vcB])
+            let iLN0b = MLXRandom.normal([H]).asType(.float16)
+            let pLN0b = MLXRandom.normal([H]).asType(.float16)
+            let iLN1b = MLXRandom.normal([H]).asType(.float16)
+            let pLN1b = MLXRandom.normal([H]).asType(.float16)
+            MLX.eval([iLN0b, pLN0b, iLN1b, pLN1b])
+            let layersB = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0b, postLN: pLN0b,
+                    gdn: gdnWb, attn: nil, moe: moe0b.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1b, postLN: pLN1b,
+                    gdn: nil, attn: attnWb, moe: moe1b.w, moeE: stE, moeI: stI),
+            ]
+            func freshCachesB() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: csB, recState: rsB),
+                 RawVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
+            }
+            let maxSeqB = 4 + M1 + M2 + 8    // initial(4) + max scenario(M1 or M2) + margin
+            let maxMb   = Swift.max(M1, M2) + 2
+            // Two independent fused forwards starting from identical state B
+            guard let fusedNA = RawFusedVerify.RawFusedForward(
+                    layers: layersB, caches: freshCachesB(), maxM: maxMb, H: H, maxSeqLen: maxSeqB),
+                  let fusedA3 = RawFusedVerify.RawFusedForward(
+                    layers: layersB, caches: freshCachesB(), maxM: maxMb, H: H, maxSeqLen: maxSeqB)
+            else { return (false, "init nil") }
+            // Random hidden inputs shared between paths
+            let step1X  = MLXRandom.normal([M1, H]).asType(.float16); step1X.eval()
+            let step2X  = MLXRandom.normal([D2 + 1, H]).asType(.float16); step2X.eval()
+            let pendingX = step1X[0 ..< pk]   // [u]+drafts.prefix(p), shape [pk=3, H]
+            // A3 step-2 batch: pending + [u'] + next_drafts = [pk+D2+1, H]
+            let step2A3X = MLX.concatenated([pendingX, step2X], axis: 0); step2A3X.eval()
+            // ── NON-A3 PATH ──────────────────────────────────────────────────────
+            // Step 1: batched verify [u]+drafts → reject at p → rollback to B → rebuild forward(pending)
+            let snapNA = fusedNA.snapshot()
+            guard let _ = fusedNA.forwardRows(step1X, M: M1)
+            else { return (false, "non-A3 step1 nil") }
+            fusedNA.rollbackOneStep(snapNA)              // cache back to B
+            guard let _ = fusedNA.forwardRows(pendingX, M: pk)  // rebuild → B+pk
+            else { return (false, "non-A3 rebuild nil") }
+            // Step 2: from rebuilt state B+pk, forward([u']+next_drafts)
+            guard let hNA = fusedNA.forwardRows(step2X, M: D2 + 1)
+            else { return (false, "non-A3 step2 nil") }
+            hNA.eval()
+            // ── A3 PATH PROXY (kernel-level simulation) ──────────────────────────
+            // Step 1: same verify → reject at p → rollback to B → NO rebuild (cache stays at B)
+            let snapA3 = fusedA3.snapshot()
+            guard let _ = fusedA3.forwardRows(step1X, M: M1)
+            else { return (false, "A3 step1 nil") }
+            fusedA3.rollbackOneStep(snapA3)              // cache back to B; no rebuild
+            // Step 2 (A3): fuse pending+[u']+next_drafts in one batched call from B
+            guard let hA3full = fusedA3.forwardRows(step2A3X, M: M2)
+            else { return (false, "A3 step2 fused nil") }
+            hA3full.eval()
+            let hA3 = hA3full[pk ..< M2]; hA3.eval()   // decision rows [pk..M2-1], shape [D2+1, H]
+            // ── ASSERT: non-A3 step-2 ≡ A3 step-2 decision rows (bit-identical) ──
+            let (ok30, d30) = bitEqual(hNA, hA3)
+            if !ok30 { return (false, "non-A3 vs A3: \(d30)") }
+            return (true, "ok")
+        }
+
+        // Test 31 (T-A3-flush): pending cap(24) flush advances the committed boundary correctly.
+        // Asserts that flushing 24 pending tokens in one batched forward, then forwarding a
+        // verify batch ([u]+drafts D=3), produces decision rows bit-identical to a reference
+        // path of 28 sequential single-row forwards.
+        //
+        // Validates the flush mechanism (§3: "pending.count が cap を超えたら forward(pending)"):
+        //   flush path: forwardRows(pending×24) → forwardRows([u]+drafts×4) → verify rows
+        //   ref path:   forwardRows([xi])×28 sequentially → same verify rows
+        //   Assert: verify rows bit-identical.
+        //
+        // GREEN by premise: kernel order-stability (test 23). This test catches A3 flush bugs
+        // where the pending buffer is mis-serialised, the boundary advances by the wrong count,
+        // or the subsequent verify call uses a stale cache state.
+        run("a3_flush_boundary") {
+            let H          = stH
+            let pendingCap = 24     // A3 pending cap from spec §3 (same as MLX version)
+            let flushN     = pendingCap    // flush exactly at cap
+            let D          = 3             // drafts after flush
+            let M_total    = flushN + 1 + D  // 28 positions total in reference path
+            let moe0c = stMkMoE(), moe1c = stMkMoE()
+            let gdnWc = stMkGdnW(), attnWc = stMkAttnW()
+            let csC = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rsC = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kcC = MLXRandom.normal([stNkv, 4, stHd]).asType(.float16)  // 4-position initial KV
+            let vcC = MLXRandom.normal([stNkv, 4, stHd]).asType(.float16)
+            MLX.eval([csC, rsC, kcC, vcC])
+            let iLN0c = MLXRandom.normal([H]).asType(.float16)
+            let pLN0c = MLXRandom.normal([H]).asType(.float16)
+            let iLN1c = MLXRandom.normal([H]).asType(.float16)
+            let pLN1c = MLXRandom.normal([H]).asType(.float16)
+            MLX.eval([iLN0c, pLN0c, iLN1c, pLN1c])
+            let layersC = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0c, postLN: pLN0c,
+                    gdn: gdnWc, attn: nil, moe: moe0c.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1c, postLN: pLN1c,
+                    gdn: nil, attn: attnWc, moe: moe1c.w, moeE: stE, moeI: stI),
+            ]
+            func freshCachesC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: csC, recState: rsC),
+                 RawVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
+            }
+            // maxSeqLen: initial(4) + M_total(28) + margin = 40; use 64 for safety
+            // maxM: must cover flushN=24 (largest single call in flush path)
+            guard let refFused = RawFusedVerify.RawFusedForward(
+                    layers: layersC, caches: freshCachesC(),
+                    maxM: flushN + 2, H: H, maxSeqLen: 64),
+                  let flushFused = RawFusedVerify.RawFusedForward(
+                    layers: layersC, caches: freshCachesC(),
+                    maxM: flushN + 2, H: H, maxSeqLen: 64)
+            else { return (false, "init nil") }
+            // Random inputs for all M_total positions (shared between paths)
+            let allXc     = MLXRandom.normal([M_total, H]).asType(.float16); allXc.eval()
+            let pendingXc = allXc[0 ..< flushN]        // 24 rows (flush batch)
+            let verifyXc  = allXc[flushN ..< M_total]  // 4 rows ([u]+drafts)
+            // ── REFERENCE PATH: M_total sequential single-row forwards ────────────
+            var refParts: [MLXArray] = []
+            for i in 0 ..< M_total {
+                let xi = allXc[i ..< i + 1]    // [1, H]
+                guard let out = refFused.forwardRows(xi, M: 1)
+                else { return (false, "ref fwd nil i=\(i)") }
+                out.eval()
+                if i >= flushN { refParts.append(out) }   // collect verify rows only
+            }
+            let refOutC = MLX.concatenated(refParts, axis: 0); refOutC.eval()   // [1+D, H]
+            // ── FLUSH PATH: batch forward(pending=24) then batch forward([u]+drafts=4) ──
+            guard let _ = flushFused.forwardRows(pendingXc, M: flushN)   // flush pending
+            else { return (false, "flush fwd nil") }
+            guard let flushOutC = flushFused.forwardRows(verifyXc, M: 1 + D)  // verify
+            else { return (false, "verify fwd nil") }
+            flushOutC.eval()
+            // ── ASSERT: flush path verify rows ≡ reference path verify rows ──
+            let (ok31, d31) = bitEqual(flushOutC, refOutC)
+            if !ok31 { return (false, "flush boundary: \(d31)") }
             return (true, "ok")
         }
 
