@@ -58,8 +58,7 @@ public enum RawSpecRunner {
 
     /// fused backend(1-CB step: embed→40層→final norm→lm_head→argmax、readback は token id のみ。
     /// rollback は KV len 巻き戻し+ping-pong swap)。
-    static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int)
-        -> (SpecBackend, RawFusedVerify.RawFusedForward)? {
+    static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
         guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
         let forward: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
@@ -71,7 +70,7 @@ public enum RawSpecRunner {
         } else {
             step = makeStepArgmax(engine: engine, forward: forward)
         }
-        let backend = SpecBackend(
+        return SpecBackend(
             forward: forward,
             stepArgmax: step,
             snapshot: { fwd.snapshot() },
@@ -79,7 +78,6 @@ public enum RawSpecRunner {
                 guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
-        return (backend, fwd)
     }
 
     /// streaming fused backend(strict segmented per-layer CB)。
@@ -297,26 +295,13 @@ public enum RawSpecRunner {
                 return streamingBackend(engine: engine, modelDir: modelDir, maxM: maxM,
                                         maxSeqLen: maxSeqLen, C: rawC).map { $0.0 }
             } else if useFused {
-                return fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen).map { $0.0 }
+                return fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
             } else {
                 return composedBackend(engine: engine)
             }
         }
-        // ── lmhead2 telemetry: fwd を射出保留し certRate() を readback(QWISP_LMHEAD2=1 時のみ使用)。
-        var mainFwd: RawFusedVerify.RawFusedForward? = nil
-        let backend: SpecBackend
-        if isStreaming {
-            guard let r = streamingBackend(engine: engine, modelDir: modelDir, maxM: maxM,
-                                            maxSeqLen: maxSeqLen, C: rawC)
-            else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
-            backend = r.0; mainFwd = r.1
-        } else if useFused {
-            guard let r = fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
-            else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
-            backend = r.0; mainFwd = r.1
-        } else {
-            backend = composedBackend(engine: engine)
-        }
+        guard let backend = mkBackend()
+        else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
 
         // streaming stats 追跡は LayerExpertCache の static counters 経由(リセット済み)。
         // stream-vs-resident check は別途 resident backend を構築する。
@@ -470,14 +455,6 @@ public enum RawSpecRunner {
             tokps,
             Double(accTok) / Double(Swift.max(steps, 1)),
             match, N, Double(match) / Double(N) * 100) + statsLine
-
-        // ── lmhead2 cert-rate telemetry(spec §3.2 step 6)── QWISP_LMHEAD2=1 時のみ。
-        //   fwd.certRate() は engine build 以後の累計 (certified, total)。test script が `lmhead2 cert-rate` を grep。
-        if RawFusedVerify.RawFusedForward.lmHead2, let fwd = mainFwd {
-            let (certified, total) = fwd.certRate()
-            let pct = total > 0 ? Double(certified) / Double(total) * 100.0 : 0.0
-            print(String(format: "[RawSpec] lmhead2 cert-rate: %d/%d=%.1f%%", certified, total, pct))
-        }
 
         // ── STREAM-VS-RESIDENT CHECK ──────────────────────────────────────
         // QWISP_RAWSTREAM_CHECK=1 (strict streaming only): run resident path and diff outputs.
@@ -744,9 +721,8 @@ public enum RawSpecRunner {
         print("[raw-spec] stream-vs-resident: loading resident weights ...")
         store.residentAll()
         print("[raw-spec] stream-vs-resident: building resident fused backend ...")
-        guard let resident = fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
+        guard let residentBackend = fusedBackend(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
         else { return "\n[RawSpec] stream-vs-resident ERROR: resident backend nil" }
-        let residentBackend = resident.0
 
         print("[raw-spec] stream-vs-resident: running resident prefill + spec loop ...")
         let useA3 = Tell.envFlag("QWISP_RAW_A3")

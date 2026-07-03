@@ -193,13 +193,6 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _computeGBetaRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _embedRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _argmaxRowsPipeline: MTLComputePipelineState?
-    nonisolated(unsafe) static var _hnormRowsPipeline: MTLComputePipelineState?
-    nonisolated(unsafe) static var _argmaxCertRowsPipeline: MTLComputePipelineState?
-    nonisolated(unsafe) static var _argmaxRowsFlaggedPipeline: MTLComputePipelineState?
-    // qmm4_rows_flagged = qmm4(qmv) の忠実コピー + per-row certFlag early-out。既存 _qmmPipeline とは
-    // 別 pipeline(QWISP_QMM_MATH 一致の compile opts で別関数として compile)。uncert 行の logits4 は
-    // _qmmPipeline と bit-identical(同一 source・同一 compile opts・同一 dispatch 形状)。
-    nonisolated(unsafe) static var _qmm4RowsFlaggedPipeline: MTLComputePipelineState?
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
@@ -208,9 +201,7 @@ public enum RawFusedVerify {
         if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil
             && _convHistRowsPipeline != nil && _shiftConvRowsPipeline != nil
             && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil
-            && _embedRowsPipeline != nil && _argmaxRowsPipeline != nil
-            && _hnormRowsPipeline != nil && _argmaxCertRowsPipeline != nil
-            && _argmaxRowsFlaggedPipeline != nil { return true }
+            && _embedRowsPipeline != nil && _argmaxRowsPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -351,118 +342,6 @@ public enum RawFusedVerify {
             }
             if (tid == 0) outIdx[m] = redi[0];
         }
-        // hnorm_rows: 行毎 L2 norm。x[M,K] f16 -> out[M] f32(1 threadgroup/行, 256 threads, f32 tree reduction)。
-        kernel void hnorm_rows(device const half* x  [[buffer(0)]],   // [M, K]
-                               device float*       out [[buffer(1)]],  // [M]
-                               constant uint& K [[buffer(2)]],
-                               uint m   [[threadgroup_position_in_grid]],
-                               uint tid [[thread_position_in_threadgroup]],
-                               uint tgs [[threads_per_threadgroup]]) {
-            threadgroup float red[256];
-            device const half* row = x + (size_t)m * K;
-            float acc = 0.0f;
-            for (uint k = tid; k < K; k += tgs) { float xv = (float)row[k]; acc += xv * xv; }
-            red[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs/2; s > 0; s >>= 1) {
-                if (tid < s) red[tid] += red[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) out[m] = precise::sqrt(red[0]);
-        }
-        // argmax_cert_rows: 行 m ごとに(1 threadgroup/行)1 pass で (a)logits2 の top-1(=v*) と
-        // (b)logits2+rowE·hnorm+ε の top-2(value+idx, first-index tie-break)を求め、
-        // challenger = (bTop1.idx != v*) ? bTop1.val : bTop2.val とし、
-        // a[v*] - (rowE[v*]·hnorm + ε) > challenger なら tokensOut[m]=v*, certFlag[m]=1, atomic++certCount
-        // (§3.2 cert 条件、strict inequality)。さもなくば certFlag[m]=0(tokensOut は後段 argmax_rows_flagged が書く)。
-        // 上記 upd_top2 は first-index tie-break を保存する top-2 更新(value+idx)。
-        inline void upd_top2(thread float& m1, thread int& i1, thread float& m2, thread int& i2,
-                             float val, int idx) {
-            if (val > m1 || (val == m1 && idx < i1)) { m2 = m1; i2 = i1; m1 = val; i1 = idx; }
-            else if (val > m2 || (val == m2 && idx < i2)) { m2 = val; i2 = idx; }
-        }
-        kernel void argmax_cert_rows(device const half*   logits2 [[buffer(0)]],   // [M, V] f16(qmm2 出力)
-                                     device const half*   rowE    [[buffer(1)]],    // [V]  f16
-                                     device const float*  hnorm   [[buffer(2)]],    // [M]  f32
-                                     device int*          tokensOut [[buffer(3)]],  // [M]  int32
-                                     device int*          certFlag  [[buffer(4)]],  // [M]  int32 (0/1)
-                                     device atomic_int*   certCount [[buffer(5)]],   // [1]  atomic
-                                     constant uint&  V   [[buffer(6)]],
-                                     constant float& EPS [[buffer(7)]],
-                                     uint m   [[threadgroup_position_in_grid]],
-                                     uint tid [[thread_position_in_threadgroup]],
-                                     uint tgs [[threads_per_threadgroup]]) {
-            threadgroup float redA[256];  threadgroup int rediA[256];   // top-1 of a (logits2)
-            threadgroup float redB1[256]; threadgroup int redB1i[256];  // top-1 of b
-            threadgroup float redB2[256]; threadgroup int redB2i[256];  // top-2 of b
-            device const half* lrow = logits2 + (size_t)m * V;
-            float hn = hnorm[m];
-            float aBest = -INFINITY; int aIdx = 0;
-            float b1 = -INFINITY, b2 = -INFINITY; int bi1 = 0, bi2 = 0;
-            for (uint v = tid; v < V; v += tgs) {
-                float lv = (float)lrow[v];
-                if (lv > aBest) { aBest = lv; aIdx = (int)v; }   // thread 内は v 昇順 → 先頭一致(argmax_rows と同一)
-                float bv = lv + (float)rowE[v] * hn + EPS;
-                upd_top2(b1, bi1, b2, bi2, bv, (int)v);
-            }
-            redA[tid] = aBest; rediA[tid] = aIdx;
-            redB1[tid] = b1; redB1i[tid] = bi1; redB2[tid] = b2; redB2i[tid] = bi2;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs/2; s > 0; s >>= 1) {
-                if (tid < s) {
-                    if (redA[tid+s] > redA[tid] || (redA[tid+s] == redA[tid] && rediA[tid+s] < rediA[tid])) {
-                        redA[tid] = redA[tid+s]; rediA[tid] = rediA[tid+s];
-                    }
-                    float m1 = redB1[tid], m2 = redB2[tid]; int i1 = redB1i[tid], i2 = redB2i[tid];
-                    upd_top2(m1, i1, m2, i2, redB1[tid+s], redB1i[tid+s]);
-                    upd_top2(m1, i1, m2, i2, redB2[tid+s], redB2i[tid+s]);
-                    redB1[tid] = m1; redB1i[tid] = i1; redB2[tid] = m2; redB2i[tid] = i2;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) {
-                int vstar = rediA[0];
-                float aStar = redA[0];
-                float chall = (redB1i[0] != vstar) ? redB1[0] : redB2[0];
-                float lower = aStar - ((float)rowE[vstar] * hn + EPS);
-                if (lower > chall) {
-                    tokensOut[m] = vstar;
-                    certFlag[m] = 1;
-                    atomic_fetch_add_explicit(certCount, 1, memory_order_relaxed);
-                } else {
-                    certFlag[m] = 0;
-                }
-            }
-        }
-        // argmax_rows_flagged: 既存 argmax_rows と同一 reduction だが threadgroup 冒頭で
-        // certFlag[m]==1 なら即 return(cert 行は tokensOut[m] を上書きしない=argmax_cert_rows が設定済み)。
-        // uncert 行は hd.logits(=logits4, qmm4_rows_flagged 出力)の argmax を書く=既存 4-bit 経路そのもの。
-        kernel void argmax_rows_flagged(device const half* logits [[buffer(0)]],   // [M, V]
-                                        device int* outIdx [[buffer(1)]],          // [M]
-                                        device const int* certFlag [[buffer(2)]],  // [M]
-                                        constant uint& V [[buffer(3)]],
-                                        uint m [[threadgroup_position_in_grid]],
-                                        uint tid [[thread_position_in_threadgroup]],
-                                        uint tgs [[threads_per_threadgroup]]) {
-            if (certFlag[m] != 0) return;
-            threadgroup float red[256]; threadgroup int redi[256];
-            device const half* row = logits + (size_t)m * V;
-            float best = -INFINITY; int bi = 0x7fffffff;
-            for (uint v = tid; v < V; v += tgs) {
-                float lv = (float)row[v];
-                if (lv > best) { best = lv; bi = (int)v; }   // thread 内は v 昇順 → 先頭一致
-            }
-            red[tid] = best; redi[tid] = bi;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs/2; s > 0; s >>= 1) {
-                if (tid < s) {
-                    if (red[tid+s] > red[tid] || (red[tid+s] == red[tid] && redi[tid+s] < redi[tid])) {
-                        red[tid] = red[tid+s]; redi[tid] = redi[tid+s];
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) outIdx[m] = redi[0];
-        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
@@ -475,9 +354,6 @@ public enum RawFusedVerify {
             _computeGBetaRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_g_beta_rows")!)
             _embedRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "embed_rows_q4")!)
             _argmaxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_rows")!)
-            _hnormRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "hnorm_rows")!)
-            _argmaxCertRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_cert_rows")!)
-            _argmaxRowsFlaggedPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_rows_flagged")!)
             return true
         } catch { print("[raw-fused-aux] compile: \(error)"); return false }
     }
@@ -1536,14 +1412,6 @@ public enum RawFusedVerify {
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
-        /// lm_head を margin-certified 2-bit 先読み + 4-bit fallback に置換する(QWISP_LMHEAD2=1)。既定 off。
-        /// notes/05 §3。cert 行は 2-bit qmv → argmax(4-bit と bit 一致を bound+ε で保証)、
-        /// uncert 行のみ既存 4-bit qmv kernel で fallback → 全行で 4-bit 経路と bit-exact。
-        nonisolated(unsafe) public static var lmHead2 =
-            ProcessInfo.processInfo.environment["QWISP_LMHEAD2"] == "1"
-        /// lmhead2 cert 累計(引擎 build 以後): certified は GPU atomic counter、total は CPU カウンタ。
-        public var certTotalRows: Int = 0
-        public var totalRows: Int = 0
 
         // ── streaming mode ─────────────────────────────────────────────────────────────
         public enum RawStreamMode { case resident, strict, bolt }
@@ -1849,20 +1717,13 @@ public enum RawFusedVerify {
             let logits: MTLBuffer        // [maxM, vocab] f16
             let tokensOut: MTLBuffer     // [maxM] int32
             let retained: [MLXArray]
-            // ── lmhead2 (Round B): nil 当 feature off。cert 経路の追加常駐 buffer 群。──
-            let lmW2: MTLBuffer?, lmS2: MTLBuffer?, lmB2: MTLBuffer?   // 2-bit copy [V,K/16]/[V,K/64]
-            let rowE: MTLBuffer?      // [V] f16  per-row error norms
-            let hnorm: MTLBuffer?     // [maxM] f32
-            let certFlag: MTLBuffer?  // [maxM] int32 (0/1)
-            let certCount: MTLBuffer? // [1] int32 atomic(GPU 側で Step 毎加算 → readback で累計)
         }
         var head: HeadBufs? = nil
 
         /// head(embed/lm_head/final norm)を常駐 buffer 化して 1-CB step を有効化する。
         public func attachHead(embedW: MLXArray, embedS: MLXArray, embedB: MLXArray,
                                lmW: MLXArray, lmS: MLXArray, lmB: MLXArray,
-                               fnW: MLXArray, vocab: Int,
-                               lm2: (MLXArray, MLXArray, MLXArray, MLXArray)? = nil) -> Bool {
+                               fnW: MLXArray, vocab: Int) -> Bool {
             if RawMetalForward._qmm4TiledPipeline == nil {                 // pipeline warm(compile)
                 let x = MLXRandom.normal([1, 512]).asType(.float16)
                 let wf = MLXRandom.normal([8, 512]).asType(.float16)
@@ -1887,37 +1748,9 @@ public enum RawFusedVerify {
                   let lg = device.makeBuffer(length: maxM * vocab * 2, options: .storageModeShared),
                   let to = device.makeBuffer(length: maxM * 4, options: .storageModeShared) else { return false }
             head = HeadBufs(embedW: ew, embedS: es, embedB: eb, lmW: lw, lmS: ls, lmB: lb,
-                            fnW: fn, vocab: vocab, tokensIn: ti, logits: lg, tokensOut: to, retained: keep,
-                            lmW2: nil, lmS2: nil, lmB2: nil, rowE: nil, hnorm: nil, certFlag: nil, certCount: nil)
+                            fnW: fn, vocab: vocab, tokensIn: ti, logits: lg, tokensOut: to, retained: keep)
             return true
         }
-
-        /// lmhead2 用の常駐 buffer 群を構築して head の 2-bit フィールドを埋める(QWISP_LMHEAD2=1 時)。
-        /// lm2 = buildLMHead2 の戻り値(w2,s2,b2,rowE)。noCopy 寿命規約: 裏 MLXArray を retain。
-        public func attachHeadLMHead2(_ lm2: (MLXArray, MLXArray, MLXArray, MLXArray)) -> Bool {
-            guard var hd = head, let (device, _) = RawMetalForward.ensure() else { return false }
-            guard ensureRowsAuxPipelines(), ensureQmm2RowsPipeline(), ensureQmm4RowsFlaggedPipeline() else { return false }
-            let (w2, s2, b2, rowE) = lm2
-            let s2A = s2.asType(.float16), b2A = b2.asType(.float16), rowEA = rowE.asType(.float16)
-            guard let bw2 = RawMetalForward.mtlBuf(w2, device),
-                  let bs2 = RawMetalForward.mtlBuf(s2A, device),
-                  let bb2 = RawMetalForward.mtlBuf(b2A, device),
-                  let bre = RawMetalForward.mtlBuf(rowEA, device),
-                  let hn = device.makeBuffer(length: maxM * 4, options: .storageModeShared),
-                  let cf = device.makeBuffer(length: maxM * 4, options: .storageModeShared),
-                  let cc = device.makeBuffer(length: 4, options: .storageModeShared) else { return false }
-            retainedArrays.append(contentsOf: [w2, s2A, b2A, rowEA])
-            head = HeadBufs(embedW: hd.embedW, embedS: hd.embedS, embedB: hd.embedB,
-                            lmW: hd.lmW, lmS: hd.lmS, lmB: hd.lmB, fnW: hd.fnW, vocab: hd.vocab,
-                            tokensIn: hd.tokensIn, logits: hd.logits, tokensOut: hd.tokensOut,
-                            retained: hd.retained,
-                            lmW2: bw2, lmS2: bs2, lmB2: bb2, rowE: bre,
-                            hnorm: hn, certFlag: cf, certCount: cc)
-            return true
-        }
-
-        /// lmhead2 telemetry: engine build 以後の累計 (certified, total)。flag off なら (0,0)。
-        public func certRate() -> (certified: Int, total: Int) { (certTotalRows, totalRows) }
 
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
@@ -1945,24 +1778,6 @@ public enum RawFusedVerify {
             // 両者とも M 不変(test 済)ゆえ flag を run 中固定なら decode≡verify(self-consistent)。速度トレードオフのみ。
             func encodeFinalOps(_ enc: MTLComputeCommandEncoder) {
                 RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
-                // ── lmhead2 (Round B): hnorm → qmm2 → argmax_cert → qmm4_flagged → argmax_flagged ──
-                //   同一 encoder/CB、CPU sync 無し。flag off ならこの block 全体を skip(既存経路 byte 不変)。
-                if RawFusedForward.lmHead2, let w2 = hd.lmW2, let s2 = hd.lmS2, let b2 = hd.lmB2,
-                   let re = hd.rowE, let hn = hd.hnorm, let cf = hd.certFlag, let cc = hd.certCount {
-                    cc.contents().bindMemory(to: Int32.self, capacity: 1).pointee = 0   // atomic counter reset
-                    RawFusedVerify.encodeHnormRows(enc, x: normed, out: hn, M: M, K: H)
-                    RawFusedVerify.encodeQmm2Rows(enc, w: w2, scales: s2, biases: b2, x: normed,
-                                                 out: hd.logits, M: M, K: H, V: hd.vocab)
-                    RawFusedVerify.encodeArgmaxCertRows(enc, logits2: hd.logits, rowE: re, hnorm: hn,
-                                                       tokensOut: hd.tokensOut, certFlag: cf, certCount: cc,
-                                                       M: M, V: hd.vocab)
-                    RawFusedVerify.encodeQmm4RowsFlagged(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
-                                                        x: normed, out: hd.logits, certFlag: cf,
-                                                        M: M, K: H, N: hd.vocab)
-                    RawFusedVerify.encodeArgmaxRowsFlagged(enc, logits: hd.logits, outIdx: hd.tokensOut,
-                                                           certFlag: cf, M: M, V: hd.vocab)
-                    return
-                }
                 if RawFusedForward.lmHeadQmv {
                     RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
                                                  x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
@@ -2009,11 +1824,6 @@ public enum RawFusedVerify {
             }
 
             let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
-            // lmhead2 telemetry: certCount(今 step の cert 行数)を累計。flag off なら hd.certCount == nil。
-            if let cc = hd.certCount, RawFusedForward.lmHead2 {
-                certTotalRows += Int(cc.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
-                totalRows += M
-            }
             return (0 ..< M).map { Int(ptr[$0]) }
         }
 
@@ -2036,361 +1846,5 @@ public enum RawFusedVerify {
             if let kv = L.kvCache { let (k, v) = RawFusedVerify.readKVCache(kv); return (k, v) }
             return (nil, nil)
         }
-    }
-
-    // ── LMHEAD2 (Round A): margin-certified 2-bit lm_head — notes/05-lmhead-margin-cert-spec.md §3 ──
-    //
-    // These two functions are the CONTRACT API for the margin-certified 2-bit lm_head feature.
-    // ε = 0.05 (fixed constant, spec §3.2) lives here only; it must NOT appear in any test
-    // assertion or tolerance.
-
-    nonisolated(unsafe) static var _qmm2RowsPipeline: MTLComputePipelineState?
-
-    /// qmm2_rows pipeline を compule(冪等)。qmm2RowsFlat(単発)と fused chain(encodeQmm2Rows)で共有。
-    static func ensureQmm2RowsPipeline() -> Bool {
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
-        if _qmm2RowsPipeline != nil { return true }
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-        // qmm2_rows: 2-bit affine dequant-then-dot, one threadgroup per output column n(=v).
-        // value j within a uint32 occupies bits 2*j .. 2*j+1 (little-endian, MLX convention —
-        // matches the 4-bit kernel's (pack >> (4*(k%8))) & 0xf idiom extended to 2-bit).
-        kernel void qmm2_rows(device const uint32_t* w   [[buffer(0)]],   // [V, K/16]
-                              device const half*     scales [[buffer(1)]], // [V, K/64]
-                              device const half*     biases [[buffer(2)]],
-                              device const half*     x      [[buffer(3)]], // [M, K]
-                              device half*           y      [[buffer(4)]], // [M, V]
-                              constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],
-                              constant int& M [[buffer(7)]],
-                              uint  n   [[threadgroup_position_in_grid]],
-                              uint  lid [[thread_position_in_threadgroup]],
-                              uint  tgs [[threads_per_threadgroup]]) {
-            threadgroup float wdq[2048];   // dequant-済 weight 行 n (K ≤ 2048)
-            threadgroup float red[256];
-            const int Kg = K / 64;
-            for (int k = (int)lid; k < K; k += (int)tgs) {
-                uint pack = w[n * (K/16) + k/16];
-                uint q2 = (pack >> (2u * (uint)(k % 16))) & 0x3u;
-                int g = k / 64;
-                wdq[k] = (float)scales[n*Kg + g] * (float)q2 + (float)biases[n*Kg + g];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int m = 0; m < M; m++) {
-                float acc = 0.0f;
-                for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)x[m*K + k] * wdq[k];
-                red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint s = tgs/2; s > 0; s >>= 1) {
-                    if (lid < s) red[lid] += red[lid + s];
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                }
-                if (lid == 0) y[m*N + n] = (half)red[0];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-        """
-        do { let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
-             _qmm2RowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm2_rows")!)
-             return true
-        } catch { print("[raw-qmm2-rows] compile: \(error)"); return false }
-    }
-
-    /// §3.2 step 2: qmm2_rows — 2-bit affine qmv (gs=64). x[M,K] · Wq2[V,K] → y[M,V] (f16).
-    /// Layout (analogous to qmm4_tiled, derived from MLX packing convention used in qmm4_rows):
-    ///   - w2   : uint32 [V, K/16]   (2-bit packs 16 values per uint32, little-endian bit order)
-    ///   - s2/b2:  f16   [V, K/64]   (one (scale,bias) per group of 64)
-    /// Each threadgroup owns one output column v ∈ [0,V): cooperative-dequant weight row v into
-    /// threadgroup memory once, then dot against each of the M x-rows (f32 accumulate, f16 store).
-    /// Per-row accumulation order depends only on K and threadgroup size (M-independent).
-    /// Grid=(V,1,1), threadgroup=256. K must be ≤ 2048 (threadgroup array bound). Returns [M*V] f16
-    /// row-major (y[m*V + v]).
-    static func qmm2RowsFlat(_ x: MLXArray, _ wq2: MLXArray, scales: MLXArray, biases: MLXArray,
-                             M: Int, K: Int, V: Int) -> [Float16]? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
-        guard K <= 2048, K % 64 == 0, M >= 1, V >= 1 else { return nil }
-        guard ensureQmm2RowsPipeline() else { return nil }
-        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bwq = RawMetalForward.mtlBuf(wq2, device),
-              let bsc = RawMetalForward.mtlBuf(scales.asType(.float16), device),
-              let bbi = RawMetalForward.mtlBuf(biases.asType(.float16), device)
-        else { return nil }
-        let outBuf = device.makeBuffer(length: M * V * 2, options: .storageModeShared)!
-        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_qmm2RowsPipeline!)
-        enc.setBuffer(bwq, offset: 0, index: 0)
-        enc.setBuffer(bsc, offset: 0, index: 1)
-        enc.setBuffer(bbi, offset: 0, index: 2)
-        enc.setBuffer(bx, offset: 0, index: 3)
-        enc.setBuffer(outBuf, offset: 0, index: 4)
-        var kk = Int32(K), nn = Int32(V), mm = Int32(M)
-        enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
-        enc.dispatchThreadgroups(MTLSize(width: V, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * V)
-        return Array(UnsafeBufferPointer(start: ptr, count: M * V))
-    }
-
-    // ── Round B encode helpers: 上記 kernel 群を「既存 encoder に encode するだけ」で提供
-    //    (cb/readback 無し)。fused 1-CB chain(hnorm→qmm2→argmax_cert→qmm4_flagged→argmax_flagged)用。
-
-    /// §3.2 step 1 encode: x[M,K] f16 → hnorm[M] f32。1 threadgroup/行, 256 threads。
-    static func encodeHnormRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
-                                M: Int, K: Int) {
-        enc.setComputePipelineState(_hnormRowsPipeline!)
-        enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
-        var kk = UInt32(K); enc.setBytes(&kk, length: 4, index: 2)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-    }
-
-    /// §3.2 step 2 encode: 2-bit affine qmv。x[M,K]·Wq2[V,K]→out[M,V] f16(_qmm2RowsPipeline 使用)。
-    /// encodeQmmQmv と同 idiom: buffer 0-4 + K/N/M。grid=(V,1,1), threadgroup=256。
-    static func encodeQmm2Rows(_ enc: MTLComputeCommandEncoder,
-                               w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
-                               x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, V: Int) {
-        enc.setComputePipelineState(_qmm2RowsPipeline!)
-        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
-        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
-        enc.setBuffer(out, offset: 0, index: 4)
-        var kk = Int32(K), nn = Int32(V), mm = Int32(M)
-        enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
-        enc.dispatchThreadgroups(MTLSize(width: V, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-    }
-
-    /// §3.2 step 3 encode: argmax_cert_rows。logits2[M,V]·rowE[V]·hnorm[M]→tokensOut[M],certFlag[M],certCount。
-    static func encodeArgmaxCertRows(_ enc: MTLComputeCommandEncoder,
-                                     logits2: MTLBuffer, rowE: MTLBuffer, hnorm: MTLBuffer,
-                                     tokensOut: MTLBuffer, certFlag: MTLBuffer, certCount: MTLBuffer,
-                                     M: Int, V: Int) {
-        enc.setComputePipelineState(_argmaxCertRowsPipeline!)
-        enc.setBuffer(logits2, offset: 0, index: 0); enc.setBuffer(rowE, offset: 0, index: 1)
-        enc.setBuffer(hnorm, offset: 0, index: 2); enc.setBuffer(tokensOut, offset: 0, index: 3)
-        enc.setBuffer(certFlag, offset: 0, index: 4); enc.setBuffer(certCount, offset: 0, index: 5)
-        var vv = UInt32(V); var eps = Float(0.05)
-        enc.setBytes(&vv, length: 4, index: 6); enc.setBytes(&eps, length: 4, index: 7)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-    }
-
-    /// §3.2 step 5 encode: argmax_rows_flagged。certFlag[m]==0 の行のみ hd.logits(=logits4)の argmax を書く。
-    static func encodeArgmaxRowsFlagged(_ enc: MTLComputeCommandEncoder,
-                                        logits: MTLBuffer, outIdx: MTLBuffer, certFlag: MTLBuffer,
-                                        M: Int, V: Int) {
-        enc.setComputePipelineState(_argmaxRowsFlaggedPipeline!)
-        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(outIdx, offset: 0, index: 1)
-        enc.setBuffer(certFlag, offset: 0, index: 2)
-        var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 3)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-    }
-
-    /// qmm4_rows_flagged pipeline を compile(既存 qmm4 qmv kernel source の忠実コピー + certFlag early-out。
-    /// 不等号・演算順序・定数・SIMD 構成は qmm4 と同一 → uncert 行の logits4 は _qmmPipeline と bit-identical。
-    /// compile opts も QWISP_QMM_MATH を尊重して qmm4 と一致させる)。
-    static func ensureQmm4RowsFlaggedPipeline() -> Bool {
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
-        if _qmm4RowsFlaggedPipeline != nil { return true }
-        let XT = "half"
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-        #define SIMD_SIZE 32
-        inline float ld16(const device \(XT)* x, thread float* xt) {
-            float sum = 0.0f;
-            for (int i = 0; i < 16; i += 4) {
-                sum += x[i] + x[i+1] + x[i+2] + x[i+3];
-                xt[i]   = x[i];
-                xt[i+1] = x[i+1] / 16.0f;
-                xt[i+2] = x[i+2] / 256.0f;
-                xt[i+3] = x[i+3] / 4096.0f;
-            }
-            return sum;
-        }
-        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
-            float accum = 0.0f;
-            const device uint16_t* ws = (const device uint16_t*)w;
-            for (int i = 0; i < 4; i++) {
-                accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
-                          xt[4*i+1] * (float)(ws[i] & 0x00f0) +
-                          xt[4*i+2] * (float)(ws[i] & 0x0f00) +
-                          xt[4*i+3] * (float)(ws[i] & 0xf000));
-            }
-            return scale * accum + sum * bias;
-        }
-        kernel void qmm4_rows_flagged(device const uint32_t* w      [[buffer(0)]],
-                                      device const \(XT)*    scales [[buffer(1)]],
-                                      device const \(XT)*    biases [[buffer(2)]],
-                                      device const \(XT)*    x      [[buffer(3)]],
-                                      device \(XT)*          y      [[buffer(4)]],
-                                      constant int&          in_vec_size  [[buffer(5)]],
-                                      constant int&          out_vec_size [[buffer(6)]],
-                                      device const int*      certFlag    [[buffer(7)]],
-                                      device const int*      stopFlag [[buffer(16)]],
-                                      uint3 tid      [[threadgroup_position_in_grid]],
-                                      uint  simd_gid [[simdgroup_index_in_threadgroup]],
-                                      uint  simd_lid [[thread_index_in_simdgroup]]) {
-            if (stopFlag[0] != 0) return;
-            if (certFlag[tid.x] != 0) return;               // ★ cert 行は weight を読まず即 return
-            constexpr int packs_per_thread = 2;
-            constexpr int num_simdgroups = 2;
-            constexpr int results_per_simdgroup = 4;
-            constexpr int pack_factor = 8;
-            constexpr int bytes_per_pack = 4;
-            constexpr int values_per_thread = 16;
-            constexpr int block_size = 512;
-            constexpr int scale_step_per_thread = 4;
-            const device uint8_t* ws = (const device uint8_t*)w;
-            typedef float U;
-            thread U x_thread[16];
-            thread U result[4] = {0};
-            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-            const int in_vec_size_g = in_vec_size / 64;
-            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
-            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-            x += tid.x * in_vec_size + simd_lid * values_per_thread;
-            y += tid.x * out_vec_size + out_row;
-            for (int k = 0; k < in_vec_size; k += block_size) {
-                U sum = ld16(x, x_thread);
-                for (int row = 0; row < results_per_simdgroup; row++) {
-                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                    const device \(XT)* sl = scales + row * in_vec_size_g;
-                    const device \(XT)* bl = biases + row * in_vec_size_g;
-                    U s = sl[0]; U b = bl[0];
-                    result[row] += qd4(wl, x_thread, s, b, sum);
-                }
-                ws += block_size * bytes_per_pack / pack_factor;
-                scales += block_size / 64;
-                biases += block_size / 64;
-                x += block_size;
-            }
-            for (int row = 0; row < results_per_simdgroup; row++) {
-                result[row] = simd_sum(result[row]);
-                if (simd_lid == 0) y[row] = (\(XT))result[row];
-            }
-        }
-        """
-        let opts = MTLCompileOptions()
-        let mathSel = ProcessInfo.processInfo.environment["QWISP_QMM_MATH"] ?? "safe"
-        if #available(macOS 15.0, *) {
-            switch mathSel {
-            case "fast": opts.mathMode = .fast
-            case "relaxed": opts.mathMode = .relaxed
-            default: opts.mathMode = .safe
-            }
-        } else {
-            opts.fastMathEnabled = (mathSel == "fast")
-        }
-        do { let lib = try device.makeLibrary(source: src, options: opts)
-             _qmm4RowsFlaggedPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_rows_flagged")!)
-             return true
-        } catch { print("[raw-qmm4-rows-flagged] compile: \(error)"); return false }
-    }
-
-    /// §3.2 step 4 encode: qmm4_rows_flagged(既存 qmm4 qmv と同一計算 + certFlag early-out)。
-    /// uncert 行のみ logits4 を hd.logits へ上書き。cert 行は weight を読まない。
-    static func encodeQmm4RowsFlagged(_ enc: MTLComputeCommandEncoder,
-                                      w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
-                                      x: MTLBuffer, out: MTLBuffer, certFlag: MTLBuffer,
-                                      M: Int, K: Int, N: Int) {
-        enc.setComputePipelineState(_qmm4RowsFlaggedPipeline!)
-        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
-        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
-        enc.setBuffer(out, offset: 0, index: 4)
-        var kk = Int32(K), nn = Int32(N)
-        enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
-        enc.setBuffer(certFlag, offset: 0, index: 7)
-        RawMetalForward.bindStop(enc, 16)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
-    }
-
-    /// Test entry: full margin-cert chain on provided quantized weights.
-    /// x      [M, K] f16  — final-normed hidden rows for M decode steps.
-    /// w4/s4/b4            — 4-bit affine lm_head (groupSize=64) already resident.
-    /// w2/s2/b2            — 2-bit affine copy built by buildLMHead2 (groupSize=64).
-    /// rowE   [V] f16      — per-row error norms: rowE[v] = ‖dq2(v)−dq4(v)‖₂.
-    /// Returns (tokens:[M], cert:[M]) or nil on setup failure.
-    //
-    // Round B: production kernel chain(spec §3.2 — composed==fused doctrine)。1 CB で
-    //   hnorm_rows → qmm2_rows → argmax_cert_rows → qmm4_rows_flagged → argmax_rows_flagged
-    //   を実行し tokensOut+certFlag を読み出す。EPS=0.05 は argmax_cert_rows kernel 内のみ。
-    //   (Round A の CPU composition は削除: 単体 test が本 chain を直接 gate する)
-    public static func lmhead2CertStep(x: MLXArray,
-                                       w4: MLXArray, s4: MLXArray, b4: MLXArray,
-                                       w2: MLXArray, s2: MLXArray, b2: MLXArray,
-                                       rowE: MLXArray,
-                                       M: Int, K: Int, V: Int) -> (tokens: [Int], cert: [Bool])? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
-        // Round B: production kernel chain を 1 CB で駆動(spec §3.2 — composed==fused doctrine)。
-        //   hnorm_rows → qmm2_rows → argmax_cert_rows → qmm4_rows_flagged → argmax_rows_flagged。
-        //   readback は tokensOut(全部行) + certFlag(各行 0/1)。EPS=0.05 は argmax_cert_rows kernel 内のみ。
-        guard ensureRowsAuxPipelines(), ensureQmm2RowsPipeline(), ensureQmm4RowsFlaggedPipeline() else { return nil }
-        let xf16 = x.asType(.float16)
-        let s2A = s2.asType(.float16), b2A = b2.asType(.float16), rowEA = rowE.asType(.float16)
-        let s4A = s4.asType(.float16), b4A = b4.asType(.float16)
-        guard let bx = RawMetalForward.mtlBuf(xf16, device),
-              let bw2 = RawMetalForward.mtlBuf(w2, device),
-              let bs2 = RawMetalForward.mtlBuf(s2A, device),
-              let bb2 = RawMetalForward.mtlBuf(b2A, device),
-              let bre = RawMetalForward.mtlBuf(rowEA, device),
-              let bw4 = RawMetalForward.mtlBuf(w4, device),
-              let bs4 = RawMetalForward.mtlBuf(s4A, device),
-              let bb4 = RawMetalForward.mtlBuf(b4A, device),
-              let lg = device.makeBuffer(length: M * V * 2, options: .storageModeShared),
-              let hn = device.makeBuffer(length: M * 4, options: .storageModeShared),
-              let cf = device.makeBuffer(length: M * 4, options: .storageModeShared),
-              let cc = device.makeBuffer(length: 4, options: .storageModeShared),
-              let to = device.makeBuffer(length: M * 4, options: .storageModeShared) else { return nil }
-        cc.contents().bindMemory(to: Int32.self, capacity: 1).pointee = 0   // atomic counter reset
-        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        encodeHnormRows(enc, x: bx, out: hn, M: M, K: K)
-        encodeQmm2Rows(enc, w: bw2, scales: bs2, biases: bb2, x: bx, out: lg, M: M, K: K, V: V)
-        encodeArgmaxCertRows(enc, logits2: lg, rowE: bre, hnorm: hn,
-                             tokensOut: to, certFlag: cf, certCount: cc, M: M, V: V)
-        encodeQmm4RowsFlagged(enc, w: bw4, scales: bs4, biases: bb4, x: bx, out: lg, certFlag: cf,
-                             M: M, K: K, N: V)
-        encodeArgmaxRowsFlagged(enc, logits: lg, outIdx: to, certFlag: cf, M: M, V: V)
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let tp = to.contents().bindMemory(to: Int32.self, capacity: M)
-        let cp = cf.contents().bindMemory(to: Int32.self, capacity: M)
-        let tokens = (0 ..< M).map { Int(tp[$0]) }
-        let cert = (0 ..< M).map { cp[$0] != 0 }
-        return (tokens, cert)
-    }
-
-    /// Build 2-bit copy of a 4-bit lm_head and compute per-row error norms.
-    /// w4/s4/b4 — input 4-bit affine lm_head (groupSize=64, shape [V, K/8] packed).
-    /// Returns (w2, s2, b2, rowE) where rowE[v] = ‖dq2(v)−dq4(v)‖₂ stored as f16.
-    //
-    // §3.1: 2-bit is the quantization of the 4-bit *dequant result* (not the original weights), so
-    // the error vector dq2−dq4 is exactly what the bound (§3.2) uses. rowE computed in f32 then
-    // downcast to f16 per spec.
-    public static func buildLMHead2(w4: MLXArray, s4: MLXArray, b4: MLXArray,
-                                    V: Int, K: Int)
-        -> (w2: MLXArray, s2: MLXArray, b2: MLXArray, rowE: MLXArray)? {
-        // W4 = dequant(w4, s4, b4) (f32 for stable L2), kept only transiently.
-        let dq4f = MLX.dequantized(w4, scales: s4, biases: b4, groupSize: 64, bits: 4, mode: .affine)
-            .asType(.float32)
-        MLX.eval(dq4f)
-        // The 4-bit dequant result is fed to MLX.quantized as f16 (same convention as the rest of
-        // the repo: MLX.quantized is always called with an f16 source here).
-        let dq4f16 = dq4f.asType(.float16)
-        MLX.eval(dq4f16)
-        // (lmW2, lmS2, lmB2) = quantize the 4-bit dequant result to 2-bit affine, gs=64.
-        let (w2, s2, b2opt) = MLX.quantized(dq4f16, groupSize: 64, bits: 2, mode: .affine)
-        guard let b2 = b2opt else { return nil }
-        // Re-dequant the 2-bit copy to compute the per-row error norm.
-        let dq2f = MLX.dequantized(w2, scales: s2, biases: b2, groupSize: 64, bits: 2, mode: .affine)
-            .asType(.float32)
-        MLX.eval(dq2f)
-        // rowE[v] = ‖dq2(v) − dq4(v)‖₂  (L2 over K), f32 → f16.
-        let diff = dq2f - dq4f
-        let rowE = MLX.sqrt(MLX.sum(diff * diff, axis: -1)).asType(.float16)
-        MLX.eval([w2, s2, b2, rowE])
-        return (w2, s2, b2, rowE)
     }
 }
