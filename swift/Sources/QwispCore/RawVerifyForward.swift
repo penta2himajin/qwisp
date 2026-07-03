@@ -224,26 +224,25 @@ public enum RawVerifyForward {
               let u = RawMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
                                                     inds: indsFlat, M: M, Ktop: Ktop, K: H, N: I)
         else { return nil }
-        let h = (g * MLX.sigmoid(g)) * u                                        // [M*Ktop, I] elementwise
+        // swiglu は raw Metal kernel(stable sigmoid, f16)— fused 経路と同一数値系(engine 内自己整合が規範)
+        guard let h = RawMetalForward.swigluRaw(g, u) else { return nil }       // [M*Ktop, I] elementwise
         guard let d = RawMetalForward.gatherQmmRows(h, w.swDWq, scales: w.swDSc, biases: w.swDBi,
                                                     inds: indsFlat, M: M, Ktop: Ktop, K: I, N: H,
                                                     lhsPerExpert: true)
         else { return nil }
-        // combine: Ktop 項の明示順序和(shape 依存 reduction を避け M 非依存の加算列に固定)
-        let dR = d.reshaped([M, Ktop, H])
-        var y = dR[0..., 0] * scores[0..., 0 ..< 1]
-        for ki in 1 ..< Ktop { y = y + dR[0..., ki] * scores[0..., ki ..< ki + 1] }
+        // combine: raw kernel(k 昇順 f16 逐次和)— fused の combine_rows と丸め列を共有(M 非依存)
+        guard let y = RawFusedVerify.combineRowsRaw(d, scores, M: M, Ktop: Ktop, N: H) else { return nil }
         // shared expert + sigmoid(sharedGate) — sharedGate は pad 8 列の列 0 を使用
         guard let sg = RawMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
               let su = RawMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I)
         else { return nil }
-        let shAct = (sg * MLX.sigmoid(sg)) * su
+        guard let shAct = RawMetalForward.swigluRaw(sg, su) else { return nil } // raw swiglu(fused と同一)
         guard let sharedY = RawMetalForward.qmmRows(shAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
               let sgl = RawMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi,
                                              M: M, K: H, N: 8)
         else { return nil }
-        let gateScale = MLX.sigmoid(sgl[0..., 0 ..< 1])                          // [M,1]
-        return y + gateScale * sharedY
+        // final: y + sigmoid(sgl[:,0])·sharedY — raw kernel(fused の final_combine_rows と同一)
+        return RawFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
     }
 
     /// decoder 層 1 枚の仕様(mixer 種別 + 重み + MoE)。

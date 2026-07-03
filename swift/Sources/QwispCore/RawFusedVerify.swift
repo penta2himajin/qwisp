@@ -177,4 +177,297 @@ public enum RawFusedVerify {
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N2)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N2)), [M, N2])
     }
+
+    // ── Stage A(P3 続き): fused MoE block — moeBlockRows(metalRoute) 全段を単一 encoder 化 ──
+
+    nonisolated(unsafe) static var _combineRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _finalCombineRowsPipeline: MTLComputePipelineState?
+
+    /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
+    /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
+    static func ensureRowsAuxPipelines() -> Bool {
+        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // combine_rows: y[m,n] = Σ_k d[(m*K+k)*N+n]·scores[m*K+k]（f16 の k 昇順逐次和 =
+        // composed moeBlockRows の明示順序 ki ループと同一の演算列。f16 で 0+x==x ゆえ acc=0 開始も同値）。
+        kernel void combine_rows(device const half* d [[buffer(0)]], device const half* scores [[buffer(1)]],
+                                 device half* y [[buffer(2)]], constant uint& K [[buffer(3)]],
+                                 constant uint& N [[buffer(4)]], constant uint& total [[buffer(5)]],
+                                 uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint m = i / N, n = i % N;
+            half acc = (half)0;
+            for (uint k = 0; k < K; ++k) acc += d[(m*K + k)*N + n] * scores[m*K + k];
+            y[i] = acc;
+        }
+        // final_combine_rows: out[m,n] = y[m,n] + sigmoid(sgl[m*8])·sharedY[m,n]。
+        // sigmoid は MLX stable(half, metal::exp)= composed の MLX.sigmoid(sgl[:,0:1]) と同一。
+        kernel void final_combine_rows(device const half* y [[buffer(0)]], device const half* sharedY [[buffer(1)]],
+                                       device const half* sgl [[buffer(2)]], device half* outp [[buffer(3)]],
+                                       constant uint& N [[buffer(4)]], constant uint& total [[buffer(5)]],
+                                       uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint m = i / N;
+            half gv = sgl[m * 8];
+            half yv = (half)1 / ((half)1 + exp(metal::abs(gv)));
+            half s = (gv < (half)0) ? yv : ((half)1 - yv);
+            outp[i] = y[i] + s * sharedY[i];
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            _combineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine_rows")!)
+            _finalCombineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine_rows")!)
+            return true
+        } catch { print("[raw-fused-aux] compile: \(error)"); return false }
+    }
+
+    /// qmm8(router gate / shared gate logits)を encode-only で提供。qmm8 と同一 pipeline/dispatch。
+    static func encodeQmm8Rows(_ enc: MTLComputeCommandEncoder,
+                               w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                               x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int) {
+        enc.setComputePipelineState(RawMetalForward._qmm8Pipeline!)
+        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(out, offset: 0, index: 4)
+        var kk = Int32(K), nn = Int32(N)
+        enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+        RawMetalForward.bindStop(enc, 16)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    /// route_top8_rows を encode-only で提供。routeTop8Rows と同一 pipeline/dispatch。
+    static func encodeRouteTop8Rows(_ enc: MTLComputeCommandEncoder,
+                                    logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+                                    M: Int, N: Int, K: Int) {
+        enc.setComputePipelineState(_routeRowsPipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K)
+        enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// swiglu(既存 aux kernel, per-element 独立=M 不変)を encode-only で提供。
+    static func encodeSwiglu(_ enc: MTLComputeCommandEncoder, g: MTLBuffer, u: MTLBuffer, h: MTLBuffer, total: Int) {
+        let p = RawMetalForward._swigluPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(g, offset: 0, index: 0); enc.setBuffer(u, offset: 0, index: 1); enc.setBuffer(h, offset: 0, index: 2)
+        var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeCombineRows(_ enc: MTLComputeCommandEncoder, d: MTLBuffer, scores: MTLBuffer, y: MTLBuffer,
+                                  Ktop: Int, N: Int, M: Int) {
+        let p = _combineRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(d, offset: 0, index: 0); enc.setBuffer(scores, offset: 0, index: 1); enc.setBuffer(y, offset: 0, index: 2)
+        var kk = UInt32(Ktop), nn = UInt32(N), t = UInt32(M * N)
+        enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&nn, length: 4, index: 4); enc.setBytes(&t, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeFinalCombineRows(_ enc: MTLComputeCommandEncoder, y: MTLBuffer, sharedY: MTLBuffer,
+                                       sgl: MTLBuffer, out: MTLBuffer, N: Int, M: Int) {
+        let p = _finalCombineRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(y, offset: 0, index: 0); enc.setBuffer(sharedY, offset: 0, index: 1)
+        enc.setBuffer(sgl, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
+        var nn = UInt32(N), t = UInt32(M * N)
+        enc.setBytes(&nn, length: 4, index: 4); enc.setBytes(&t, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// per-op wrapper: combine_rows(y[m,n]=Σ_k d·scores)を単発 CB で実行。composed が使うことで
+    /// fused と combine の丸め列(FMA 有無含む)を共有する。
+    public static func combineRowsRaw(_ d: MLXArray, _ scores: MLXArray, M: Int, Ktop: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let bd = RawMetalForward.mtlBuf(d.asType(.float16), device),
+              let bs = RawMetalForward.mtlBuf(scores.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeCombineRows(enc, d: bd, scores: bs, y: outBuf, Ktop: Ktop, N: N, M: M)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+    }
+
+    /// per-op wrapper: final_combine_rows(out = y + sigmoid(sgl[:,0])·sharedY)を単発 CB で実行。
+    /// composed moeBlockRows がこれを使うことで fused と elementwise 数値系を共有する。
+    public static func finalCombineRowsRaw(_ y: MLXArray, _ sharedY: MLXArray, _ sgl: MLXArray,
+                                           M: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let by = RawMetalForward.mtlBuf(y.asType(.float16), device),
+              let bs = RawMetalForward.mtlBuf(sharedY.asType(.float16), device),
+              let bg = RawMetalForward.mtlBuf(sgl.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeFinalCombineRows(enc, y: by, sharedY: bs, sgl: bg, out: outBuf, N: N, M: M)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+    }
+
+    /// MoE block 用の重み MTLBuffer 束(composed wrapper と同一の型変換で常駐化)。
+    public struct MoEBlockBufs {
+        let gW: MTLBuffer, gS: MTLBuffer, gB: MTLBuffer
+        let swGW: MTLBuffer, swGS: MTLBuffer, swGB: MTLBuffer
+        let swUW: MTLBuffer, swUS: MTLBuffer, swUB: MTLBuffer
+        let swDW: MTLBuffer, swDS: MTLBuffer, swDB: MTLBuffer
+        let shGW: MTLBuffer, shGS: MTLBuffer, shGB: MTLBuffer
+        let shUW: MTLBuffer, shUS: MTLBuffer, shUB: MTLBuffer
+        let shDW: MTLBuffer, shDS: MTLBuffer, shDB: MTLBuffer
+        let sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer
+    }
+
+    static func prepareMoEBlockBufs(_ w: RawVerifyForward.MoEBlockW, _ device: MTLDevice) -> MoEBlockBufs? {
+        func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
+            guard let bq = RawMetalForward.mtlBuf(q, device),
+                  let bs = RawMetalForward.mtlBuf(s.asType(.float16), device),
+                  let bb = RawMetalForward.mtlBuf(b.asType(.float16), device) else { return nil }
+            return (bq, bs, bb)
+        }
+        guard let g = trio(w.gateWq, w.gateSc, w.gateBi),
+              let swG = trio(w.swGWq, w.swGSc, w.swGBi), let swU = trio(w.swUWq, w.swUSc, w.swUBi),
+              let swD = trio(w.swDWq, w.swDSc, w.swDBi),
+              let shG = trio(w.shGWq, w.shGSc, w.shGBi), let shU = trio(w.shUWq, w.shUSc, w.shUBi),
+              let shD = trio(w.shDWq, w.shDSc, w.shDBi),
+              let sg = trio(w.sharedGateWq, w.sharedGateSc, w.sharedGateBi) else { return nil }
+        return MoEBlockBufs(gW: g.0, gS: g.1, gB: g.2,
+                            swGW: swG.0, swGS: swG.1, swGB: swG.2,
+                            swUW: swU.0, swUS: swU.1, swUB: swU.2,
+                            swDW: swD.0, swDS: swD.1, swDB: swD.2,
+                            shGW: shG.0, shGS: shG.1, shGB: shG.2,
+                            shUW: shU.0, shUS: shU.1, shUB: shU.2,
+                            shDW: shD.0, shDS: shD.1, shDB: shD.2,
+                            sgW: sg.0, sgS: sg.1, sgB: sg.2)
+    }
+
+    /// MoE block × M 行の全段(routing→routed experts→combine→shared→final)を **既存 encoder に
+    /// encode するだけ**の形で提供。入力 x[M,H] と出力 out[M,H] は常駐 MTLBuffer。
+    /// 演算列は moeBlockRows(metalRoute: true) と 1:1(同一 pipeline・同一 dispatch 形状)。
+    /// scratch は呼び出し側が確保(encodeMoEBlockScratch)。
+    public struct MoEScratch {
+        let gl: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer
+        let g: MTLBuffer, u: MTLBuffer, h: MTLBuffer, d: MTLBuffer, y: MTLBuffer
+        let sg: MTLBuffer, su: MTLBuffer, shAct: MTLBuffer, sharedY: MTLBuffer, sgl: MTLBuffer
+    }
+
+    static func makeMoEScratch(_ device: MTLDevice, M: Int, E: Int, I: Int, Ktop: Int, H: Int) -> MoEScratch? {
+        func buf(_ n: Int) -> MTLBuffer? { device.makeBuffer(length: n, options: .storageModeShared) }
+        guard let gl = buf(M * E * 2), let inds = buf(M * Ktop * 4), let scores = buf(M * Ktop * 2),
+              let g = buf(M * Ktop * I * 2), let u = buf(M * Ktop * I * 2), let h = buf(M * Ktop * I * 2),
+              let d = buf(M * Ktop * H * 2), let y = buf(M * H * 2),
+              let sg = buf(M * I * 2), let su = buf(M * I * 2), let shAct = buf(M * I * 2),
+              let sharedY = buf(M * H * 2), let sgl = buf(M * 8 * 2) else { return nil }
+        return MoEScratch(gl: gl, inds: inds, scores: scores, g: g, u: u, h: h, d: d, y: y,
+                          sg: sg, su: su, shAct: shAct, sharedY: sharedY, sgl: sgl)
+    }
+
+    static func encodeMoEBlockRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
+                                   w: MoEBlockBufs, sc: MoEScratch,
+                                   M: Int, E: Int, I: Int, Ktop: Int, H: Int) {
+        // ① routing: gate qmm8 → route_top8_rows(inds+renorm scores)
+        encodeQmm8Rows(enc, w: w.gW, scales: w.gS, biases: w.gB, x: x, out: sc.gl, M: M, K: H, N: E)
+        encodeRouteTop8Rows(enc, logits: sc.gl, inds: sc.inds, scores: sc.scores, M: M, N: E, K: Ktop)
+        // ② routed experts: gather g/u(行共有 lhs)→ swiglu → gather d(per-mk lhs)→ combine
+        encodeGatherQmmRows(enc, w: w.swGW, scales: w.swGS, biases: w.swGB, x: x, inds: sc.inds, out: sc.g,
+                            M: M, Ktop: Ktop, K: H, N: I, lhsPer: false)
+        encodeGatherQmmRows(enc, w: w.swUW, scales: w.swUS, biases: w.swUB, x: x, inds: sc.inds, out: sc.u,
+                            M: M, Ktop: Ktop, K: H, N: I, lhsPer: false)
+        encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: M * Ktop * I)
+        encodeGatherQmmRows(enc, w: w.swDW, scales: w.swDS, biases: w.swDB, x: sc.h, inds: sc.inds, out: sc.d,
+                            M: M, Ktop: Ktop, K: I, N: H, lhsPer: true)
+        encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y, Ktop: Ktop, N: H, M: M)
+        // ③ shared expert: sg/su qmm → swiglu → down qmm
+        encodeQmmRows(enc, w: w.shGW, scales: w.shGS, biases: w.shGB, x: x, out: sc.sg, M: M, K: H, N: I)
+        encodeQmmRows(enc, w: w.shUW, scales: w.shUS, biases: w.shUB, x: x, out: sc.su, M: M, K: H, N: I)
+        encodeSwiglu(enc, g: sc.sg, u: sc.su, h: sc.shAct, total: M * I)
+        encodeQmmRows(enc, w: w.shDW, scales: w.shDS, biases: w.shDB, x: sc.shAct, out: sc.sharedY, M: M, K: I, N: H)
+        // ④ shared gate logits(qmm8 N=8, 列0のみ使用)→ final combine
+        encodeQmm8Rows(enc, w: w.sgW, scales: w.sgS, biases: w.sgB, x: x, out: sc.sgl, M: M, K: H, N: 8)
+        encodeFinalCombineRows(enc, y: sc.y, sharedY: sc.sharedY, sgl: sc.sgl, out: out, N: H, M: M)
+    }
+
+    /// 全 pipeline を warm(compile)。fused 経路の前提(encode 時に force-unwrap するため)。
+    static func ensureMoEPipelines(E: Int = 256, Ktop: Int = 8) -> Bool {
+        ensureQmmPipeline()
+        guard RawMetalForward.compileQmm8(), RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines()
+        else { return false }
+        if _routeRowsPipeline == nil {
+            let dummy = MLXArray.zeros([1, E]).asType(.float16); dummy.eval()
+            _ = routeTop8Rows(dummy, M: 1, N: E, K: Ktop)
+        }
+        if RawMetalForward._gqmmRowsPipeline == nil {
+            let x = MLXRandom.normal([1, 512]).asType(.float16)
+            let wf = MLXRandom.normal([2, 8, 512]).asType(.float16)
+            let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            let inds = MLXArray([Int32(0)], [1])
+            MLX.eval([x, wq, s, b!, inds])
+            _ = RawMetalForward.gatherQmmRows(x, wq, scales: s, biases: b!, inds: inds, M: 1, Ktop: 1, K: 512, N: 8)
+        }
+        return _routeRowsPipeline != nil && RawMetalForward._gqmmRowsPipeline != nil
+    }
+
+    /// debug: fused MoE block の全中間 buffer を読み出して返す(段階別バイセクト用)。
+    public static func fusedMoEBlockRowsDump(_ x: MLXArray, _ w: RawVerifyForward.MoEBlockW,
+                                             M: Int, E: Int, I: Int, Ktop: Int = 8) -> [String: MLXArray]? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        let H = x.dim(-1)
+        guard ensureMoEPipelines(E: E, Ktop: Ktop) else { return nil }
+        guard let bufs = prepareMoEBlockBufs(w, device),
+              let sc = makeMoEScratch(device, M: M, E: E, I: I, Ktop: Ktop, H: H),
+              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeMoEBlockRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, M: M, E: E, I: I, Ktop: Ktop, H: H)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        func rd(_ b: MTLBuffer, _ n: Int, _ shape: [Int]) -> MLXArray {
+            let p = b.contents().bindMemory(to: Float16.self, capacity: n)
+            return MLXArray(Array(UnsafeBufferPointer(start: p, count: n)), shape)
+        }
+        func rdI(_ b: MTLBuffer, _ n: Int, _ shape: [Int]) -> MLXArray {
+            let p = b.contents().bindMemory(to: Int32.self, capacity: n)
+            return MLXArray(Array(UnsafeBufferPointer(start: p, count: n)), shape)
+        }
+        return ["gl": rd(sc.gl, M * E, [M, E]),
+                "inds": rdI(sc.inds, M * Ktop, [M * Ktop]),
+                "scores": rd(sc.scores, M * Ktop, [M, Ktop]),
+                "g": rd(sc.g, M * Ktop * I, [M * Ktop, I]),
+                "u": rd(sc.u, M * Ktop * I, [M * Ktop, I]),
+                "h": rd(sc.h, M * Ktop * I, [M * Ktop, I]),
+                "d": rd(sc.d, M * Ktop * H, [M * Ktop, H]),
+                "y": rd(sc.y, M * H, [M, H]),
+                "sg": rd(sc.sg, M * I, [M, I]),
+                "su": rd(sc.su, M * I, [M, I]),
+                "shAct": rd(sc.shAct, M * I, [M, I]),
+                "sharedY": rd(sc.sharedY, M * H, [M, H]),
+                "sgl": rd(sc.sgl, M * 8, [M, 8]),
+                "out": rd(outBuf, M * H, [M, H])]
+    }
+
+    /// テスト支援: fused MoE block 単発実行(単一 CB + 常駐中間)。moeBlockRows(metalRoute) と bit 一致すべき。
+    public static func fusedMoEBlockRows(_ x: MLXArray, _ w: RawVerifyForward.MoEBlockW,
+                                         M: Int, E: Int, I: Int, Ktop: Int = 8) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        let H = x.dim(-1)
+        guard ensureMoEPipelines(E: E, Ktop: Ktop) else { return nil }
+        guard let bufs = prepareMoEBlockBufs(w, device),
+              let sc = makeMoEScratch(device, M: M, E: E, I: I, Ktop: Ktop, H: H),
+              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeMoEBlockRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, M: M, E: E, I: I, Ktop: Ktop, H: H)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+    }
 }

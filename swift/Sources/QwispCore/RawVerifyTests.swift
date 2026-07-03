@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 19
+        let total = 20
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -795,6 +795,76 @@ public enum RawVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 20 (P3-A): fused MoE block(単一 encoder + 常駐中間, 全段 Metal)≡ composed moeBlockRows(metalRoute)
+        run("fused_moe_block_bitexact") {
+            let H = 2048, E = 16, I = 512, Ktop = 8
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+            let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+            let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                guard let ref = RawVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                else { return (false, "composed nil M=\(M)") }
+                ref.eval()
+                guard let got = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                else { return (false, "fused nil M=\(M)") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok {
+                    // 段階バイセクト: composed per-op 中間 vs fused dump で最初の乖離段を特定
+                    guard let dump = RawFusedVerify.fusedMoEBlockRowsDump(x, w, M: M, E: E, I: I, Ktop: Ktop),
+                          let cgl = RawMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E),
+                          let (ci, cs) = RawFusedVerify.routeTop8Rows(cgl, M: M, N: E, K: Ktop)
+                    else { return (false, "M=\(M): \(d) (dump nil)") }
+                    let cif = ci.reshaped([M * Ktop]).asType(.int32); cif.eval()
+                    guard let cg = RawMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
+                                                                 inds: cif, M: M, Ktop: Ktop, K: H, N: I),
+                          let cu = RawMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
+                                                                 inds: cif, M: M, Ktop: Ktop, K: H, N: I),
+                          let ch = RawMetalForward.swigluRaw(cg, cu),
+                          let cd = RawMetalForward.gatherQmmRows(ch, w.swDWq, scales: w.swDSc, biases: w.swDBi,
+                                                                 inds: cif, M: M, Ktop: Ktop, K: I, N: H, lhsPerExpert: true),
+                          let csg = RawMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
+                          let csu = RawMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I),
+                          let cshAct = RawMetalForward.swigluRaw(csg, csu),
+                          let csharedY = RawMetalForward.qmmRows(cshAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
+                          let csgl = RawMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi, M: M, K: H, N: 8)
+                    else { return (false, "M=\(M): \(d) (composed stage nil)") }
+                    guard let cy = RawFusedVerify.combineRowsRaw(cd, cs, M: M, Ktop: Ktop, N: H)
+                    else { return (false, "M=\(M): \(d) (combine nil)") }
+                    cy.eval()
+                    let stages: [(String, MLXArray)] = [
+                        ("gl", cgl), ("inds", cif.asType(.int32)), ("scores", cs), ("g", cg), ("u", cu),
+                        ("h", ch), ("d", cd), ("y", cy), ("sg", csg), ("su", csu),
+                        ("shAct", cshAct), ("sharedY", csharedY), ("sgl", csgl)]
+                    for (nm, cref) in stages {
+                        guard let f = dump[nm] else { continue }
+                        let (sok, sd) = bitEqual(f.asType(.float32), cref.asType(.float32))
+                        if !sok { return (false, "M=\(M) stage=\(nm): \(sd)") }
+                    }
+                    return (false, "M=\(M) out-only: \(d)")
+                }
             }
             return (true, "ok")
         }
