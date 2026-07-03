@@ -1692,7 +1692,7 @@ public enum RawMetalForward {
               let bConvW = mtl(w.conv1dW, .float32),
               let bNormW = mtl(w.normWeight, w.normWeight.dtype == .float32 ? .float32 : .float16),   // la_norm dtype 維持
               let bALog = mtl(w.aLog, .float32), let bDt = mtl(w.dtBias, .float32),
-              let bOnes = MLXArray.ones([headKDim], dtype: mtlBuf(.float16), device)
+              let bOnes = MLXArray.ones([headKDim], dtype: .float16).asMTLBuffer(device: device, noCopy: false)
         else { print("[raw-gdn-se] weight buffer nil"); return nil }
         let normF32 = (w.normWeight.dtype == .float32)
         let convInput = mk(convKernel * convDim * 2); memset(convInput.contents(), 0, convKernel * convDim * 2)  // zero 1 回（qkv が row(K-1)を毎回上書き）
