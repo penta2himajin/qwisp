@@ -198,17 +198,25 @@ public enum RawVerifyForward {
     /// MoE block × M 行。routing は production と同一の MLX glue(softmax precise → argPartition top-K →
     /// renorm — 全て per-row op。M 形状安定性は rows≡loop テストが検証し、破れたら raw route_top8 へピボット)。
     /// expert 計算は gatherQmmRows(gate/up: 行共有 lhs, down: per-(row,ki) lhs)+ 明示順序 combine。
+    /// metalRoute=false: MLX routing(softmax/argPartition, oracle 用)。
+    /// metalRoute=true : routeTop8Rows(per-row Metal, sync 島なし = 融合の本命)。両者とも各行独立=M不変。
     public static func moeBlockRows(_ x: MLXArray, _ w: MoEBlockW,
-                                    M: Int, E: Int, I: Int, Ktop: Int = 8) -> MLXArray? {
+                                    M: Int, E: Int, I: Int, Ktop: Int = 8, metalRoute: Bool = false) -> MLXArray? {
         let H = x.dim(-1)
         // routing(per-row)
         guard let gl = RawMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E)
         else { return nil }
-        let gates = MLX.softmax(gl, axis: -1, precise: true)
-        let order = MLX.argPartition(gates, kth: E - Ktop, axis: -1)
-        let inds = order[0..., (E - Ktop)...]                                   // [M, Ktop]
-        var scores = MLX.takeAlong(gates, inds, axis: -1)
-        scores = scores / scores.sum(axis: -1, keepDims: true)                  // normTopk
+        let inds: MLXArray, scores: MLXArray
+        if metalRoute {
+            guard let (mi, ms) = RawFusedVerify.routeTop8Rows(gl, M: M, N: E, K: Ktop) else { return nil }
+            inds = mi; scores = ms                                              // [M,Ktop] 選択+renorm 済
+        } else {
+            let gates = MLX.softmax(gl, axis: -1, precise: true)
+            let order = MLX.argPartition(gates, kth: E - Ktop, axis: -1)
+            inds = order[0..., (E - Ktop)...]                                   // [M, Ktop]
+            let sc = MLX.takeAlong(gates, inds, axis: -1)
+            scores = sc / sc.sum(axis: -1, keepDims: true)                      // normTopk
+        }
         let indsFlat = inds.reshaped([M * Ktop]).asType(.int32); indsFlat.eval()
         // routed experts: gate/up(行共有 x)→ swiglu → down(per-mk lhs)
         guard let g = RawMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,

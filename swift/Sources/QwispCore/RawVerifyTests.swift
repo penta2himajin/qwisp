@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 17
+        let total = 18
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -722,6 +722,48 @@ public enum RawVerifyTests {
                 if !oki { return (false, "inds M=\(M): \(di)") }
                 let (oks, ds) = bitEqual(gs, refS)
                 if !oks { return (false, "scores M=\(M): \(ds)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 18 (P2c): metalRoute MoE block(argPartition→routeTop8Rows)が M不変 = self-consistent
+        run("moe_metalroute_rows_invariant") {
+            let H = 2048, E = 16, I = 512, Ktop = 8
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+            let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+            let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                guard let got = RawVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                else { return (false, "rows nil M=\(M)") }
+                got.eval()
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    guard let r = RawVerifyForward.moeBlockRows(x[m ..< m+1], w, M: 1, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                    else { return (false, "ref nil M=\(M) m=\(m)") }
+                    r.eval(); refParts.append(r)
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
         }
