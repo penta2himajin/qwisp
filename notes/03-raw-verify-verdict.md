@@ -94,3 +94,51 @@ threadgroup 低 occupancy が weight 再利用の利を上回り、**全 M で q
 (cert/guard/VSEQ 不要)。code/agentic は MLX 正準と token-exact。→ default 昇格候補。**
 残: ①longctx/shortnl の fidelity 軸 100% 化 = U3(raw 正準で refs 再生成)②全 RAM tier(streaming)検証
 ③本番配線(Tell default backend 切替の是非は owner 判断, auto-commit 禁止)。RAWTESTS 24/24 green。
+
+---
+## ★追記(2026-07-03 続き2, commit b3f06fb/392dc86): streaming tier(C<256)対応と判定
+
+RawFusedForward を C<256 per-layer LRU arena(LayerExpertCache)で動くようにした。
+
+### 機構
+- **RawFusedExpertProvider**: 層別 C-slot arena の 9 gather buffer(gate/up/down×w/s/b)+ 同期 ensure(pread)。
+  gqmm4_rows は inds で重み先頭次元を index するだけなので、**kernel 変更ゼロ**で arena buffer に差し替え可能。
+- **strict streaming**: MoE を route/gather/shared の 3 フェーズに分割し、層ごとに CB を切って
+  route inds を readback → `ensure`(miss pread)→ 層別 slotTable 書込 → 新 CB で slot_remap_rows+gather。
+  **union>C は貪欲行チャンク分割で厳密対応**(chunk 間で CB を wait してから次 ensure)→ guard/cert 不要の
+  lossless-by-construction を streaming でも維持。draft 長のハード上限が消える(chunk が増えるだけ)。
+- **bolt**: TellBolt 準拠 calib(counts+coact、strict readback に相乗りする indsCaptureHook=無料)→
+  exact prefill → top-C ensure + buildBuddyTable → **層別 frozen table を GPU buffer に凍結 → 1-CB 維持で io=0**。
+  deviation: B3 in-decode fetch / A3 pending-prefix は未実装(v1)。
+- runner: `QWISP_RAW_C=<C>`(streaming, maxK default C·3/8)、`QWISP_RAW_BOLT=1`、
+  `QWISP_RAWSTREAM_CHECK=1`(resident fused と OUT_TOKENS diff する gate)。
+
+### 正しさ gate(全通過, M1 Max)
+- RAWTESTS 24→**28/28**(strict≡resident bit テスト C=8<E=16 合成: chunk 発生・LRU eviction 連鎖・bolt exact-table)
+- 実重み: strict C=64 code GEN=128 → ref 128/128・**stream-vs-resident 128/128 IDENTICAL**・self LOSSLESS。
+  C=128 agentic GEN=64 → 64/64 IDENTICAL + LOSSLESS。resident 回帰 69.6 tok/s 128/128(経路不変)。
+
+### 速度(GEN=128, timed=decode, throttle=preadInto leaky-bucket 1.5GB/s, MLX は同条件 bench-batch 実測)
+strict(両者 lossless):
+| cell | raw fused | MLX strict | 比 |
+|--|--|--|--|
+| C=64 fast code/agentic | 24.5 / 18.3 | 21.7 / 20.2 | 1.13x / 0.91x |
+| C=128 fast code/agentic | 31.3 / 26.4 | 28.6 / 28.0 | 1.09x / 0.94x |
+| C=64 slow code/agentic | 6.4 / 3.5 | 5.9 / 4.0 | 1.08x / 0.88x |
+| C=128 slow code/agentic | 11.6 / 7.9 | 11.0 / 8.5 | 1.05x / 0.93x |
+
+bolt(L3 near-lossless):
+| cell | raw bolt | MLX bolt | 比 |
+|--|--|--|--|
+| C=64 fast code/agentic | 105.5 / 56.7 | 31.1 / 33.3 | **3.4x / 1.7x** |
+| C=64 slow code/agentic | 100.5 / 54.1 | 29.1 / 31.6 | **3.5x / 1.7x** |
+
+### 判定
+- **strict streaming: MLX strict とパリティ**(code +5-13% / agentic −6-12%)。両者とも per-layer sync 律速で、
+  raw の resident での優位(dispatch スラック)は sync 床に食われる。lossless 保証は raw の方が強い
+  (構造保証、guard/OVERFLOW_MARGIN/prefill-chunk 定数などの運用注意が不要)。
+- **bolt streaming: raw が 1.7-3.5x で圧勝、throttle 完全非感応(io=0)**。slow-NAND 8GB 相当で 100 tok/s 級(code)。
+  1-CB no-sync 構造が raw の edge と噛み合う本命セル。
+- 残課題: ① raw bolt の品質軸(teacher-forced fidelity)未計測(free-run 3-4% は greedy-chaos 指標で無意味、
+  MLX bolt の TF ~88-97% に相当する測定が要る)② B3 in-decode fetch / A3 pending-prefix の移植(bolt 更なる上積み)
+  ③ runner の THROTTLE_DEFER 対応(slow セルの wall 時間短縮のみ、数値不変)。
