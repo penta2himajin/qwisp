@@ -147,9 +147,10 @@ public enum RawVerifyForward {
               let kn0 = RawMetalForward.rmsNormRows(k1, nil, M: M * numKHeads, eps: eps, D: headKDim) else { return nil }
         let qN = ((invScale * invScale) * qn0).reshaped([1, M, numKHeads, headKDim])
         let kN = (invScale * kn0).reshaped([1, M, numKHeads, headKDim])
-        // ⑤ recurrence: in-kernel T=M 逐次(chained T=1 と bit 一致は kernel テスト済み)
-        let g = GatedDelta.computeG(w.aLog, aP.reshaped([1, M, numVHeads]), w.dtBias)
-        let beta = MLX.sigmoid(bP.reshaped([1, M, numVHeads]))
+        // ⑤ recurrence: in-kernel T=M 逐次(chained T=1 と bit 一致は kernel テスト済み)。
+        // g/β は raw kernel(compute_g_beta_rows)— fused と数値系共有
+        guard let (g, beta) = RawFusedVerify.computeGBetaRowsRaw(aP, bP, w.aLog, w.dtBias, M: M, Hv: numVHeads)
+        else { return nil }
         guard let (coreOut, stOut) = RawMetalForward.gatedDeltaStepRows(qN, kN, v1, g: g, beta: beta, state: recState,
                                                                         M: M, B: 1, Hk: numKHeads, Dk: headKDim,
                                                                         Hv: numVHeads, Dv: headVDim) else { return nil }
@@ -159,8 +160,9 @@ public enum RawVerifyForward {
         guard let normed = RawMetalForward.rmsNormRows(coreOut.reshaped([M * numVHeads, headVDim]), w.normWeight,
                                                        M: M * numVHeads, eps: eps, D: headVDim, promoteF32: promoteRMS)
         else { return nil }
-        let zr = z.reshaped([M * numVHeads, headVDim])
-        let gated = (MLXNN.silu(zr.asType(.float32)) * normed.asType(.float32)).asType(.float16)
+        // silu(z)·normed は raw kernel(gate/gate16)— fused と数値系共有
+        guard let gated = RawFusedVerify.gateRaw(z, normed, promote: promoteRMS, total: M * valueDim)
+        else { return nil }
         let outV = gated.reshaped([M, valueDim])
         // ⑦ out_proj
         return RawMetalForward.qmmRows(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: M, K: valueDim, N: H)

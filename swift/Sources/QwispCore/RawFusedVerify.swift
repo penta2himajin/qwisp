@@ -183,12 +183,18 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _combineRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _finalCombineRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _writeKVRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _convHistRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _shiftConvRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sliceRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _computeGBetaRowsPipeline: MTLComputePipelineState?
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
     static func ensureRowsAuxPipelines() -> Bool {
         guard let (device, _) = RawMetalForward.ensure() else { return false }
-        if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil { return true }
+        if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil
+            && _convHistRowsPipeline != nil && _shiftConvRowsPipeline != nil
+            && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -228,12 +234,74 @@ public enum RawFusedVerify {
             uint m = i / (KV*D), rem = i % (KV*D), h = rem / D, dd = rem % D;
             cache[h*maxLen*D + (pos+m)*D + dd] = src[(m*KV + h)*D + dd];
         }
+        // conv1d_silu_hist_rows: conv 窓を hist[K-1,C]+qkv[M,C] の直読みで構成(composed の
+        // concat+stack と同値の値列)。演算は conv1d_silu_rows と完全同一(f32 acc, precise silu)。
+        kernel void conv1d_silu_hist_rows(device const half* hist [[buffer(0)]],
+                                          device const half* qkv  [[buffer(1)]],
+                                          device const float* w   [[buffer(2)]],
+                                          device half* outp       [[buffer(3)]],
+                                          constant uint& K [[buffer(4)]], constant uint& C [[buffer(5)]],
+                                          uint2 pos [[thread_position_in_grid]]) {
+            uint c = pos.x, m = pos.y;
+            if (c >= C) return;
+            float acc = 0.0f;
+            for (uint k = 0; k < K; ++k) {
+                uint idx = m + k;
+                float xv = (idx < K - 1) ? (float)hist[idx*C + c] : (float)qkv[(idx - (K-1))*C + c];
+                acc += xv * w[c*K + k];
+            }
+            float ax = metal::abs(acc);
+            float y = 1.0f / (1.0f + precise::exp(ax));
+            float s = (acc < 0.0f) ? y : (1.0f - y);
+            outp[m*C + c] = (half)(acc * s);
+        }
+        // shift_conv_rows: hist ← concat(hist,qkv)[M .. M+K-2](composed の convState 更新と同値)。
+        // thread=列 c、j 昇順で src=M+j>j ゆえ in-place race-free。
+        kernel void shift_conv_rows(device half* hist [[buffer(0)]], device const half* qkv [[buffer(1)]],
+                                    constant uint& K [[buffer(2)]], constant uint& C [[buffer(3)]],
+                                    constant uint& M [[buffer(4)]],
+                                    uint c [[thread_position_in_grid]]) {
+            if (c >= C) return;
+            for (uint j = 0; j + 1 < K; ++j) {
+                uint src = M + j;
+                hist[j*C + c] = (src < K - 1) ? hist[src*C + c] : qkv[(src - (K-1))*C + c];
+            }
+        }
+        // slice_rows: 行毎 strided 抽出(純コピー)。out[m*W+j] = in[m*stride + off + j]。
+        kernel void slice_rows(device const half* inp [[buffer(0)]], device half* outp [[buffer(1)]],
+                               constant uint& off [[buffer(2)]], constant uint& W [[buffer(3)]],
+                               constant uint& strideLen [[buffer(4)]], constant uint& total [[buffer(5)]],
+                               uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint m = i / W, j = i % W;
+            outp[i] = inp[m*strideLen + off + j];
+        }
+        // compute_g_beta_rows: 既存 compute_g_beta の M-row 拡張(i を M*Hv に、aLog/dtBias は i%Hv)。
+        kernel void compute_g_beta_rows(device const half* a [[buffer(0)]], device const half* b [[buffer(1)]],
+                                        device const float* aLog [[buffer(2)]], device const float* dtBias [[buffer(3)]],
+                                        device float* g [[buffer(4)]], device float* beta [[buffer(5)]],
+                                        constant uint& Hv [[buffer(6)]], constant uint& total [[buffer(7)]],
+                                        uint i [[thread_position_in_grid]]) {
+            if (i >= total) return;
+            uint hv = i % Hv;
+            half bh = b[i];
+            half y = (half)1 / ((half)1 + exp(metal::abs(bh)));
+            half sb = (bh < (half)0) ? y : ((half)1 - y);
+            beta[i] = (float)sb;
+            float x = (float)a[i] + dtBias[hv];
+            float sp = max(x, 0.0f) + precise::log(1.0f + precise::exp(-metal::abs(x)));
+            g[i] = precise::exp(-precise::exp(aLog[hv]) * sp);
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
             _combineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine_rows")!)
             _finalCombineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine_rows")!)
             _writeKVRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "write_kv_rows")!)
+            _convHistRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv1d_silu_hist_rows")!)
+            _shiftConvRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shift_conv_rows")!)
+            _sliceRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "slice_rows")!)
+            _computeGBetaRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_g_beta_rows")!)
             return true
         } catch { print("[raw-fused-aux] compile: \(error)"); return false }
     }
@@ -768,5 +836,327 @@ public enum RawFusedVerify {
         let out = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
         let (kc, vc) = readKVCache(kv)
         return (out, kc, vc)
+    }
+
+    // ── Stage C(P3 続き): fused GDN 層 — gdnLayerRows 全段を単一 encoder 化 ──
+
+    static func encodeConvHistRows(_ enc: MTLComputeCommandEncoder, hist: MTLBuffer, qkv: MTLBuffer,
+                                   w: MTLBuffer, out: MTLBuffer, K: Int, C: Int, M: Int) {
+        let p = _convHistRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(hist, offset: 0, index: 0); enc.setBuffer(qkv, offset: 0, index: 1)
+        enc.setBuffer(w, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
+        var kk = UInt32(K), cc = UInt32(C)
+        enc.setBytes(&kk, length: 4, index: 4); enc.setBytes(&cc, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: C, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeShiftConvRows(_ enc: MTLComputeCommandEncoder, hist: MTLBuffer, qkv: MTLBuffer,
+                                    K: Int, C: Int, M: Int) {
+        let p = _shiftConvRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(hist, offset: 0, index: 0); enc.setBuffer(qkv, offset: 0, index: 1)
+        var kk = UInt32(K), cc = UInt32(C), mm = UInt32(M)
+        enc.setBytes(&kk, length: 4, index: 2); enc.setBytes(&cc, length: 4, index: 3); enc.setBytes(&mm, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: C, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeSliceRows(_ enc: MTLComputeCommandEncoder, input: MTLBuffer, out: MTLBuffer,
+                                off: Int, W: Int, stride: Int, M: Int) {
+        let p = _sliceRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
+        var o = UInt32(off), ww = UInt32(W), st = UInt32(stride), t = UInt32(M * W)
+        enc.setBytes(&o, length: 4, index: 2); enc.setBytes(&ww, length: 4, index: 3)
+        enc.setBytes(&st, length: 4, index: 4); enc.setBytes(&t, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: M * W, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeComputeGBetaRows(_ enc: MTLComputeCommandEncoder, a: MTLBuffer, b: MTLBuffer,
+                                       aLog: MTLBuffer, dtBias: MTLBuffer, g: MTLBuffer, beta: MTLBuffer,
+                                       Hv: Int, M: Int) {
+        let p = _computeGBetaRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(a, offset: 0, index: 0); enc.setBuffer(b, offset: 0, index: 1)
+        enc.setBuffer(aLog, offset: 0, index: 2); enc.setBuffer(dtBias, offset: 0, index: 3)
+        enc.setBuffer(g, offset: 0, index: 4); enc.setBuffer(beta, offset: 0, index: 5)
+        var hv = UInt32(Hv), t = UInt32(M * Hv)
+        enc.setBytes(&hv, length: 4, index: 6); enc.setBytes(&t, length: 4, index: 7)
+        enc.dispatchThreads(MTLSize(width: M * Hv, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// scale_mul(既存 aux kernel, in-place x[i]=(half)s·x[i])を encode-only で提供。
+    static func encodeScaleMul(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, s: Float, total: Int) {
+        let p = RawMetalForward._scalePipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(x, offset: 0, index: 0)
+        var ss = s, t = UInt32(total)
+        enc.setBytes(&ss, length: 4, index: 1); enc.setBytes(&t, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// gate/gate16(既存 aux kernel): outV=(half)(silu(z)·normed)。promote=normed f32。
+    static func encodeGate(_ enc: MTLComputeCommandEncoder, z: MTLBuffer, normed: MTLBuffer, outV: MTLBuffer,
+                           total: Int, promote: Bool) {
+        let p = promote ? RawMetalForward._gatePipeline! : RawMetalForward._gate16Pipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(z, offset: 0, index: 0); enc.setBuffer(normed, offset: 0, index: 1); enc.setBuffer(outV, offset: 0, index: 2)
+        var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// gated_delta_step(既存 _recurPipeline, T=M 逐次)を encode-only で提供。
+    static func encodeGatedDeltaStepRows(_ enc: MTLComputeCommandEncoder,
+                                         q: MTLBuffer, k: MTLBuffer, v: MTLBuffer,
+                                         g: MTLBuffer, beta: MTLBuffer,
+                                         stateIn: MTLBuffer, stateOut: MTLBuffer, y: MTLBuffer,
+                                         T: Int, B: Int, Hv: Int, Dv: Int) {
+        let p = RawMetalForward._recurPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1); enc.setBuffer(v, offset: 0, index: 2)
+        enc.setBuffer(g, offset: 0, index: 3); enc.setBuffer(beta, offset: 0, index: 4); enc.setBuffer(stateIn, offset: 0, index: 5)
+        var tt = Int32(T); enc.setBytes(&tt, length: 4, index: 6)
+        enc.setBuffer(y, offset: 0, index: 7); enc.setBuffer(stateOut, offset: 0, index: 8)
+        RawMetalForward.bindStop(enc, 16)
+        enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: B * Hv),
+                            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+    }
+
+    /// per-op wrapper: compute_g_beta_rows(composed gdnLayerRows が使い fused と g/β 数値系を共有)。
+    /// aP/bP[M,Hv] f16, aLog/dtBias[Hv] f32 → (g, beta) 各 [1,M,Hv] f32。
+    public static func computeGBetaRowsRaw(_ aP: MLXArray, _ bP: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
+                                           M: Int, Hv: Int) -> (MLXArray, MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let ba = RawMetalForward.mtlBuf(aP.asType(.float16), device),
+              let bb = RawMetalForward.mtlBuf(bP.asType(.float16), device),
+              let bal = RawMetalForward.mtlBuf(aLog.asType(.float32), device),
+              let bdt = RawMetalForward.mtlBuf(dtBias.asType(.float32), device),
+              let gBuf = device.makeBuffer(length: M * Hv * 4, options: .storageModeShared),
+              let betaBuf = device.makeBuffer(length: M * Hv * 4, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeComputeGBetaRows(enc, a: ba, b: bb, aLog: bal, dtBias: bdt, g: gBuf, beta: betaBuf, Hv: Hv, M: M)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let gp = gBuf.contents().bindMemory(to: Float.self, capacity: M * Hv)
+        let bp = betaBuf.contents().bindMemory(to: Float.self, capacity: M * Hv)
+        return (MLXArray(Array(UnsafeBufferPointer(start: gp, count: M * Hv)), [1, M, Hv]),
+                MLXArray(Array(UnsafeBufferPointer(start: bp, count: M * Hv)), [1, M, Hv]))
+    }
+
+    /// per-op wrapper: gate/gate16(composed gdnLayerRows が使い fused と silu-gate 数値系を共有)。
+    /// z[M,valueDim] f16 × normed(f32 promote / f16)→ outV [total] f16。
+    public static func gateRaw(_ z: MLXArray, _ normed: MLXArray, promote: Bool, total: Int) -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(), RawMetalForward.ensureAuxPipelines() else { return nil }
+        guard let bz = RawMetalForward.mtlBuf(z.asType(.float16), device),
+              let bn = RawMetalForward.mtlBuf(normed.asType(promote ? .float32 : .float16), device),
+              let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGate(enc, z: bz, normed: bn, outV: outBuf, total: total, promote: promote)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: total)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), [total])
+    }
+
+    /// GDN 層用の重み MTLBuffer 束。
+    public struct GdnLayerBufs {
+        let qkvW: MTLBuffer, qkvS: MTLBuffer, qkvB: MTLBuffer
+        let zW: MTLBuffer, zS: MTLBuffer, zB: MTLBuffer
+        let bW: MTLBuffer, bS: MTLBuffer, bB: MTLBuffer
+        let aW: MTLBuffer, aS: MTLBuffer, aB: MTLBuffer
+        let outW: MTLBuffer, outS: MTLBuffer, outB: MTLBuffer
+        let conv1dW: MTLBuffer          // f32 [C, K]
+        let normWeight: MTLBuffer       // f16 or f32(promote に対応)
+        let promoteRMS: Bool
+        let aLog: MTLBuffer, dtBias: MTLBuffer   // f32 [Hv]
+        let onesDk: MTLBuffer           // f16 ones [Dk](qk-norm no-weight 用)
+    }
+
+    static func prepareGdnLayerBufs(_ w: RawVerifyForward.GDNLayerW, Dk: Int, _ device: MTLDevice) -> GdnLayerBufs? {
+        func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
+            guard let bq = RawMetalForward.mtlBuf(q, device),
+                  let bs = RawMetalForward.mtlBuf(s.asType(.float16), device),
+                  let bb = RawMetalForward.mtlBuf(b.asType(.float16), device) else { return nil }
+            return (bq, bs, bb)
+        }
+        let promote = (w.normWeight.dtype == .float32)
+        let ones = MLXArray.ones([Dk]).asType(.float16); ones.eval()
+        guard let qkv = trio(w.qkvWq, w.qkvSc, w.qkvBi), let z = trio(w.zWq, w.zSc, w.zBi),
+              let b = trio(w.bWq, w.bSc, w.bBi), let a = trio(w.aWq, w.aSc, w.aBi),
+              let o = trio(w.outWq, w.outSc, w.outBi),
+              let cw = RawMetalForward.mtlBuf(w.conv1dW.asType(.float32), device),
+              let nw = RawMetalForward.mtlBuf(w.normWeight.asType(promote ? .float32 : .float16), device),
+              let al = RawMetalForward.mtlBuf(w.aLog.asType(.float32), device),
+              let dt = RawMetalForward.mtlBuf(w.dtBias.asType(.float32), device),
+              let od = RawMetalForward.mtlBuf(ones, device) else { return nil }
+        return GdnLayerBufs(qkvW: qkv.0, qkvS: qkv.1, qkvB: qkv.2, zW: z.0, zS: z.1, zB: z.2,
+                            bW: b.0, bS: b.1, bB: b.2, aW: a.0, aS: a.1, aB: a.2,
+                            outW: o.0, outS: o.1, outB: o.2,
+                            conv1dW: cw, normWeight: nw, promoteRMS: promote, aLog: al, dtBias: dt, onesDk: od)
+    }
+
+    /// GDN 層の常駐 cache(conv hist [K-1,C] f16 + rec state [1,Hv,Dv,Dk] f32 ping-pong)。
+    public final class GdnCacheBufs {
+        let convHist: MTLBuffer
+        var state: MTLBuffer       // 現在 state(encode 入力)
+        var stateOut: MTLBuffer    // encode 出力(encode 後に swap)
+        let K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int
+        init(convHist: MTLBuffer, state: MTLBuffer, stateOut: MTLBuffer, K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int) {
+            self.convHist = convHist; self.state = state; self.stateOut = stateOut
+            self.K = K; self.C = C; self.Hv = Hv; self.Dv = Dv; self.Dk = Dk
+        }
+        func swapState() { let t = state; state = stateOut; stateOut = t }
+    }
+
+    static func makeGdnCacheBufs(_ device: MTLDevice, convInit: MLXArray?, recInit: MLXArray?,
+                                 K: Int, C: Int, Hv: Int, Dv: Int, Dk: Int) -> GdnCacheBufs? {
+        guard let hist = device.makeBuffer(length: (K - 1) * C * 2, options: .storageModeShared),
+              let st = device.makeBuffer(length: Hv * Dv * Dk * 4, options: .storageModeShared),
+              let stOut = device.makeBuffer(length: Hv * Dv * Dk * 4, options: .storageModeShared) else { return nil }
+        if let c0 = convInit {
+            let cf = c0.asType(.float16).reshaped([-1]); cf.eval()
+            let arr = cf.asArray(Float16.self)
+            hist.contents().bindMemory(to: Float16.self, capacity: (K - 1) * C)
+                .update(from: arr, count: min(arr.count, (K - 1) * C))
+        }
+        if let r0 = recInit {
+            let rf = r0.asType(.float32).reshaped([-1]); rf.eval()
+            let arr = rf.asArray(Float.self)
+            st.contents().bindMemory(to: Float.self, capacity: Hv * Dv * Dk)
+                .update(from: arr, count: min(arr.count, Hv * Dv * Dk))
+        }
+        return GdnCacheBufs(convHist: hist, state: st, stateOut: stOut, K: K, C: C, Hv: Hv, Dv: Dv, Dk: Dk)
+    }
+
+    static func readGdnCache(_ c: GdnCacheBufs) -> (MLXArray, MLXArray) {
+        let hp = c.convHist.contents().bindMemory(to: Float16.self, capacity: (c.K - 1) * c.C)
+        let sp = c.state.contents().bindMemory(to: Float.self, capacity: c.Hv * c.Dv * c.Dk)
+        return (MLXArray(Array(UnsafeBufferPointer(start: hp, count: (c.K - 1) * c.C)), [c.K - 1, c.C]),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: c.Hv * c.Dv * c.Dk)), [1, c.Hv, c.Dv, c.Dk]))
+    }
+
+    /// GDN 層の常駐 scratch。
+    public struct GdnScratch {
+        let qkv: MTLBuffer, z: MTLBuffer, bP: MTLBuffer, aP: MTLBuffer
+        let convOut: MTLBuffer
+        let q1: MTLBuffer, k1: MTLBuffer, v1: MTLBuffer
+        let qn: MTLBuffer, kn: MTLBuffer
+        let g: MTLBuffer, beta: MTLBuffer
+        let coreOut: MTLBuffer, normed: MTLBuffer, outV: MTLBuffer
+    }
+
+    static func makeGdnScratch(_ device: MTLDevice, M: Int, C: Int, keyDim: Int, valueDim: Int,
+                               Hv: Int, promote: Bool) -> GdnScratch? {
+        func buf(_ n: Int) -> MTLBuffer? { device.makeBuffer(length: n, options: .storageModeShared) }
+        guard let qkv = buf(M * C * 2), let z = buf(M * valueDim * 2),
+              let bP = buf(M * Hv * 2), let aP = buf(M * Hv * 2),
+              let convOut = buf(M * C * 2),
+              let q1 = buf(M * keyDim * 2), let k1 = buf(M * keyDim * 2), let v1 = buf(M * valueDim * 2),
+              let qn = buf(M * keyDim * 2), let kn = buf(M * keyDim * 2),
+              let g = buf(M * Hv * 4), let beta = buf(M * Hv * 4),
+              let coreOut = buf(M * valueDim * 2),
+              let normed = buf(M * valueDim * (promote ? 4 : 2)),
+              let outV = buf(M * valueDim * 2) else { return nil }
+        return GdnScratch(qkv: qkv, z: z, bP: bP, aP: aP, convOut: convOut, q1: q1, k1: k1, v1: v1,
+                          qn: qn, kn: kn, g: g, beta: beta, coreOut: coreOut, normed: normed, outV: outV)
+    }
+
+    /// GDN 層 × M 行の全段を既存 encoder に encode。演算列は gdnLayerRows と 1:1。
+    /// encode 後に cache.swapState() を呼ぶこと(state ping-pong)。
+    static func encodeGdnLayerRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
+                                   w: GdnLayerBufs, sc: GdnScratch, cache: GdnCacheBufs,
+                                   M: Int, H: Int,
+                                   numKHeads: Int = 16, numVHeads: Int = 32,
+                                   headKDim: Int = 128, headVDim: Int = 128,
+                                   convKernel: Int = 4, eps: Float = 1e-6) {
+        let keyDim = headKDim * numKHeads
+        let valueDim = headVDim * numVHeads
+        let convDim = keyDim * 2 + valueDim
+        // ① in_proj ×4
+        encodeQmmRows(enc, w: w.qkvW, scales: w.qkvS, biases: w.qkvB, x: x, out: sc.qkv, M: M, K: H, N: convDim)
+        encodeQmmRows(enc, w: w.zW, scales: w.zS, biases: w.zB, x: x, out: sc.z, M: M, K: H, N: valueDim)
+        encodeQmmRows(enc, w: w.bW, scales: w.bS, biases: w.bB, x: x, out: sc.bP, M: M, K: H, N: numVHeads)
+        encodeQmmRows(enc, w: w.aW, scales: w.aS, biases: w.aB, x: x, out: sc.aP, M: M, K: H, N: numVHeads)
+        // ② conv(hist 直読み)→ hist shift 更新(conv の後=旧 hist を読む)
+        encodeConvHistRows(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW, out: sc.convOut,
+                           K: convKernel, C: convDim, M: M)
+        encodeShiftConvRows(enc, hist: cache.convHist, qkv: sc.qkv, K: convKernel, C: convDim, M: M)
+        // ③ split q/k/v(純コピー)
+        encodeSliceRows(enc, input: sc.convOut, out: sc.q1, off: 0, W: keyDim, stride: convDim, M: M)
+        encodeSliceRows(enc, input: sc.convOut, out: sc.k1, off: keyDim, W: keyDim, stride: convDim, M: M)
+        encodeSliceRows(enc, input: sc.convOut, out: sc.v1, off: 2 * keyDim, W: valueDim, stride: convDim, M: M)
+        // ④ qk-norm(no-weight)+ scalar scale
+        let invScale = Float(pow(Double(headKDim), -0.5))
+        encodeRmsNormRows(enc, x: sc.q1, w: w.onesDk, out: sc.qn, rows: M * numKHeads, D: headKDim, eps: eps)
+        encodeRmsNormRows(enc, x: sc.k1, w: w.onesDk, out: sc.kn, rows: M * numKHeads, D: headKDim, eps: eps)
+        encodeScaleMul(enc, x: sc.qn, s: invScale * invScale, total: M * keyDim)
+        encodeScaleMul(enc, x: sc.kn, s: invScale, total: M * keyDim)
+        // ⑤ g/β → recurrence(in-kernel T=M 逐次)
+        encodeComputeGBetaRows(enc, a: sc.aP, b: sc.bP, aLog: w.aLog, dtBias: w.dtBias,
+                               g: sc.g, beta: sc.beta, Hv: numVHeads, M: M)
+        encodeGatedDeltaStepRows(enc, q: sc.qn, k: sc.kn, v: sc.v1, g: sc.g, beta: sc.beta,
+                                 stateIn: cache.state, stateOut: cache.stateOut, y: sc.coreOut,
+                                 T: M, B: 1, Hv: numVHeads, Dv: headVDim)
+        // ⑥ RMSNormGated → silu(z)·normed
+        encodeRmsNormRows(enc, x: sc.coreOut, w: w.normWeight, out: sc.normed,
+                          rows: M * numVHeads, D: headVDim, eps: eps, promoteF32: w.promoteRMS)
+        encodeGate(enc, z: sc.z, normed: sc.normed, outV: sc.outV, total: M * valueDim, promote: w.promoteRMS)
+        // ⑦ out_proj
+        encodeQmmRows(enc, w: w.outW, scales: w.outS, biases: w.outB, x: sc.outV, out: out, M: M, K: valueDim, N: H)
+    }
+
+    /// Stage C の pipeline warm(recurrent は #define 次元固定なので実次元で warm)。
+    static func ensureGdnPipelines(Hk: Int = 16, Dk: Int = 128, Hv: Int = 32, Dv: Int = 128) -> Bool {
+        ensureQmmPipeline()
+        guard RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines() else { return false }
+        if RawMetalForward._rmsPipeline == nil {
+            let x = MLXRandom.normal([1, 128]).asType(.float16); x.eval()
+            _ = RawMetalForward.rmsNorm(x, nil, eps: 1e-6, D: 128)
+        }
+        if RawMetalForward._recurPipeline == nil {
+            let q = MLXArray.zeros([1, 1, Hk, Dk]).asType(.float16)
+            let v = MLXArray.zeros([1, 1, Hv, Dv]).asType(.float16)
+            let g = MLXArray.zeros([1, 1, Hv]).asType(.float32)
+            let st = MLXArray.zeros([1, Hv, Dv, Dk]).asType(.float32)
+            MLX.eval([q, v, g, st])
+            _ = RawMetalForward.recurrent(q, q, v, g: g, beta: g, state: st, B: 1, T: 1, Hk: Hk, Dk: Dk, Hv: Hv, Dv: Dv)
+        }
+        return RawMetalForward._rmsPipeline != nil && RawMetalForward._recurPipeline != nil
+    }
+
+    /// テスト支援: fused GDN 層 単発実行(単一 CB)。gdnLayerRows と出力+conv/rec state が bit 一致すべき。
+    public static func fusedGdnLayerRows(_ x: MLXArray, _ w: RawVerifyForward.GDNLayerW,
+                                         convInit: MLXArray, recInit: MLXArray, M: Int,
+                                         numKHeads: Int = 16, numVHeads: Int = 32,
+                                         headKDim: Int = 128, headVDim: Int = 128,
+                                         convKernel: Int = 4, eps: Float = 1e-6)
+        -> (out: MLXArray, convState: MLXArray, recState: MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(),
+              ensureGdnPipelines(Hk: numKHeads, Dk: headKDim, Hv: numVHeads, Dv: headVDim) else { return nil }
+        let H = x.dim(-1)
+        let keyDim = headKDim * numKHeads
+        let valueDim = headVDim * numVHeads
+        let convDim = keyDim * 2 + valueDim
+        guard let bufs = prepareGdnLayerBufs(w, Dk: headKDim, device),
+              let sc = makeGdnScratch(device, M: M, C: convDim, keyDim: keyDim, valueDim: valueDim,
+                                      Hv: numVHeads, promote: bufs.promoteRMS),
+              let cache = makeGdnCacheBufs(device, convInit: convInit, recInit: recInit,
+                                           K: convKernel, C: convDim, Hv: numVHeads, Dv: headVDim, Dk: headKDim),
+              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGdnLayerRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, cache: cache, M: M, H: H,
+                           numKHeads: numKHeads, numVHeads: numVHeads,
+                           headKDim: headKDim, headVDim: headVDim, convKernel: convKernel, eps: eps)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        cache.swapState()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let out = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        let (cs, rs) = readGdnCache(cache)
+        return (out, cs, rs)
     }
 }
