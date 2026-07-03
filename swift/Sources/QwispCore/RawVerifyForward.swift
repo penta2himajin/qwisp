@@ -159,4 +159,76 @@ public enum RawVerifyForward {
         // ⑦ out_proj
         return RawMetalForward.qmmRows(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: M, K: valueDim, N: H)
     }
+
+    /// MoE block 重み(routed experts + shared expert + shared gate)。
+    public struct MoEBlockW {
+        let gateWq: MLXArray, gateSc: MLXArray, gateBi: MLXArray       // [E, H] 8bit
+        let swGWq: MLXArray, swGSc: MLXArray, swGBi: MLXArray          // [E, I, H] 4bit
+        let swUWq: MLXArray, swUSc: MLXArray, swUBi: MLXArray
+        let swDWq: MLXArray, swDSc: MLXArray, swDBi: MLXArray          // [E, H, I]
+        let shGWq: MLXArray, shGSc: MLXArray, shGBi: MLXArray          // [I, H] 4bit
+        let shUWq: MLXArray, shUSc: MLXArray, shUBi: MLXArray
+        let shDWq: MLXArray, shDSc: MLXArray, shDBi: MLXArray          // [H, I]
+        let sharedGateWq: MLXArray, sharedGateSc: MLXArray, sharedGateBi: MLXArray  // [Ngate(>=8 pad), H] 8bit — 列0のみ使用
+        public init(gateWq: MLXArray, gateSc: MLXArray, gateBi: MLXArray,
+                    swGWq: MLXArray, swGSc: MLXArray, swGBi: MLXArray,
+                    swUWq: MLXArray, swUSc: MLXArray, swUBi: MLXArray,
+                    swDWq: MLXArray, swDSc: MLXArray, swDBi: MLXArray,
+                    shGWq: MLXArray, shGSc: MLXArray, shGBi: MLXArray,
+                    shUWq: MLXArray, shUSc: MLXArray, shUBi: MLXArray,
+                    shDWq: MLXArray, shDSc: MLXArray, shDBi: MLXArray,
+                    sharedGateWq: MLXArray, sharedGateSc: MLXArray, sharedGateBi: MLXArray) {
+            self.gateWq = gateWq; self.gateSc = gateSc; self.gateBi = gateBi
+            self.swGWq = swGWq; self.swGSc = swGSc; self.swGBi = swGBi
+            self.swUWq = swUWq; self.swUSc = swUSc; self.swUBi = swUBi
+            self.swDWq = swDWq; self.swDSc = swDSc; self.swDBi = swDBi
+            self.shGWq = shGWq; self.shGSc = shGSc; self.shGBi = shGBi
+            self.shUWq = shUWq; self.shUSc = shUSc; self.shUBi = shUBi
+            self.shDWq = shDWq; self.shDSc = shDSc; self.shDBi = shDBi
+            self.sharedGateWq = sharedGateWq; self.sharedGateSc = sharedGateSc; self.sharedGateBi = sharedGateBi
+        }
+    }
+
+    /// MoE block × M 行。routing は production と同一の MLX glue(softmax precise → argPartition top-K →
+    /// renorm — 全て per-row op。M 形状安定性は rows≡loop テストが検証し、破れたら raw route_top8 へピボット)。
+    /// expert 計算は gatherQmmRows(gate/up: 行共有 lhs, down: per-(row,ki) lhs)+ 明示順序 combine。
+    public static func moeBlockRows(_ x: MLXArray, _ w: MoEBlockW,
+                                    M: Int, E: Int, I: Int, Ktop: Int = 8) -> MLXArray? {
+        let H = x.dim(-1)
+        // routing(per-row)
+        guard let gl = RawMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E)
+        else { return nil }
+        let gates = MLX.softmax(gl, axis: -1, precise: true)
+        let order = MLX.argPartition(gates, kth: E - Ktop, axis: -1)
+        let inds = order[0..., (E - Ktop)...]                                   // [M, Ktop]
+        var scores = MLX.takeAlong(gates, inds, axis: -1)
+        scores = scores / scores.sum(axis: -1, keepDims: true)                  // normTopk
+        let indsFlat = inds.reshaped([M * Ktop]).asType(.int32); indsFlat.eval()
+        // routed experts: gate/up(行共有 x)→ swiglu → down(per-mk lhs)
+        guard let g = RawMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
+                                                    inds: indsFlat, M: M, Ktop: Ktop, K: H, N: I),
+              let u = RawMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
+                                                    inds: indsFlat, M: M, Ktop: Ktop, K: H, N: I)
+        else { return nil }
+        let h = (g * MLX.sigmoid(g)) * u                                        // [M*Ktop, I] elementwise
+        guard let d = RawMetalForward.gatherQmmRows(h, w.swDWq, scales: w.swDSc, biases: w.swDBi,
+                                                    inds: indsFlat, M: M, Ktop: Ktop, K: I, N: H,
+                                                    lhsPerExpert: true)
+        else { return nil }
+        // combine: Ktop 項の明示順序和(shape 依存 reduction を避け M 非依存の加算列に固定)
+        let dR = d.reshaped([M, Ktop, H])
+        var y = dR[0..., 0] * scores[0..., 0 ..< 1]
+        for ki in 1 ..< Ktop { y = y + dR[0..., ki] * scores[0..., ki ..< ki + 1] }
+        // shared expert + sigmoid(sharedGate) — sharedGate は pad 8 列の列 0 を使用
+        guard let sg = RawMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
+              let su = RawMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I)
+        else { return nil }
+        let shAct = (sg * MLX.sigmoid(sg)) * su
+        guard let sharedY = RawMetalForward.qmmRows(shAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
+              let sgl = RawMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi,
+                                             M: M, K: H, N: 8)
+        else { return nil }
+        let gateScale = MLX.sigmoid(sgl[0..., 0 ..< 1])                          // [M,1]
+        return y + gateScale * sharedY
+    }
 }

@@ -3811,7 +3811,7 @@ public enum RawMetalForward {
                                       scales: MLXArray, biases: MLXArray,
                                       inds: MLXArray,
                                       M: Int, Ktop: Int, K: Int, N: Int,
-                                      gs: Int = 64) -> MLXArray? {
+                                      gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
         guard N % 8 == 0, K % 512 == 0, gs == 64 else { print("[raw-gqmm-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil }
         if _gqmmRowsPipeline == nil {
@@ -3850,6 +3850,7 @@ public enum RawMetalForward {
                               constant int& out_vec_size [[buffer(7)]],
                               constant int& ktop         [[buffer(8)]],
                               device const int* stopFlag [[buffer(9)]],
+                              constant uint& lhsPer      [[buffer(10)]],
                               uint3 tid      [[threadgroup_position_in_grid]],
                               uint  simd_gid [[simdgroup_index_in_threadgroup]],
                               uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -3872,7 +3873,7 @@ public enum RawMetalForward {
                 ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
                 scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                 biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                x += (size_t)(mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+                x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
                 y += (size_t)mk * out_vec_size + out_row;
                 for (int k = 0; k < in_vec_size; k += block_size) {
                     U sum = ld16(x, x_thread);
@@ -3910,6 +3911,7 @@ public enum RawMetalForward {
         var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
         bindStop(enc, 9)
+        var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 10)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
