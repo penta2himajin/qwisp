@@ -1159,4 +1159,151 @@ public enum RawFusedVerify {
         let (cs, rs) = readGdnCache(cache)
         return (out, cs, rs)
     }
+
+    // ── Stage D(P3 続き): 層全体 encode + 全層 1-CB forward ──
+
+    /// resid_add(既存 aux kernel, in-place h[i]+=r[i])を encode-only で提供。
+    static func encodeResidAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, r: MTLBuffer, total: Int) {
+        let p = RawMetalForward._residAddPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(h, offset: 0, index: 0); enc.setBuffer(r, offset: 0, index: 1)
+        var t = UInt32(total); enc.setBytes(&t, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// verifyForwardRows と同一 op 列の M-row fused forward。全層を単一 CB に encode し、
+    /// residual stream h は GPU 常駐 buffer。cache(KV/conv/rec)も常駐で複数 step チェーン可。
+    public final class RawFusedForward {
+        struct Layer {
+            let isLinear: Bool
+            let inputLN: MTLBuffer, postLN: MTLBuffer
+            let gdn: GdnLayerBufs?, attn: AttnLayerBufs?
+            let moe: MoEBlockBufs
+            let gdnCache: GdnCacheBufs?, kvCache: KVCacheBufs?
+            let E: Int, I: Int, Ktop: Int
+        }
+        var layers: [Layer] = []
+        let maxM: Int, H: Int
+        // attn/gdn 次元(実モデル定数)
+        let numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int, ropeBase: Float
+        let numKHeads: Int, numVHeads: Int, headKDim: Int, headVDim: Int, convKernel: Int
+        let eps: Float
+        // 共有 scratch(層間で再利用、maxM でサイズ確保)
+        let hBuf: MTLBuffer, normed: MTLBuffer, mixerOut: MTLBuffer, postNorm: MTLBuffer, moeOut: MTLBuffer
+        let attnSc: AttnScratch, gdnSc: GdnScratch, moeSc: MoEScratch
+        let device: MTLDevice, queue: MTLCommandQueue
+
+        public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
+                     maxM: Int, H: Int, maxSeqLen: Int,
+                     numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
+                     ropeDim: Int = 64, ropeBase: Float = 1e7,
+                     numKHeads: Int = 16, numVHeads: Int = 32, headKDim: Int = 128, headVDim: Int = 128,
+                     convKernel: Int = 4, eps: Float = 1e-6) {
+            guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+            self.device = device; self.queue = queue
+            self.maxM = maxM; self.H = H
+            self.numHeads = numHeads; self.numKV = numKV; self.headDim = headDim
+            self.ropeDim = ropeDim; self.ropeBase = ropeBase
+            self.numKHeads = numKHeads; self.numVHeads = numVHeads
+            self.headKDim = headKDim; self.headVDim = headVDim; self.convKernel = convKernel
+            self.eps = eps
+            let keyDim = headKDim * numKHeads
+            let valueDim = headVDim * numVHeads
+            let convDim = keyDim * 2 + valueDim
+            // pipeline warm(全種)
+            let maxE = specs.map { $0.moeE }.max() ?? 256
+            let maxKtop = specs.map { $0.moeKtop }.max() ?? 8
+            guard RawFusedVerify.ensureMoEPipelines(E: maxE, Ktop: maxKtop),
+                  RawFusedVerify.ensureAttnPipelines(),
+                  RawFusedVerify.ensureGdnPipelines(Hk: numKHeads, Dk: headKDim, Hv: numVHeads, Dv: headVDim)
+            else { return nil }
+            // 共有 scratch
+            let maxI = specs.map { $0.moeI }.max() ?? 512
+            let anyPromote = specs.contains { ($0.gdn?.normWeight.dtype ?? .float16) == .float32 }
+            guard let hB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
+                  let nB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
+                  let mB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
+                  let pB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
+                  let oB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
+                  let aSc = RawFusedVerify.makeAttnScratch(device, M: maxM, numHeads: numHeads, numKV: numKV, headDim: headDim),
+                  let gSc = RawFusedVerify.makeGdnScratch(device, M: maxM, C: convDim, keyDim: keyDim,
+                                                          valueDim: valueDim, Hv: numVHeads, promote: anyPromote),
+                  let mSc = RawFusedVerify.makeMoEScratch(device, M: maxM, E: maxE, I: maxI, Ktop: maxKtop, H: H)
+            else { return nil }
+            hBuf = hB; normed = nB; mixerOut = mB; postNorm = pB; moeOut = oB
+            attnSc = aSc; gdnSc = gSc; moeSc = mSc
+            // 層別 weight/cache buffer 化
+            for (i, s) in specs.enumerated() {
+                guard let ln = RawMetalForward.mtlBuf(s.inputLN.asType(.float16), device),
+                      let pn = RawMetalForward.mtlBuf(s.postLN.asType(.float16), device),
+                      let moe = RawFusedVerify.prepareMoEBlockBufs(s.moe, device) else { return nil }
+                var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
+                var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
+                if s.isLinear, let gw = s.gdn {
+                    guard let gb = RawFusedVerify.prepareGdnLayerBufs(gw, Dk: headKDim, device),
+                          let gc = RawFusedVerify.makeGdnCacheBufs(device, convInit: caches[i].convState,
+                                                                   recInit: caches[i].recState,
+                                                                   K: convKernel, C: convDim,
+                                                                   Hv: numVHeads, Dv: headVDim, Dk: headKDim)
+                    else { return nil }
+                    gdnB = gb; gdnC = gc
+                } else if let aw = s.attn {
+                    guard let ab = RawFusedVerify.prepareAttnLayerBufs(aw, device),
+                          let kc = RawFusedVerify.makeKVCacheBufs(device, kInit: caches[i].kCache,
+                                                                  vInit: caches[i].vCache,
+                                                                  maxLen: maxSeqLen, KV: numKV, D: headDim)
+                    else { return nil }
+                    attnB = ab; kvC = kc
+                } else { return nil }
+                layers.append(Layer(isLinear: s.isLinear, inputLN: ln, postLN: pn,
+                                    gdn: gdnB, attn: attnB, moe: moe, gdnCache: gdnC, kvCache: kvC,
+                                    E: s.moeE, I: s.moeI, Ktop: s.moeKtop))
+            }
+        }
+
+        /// 1 層を encoder に encode(norm→mixer→resid→postNorm→MoE→resid)。
+        func encodeLayer(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
+            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
+            if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
+                RawFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
+                                                  M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
+                                                  headKDim: headKDim, headVDim: headVDim,
+                                                  convKernel: convKernel, eps: eps)
+                gc.swapState()
+            } else if let aw = L.attn, let kv = L.kvCache {
+                RawFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
+                                                   M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+                                                   ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
+                kv.len += M
+            }
+            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
+            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
+            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+                                              M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
+            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+        }
+
+        /// 全層 forward(単一 CB)。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
+        public func forwardRows(_ x: MLXArray, M: Int) -> MLXArray? {
+            guard M <= maxM else { return nil }
+            let xf = x.asType(.float16).reshaped([-1]); xf.eval()
+            let arr = xf.asArray(Float16.self)
+            hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H).update(from: arr, count: M * H)
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            for L in layers { encodeLayer(enc, L, M: M) }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ptr = hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        }
+
+        /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
+        public func readLayerCache(_ i: Int) -> (MLXArray?, MLXArray?) {
+            let L = layers[i]
+            if let gc = L.gdnCache { let (c, r) = RawFusedVerify.readGdnCache(gc); return (c, r) }
+            if let kv = L.kvCache { let (k, v) = RawFusedVerify.readKVCache(kv); return (k, v) }
+            return (nil, nil)
+        }
+    }
 }
