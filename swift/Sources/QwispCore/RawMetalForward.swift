@@ -536,6 +536,41 @@ public enum RawMetalForward {
         } catch { print("[raw-slot-remap] compile: \(error)"); return false }
     }
 
+    nonisolated(unsafe) static var _slotRemapRowsPipeline: MTLComputePipelineState?
+    /// grid-based slot remap: inds[i] = slotTable[inds[i]] for i in 0..<count。
+    /// 単一 threadgroup に縛られない任意サイズ count 対応(streaming gather の行範囲 remap に使用)。
+    static func compileSlotRemapRows() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _slotRemapRowsPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void slot_remap_rows(device int* inds [[buffer(0)]],
+                                    device const int* slotTable [[buffer(1)]],
+                                    constant uint& count [[buffer(2)]],
+                                    uint tid [[thread_position_in_grid]]) {
+            if (tid < count) inds[tid] = slotTable[inds[tid]];
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _slotRemapRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "slot_remap_rows")!)
+             return true
+        } catch { print("[raw-slot-remap-rows] compile: \(error)"); return false }
+    }
+
+    /// slot_remap_rows を encode-only で提供。inds は indsByteOffset バイト目から count 要素を in-place remap。
+    static func encodeSlotRemapRows(_ enc: MTLComputeCommandEncoder,
+                                    inds: MTLBuffer, indsByteOffset: Int,
+                                    table: MTLBuffer, count: Int) {
+        let p = _slotRemapRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(inds, offset: indsByteOffset, index: 0)
+        enc.setBuffer(table, offset: 0, index: 1)
+        var ct = UInt32(count); enc.setBytes(&ct, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
     // ★ A4 in-kernel stop flag: streaming resume で miss 検出後、suffix の重い MoE gather(gqmm4/gqmm4_swiglu)を
     //   no-op 化し suffix 再計算 GPU コストを削減。activeStopFlag 非 nil(streaming)時のみ guard 発火、
     //   nil(通常/テスト)は zeroStopBuf を bind ＝guard 不発で bit-exact 不変。

@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 24
+        let total = 28
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1061,6 +1061,279 @@ public enum RawVerifyTests {
                 guard let gotA = RawFusedVerify.argmaxRowsRaw(lg, M: M, V: V)
                 else { return (false, "argmax nil M=\(M)") }
                 if gotA != refA { return (false, "argmax M=\(M): got=\(gotA) ref=\(refA)") }
+            }
+            return (true, "ok")
+        }
+
+        // ── Streaming tests (25-28) ───────────────────────────────────────
+
+        // Common model geometry for streaming tests (same as test 23).
+        let stH = 2048, stE = 16, stI = 512
+        func stQ4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let wf = MLXRandom.normal([n, k]).asType(.float16)
+            let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+        }
+        func stQ8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let wf = MLXRandom.normal([n, k]).asType(.float16)
+            let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+        }
+        func stQ4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+            let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+        }
+        // Returns (MoEBlockW, gW, gSf16, gBf16, uW, uSf16, uBf16, dW, dSf16, dBf16)
+        // so callers can share expert arrays between MoEBlockW and TestExpertProvider.
+        typealias MoEWithArrays = (w: RawVerifyForward.MoEBlockW,
+                                   gW: MLXArray, gSf16: MLXArray, gBf16: MLXArray,
+                                   uW: MLXArray, uSf16: MLXArray, uBf16: MLXArray,
+                                   dW: MLXArray, dSf16: MLXArray, dBf16: MLXArray)
+        func stMkMoE() -> MoEWithArrays {
+            let (gW, gS, gB) = stQ8(stE, stH); let (sgW, sgS, sgB) = stQ8(8, stH)
+            let (a0, a1, a2) = stQ4e(stE, stI, stH)
+            let (b0, b1, b2) = stQ4e(stE, stI, stH)
+            let (c0, c1, c2) = stQ4e(stE, stH, stI)
+            let (d0, d1, d2) = stQ4(stI, stH); let (e0, e1, e2) = stQ4(stI, stH); let (f0, f1, f2) = stQ4(stH, stI)
+            let moeW = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            return (w: moeW,
+                    gW: a0, gSf16: a1.asType(.float16), gBf16: a2.asType(.float16),
+                    uW: b0, uSf16: b1.asType(.float16), uBf16: b2.asType(.float16),
+                    dW: c0, dSf16: c1.asType(.float16), dBf16: c2.asType(.float16))
+        }
+        let stHk = 16, stDk = 128, stHv = 32, stDv = 128, stCK = 4
+        let stConvDim = stHk * stDk * 2 + stHv * stDv
+        func stMkGdnW() -> RawVerifyForward.GDNLayerW {
+            let (qkvW, qkvS, qkvB) = stQ4(stConvDim, stH); let (zW, zS, zB) = stQ4(stHv * stDv, stH)
+            let (bW, bS, bB) = stQ4(stHv, stH); let (aW, aS, aB) = stQ4(stHv, stH); let (oW, oS, oB) = stQ4(stH, stHv * stDv)
+            return RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([stConvDim, stCK]).asType(.float16),
+                normWeight: MLXRandom.normal([stDv]).asType(.float16),
+                aLog: MLXRandom.normal([stHv]).asType(.float32), dtBias: MLXRandom.normal([stHv]).asType(.float32))
+        }
+        let stNh = 16, stNkv = 2, stHd = 256
+        func stMkAttnW() -> RawVerifyForward.AttnLayerW {
+            let (aqW, aqS, aqB) = stQ4(stNh * 2 * stHd, stH); let (akW, akS, akB) = stQ4(stNkv * stHd, stH)
+            let (avW, avS, avB) = stQ4(stNkv * stHd, stH); let (aoW, aoS, aoB) = stQ4(stH, stNh * stHd)
+            return RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([stHd]).asType(.float16), kNorm: MLXRandom.normal([stHd]).asType(.float16))
+        }
+
+        // Test 25 (D1-A): strict streaming ≡ resident — C=8<E=16, multi-plan, chunk assertion.
+        run("stream_fused_strict_bitexact") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let C = 8
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let stCs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let stRs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            MLX.eval([stCs0, stRs0, stKc0, stVc0])
+            func freshC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            }
+            let layerSpecs = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
+                    uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
+                    dW: moe0.dW, dSf16: moe0.dSf16, dBf16: moe0.dBf16, device: device),
+                  let tp1 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe1.gW, gSf16: moe1.gSf16, gBf16: moe1.gBf16,
+                    uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
+                    dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
+            else { return (false, "TestExpertProvider nil") }
+            var sawMultiChunk = false
+            let plans: [[Int]] = [[1], [2], [9], [9, 3]]
+            for plan in plans {
+                guard let res = RawFusedVerify.RawFusedForward(
+                        layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64),
+                      let str = RawFusedVerify.RawFusedForward(
+                        layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64,
+                        providers: [tp0, tp1])
+                else { return (false, "init nil plan=\(plan)") }
+                for (si, M) in plan.enumerated() {
+                    let x = MLXRandom.normal([M, stH]).asType(.float16); x.eval()
+                    guard let ref = res.forwardRows(x, M: M),
+                          let got = str.forwardRows(x, M: M)
+                    else { return (false, "forwardRows nil plan=\(plan) step=\(si)") }
+                    ref.eval(); got.eval()
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "plan=\(plan) step=\(si): \(d)") }
+                    if str.lastStepChunks >= 2 { sawMultiChunk = true }
+                }
+            }
+            if !sawMultiChunk { return (false, "no multi-chunk observed across all plans (C=\(C),E=\(stE))") }
+            return (true, "ok")
+        }
+
+        // Test 26 (D1-B): strict streaming M=17 — 複数 chunk 確実に発生、bit-exact。
+        run("stream_fused_strict_m17_chunking") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let C = 8
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let stCs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let stRs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            MLX.eval([stCs0, stRs0, stKc0, stVc0])
+            let layerSpecs = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
+                    uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
+                    dW: moe0.dW, dSf16: moe0.dSf16, dBf16: moe0.dBf16, device: device),
+                  let tp1 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe1.gW, gSf16: moe1.gSf16, gBf16: moe1.gBf16,
+                    uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
+                    dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
+            else { return (false, "TestExpertProvider nil") }
+            let freshC: [RawVerifyForward.LayerCaches] = [
+                RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            guard let res = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC, maxM: 17, H: stH, maxSeqLen: 64),
+                  let str = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC, maxM: 17, H: stH, maxSeqLen: 64,
+                    providers: [tp0, tp1])
+            else { return (false, "init nil") }
+            let M = 17
+            let x = MLXRandom.normal([M, stH]).asType(.float16); x.eval()
+            guard let ref = res.forwardRows(x, M: M),
+                  let got = str.forwardRows(x, M: M)
+            else { return (false, "forwardRows nil") }
+            ref.eval(); got.eval()
+            let (ok, d) = bitEqual(got, ref)
+            if !ok { return (false, "M=17: \(d)") }
+            if str.lastStepChunks < 2 { return (false, "expected >=2 chunks M=17 C=\(C), got \(str.lastStepChunks)") }
+            return (true, "ok (chunks=\(str.lastStepChunks))")
+        }
+
+        // Test 27 (D1-C): eviction chain — 3-step [3,3,3] に渡る LRU 退去・再ロードが bit-exact を保持する。
+        run("stream_fused_eviction_chain") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let C = 8  // C < E=16 → eviction forced
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let stCs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let stRs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            MLX.eval([stCs0, stRs0, stKc0, stVc0])
+            func freshC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            }
+            let layerSpecs = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
+                    uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
+                    dW: moe0.dW, dSf16: moe0.dSf16, dBf16: moe0.dBf16, device: device),
+                  let tp1 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe1.gW, gSf16: moe1.gSf16, gBf16: moe1.gBf16,
+                    uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
+                    dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
+            else { return (false, "TestExpertProvider nil") }
+            guard let res = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC(), maxM: 9, H: stH, maxSeqLen: 64),
+                  let str = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC(), maxM: 9, H: stH, maxSeqLen: 64,
+                    providers: [tp0, tp1])
+            else { return (false, "init nil") }
+            for si in 0..<3 {
+                let M = 3
+                let x = MLXRandom.normal([M, stH]).asType(.float16); x.eval()
+                guard let ref = res.forwardRows(x, M: M),
+                      let got = str.forwardRows(x, M: M)
+                else { return (false, "forwardRows nil step=\(si)") }
+                ref.eval(); got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "step=\(si): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 28 (D1-D): bolt streaming ≡ resident — C=E=16 全エキスパート事前ロード+frozen table。
+        run("stream_fused_bolt_exact_table") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let C = stE  // C = E: all experts fit without eviction
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let stCs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let stRs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
+            MLX.eval([stCs0, stRs0, stKc0, stVc0])
+            func freshC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            }
+            let layerSpecs = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            // Create providers, warm all experts, build frozen slot tables.
+            guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
+                    uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
+                    dW: moe0.dW, dSf16: moe0.dSf16, dBf16: moe0.dBf16, device: device),
+                  let tp1 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                    gW: moe1.gW, gSf16: moe1.gSf16, gBf16: moe1.gBf16,
+                    uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
+                    dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
+            else { return (false, "TestExpertProvider nil") }
+            let sm0 = tp0.ensure(Array(0..<stE))  // warm all E experts into arena
+            let sm1 = tp1.ensure(Array(0..<stE))
+            var tbl0 = [Int32](repeating: 0, count: stE), tbl1 = [Int32](repeating: 0, count: stE)
+            for (e, s) in sm0 { tbl0[e] = Int32(s) }
+            for (e, s) in sm1 { tbl1[e] = Int32(s) }
+            // Create resident (no providers) and bolt (with providers) forwards.
+            guard let res = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64),
+                  let blt = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64,
+                    providers: [tp0, tp1])
+            else { return (false, "init nil") }
+            blt.setBoltTables([tbl0, tbl1])
+            for M in [1, 2, 9, 17] {
+                let x = MLXRandom.normal([M, stH]).asType(.float16); x.eval()
+                guard let ref = res.forwardRows(x, M: M),
+                      let got = blt.forwardRows(x, M: M)
+                else { return (false, "forwardRows nil M=\(M)") }
+                ref.eval(); got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
         }

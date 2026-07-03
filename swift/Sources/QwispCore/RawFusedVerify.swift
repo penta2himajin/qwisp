@@ -30,14 +30,18 @@ public enum RawFusedVerify {
 
     /// gqmm4_rows を encode-only で提供(cb/readback 無し)。inds/x/w/s/b/out 全て MTLBuffer 常駐。
     /// _gqmmRowsPipeline(gatherQmmRows と共有)。lhsPer: down_proj(x を mk 行で index)は true。
+    /// xByteOffset/indsOffset/outByteOffset: 行範囲 gather(streaming chunk)でバイトオフセット指定可。
     static func encodeGatherQmmRows(_ enc: MTLComputeCommandEncoder,
                                     w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                                     x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
-                                    M: Int, Ktop: Int, K: Int, N: Int, lhsPer: Bool) {
+                                    M: Int, Ktop: Int, K: Int, N: Int, lhsPer: Bool,
+                                    xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
         enc.setComputePipelineState(RawMetalForward._gqmmRowsPipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
-        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
-        enc.setBuffer(inds, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: xByteOffset, index: 3)
+        enc.setBuffer(inds, offset: indsOffset, index: 4)
+        enc.setBuffer(out, offset: outByteOffset, index: 5)
         var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
         RawMetalForward.bindStop(enc, 9)
@@ -383,20 +387,28 @@ public enum RawFusedVerify {
     }
 
     /// swiglu(既存 aux kernel, per-element 独立=M 不変)を encode-only で提供。
-    static func encodeSwiglu(_ enc: MTLComputeCommandEncoder, g: MTLBuffer, u: MTLBuffer, h: MTLBuffer, total: Int) {
+    /// byteOffset: streaming chunk で g/u/h の共通バイトオフセット(3 バッファとも同一)。
+    static func encodeSwiglu(_ enc: MTLComputeCommandEncoder, g: MTLBuffer, u: MTLBuffer, h: MTLBuffer,
+                              total: Int, byteOffset: Int = 0) {
         let p = RawMetalForward._swigluPipeline!
         enc.setComputePipelineState(p)
-        enc.setBuffer(g, offset: 0, index: 0); enc.setBuffer(u, offset: 0, index: 1); enc.setBuffer(h, offset: 0, index: 2)
+        enc.setBuffer(g, offset: byteOffset, index: 0)
+        enc.setBuffer(u, offset: byteOffset, index: 1)
+        enc.setBuffer(h, offset: byteOffset, index: 2)
         var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 
+    /// dByteOffset/scoresOffset/yByteOffset: streaming chunk で行範囲バイトオフセット指定可。
     static func encodeCombineRows(_ enc: MTLComputeCommandEncoder, d: MTLBuffer, scores: MTLBuffer, y: MTLBuffer,
-                                  Ktop: Int, N: Int, M: Int) {
+                                  Ktop: Int, N: Int, M: Int,
+                                  dByteOffset: Int = 0, scoresOffset: Int = 0, yByteOffset: Int = 0) {
         let p = _combineRowsPipeline!
         enc.setComputePipelineState(p)
-        enc.setBuffer(d, offset: 0, index: 0); enc.setBuffer(scores, offset: 0, index: 1); enc.setBuffer(y, offset: 0, index: 2)
+        enc.setBuffer(d, offset: dByteOffset, index: 0)
+        enc.setBuffer(scores, offset: scoresOffset, index: 1)
+        enc.setBuffer(y, offset: yByteOffset, index: 2)
         var kk = UInt32(Ktop), nn = UInt32(N), t = UInt32(M * N)
         enc.setBytes(&kk, length: 4, index: 3); enc.setBytes(&nn, length: 4, index: 4); enc.setBytes(&t, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
@@ -504,7 +516,11 @@ public enum RawFusedVerify {
         let retained: [MLXArray]
     }
 
-    static func prepareMoEBlockBufs(_ w: RawVerifyForward.MoEBlockW, _ device: MTLDevice) -> MoEBlockBufs? {
+    /// expertOverride 非 nil 時は sw*(routed expert)フィールドをそこから取り、
+    /// w.swGWq 等は一切 materialize しない(streaming 時は mmap-lazy 重みをメモリに展開しないため)。
+    /// gate/shared/sharedGate は常に w から変換。
+    static func prepareMoEBlockBufs(_ w: RawVerifyForward.MoEBlockW, _ device: MTLDevice,
+                                     expertOverride: [MTLBuffer]? = nil) -> MoEBlockBufs? {
         var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
             let sc = s.asType(.float16), bc = b.asType(.float16)
@@ -514,16 +530,33 @@ public enum RawFusedVerify {
                   let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
-        guard let g = trio(w.gateWq, w.gateSc, w.gateBi),
-              let swG = trio(w.swGWq, w.swGSc, w.swGBi), let swU = trio(w.swUWq, w.swUSc, w.swUBi),
-              let swD = trio(w.swDWq, w.swDSc, w.swDBi),
-              let shG = trio(w.shGWq, w.shGSc, w.shGBi), let shU = trio(w.shUWq, w.shUSc, w.shUBi),
+        guard let g = trio(w.gateWq, w.gateSc, w.gateBi) else { return nil }
+
+        // sw*(routed expert): expertOverride あれば arena buffer 直接使用。
+        let swGW: MTLBuffer, swGS: MTLBuffer, swGB: MTLBuffer
+        let swUW: MTLBuffer, swUS: MTLBuffer, swUB: MTLBuffer
+        let swDW: MTLBuffer, swDS: MTLBuffer, swDB: MTLBuffer
+        if let ov = expertOverride, ov.count >= 9 {
+            (swGW, swGS, swGB) = (ov[0], ov[1], ov[2])
+            (swUW, swUS, swUB) = (ov[3], ov[4], ov[5])
+            (swDW, swDS, swDB) = (ov[6], ov[7], ov[8])
+        } else {
+            guard let swG = trio(w.swGWq, w.swGSc, w.swGBi),
+                  let swU = trio(w.swUWq, w.swUSc, w.swUBi),
+                  let swD = trio(w.swDWq, w.swDSc, w.swDBi) else { return nil }
+            (swGW, swGS, swGB) = (swG.0, swG.1, swG.2)
+            (swUW, swUS, swUB) = (swU.0, swU.1, swU.2)
+            (swDW, swDS, swDB) = (swD.0, swD.1, swD.2)
+        }
+
+        guard let shG = trio(w.shGWq, w.shGSc, w.shGBi),
+              let shU = trio(w.shUWq, w.shUSc, w.shUBi),
               let shD = trio(w.shDWq, w.shDSc, w.shDBi),
               let sg = trio(w.sharedGateWq, w.sharedGateSc, w.sharedGateBi) else { return nil }
         return MoEBlockBufs(gW: g.0, gS: g.1, gB: g.2,
-                            swGW: swG.0, swGS: swG.1, swGB: swG.2,
-                            swUW: swU.0, swUS: swU.1, swUB: swU.2,
-                            swDW: swD.0, swDS: swD.1, swDB: swD.2,
+                            swGW: swGW, swGS: swGS, swGB: swGB,
+                            swUW: swUW, swUS: swUS, swUB: swUB,
+                            swDW: swDW, swDS: swDS, swDB: swDB,
                             shGW: shG.0, shGS: shG.1, shGB: shG.2,
                             shUW: shU.0, shUS: shU.1, shUB: shU.2,
                             shDW: shD.0, shDS: shD.1, shDB: shD.2,
@@ -552,29 +585,80 @@ public enum RawFusedVerify {
                           sg: sg, su: su, shAct: shAct, sharedY: sharedY, sgl: sgl)
     }
 
-    static func encodeMoEBlockRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
-                                   w: MoEBlockBufs, sc: MoEScratch,
-                                   M: Int, E: Int, I: Int, Ktop: Int, H: Int) {
-        // ① routing: gate qmm8 → route_top8_rows(inds+renorm scores)
+    // ── MoE block の 3 フェーズ分割 ──────────────────────────────────────────────────────────────
+    // strict streaming では ①(route) で CB を切り、inds 読み出し後に ②(gather) を chunk 毎に
+    // encode し、最後に ③④(shared) をまとめて encode する。resident/bolt は 3 つを連続 encode。
+
+    /// ① routing: gate qmm8 → route_top8_rows(inds+renorm scores)。
+    static func encodeMoERouteRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer,
+                                    w: MoEBlockBufs, sc: MoEScratch,
+                                    M: Int, E: Int, H: Int, Ktop: Int) {
         encodeQmm8Rows(enc, w: w.gW, scales: w.gS, biases: w.gB, x: x, out: sc.gl, M: M, K: H, N: E)
         encodeRouteTop8Rows(enc, logits: sc.gl, inds: sc.inds, scores: sc.scores, M: M, N: E, K: Ktop)
-        // ② routed experts: gather g/u(行共有 lhs)→ swiglu → gather d(per-mk lhs)→ combine
-        encodeGatherQmmRows(enc, w: w.swGW, scales: w.swGS, biases: w.swGB, x: x, inds: sc.inds, out: sc.g,
-                            M: M, Ktop: Ktop, K: H, N: I, lhsPer: false)
-        encodeGatherQmmRows(enc, w: w.swUW, scales: w.swUS, biases: w.swUB, x: x, inds: sc.inds, out: sc.u,
-                            M: M, Ktop: Ktop, K: H, N: I, lhsPer: false)
-        encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: M * Ktop * I)
-        encodeGatherQmmRows(enc, w: w.swDW, scales: w.swDS, biases: w.swDB, x: sc.h, inds: sc.inds, out: sc.d,
-                            M: M, Ktop: Ktop, K: I, N: H, lhsPer: true)
-        encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y, Ktop: Ktop, N: H, M: M)
-        // ③ shared expert: sg/su qmm → swiglu → down qmm
+    }
+
+    /// ② routed experts gather フェーズ (行 [r0, r1) のみ)。
+    /// slotTable 非 nil の場合は gather 前に inds[r0*Ktop ..< r1*Ktop] を GPU remap。
+    /// w.sw* は arena buffer(streaming 時)または resident buffer(bolt/resident 時)。
+    static func encodeMoEGatherRowsRange(_ enc: MTLComputeCommandEncoder,
+                                          x: MTLBuffer, w: MoEBlockBufs, sc: MoEScratch,
+                                          r0: Int, r1: Int, Ktop: Int, I: Int, H: Int,
+                                          slotTable: MTLBuffer?) {
+        let Mc = r1 - r0
+        let xOff    = r0 * H * 2
+        let indsOff = r0 * Ktop * 4
+        let guOff   = r0 * Ktop * I * 2
+        let dOff    = r0 * Ktop * H * 2
+        let scOff   = r0 * Ktop * 2
+        let yOff    = r0 * H * 2
+
+        if let st = slotTable {
+            RawMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
+                                                table: st, count: Mc * Ktop)
+        }
+        // gather g/u(行共有 lhs)
+        encodeGatherQmmRows(enc, w: w.swGW, scales: w.swGS, biases: w.swGB,
+                            x: x, inds: sc.inds, out: sc.g,
+                            M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
+                            xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+        encodeGatherQmmRows(enc, w: w.swUW, scales: w.swUS, biases: w.swUB,
+                            x: x, inds: sc.inds, out: sc.u,
+                            M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false,
+                            xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+        // swiglu
+        encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: Mc * Ktop * I, byteOffset: guOff)
+        // gather d(per-mk lhs, x=sc.h)
+        encodeGatherQmmRows(enc, w: w.swDW, scales: w.swDS, biases: w.swDB,
+                            x: sc.h, inds: sc.inds, out: sc.d,
+                            M: Mc, Ktop: Ktop, K: I, N: H, lhsPer: true,
+                            xByteOffset: guOff, indsOffset: indsOff, outByteOffset: dOff)
+        // combine → sc.y[r0*H .. r1*H]
+        encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y,
+                          Ktop: Ktop, N: H, M: Mc,
+                          dByteOffset: dOff, scoresOffset: scOff, yByteOffset: yOff)
+    }
+
+    /// ③④ shared expert + final combine → out[M,H]。
+    static func encodeMoESharedRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
+                                     w: MoEBlockBufs, sc: MoEScratch, M: Int, I: Int, H: Int) {
         encodeQmmRows(enc, w: w.shGW, scales: w.shGS, biases: w.shGB, x: x, out: sc.sg, M: M, K: H, N: I)
         encodeQmmRows(enc, w: w.shUW, scales: w.shUS, biases: w.shUB, x: x, out: sc.su, M: M, K: H, N: I)
         encodeSwiglu(enc, g: sc.sg, u: sc.su, h: sc.shAct, total: M * I)
         encodeQmmRows(enc, w: w.shDW, scales: w.shDS, biases: w.shDB, x: sc.shAct, out: sc.sharedY, M: M, K: I, N: H)
-        // ④ shared gate logits(qmm8 N=8, 列0のみ使用)→ final combine
         encodeQmm8Rows(enc, w: w.sgW, scales: w.sgS, biases: w.sgB, x: x, out: sc.sgl, M: M, K: H, N: 8)
         encodeFinalCombineRows(enc, y: sc.y, sharedY: sc.sharedY, sgl: sc.sgl, out: out, N: H, M: M)
+    }
+
+    /// MoE block 全段(3 フェーズ連続 encode)。resident 経路(slotTable:nil)と bolt 経路(slotTable:非nil)を兼ねる。
+    /// resident 時: slotTable=nil → remap なし、sw* は常駐 buffer。
+    /// bolt 時: slotTable=frozen table → GPU remap、sw* は arena buffer(expertOverride 済み)。
+    static func encodeMoEBlockRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
+                                   w: MoEBlockBufs, sc: MoEScratch,
+                                   M: Int, E: Int, I: Int, Ktop: Int, H: Int,
+                                   slotTable: MTLBuffer? = nil) {
+        encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop)
+        encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
+        encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H)
     }
 
     /// 全 pipeline を warm(compile)。fused 経路の前提(encode 時に force-unwrap するため)。
@@ -582,6 +666,8 @@ public enum RawFusedVerify {
         ensureQmmPipeline()
         guard RawMetalForward.compileQmm8(), RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines()
         else { return false }
+        // slot_remap_rows(streaming chunk remap 用 grid kernel)も同時に warm
+        _ = RawMetalForward.compileSlotRemapRows()
         if _routeRowsPipeline == nil {
             let dummy = MLXArray.zeros([1, E]).asType(.float16); dummy.eval()
             _ = routeTop8Rows(dummy, M: 1, N: E, K: Ktop)
@@ -1321,18 +1407,29 @@ public enum RawFusedVerify {
         let device: MTLDevice, queue: MTLCommandQueue
         /// zero-copy buffer の裏 MLXArray 保持(asType 変換の一時 array を allocator 再利用から守る)
         public var retainedArrays: [MLXArray] = []
-        /// profile: 直近 stepArgmax の GPU-exec(gpuEnd-gpuStart)ms。wall と比較して CPU overhead を分離。
+        /// profile: 直近 step の全 CB GPU-exec 合計 ms。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
+
+        // ── streaming mode ─────────────────────────────────────────────────────────────
+        public enum RawStreamMode { case resident, strict, bolt }
+        public private(set) var streamMode: RawStreamMode = .resident
+        /// per-layer provider(streaming 時非 nil)。layers と等長。
+        var providers: [RawFusedExpertProvider]? = nil
+        /// per-layer slot table buffer([E] int32, storageModeShared)。strict/bolt で ensure 結果を書き込む。
+        var slotTables: [MTLBuffer] = []
+        /// 直近 step の最大 chunk 数/層(strict モードのテスト検証用)。
+        public private(set) var lastStepChunks: Int = 0
 
         public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
                      numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
                      ropeDim: Int = 64, ropeBase: Float = 1e7,
                      numKHeads: Int = 16, numVHeads: Int = 32, headKDim: Int = 128, headVDim: Int = 128,
-                     convKernel: Int = 4, eps: Float = 1e-6) {
+                     convKernel: Int = 4, eps: Float = 1e-6,
+                     providers initProviders: [RawFusedExpertProvider]? = nil) {
             guard let (device, queue) = RawMetalForward.ensure() else { return nil }
             self.device = device; self.queue = queue
             self.maxM = maxM; self.H = H
@@ -1370,9 +1467,11 @@ public enum RawFusedVerify {
             for (i, s) in specs.enumerated() {
                 let lnA = s.inputLN.asType(.float16), pnA = s.postLN.asType(.float16)
                 retainedArrays.append(contentsOf: [lnA, pnA])
+                // streaming: sw*(routed expert)は provider の arena buffer を使う
+                let ov = initProviders?[i].gatherBuffers(device: device)
                 guard let ln = RawMetalForward.mtlBuf(lnA, device),
                       let pn = RawMetalForward.mtlBuf(pnA, device),
-                      let moe = RawFusedVerify.prepareMoEBlockBufs(s.moe, device) else { return nil }
+                      let moe = RawFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov) else { return nil }
                 var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
                 var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
                 if s.isLinear, let gw = s.gdn {
@@ -1395,10 +1494,38 @@ public enum RawFusedVerify {
                                     gdn: gdnB, attn: attnB, moe: moe, gdnCache: gdnC, kvCache: kvC,
                                     E: s.moeE, I: s.moeI, Ktop: s.moeKtop))
             }
+            // streaming mode setup
+            if let p = initProviders {
+                guard p.count == specs.count else { return nil }
+                providers = p
+                streamMode = .strict
+                for (i, s) in specs.enumerated() {
+                    guard let st = device.makeBuffer(length: s.moeE * 4, options: .storageModeShared) else { return nil }
+                    slotTables.append(st)
+                    _ = i  // suppress unused warning
+                }
+            }
         }
 
-        /// 1 層を encoder に encode(norm→mixer→resid→postNorm→MoE→resid)。
+        /// 1 層を encoder に encode(norm→mixer→resid→postNorm→MoE→resid)。resident/bolt 経路のみ。
         func encodeLayer(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
+            encodePreMoE(enc, L, M: M)
+            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+                                              M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
+            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+        }
+
+        /// bolt 層: resident と同一だが MoE gather 前に全 inds を GPU remap する。
+        func encodeLayerBolt(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, li: Int) {
+            encodePreMoE(enc, L, M: M)
+            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+                                              M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
+                                              slotTable: slotTables[li])
+            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+        }
+
+        /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
+        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
             RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
             if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
                 RawFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
@@ -1414,29 +1541,166 @@ public enum RawFusedVerify {
             }
             RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
             RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
-            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
-                                              M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
-            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
-        /// 全層 forward(単一 CB)。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
-        /// finalNormW を渡すと最終 rmsNorm も同一 CB に同梱し normed [M,H] を返す。
+        // ── streaming helpers ─────────────────────────────────────────────────────────
+
+        struct MoEChunk { let r0, r1: Int; let experts: [Int] }
+
+        /// inds[M*Ktop] をスキャンし、各 chunk の distinct expert union が C 以下になるように貪欲分割。
+        private func partitionChunks(_ inds: [Int32], M: Int, Ktop: Int, C: Int) -> [MoEChunk] {
+            var chunks: [MoEChunk] = []
+            var r0 = 0
+            var cur = Set<Int>()
+            for m in 0..<M {
+                var row = Set<Int>()
+                for k in 0..<Ktop { row.insert(Int(inds[m * Ktop + k])) }
+                let next = cur.union(row)
+                if next.count > C && r0 < m {
+                    chunks.append(MoEChunk(r0: r0, r1: m, experts: Array(cur).sorted()))
+                    r0 = m; cur = row
+                } else {
+                    cur = next
+                }
+            }
+            if r0 < M { chunks.append(MoEChunk(r0: r0, r1: M, experts: Array(cur).sorted())) }
+            return chunks
+        }
+
+        // ── setBoltTables / setStrictStreaming ────────────────────────────────────────
+
+        /// per-layer frozen slot table を設定し bolt モードに切り替え。tables[li][e] = slot id。
+        public func setBoltTables(_ tables: [[Int32]]) {
+            for (li, tbl) in tables.enumerated() {
+                guard li < slotTables.count else { break }
+                let p = slotTables[li].contents().bindMemory(to: Int32.self, capacity: tbl.count)
+                for (e, s) in tbl.enumerated() { p[e] = s }
+            }
+            streamMode = .bolt
+        }
+
+        /// bolt → strict に戻す(slot table は保持)。
+        public func setStrictStreaming() { streamMode = .strict }
+
+        /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
+        /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
         public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
             guard M <= maxM else { return nil }
+            // hBuf upload(resident/bolt/strict 共通)
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
             hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H).update(from: arr, count: M * H)
-            let cb = queue.makeCommandBuffer()!
-            let enc = cb.makeComputeCommandEncoder()!
-            for L in layers { encodeLayer(enc, L, M: M) }
-            if let fw = finalNormW {
-                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+
+            switch streamMode {
+            case .resident:
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                for L in layers { encodeLayer(enc, L, M: M) }
+                if let fw = finalNormW {
+                    RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+                }
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            case .bolt:
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }
+                if let fw = finalNormW {
+                    RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+                }
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            case .strict:
+                runStrictLayers(M: M, firstCBExtra: nil, finalCBExtra: { enc in
+                    if let fw = finalNormW {
+                        RawFusedVerify.encodeRmsNormRows(enc, x: self.hBuf, w: fw, out: self.normed,
+                                                         rows: M, D: self.H, eps: self.eps)
+                    }
+                })
             }
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        }
+
+        /// strict モードのコア: per-layer CB 分割 + CPU ensure + chunk gather ループ。
+        /// firstCBExtra: 最初の CB の先頭に encode する追加 op(stepArgmax の embed 等)。
+        /// finalCBExtra: 最後の CB に追加する op(finalNorm / lm_head / argmax 等)。
+        private func runStrictLayers(M: Int,
+                                     firstCBExtra: ((MTLComputeCommandEncoder) -> Void)?,
+                                     finalCBExtra: (MTLComputeCommandEncoder) -> Void) {
+            var gpuMs = 0.0
+            var curCB: MTLCommandBuffer? = nil
+            var curEnc: MTLComputeCommandEncoder? = nil
+
+            func openCB() {
+                curCB = queue.makeCommandBuffer()!
+                curEnc = curCB!.makeComputeCommandEncoder()!
+            }
+            func flushCB() {
+                curEnc!.endEncoding()
+                curCB!.commit()
+                curCB!.waitUntilCompleted()
+                gpuMs += (curCB!.gpuEndTime - curCB!.gpuStartTime) * 1000.0
+                curEnc = nil; curCB = nil
+            }
+
+            // 最初の CB: (embed など)+ layer[0] pre-MoE + route
+            openCB()
+            firstCBExtra?(curEnc!)
+            encodePreMoE(curEnc!, layers[0], M: M)
+            RawFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[0].moe, sc: moeSc,
+                                              M: M, E: layers[0].E, H: H, Ktop: layers[0].Ktop)
+            flushCB()   // route 読み出しのため待機
+
+            var maxChunks = 0
+
+            for (li, L) in layers.enumerated() {
+                let provider = providers![li]
+                let indsCount = M * L.Ktop
+                let indsRaw = moeSc.inds.contents().bindMemory(to: Int32.self, capacity: indsCount)
+                let inds = Array(UnsafeBufferPointer(start: indsRaw, count: indsCount))
+                let chunks = partitionChunks(inds, M: M, Ktop: L.Ktop, C: provider.C)
+                maxChunks = max(maxChunks, chunks.count)
+
+                let stPtr = slotTables[li].contents().bindMemory(to: Int32.self, capacity: L.E)
+
+                for (ci, chunk) in chunks.enumerated() {
+                    let slotMap = provider.ensure(chunk.experts)
+                    for (e, slot) in slotMap { stPtr[e] = Int32(slot) }
+
+                    if curEnc == nil { openCB() }
+                    RawFusedVerify.encodeMoEGatherRowsRange(curEnc!, x: postNorm, w: L.moe, sc: moeSc,
+                                                            r0: chunk.r0, r1: chunk.r1,
+                                                            Ktop: L.Ktop, I: L.I, H: H,
+                                                            slotTable: slotTables[li])
+                    if ci < chunks.count - 1 { flushCB() }   // 次 ensure 前に GPU 完了を保証
+                }
+
+                // 最後 chunk の CB にそのまま shared + resid を連結
+                RawFusedVerify.encodeMoESharedRows(curEnc!, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+                                                    M: M, I: L.I, H: H)
+                RawFusedVerify.encodeResidAdd(curEnc!, h: hBuf, r: moeOut, total: M * H)
+
+                if li + 1 < layers.count {
+                    // 次層の pre-MoE + route を同 CB に連結してから flush(route 読み出し)
+                    encodePreMoE(curEnc!, layers[li + 1], M: M)
+                    RawFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[li + 1].moe, sc: moeSc,
+                                                      M: M, E: layers[li + 1].E, H: H, Ktop: layers[li + 1].Ktop)
+                    flushCB()
+                }
+                // else: 最終層 → enc を開けたまま finalCBExtra に渡す
+            }
+
+            // 最後の CB に final ops を追加して flush
+            finalCBExtra(curEnc!)
+            flushCB()
+
+            lastStepChunks = maxChunks
+            RawFusedForward.profLastGPUMs = gpuMs
         }
 
         // ── head 同梱(1-CB step): embed → 40層 → final norm → lm_head(qmmTiled) → argmax ──
@@ -1485,52 +1749,76 @@ public enum RawFusedVerify {
         }
 
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
-        /// CB 1 本・readback は int32 [M] のみ(MLX op ゼロ)。cache は常駐更新。
+        /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
         public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
             guard let hd = head, tokens.count <= maxM else { return nil }
             let M = tokens.count
             hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
-            let cb = queue.makeCommandBuffer()!
-            let enc = cb.makeComputeCommandEncoder()!
+
             // embed: tokens → hBuf [M, H]
-            let ep = RawFusedVerify._embedRowsPipeline!
-            enc.setComputePipelineState(ep)
-            enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
-            enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
-            enc.setBuffer(hBuf, offset: 0, index: 4)
-            var hh = UInt32(H), tt = UInt32(M * H)
-            enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
-            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
-            // 40 層 + final norm
-            for L in layers { encodeLayer(enc, L, M: M) }
-            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
-            // lm_head。既定=qmm4_tiled(重み行を threadgroup に 1 回 dequant し M 行で共有=verify M>1 で有利)。
+            func encodeEmbed(_ enc: MTLComputeCommandEncoder) {
+                let ep = RawFusedVerify._embedRowsPipeline!
+                enc.setComputePipelineState(ep)
+                enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
+                enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+                enc.setBuffer(hBuf, offset: 0, index: 4)
+                var hh = UInt32(H), tt = UInt32(M * H)
+                enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            }
+
+            // final norm → lm_head(qmm4_tiled or qmv) → argmax
+            // lm_head: 既定=qmm4_tiled(重み行を threadgroup に 1 回 dequant し M 行で共有=verify M>1 で有利)。
             // QWISP_LMHEAD_QMV=1: qmm4(per-row qmv, threadgroup dequant 無し=高 occupancy)= M=1 decode で有利。
             // 両者とも M 不変(test 済)ゆえ flag を run 中固定なら decode≡verify(self-consistent)。速度トレードオフのみ。
-            if RawFusedForward.lmHeadQmv {
-                RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
-                                             x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
-            } else {
-                let qp = RawMetalForward._qmm4TiledPipeline!
-                enc.setComputePipelineState(qp)
-                enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
-                enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
-                enc.setBuffer(hd.logits, offset: 0, index: 4)
-                var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
-                enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
-                enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+            func encodeFinalOps(_ enc: MTLComputeCommandEncoder) {
+                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
+                if RawFusedForward.lmHeadQmv {
+                    RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                                 x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
+                } else {
+                    let qp = RawMetalForward._qmm4TiledPipeline!
+                    enc.setComputePipelineState(qp)
+                    enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+                    enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
+                    enc.setBuffer(hd.logits, offset: 0, index: 4)
+                    var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+                    enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                }
+                let ap = RawFusedVerify._argmaxRowsPipeline!
+                enc.setComputePipelineState(ap)
+                enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(hd.tokensOut, offset: 0, index: 1)
+                var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
+                enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
-            // 行毎 argmax(先頭一致 tie-break = MLX argMax と同一)
-            let ap = RawFusedVerify._argmaxRowsPipeline!
-            enc.setComputePipelineState(ap)
-            enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(hd.tokensOut, offset: 0, index: 1)
-            var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
-            enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            switch streamMode {
+            case .resident:
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                encodeEmbed(enc)
+                for L in layers { encodeLayer(enc, L, M: M) }
+                encodeFinalOps(enc)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            case .bolt:
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                encodeEmbed(enc)
+                for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }
+                encodeFinalOps(enc)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            case .strict:
+                runStrictLayers(M: M, firstCBExtra: encodeEmbed, finalCBExtra: encodeFinalOps)
+            }
+
             let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
             return (0 ..< M).map { Int(ptr[$0]) }
         }
