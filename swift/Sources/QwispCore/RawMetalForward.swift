@@ -34,6 +34,14 @@ public enum RawMetalForward {
 
     /// ★ MLX metallib との bit 一致に必須のコンパイル設定。MLX は safe-math(FMA contraction 無効)ビルド
     ///   ＝厳密 IEEE。fast-math だと FMA で last-bit がずれ非 bit-exact になる（qmm で実証: safe=rel0 / fast=2e-7）。
+
+    /// buffer 化: MLX 常駐テンソルは可能なら zero-copy(unified memory 直参照)、不可なら copy。
+    /// 実モデル重みの per-call copy(254MB 級)を排除する perf 用。数値へは無影響(同一バイト)。
+    static func mtlBuf(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
+        if let b = a.asMTLBuffer(device: device, noCopy: true) { return b }
+        return mtlBuf(a, device)
+    }
+
     static func mlxMatchCompileOpts() -> MTLCompileOptions {
         let opts = MTLCompileOptions()
         if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
@@ -88,8 +96,8 @@ public enum RawMetalForward {
                  _qmm4TiledPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_tiled")!)
             } catch { return "compile: \(error)" }
         }
-        guard let bx = x.asMTLBuffer(device: device, noCopy: false), let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = sc.asType(.float16).asMTLBuffer(device: device, noCopy: false), let bbi = bi.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+        guard let bx = mtlBuf(x, device), let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(sc.asType(.float16), device), let bbi = mtlBuf(bi.asType(.float16), device)
         else { return "buf nil" }
         let outBuf = device.makeBuffer(length: M*N*2, options: .storageModeShared)!
         func runTiled() -> Double {
@@ -179,10 +187,10 @@ public enum RawMetalForward {
                     function: lib.makeFunction(name: "qmm4_tiled")!)
             } catch { print("[raw-qmmTiled] compile: \(error)"); return nil }
         }
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device)
         else { return nil }
         let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!
@@ -318,10 +326,10 @@ public enum RawMetalForward {
         }
         let dt: DType = xF32 ? .float32 : .float16
         let elem = xF32 ? 4 : 2
-        guard let bx = x.asType(dt).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(dt).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(dt).asMTLBuffer(device: device, noCopy: false)
+        guard let bx = mtlBuf(x.asType(dt), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(dt), device),
+              let bbi = mtlBuf(biases.asType(dt), device)
         else { return nil }
         let outBuf = device.makeBuffer(length: M * N * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!
@@ -431,10 +439,10 @@ public enum RawMetalForward {
     static func qmm8(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int) -> MLXArray? {
         guard let (device, queue) = ensure(), compileQmm8() else { return nil }
         guard N % 8 == 0, K % 512 == 0 else { print("[raw-qmm8] 非fast N=\(N) K=\(K)"); return nil }
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_qmm8Pipeline!)
@@ -609,7 +617,7 @@ public enum RawMetalForward {
     /// standalone routing（検証用）: gate_logits[N] → (inds[K] int32, scores[K] f16)。
     static func routeTop8(_ logits: MLXArray, N: Int, K: Int) -> (MLXArray, MLXArray)? {
         guard let (device, queue) = ensure(), compileRoute() else { return nil }
-        guard let bl = logits.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bl = mtlBuf(logits.asType(.float16), device) else { return nil }
         let bInds = device.makeBuffer(length: K * 4, options: .storageModeShared)!
         let bScores = device.makeBuffer(length: K * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -743,10 +751,10 @@ public enum RawMetalForward {
         let rows = x.size / D
         let wType: DType = promoteF32 ? .float32 : .float16
         let elemSize = promoteF32 ? 4 : 2
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device) else { return nil }
         // weight=nil は ones[D](w_stride=1)。MLX も no-weight 時 ones を渡す挙動と一致。
         let wArr = (weight?.asType(wType) ?? MLXArray.ones([D], dtype: wType))
-        guard let bw = wArr.asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bw = mtlBuf(wArr, device) else { return nil }
         let outBuf = device.makeBuffer(length: rows * D * elemSize, options: .storageModeShared)!
         // threadgroup_size = ceil(D/N_READS) を simd(32) 倍数に切上げ（MLX dispatch と一致）。
         let tgNeeded = (D + 3) / 4
@@ -796,7 +804,7 @@ public enum RawMetalForward {
             } catch { print("[raw-smax] compile: \(error)"); return nil }
         }
         let rows = x.size / D
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: rows * D * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_softmaxPipeline!)
@@ -1036,12 +1044,12 @@ public enum RawMetalForward {
                  _recurPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gated_delta_step")!)
             } catch { print("[raw-recur] compile: \(error)"); return nil }
         }
-        guard let bq = q.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bk = k.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bv = v.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bg = g.asType(.float32).asMTLBuffer(device: device, noCopy: false),
-              let bb = beta.asType(.float32).asMTLBuffer(device: device, noCopy: false),
-              let bs = state.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bq = mtlBuf(q.asType(.float16), device),
+              let bk = mtlBuf(k.asType(.float16), device),
+              let bv = mtlBuf(v.asType(.float16), device),
+              let bg = mtlBuf(g.asType(.float32), device),
+              let bb = mtlBuf(beta.asType(.float32), device),
+              let bs = mtlBuf(state.asType(.float32), device) else { return nil }
         let yBuf = device.makeBuffer(length: B*T*Hv*Dv*2, options: .storageModeShared)!
         let soBuf = device.makeBuffer(length: B*Hv*Dv*Dk*4, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -1151,11 +1159,11 @@ public enum RawMetalForward {
                  _gqmmPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4")!)
             } catch { print("[raw-gqmm] compile: \(error)"); return nil }
         }
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bin = inds.asType(.int32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
         let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_gqmmPipeline!)
@@ -1197,7 +1205,7 @@ public enum RawMetalForward {
             guard let bwq = w.asMTLBuffer(device: device, noCopy: true),
                   let bsc = s.asMTLBuffer(device: device, noCopy: true),
                   let bbi = bi.asMTLBuffer(device: device, noCopy: true),
-                  let bx = x0.asMTLBuffer(device: device, noCopy: false) else { continue }
+                  let bx = mtlBuf(x0, device) else { continue }
             var inds = (0 ..< Ktop).map { Int32($0 * (B / Ktop)) }   // B 全域に散らした index
             let bin = device.makeBuffer(bytes: &inds, length: Ktop * 4, options: .storageModeShared)!
             let outBuf = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
@@ -1389,9 +1397,9 @@ public enum RawMetalForward {
             } catch { print("[raw-sdpa] compile: \(error)"); return nil }
         }
         let dt: DType = inF32 ? .float32 : .float16, elem = inF32 ? 4 : 2
-        guard let bq = q.asType(dt).asMTLBuffer(device: device, noCopy: false),
-              let bk = k.asType(dt).asMTLBuffer(device: device, noCopy: false),
-              let bv = v.asType(dt).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bq = mtlBuf(q.asType(dt), device),
+              let bk = mtlBuf(k.asType(dt), device),
+              let bv = mtlBuf(v.asType(dt), device) else { return nil }
         let outBuf = device.makeBuffer(length: H * D * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(inF32 ? _sdpaF32Pipeline! : _sdpaPipeline!)
@@ -1441,8 +1449,8 @@ public enum RawMetalForward {
                  _conv1dPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv1d_silu")!)
             } catch { print("[raw-conv1d] compile: \(error)"); return nil }
         }
-        guard let bx = input.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bw = w.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }   // w は f32(MLX f32Conv 一致)
+        guard let bx = mtlBuf(input.asType(.float16), device),
+              let bw = mtlBuf(w.asType(.float32), device) else { return nil }   // w は f32(MLX f32Conv 一致)
         let outBuf = device.makeBuffer(length: C * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_conv1dPipeline!)
@@ -1487,7 +1495,7 @@ public enum RawMetalForward {
         }
         let rows = x.size / HD
         let dt: DType = xF32 ? .float32 : .float16, elem = xF32 ? 4 : 2
-        guard let bx = x.asType(dt).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(dt), device) else { return nil }
         let outBuf = device.makeBuffer(length: rows * HD * elem, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(xF32 ? _ropeF32Pipeline! : _ropePipeline!)
@@ -1526,11 +1534,11 @@ public enum RawMetalForward {
         let refChain = MLXFast.rmsNorm(mq, weight: nw, eps: 1e-6); refChain.eval()
 
         // 単一 encoder で qmm→rmsNorm を連結
-        guard let bx = xin.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bnw = nw.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return "[chain] buf nil" }
+        guard let bx = mtlBuf(xin.asType(.float16), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device),
+              let bnw = mtlBuf(nw.asType(.float16), device) else { return "[chain] buf nil" }
         let mid = device.makeBuffer(length: N * 2, options: .storageModeShared)!     // ping
         let mid2 = device.makeBuffer(length: N * 2, options: .storageModeShared)!    // pong
         func cpuNs() -> UInt64 { var r = rusage(); getrusage(RUSAGE_SELF, &r)
@@ -1674,17 +1682,17 @@ public enum RawMetalForward {
         guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
         let keyDim = headKDim * numKHeads, valueDim = headVDim * numVHeads, convDim = keyDim * 2 + valueDim
         let Dk = headKDim, Dv = headVDim, Hv = numVHeads, Hk = numKHeads
-        func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { a.asType(t).asMTLBuffer(device: device, noCopy: false) }
+        func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { mtlBuf(a.asType(t), device) }
         func mk(_ bytes: Int) -> MTLBuffer { device.makeBuffer(length: bytes, options: .storageModeShared)! }
-        guard let bQkvW = w.qkvWq.asMTLBuffer(device: device, noCopy: false), let bQkvS = mtl(w.qkvSc, .float16), let bQkvB = mtl(w.qkvBi, .float16),
-              let bZW = w.zWq.asMTLBuffer(device: device, noCopy: false), let bZS = mtl(w.zSc, .float16), let bZB = mtl(w.zBi, .float16),
-              let bAW = w.aWq.asMTLBuffer(device: device, noCopy: false), let bAS = mtl(w.aSc, .float16), let bAB = mtl(w.aBi, .float16),
-              let bBW = w.bWq.asMTLBuffer(device: device, noCopy: false), let bBS = mtl(w.bSc, .float16), let bBB = mtl(w.bBi, .float16),
-              let bOW = w.outWq.asMTLBuffer(device: device, noCopy: false), let bOS = mtl(w.outSc, .float16), let bOB = mtl(w.outBi, .float16),
+        guard let bQkvW = mtlBuf(w.qkvWq, device), let bQkvS = mtl(w.qkvSc, .float16), let bQkvB = mtl(w.qkvBi, .float16),
+              let bZW = mtlBuf(w.zWq, device), let bZS = mtl(w.zSc, .float16), let bZB = mtl(w.zBi, .float16),
+              let bAW = mtlBuf(w.aWq, device), let bAS = mtl(w.aSc, .float16), let bAB = mtl(w.aBi, .float16),
+              let bBW = mtlBuf(w.bWq, device), let bBS = mtl(w.bSc, .float16), let bBB = mtl(w.bBi, .float16),
+              let bOW = mtlBuf(w.outWq, device), let bOS = mtl(w.outSc, .float16), let bOB = mtl(w.outBi, .float16),
               let bConvW = mtl(w.conv1dW, .float32),
               let bNormW = mtl(w.normWeight, w.normWeight.dtype == .float32 ? .float32 : .float16),   // la_norm dtype 維持
               let bALog = mtl(w.aLog, .float32), let bDt = mtl(w.dtBias, .float32),
-              let bOnes = MLXArray.ones([headKDim], dtype: .float16).asMTLBuffer(device: device, noCopy: false)
+              let bOnes = MLXArray.ones([headKDim], dtype: mtlBuf(.float16), device)
         else { print("[raw-gdn-se] weight buffer nil"); return nil }
         let normF32 = (w.normWeight.dtype == .float32)
         let convInput = mk(convKernel * convDim * 2); memset(convInput.contents(), 0, convKernel * convDim * 2)  // zero 1 回（qkv が row(K-1)を毎回上書き）
@@ -1828,8 +1836,8 @@ public enum RawMetalForward {
     struct NormWeightBuffers { let inputNormW, postNormW: MTLBuffer }
     static func prepareNormWeights(input: MLXArray, post: MLXArray) -> NormWeightBuffers? {
         guard let (device, _) = ensure() else { return nil }
-        guard let iw = input.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let pw = post.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let iw = mtlBuf(input.asType(.float16), device),
+              let pw = mtlBuf(post.asType(.float16), device) else { return nil }
         return NormWeightBuffers(inputNormW: iw, postNormW: pw)
     }
 
@@ -1841,7 +1849,7 @@ public enum RawMetalForward {
     /// MLXArray を f16 MTLBuffer 化（重み常駐用）。
     static func f16Buffer(_ a: MLXArray) -> MTLBuffer? {
         guard let (device, _) = ensure() else { return nil }
-        return a.asType(.float16).asMTLBuffer(device: device, noCopy: false)
+        return mtlBuf(a.asType(.float16), device)
     }
     /// MLXArray[*,H] → hBuf（f16）書込み。
     static func writeBuffer(_ buf: MTLBuffer, _ a: MLXArray, _ H: Int) {
@@ -1915,9 +1923,9 @@ public enum RawMetalForward {
     struct Gate8Buffers { let wq, sc, bi: MTLBuffer; let N: Int }
     static func prepareGate8(_ w: MLXArray, _ s: MLXArray, _ b: MLXArray) -> Gate8Buffers? {
         guard let (device, _) = ensure(), compileQmm8(), compileRoute() else { return nil }
-        guard let wq = w.asMTLBuffer(device: device, noCopy: false),
-              let sc = s.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bi = b.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let wq = mtlBuf(w, device),
+              let sc = mtlBuf(s.asType(.float16), device),
+              let bi = mtlBuf(b.asType(.float16), device) else { return nil }
         return Gate8Buffers(wq: wq, sc: sc, bi: bi, N: w.dim(0))
     }
 
@@ -2509,12 +2517,12 @@ public enum RawMetalForward {
                                    H: Int = 2048, maxLen: Int = 0) -> AttnBuffers? {
         guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
         let qd2 = 2 * headDim
-        func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { a.asType(t).asMTLBuffer(device: device, noCopy: false) }
+        func mtl(_ a: MLXArray, _ t: DType) -> MTLBuffer? { mtlBuf(a.asType(t), device) }
         func mk(_ bytes: Int) -> MTLBuffer { device.makeBuffer(length: bytes, options: .storageModeShared)! }
-        guard let qW = w.qWq.asMTLBuffer(device: device, noCopy: false), let qS = mtl(w.qSc, .float16), let qB = mtl(w.qBi, .float16),
-              let kW = w.kWq.asMTLBuffer(device: device, noCopy: false), let kS = mtl(w.kSc, .float16), let kB = mtl(w.kBi, .float16),
-              let vW = w.vWq.asMTLBuffer(device: device, noCopy: false), let vS = mtl(w.vSc, .float16), let vB = mtl(w.vBi, .float16),
-              let oW = w.oWq.asMTLBuffer(device: device, noCopy: false), let oS = mtl(w.oSc, .float16), let oB = mtl(w.oBi, .float16),
+        guard let qW = mtlBuf(w.qWq, device), let qS = mtl(w.qSc, .float16), let qB = mtl(w.qBi, .float16),
+              let kW = mtlBuf(w.kWq, device), let kS = mtl(w.kSc, .float16), let kB = mtl(w.kBi, .float16),
+              let vW = mtlBuf(w.vWq, device), let vS = mtl(w.vSc, .float16), let vB = mtl(w.vBi, .float16),
+              let oW = mtlBuf(w.oWq, device), let oS = mtl(w.oSc, .float16), let oB = mtl(w.oBi, .float16),
               let qNormW = mtl(w.qNorm, .float16), let kNormW = mtl(w.kNorm, .float16)
         else { print("[raw-attn-se] weight buffer nil"); return nil }
         let qDim = numHeads * qd2, kvDim = numKV * headDim, vDim = numHeads * headDim
@@ -2698,8 +2706,8 @@ public enum RawMetalForward {
                                   shG: (MLXArray, MLXArray, MLXArray), shU: (MLXArray, MLXArray, MLXArray), shD: (MLXArray, MLXArray, MLXArray),
                                   Hin: Int, I: Int, topK: Int) -> MoEBuffers? {
         guard let (device, _) = ensure(), ensureAuxPipelines() else { return nil }
-        func wb(_ a: MLXArray) -> MTLBuffer? { a.asMTLBuffer(device: device, noCopy: false) }
-        func fb(_ a: MLXArray) -> MTLBuffer? { a.asType(.float16).asMTLBuffer(device: device, noCopy: false) }
+        func wb(_ a: MLXArray) -> MTLBuffer? { mtlBuf(a, device) }
+        func fb(_ a: MLXArray) -> MTLBuffer? { mtlBuf(a.asType(.float16), device) }
         func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
         guard let swGW = wb(swG.0), let swGS = fb(swG.1), let swGB = fb(swG.2),
               let swUW = wb(swU.0), let swUS = fb(swU.1), let swUB = fb(swU.2),
@@ -2790,8 +2798,8 @@ public enum RawMetalForward {
     static func swigluRaw(_ g: MLXArray, _ u: MLXArray) -> MLXArray? {
         guard let (device, queue) = ensure(), ensureAuxPipelines(), let p = _swigluPipeline else { return nil }
         let total = g.size
-        guard let bg = g.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bu = u.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bg = mtlBuf(g.asType(.float16), device),
+              let bu = mtlBuf(u.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(p)
@@ -2805,8 +2813,8 @@ public enum RawMetalForward {
     /// raw combine: y[n]=Σ_k (d[k,n]*scores[k])（全 f16, MLX の f16 sum と一致）。
     static func combineRaw(_ d: MLXArray, _ scores: MLXArray, K: Int, N: Int) -> MLXArray? {
         guard let (device, queue) = ensure(), ensureAuxPipelines(), let p = _combinePipeline else { return nil }
-        guard let bd = d.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bs = scores.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bd = mtlBuf(d.asType(.float16), device),
+              let bs = mtlBuf(scores.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(p)
@@ -3406,8 +3414,8 @@ public enum RawMetalForward {
                            swGateW: swGW, swGateS: swGS, swGateB: swGB, swUpW: swUW, swUpS: swUS, swUpB: swUB,
                            swDownW: swDW, swDownS: swDS, swDownB: swDB, shGate: shGate, shUp: shUp, shDown: shDown, sharedGate: sharedGate)
         let similar = ProcessInfo.processInfo.environment["QWISP_MOE_SIM"] == "1"
-        func wb(_ a: MLXArray) -> MTLBuffer { a.asMTLBuffer(device: device, noCopy: false)! }
-        func fb(_ a: MLXArray) -> MTLBuffer { a.asType(.float16).asMTLBuffer(device: device, noCopy: false)! }
+        func wb(_ a: MLXArray) -> MTLBuffer { mtlBuf(a, device)! }
+        func fb(_ a: MLXArray) -> MTLBuffer { mtlBuf(a.asType(.float16), device)! }
         func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
         // 重み buffer は B 非依存（共有）。一度だけ作る。
         let gateWb = wb(gT.0), gateSb = fb(gT.1), gateBb = fb(gT.2)
@@ -3497,8 +3505,8 @@ public enum RawMetalForward {
               let swDW = r["switch_mlp.down_proj.weight"], let swDS = r["switch_mlp.down_proj.scales"], let swDB = r["switch_mlp.down_proj.biases"]
         else { return "[m1-floor] ref キー不足" }
         let Hin = swGS.dim(-1) * 64, topK = 8, E = 256, I = swGW.dim(-2)
-        func wb(_ a: MLXArray) -> MTLBuffer { a.asMTLBuffer(device: device, noCopy: false)! }
-        func fb(_ a: MLXArray) -> MTLBuffer { a.asType(.float16).asMTLBuffer(device: device, noCopy: false)! }
+        func wb(_ a: MLXArray) -> MTLBuffer { mtlBuf(a, device)! }
+        func fb(_ a: MLXArray) -> MTLBuffer { mtlBuf(a.asType(.float16), device)! }
         func mk(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
         let gW = wb(swGW), gS = fb(swGS), gB = fb(swGB), uW = wb(swUW), uS = fb(swUS), uB = fb(swUB), dW = wb(swDW), dS = fb(swDS), dB = fb(swDB)
         let bx = mk(Hin*2), hbuf = mk(topK*I*2), gOut = mk(topK*I*2), uOut = mk(topK*I*2), dOut = mk(topK*Hin*2), binds = mk(topK*4)
@@ -3897,11 +3905,11 @@ public enum RawMetalForward {
                  _gqmmRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4_rows")!)
             } catch { print("[raw-gqmm-rows] compile: \(error)"); return nil }
         }
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bwq = wq.asMTLBuffer(device: device, noCopy: false),
-              let bsc = scales.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bbi = biases.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bin = inds.asType(.int32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_gqmmRowsPipeline!)
@@ -4008,9 +4016,9 @@ public enum RawMetalForward {
                  _sdpaRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa_rows")!)
             } catch { print("[raw-sdpa-rows] compile: \(error)"); return nil }
         }
-        guard let bq = q.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bk = k.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bv = v.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bq = mtlBuf(q.asType(.float16), device),
+              let bk = mtlBuf(k.asType(.float16), device),
+              let bv = mtlBuf(v.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * H * D * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_sdpaRowsPipeline!)
@@ -4059,8 +4067,8 @@ public enum RawMetalForward {
                      function: lib.makeFunction(name: "conv1d_silu_rows")!)
             } catch { print("[raw-conv1d-rows] compile: \(error)"); return nil }
         }
-        guard let bx = windows.asType(.float16).asMTLBuffer(device: device, noCopy: false),
-              let bw = w.asType(.float32).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(windows.asType(.float16), device),
+              let bw = mtlBuf(w.asType(.float32), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * C * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_conv1dSiluRowsPipeline!)
@@ -4132,7 +4140,7 @@ public enum RawMetalForward {
         }
         let totalRows = M * numHeads
         let total = totalRows * HD
-        guard let bx = x.asType(.float16).asMTLBuffer(device: device, noCopy: false) else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(_ropeRowsPipeline!)
