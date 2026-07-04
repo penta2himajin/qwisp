@@ -25,6 +25,7 @@ public enum RawSpecRunner {
         let stepArgmax: ([Int32]) -> [Int]?
         let snapshot: () -> Any
         let rollback: (Any) -> Void
+        var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
     }
 
     /// forward+lm_head+MLX argMax による stepArgmax 合成(composed 用 fallback)。
@@ -70,7 +71,7 @@ public enum RawSpecRunner {
         } else {
             step = makeStepArgmax(engine: engine, forward: forward)
         }
-        return SpecBackend(
+        var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
             snapshot: { fwd.snapshot() },
@@ -78,6 +79,12 @@ public enum RawSpecRunner {
                 guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
+        // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
+        // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
+        if fwd.head != nil {
+            backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
+        }
+        return backend
     }
 
     /// streaming fused backend(strict segmented per-layer CB)。
@@ -98,7 +105,7 @@ public enum RawSpecRunner {
         } else {
             step = makeStepArgmax(engine: engine, forward: forward)
         }
-        let backend = SpecBackend(
+        var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
             snapshot: { fwd.snapshot() },
@@ -106,6 +113,10 @@ public enum RawSpecRunner {
                 guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
+        // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
+        if fwd.head != nil {
+            backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
+        }
         return (backend, fwd, providers)
     }
 
@@ -325,6 +336,11 @@ public enum RawSpecRunner {
         var pending: [Int] = []  // A3: tokens committed but not yet realized in cache
         // pendingCap = 24 (already declared above for maxM computation)
 
+        // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
+        // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
+        // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
+        let chainK = Tell.envInt("QWISP_CHAIN_K", 0)
+
         let t0 = DispatchTime.now()
 
         while out.count < N {
@@ -336,6 +352,22 @@ public enum RawSpecRunner {
 
             if D == 0 {
                 // No draft available
+                // Phase II-a chain path: only the non-A3 / empty-pending greedy span.
+                // chainedStepArgmax is bit-exact to K sequential stepArgmax([t]) calls, so OUT_TOKENS
+                // stays byte-identical to per-step while collapsing K CPU round-trips to 1.
+                if chainK > 0, let chainFn = backend.chainedStepArgmax,
+                   (!useA3 || pending.isEmpty) {
+                    if let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
+                        out.append(u); hist.append(u)
+                        let addN = Swift.min(chainResult.count - 1, N - out.count)
+                        for i in 0 ..< addN {
+                            out.append(chainResult[i]); hist.append(chainResult[i])
+                        }
+                        u = chainResult[chainResult.count - 1]
+                        steps += 1; continue
+                    }
+                    // chain returned nil (e.g. strict mode) → fall through to per-step
+                }
                 if useA3 && !pending.isEmpty {
                     // A3 D==0 path: stepArgmax on [pending, u] (batched)
                     let stepTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)]

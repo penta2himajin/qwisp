@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 46
+        let total = 48
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2321,6 +2321,248 @@ public enum RawVerifyTests {
                 outGot.eval()
                 let (ok, d) = bitEqual(outGot, outRef)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // ── Phase II-a G1 gate: K-step chained greedy decode tests (47-48) ──────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/09-phase2-token-feedback-spec.md §4.
+        //
+        // Model geometry: same 2-layer mini-model as tests 25–28 (stH/stE/stI,
+        // resident mode, no providers). Small vocab V=256 keeps embed/lm_head cheap.
+        // Stub returns nil → both tests RED. GREEN-by-delegation is explicitly forbidden:
+        // the stub must not call stepArgmax or forwardRows (nil-return contract enforces this).
+
+        // Test 47 (II-a G1-bitexact): chained_greedy_bitexact
+        // chainedStepArgmax(K) K-token list + post-chain cache state (KV len/contents,
+        // GDN conv+rec state) bit-equal to K sequential stepArgmax([t]) calls, K ∈ {2, 3, 8}.
+        // Both engines start from identical random initial cache state and shared head weights.
+        // Adversarial cases: K=2 (minimal chain), K=3 (odd, non-power-of-2), K=8 (8×GDN/attn steps).
+        run("chained_greedy_bitexact") {
+            let V = 256   // small vocab — embed/lm_head stay cheap in test
+            // Shared layer weights (same objects passed to both chain and ref engines)
+            let moeC0 = stMkMoE(), moeC1 = stMkMoE()
+            let gdnWC = stMkGdnW(), attnWC = stMkAttnW()
+            let iLNC0 = MLXRandom.normal([stH]).asType(.float16)
+            let pLNC0 = MLXRandom.normal([stH]).asType(.float16)
+            let iLNC1 = MLXRandom.normal([stH]).asType(.float16)
+            let pLNC1 = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([iLNC0, pLNC0, iLNC1, pLNC1])
+            let layerSpecsC = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLNC0, postLN: pLNC0,
+                    gdn: gdnWC, attn: nil, moe: moeC0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLNC1, postLN: pLNC1,
+                    gdn: nil, attn: attnWC, moe: moeC1.w, moeE: stE, moeI: stI),
+            ]
+            // Initial cache state — same values for all K iterations; each engine gets its own copy
+            let csC = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rsC = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kcC = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)   // 8 initial KV positions
+            let vcC = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([csC, rsC, kcC, vcC])
+            func freshCachesC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: csC, recState: rsC),
+                 RawVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
+            }
+            // Shared head weights (same objects for both engines — embed = lm_head = 4-bit q)
+            let ewf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewq, esc, ebiOpt) = MLX.quantized(ewf, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebi = ebiOpt else { return (false, "embed biases nil") }
+            let lwf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwq, lsc, lbiOpt) = MLX.quantized(lwf, groupSize: 64, bits: 4, mode: .affine)
+            guard let lbi = lbiOpt else { return (false, "lm biases nil") }
+            let fnWC = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewq, esc, ebi, lwq, lsc, lbi, fnWC])
+            // maxSeqLen: initial 8 + up to K=8 steps + margin = 32
+            let maxSeqC = 32
+            // Fixed seed token within [0, V)
+            let firstToken = Int32(7)
+            for K in [2, 3, 8] {
+                // Chain engine — will call chainedStepArgmax (stub → RED)
+                guard let eng1 = RawFusedVerify.RawFusedForward(
+                        layers: layerSpecsC, caches: freshCachesC(),
+                        maxM: 4, H: stH, maxSeqLen: maxSeqC)
+                else { return (false, "init eng1 nil K=\(K)") }
+                guard eng1.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                      lmW: lwq, lmS: lsc, lmB: lbi,
+                                      fnW: fnWC, vocab: V)
+                else { return (false, "attachHead eng1 nil K=\(K)") }
+                // Reference engine — will call stepArgmax K times
+                guard let eng2 = RawFusedVerify.RawFusedForward(
+                        layers: layerSpecsC, caches: freshCachesC(),
+                        maxM: 4, H: stH, maxSeqLen: maxSeqC)
+                else { return (false, "init eng2 nil K=\(K)") }
+                guard eng2.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                      lmW: lwq, lmS: lsc, lmB: lbi,
+                                      fnW: fnWC, vocab: V)
+                else { return (false, "attachHead eng2 nil K=\(K)") }
+                // STUB returns nil → test goes RED here (K=2 on first iteration)
+                guard let gotTokens = eng1.chainedStepArgmax(firstToken, K: K)
+                else { return (false, "not implemented (K=\(K))") }
+                if gotTokens.count != K {
+                    return (false, "token count K=\(K): got=\(gotTokens.count) want=\(K)")
+                }
+                // Reference: K sequential single-token stepArgmax calls
+                var refTokens: [Int] = []
+                var cur = firstToken
+                for step in 0..<K {
+                    guard let t = eng2.stepArgmax([cur])
+                    else { return (false, "ref stepArgmax nil K=\(K) step=\(step)") }
+                    refTokens.append(t[0])
+                    cur = Int32(t[0])
+                }
+                // Token list must be bit-equal
+                if gotTokens != refTokens {
+                    return (false, "tokens K=\(K): got=\(gotTokens) ref=\(refTokens)")
+                }
+                // KV len must match for every layer
+                let snap1 = eng1.snapshot(), snap2 = eng2.snapshot()
+                for li in 0..<layerSpecsC.count {
+                    if snap1.kvLens[li] != snap2.kvLens[li] {
+                        return (false, "kvLen K=\(K) layer=\(li): got=\(snap1.kvLens[li]) ref=\(snap2.kvLens[li])")
+                    }
+                }
+                // KV cache contents: layer 1 (attn). readLayerCache returns [KV, len, D] (already sliced)
+                let (k1c, v1c) = eng1.readLayerCache(1)
+                let (k2c, v2c) = eng2.readLayerCache(1)
+                for (nm, ca, cb) in [("kCache", k1c, k2c), ("vCache", v1c, v2c)] {
+                    guard let aa = ca, let bb = cb else { return (false, "KV cache nil K=\(K) \(nm)") }
+                    aa.eval(); bb.eval()
+                    let (ok, d) = bitEqual(aa, bb)
+                    if !ok { return (false, "K=\(K) \(nm): \(d)") }
+                }
+                // GDN state: layer 0. readLayerCache returns (convState [K-1,C], recState [1,Hv,Dv,Dk])
+                let (gconv1, grec1) = eng1.readLayerCache(0)
+                let (gconv2, grec2) = eng2.readLayerCache(0)
+                for (nm, ca, cb) in [("convState", gconv1, gconv2), ("recState", grec1, grec2)] {
+                    guard let aa = ca, let bb = cb else { return (false, "GDN state nil K=\(K) \(nm)") }
+                    aa.eval(); bb.eval()
+                    let (ok, d) = bitEqual(aa, bb)
+                    if !ok { return (false, "K=\(K) \(nm): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 48 (II-a G1-boundary): chained_boundary
+        // chain→per-step→chain interleave stays bit-exact:
+        //   interleaved: chainedStepArgmax(K1=3) → stepArgmax×K2=2 → chainedStepArgmax(K3=4)
+        //   reference:   stepArgmax×(K1+K2+K3=9) sequential
+        // Token list and final cache state (KV + GDN) both bit-equal.
+        // Stub nil → RED at the very first chain call (phase 1).
+        run("chained_boundary") {
+            let V = 256
+            let K1 = 3, K2 = 2, K3 = 4   // chain-step-chain counts; total = K1+K2+K3 = 9
+            let moeB0 = stMkMoE(), moeB1 = stMkMoE()
+            let gdnWB = stMkGdnW(), attnWB = stMkAttnW()
+            let iLNB0 = MLXRandom.normal([stH]).asType(.float16)
+            let pLNB0 = MLXRandom.normal([stH]).asType(.float16)
+            let iLNB1 = MLXRandom.normal([stH]).asType(.float16)
+            let pLNB1 = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([iLNB0, pLNB0, iLNB1, pLNB1])
+            let layerSpecsB = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLNB0, postLN: pLNB0,
+                    gdn: gdnWB, attn: nil, moe: moeB0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLNB1, postLN: pLNB1,
+                    gdn: nil, attn: attnWB, moe: moeB1.w, moeE: stE, moeI: stI),
+            ]
+            let csB = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rsB = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kcB = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vcB = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([csB, rsB, kcB, vcB])
+            func freshCachesB() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: csB, recState: rsB),
+                 RawVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
+            }
+            let ewfB = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewqB, escB, ebiOptB) = MLX.quantized(ewfB, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebiB = ebiOptB else { return (false, "embed biases nil") }
+            let lwfB = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwqB, lscB, lbiOptB) = MLX.quantized(lwfB, groupSize: 64, bits: 4, mode: .affine)
+            guard let lbiB = lbiOptB else { return (false, "lm biases nil") }
+            let fnWB = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewqB, escB, ebiB, lwqB, lscB, lbiB, fnWB])
+            // maxSeqLen: initial 8 + total K1+K2+K3=9 steps + margin = 32
+            let maxSeqB = 32
+            let seedToken = Int32(13)
+            // Interleaved engine (chain → step × K2 → chain)
+            guard let engC = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecsB, caches: freshCachesB(),
+                    maxM: 4, H: stH, maxSeqLen: maxSeqB)
+            else { return (false, "init engC nil") }
+            guard engC.attachHead(embedW: ewqB, embedS: escB, embedB: ebiB,
+                                   lmW: lwqB, lmS: lscB, lmB: lbiB,
+                                   fnW: fnWB, vocab: V)
+            else { return (false, "attachHead engC nil") }
+            // Reference engine (all sequential stepArgmax)
+            guard let engR = RawFusedVerify.RawFusedForward(
+                    layers: layerSpecsB, caches: freshCachesB(),
+                    maxM: 4, H: stH, maxSeqLen: maxSeqB)
+            else { return (false, "init engR nil") }
+            guard engR.attachHead(embedW: ewqB, embedS: escB, embedB: ebiB,
+                                   lmW: lwqB, lmS: lscB, lmB: lbiB,
+                                   fnW: fnWB, vocab: V)
+            else { return (false, "attachHead engR nil") }
+            // Phase 1: chain K1 steps (STUB → nil → RED immediately)
+            guard let phase1Toks = engC.chainedStepArgmax(seedToken, K: K1)
+            else { return (false, "not implemented (chain phase1)") }
+            var refCur = seedToken
+            var refAll: [Int] = []
+            for _ in 0..<K1 {
+                guard let t = engR.stepArgmax([refCur]) else { return (false, "ref stepArgmax K1") }
+                refAll.append(t[0]); refCur = Int32(t[0])
+            }
+            if phase1Toks != Array(refAll[0..<K1]) {
+                return (false, "phase1 tokens: got=\(phase1Toks) ref=\(Array(refAll[0..<K1]))")
+            }
+            // Phase 2: K2 per-step calls on engC (simulating spec verification / greedy resumption)
+            var chainCur = Int32(phase1Toks.last!)
+            for _ in 0..<K2 {
+                guard let ct = engC.stepArgmax([chainCur]) else { return (false, "engC stepArgmax K2") }
+                guard let rt = engR.stepArgmax([refCur])   else { return (false, "engR stepArgmax K2") }
+                if ct[0] != rt[0] { return (false, "phase2 token mismatch: got=\(ct[0]) ref=\(rt[0])") }
+                refAll.append(rt[0]); chainCur = Int32(ct[0]); refCur = Int32(rt[0])
+            }
+            // Phase 3: chain K3 steps (will also be nil if stub is still nil — but RED is at phase1)
+            guard let phase3Toks = engC.chainedStepArgmax(chainCur, K: K3)
+            else { return (false, "not implemented (chain phase3)") }
+            for _ in 0..<K3 {
+                guard let t = engR.stepArgmax([refCur]) else { return (false, "ref stepArgmax K3") }
+                refAll.append(t[0]); refCur = Int32(t[0])
+            }
+            let refPhase3 = Array(refAll[K1+K2 ..< K1+K2+K3])
+            if phase3Toks != refPhase3 {
+                return (false, "phase3 tokens: got=\(phase3Toks) ref=\(refPhase3)")
+            }
+            // Final cache state comparison (KV + GDN)
+            let snapC = engC.snapshot(), snapR = engR.snapshot()
+            for li in 0..<layerSpecsB.count {
+                if snapC.kvLens[li] != snapR.kvLens[li] {
+                    return (false, "final kvLen layer=\(li): got=\(snapC.kvLens[li]) ref=\(snapR.kvLens[li])")
+                }
+            }
+            let (fkC, fvC) = engC.readLayerCache(1)
+            let (fkR, fvR) = engR.readLayerCache(1)
+            for (nm, ca, cb) in [("kCache", fkC, fkR), ("vCache", fvC, fvR)] {
+                guard let aa = ca, let bb = cb else { return (false, "final KV nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "final \(nm): \(d)") }
+            }
+            let (fcC, frC) = engC.readLayerCache(0)
+            let (fcR, frR) = engR.readLayerCache(0)
+            for (nm, ca, cb) in [("convState", fcC, fcR), ("recState", frC, frR)] {
+                guard let aa = ca, let bb = cb else { return (false, "final GDN nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "final \(nm): \(d)") }
             }
             return (true, "ok")
         }

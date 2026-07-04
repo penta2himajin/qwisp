@@ -3149,6 +3149,99 @@ public enum RawFusedVerify {
             if let kv = L.kvCache { let (k, v) = RawFusedVerify.readKVCache(kv); return (k, v) }
             return (nil, nil)
         }
+
+        /// Phase II-a G1 gate: K-step chained greedy decode in a single GPU command buffer.
+        /// Encodes K greedy steps using indirect embed (step k+1 reads GPU-side tokensOut from
+        /// step k, no CPU round-trip). firstToken is the seed input for step 0.
+        /// Returns K token ids [t_0, ..., t_{K-1}] and advances KV/GDN cache state identically
+        /// to K sequential stepArgmax([t_i]) calls.
+        ///
+        /// STUB — implementation pending.
+        /// NOTE: Delegation to forwardRows or stepArgmax in this stub is FORBIDDEN per §4-G1.
+        public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
+            guard let hd = head, K > 0 else { return nil }
+            guard streamMode == .resident || streamMode == .bolt else { return nil }
+
+            // Write seed token for step 0 (CPU → shared buffer; GPU reads it inside the CB).
+            hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM)[0] = firstToken
+
+            // Per-call chain output buffer (avoids the maxM size limit on hd.tokensOut —
+            // the test uses maxM=4 with K=8, so hd.tokensOut cannot hold K int32s).
+            guard let chainBuf = device.makeBuffer(
+                length: K * MemoryLayout<Int32>.stride, options: .storageModeShared
+            ) else { return nil }
+
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+
+            let ep = RawFusedVerify._embedRowsPipeline!
+            let ap = RawFusedVerify._argmaxRowsPipeline!
+
+            for k in 0 ..< K {
+                // ── Embed 1 token ──────────────────────────────────────────────────
+                // Step 0: reads firstToken from hd.tokensIn (CPU-written before CB encode).
+                // Step k>0: indirect embed — reads GPU-written chainBuf[k-1] (no CPU round-trip).
+                enc.setComputePipelineState(ep)
+                enc.setBuffer(hd.embedW, offset: 0, index: 0)
+                enc.setBuffer(hd.embedS, offset: 0, index: 1)
+                enc.setBuffer(hd.embedB, offset: 0, index: 2)
+                if k == 0 {
+                    enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+                } else {
+                    enc.setBuffer(chainBuf, offset: (k - 1) * MemoryLayout<Int32>.stride, index: 3)
+                }
+                enc.setBuffer(hBuf, offset: 0, index: 4)
+                var hh = UInt32(H), tt = UInt32(H)   // M=1 → total = H
+                enc.setBytes(&hh, length: 4, index: 5)
+                enc.setBytes(&tt, length: 4, index: 6)
+                let tgs = min(ep.maxTotalThreadsPerThreadgroup, 256)
+                enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: tgs, height: 1, depth: 1))
+
+                // ── All layers M=1 ─────────────────────────────────────────────────
+                // encodeLayer/encodeLayerBolt internally call gc.swapState() and kv.len += 1
+                // at encode time (CPU pointer swap / counter bump), giving correct ping-pong
+                // and KV position for each step. The encode captures MTLBuffer objects (not
+                // variable bindings), so sequential encodes within this single CB are independent
+                // and memory-coherent on GPU (Metal guarantees program-order dispatch + barrier).
+                if streamMode == .bolt {
+                    for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: 1, li: li) }
+                } else {
+                    for L in layers { encodeLayer(enc, L, M: 1) }
+                }
+
+                // ── Final ops: fnorm + lm_head + argmax → chainBuf[k] ─────────────
+                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed,
+                                                 rows: 1, D: H, eps: eps)
+                if RawFusedForward.lmHeadQmv {
+                    RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                                 x: normed, out: hd.logits, M: 1, K: H, N: hd.vocab)
+                } else {
+                    let qp = RawMetalForward._qmm4TiledPipeline!
+                    enc.setComputePipelineState(qp)
+                    enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+                    enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
+                    enc.setBuffer(hd.logits, offset: 0, index: 4)
+                    var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(1)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+                    enc.setBytes(&mm, length: 4, index: 7)
+                    enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                }
+                enc.setComputePipelineState(ap)
+                enc.setBuffer(hd.logits, offset: 0, index: 0)
+                enc.setBuffer(chainBuf, offset: k * MemoryLayout<Int32>.stride, index: 1)
+                var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+            let ptr = chainBuf.contents().bindMemory(to: Int32.self, capacity: K)
+            return (0 ..< K).map { Int(ptr[$0]) }
+        }
     }
 
     // ── G1 gate: gqmm4_swiglu_rows stub (notes/06-fusion-poc-spec.md §4) ──────────────
