@@ -45,38 +45,44 @@ public enum RawFusedProf {
         // fusion 原子 A/B(同一プロセス・interleave・paired delta)— campaign G5 gate 用。
         // プロセス間比較(model load 毎の状態差)の σ~150µs を、ペア内相殺で ~10µs 台に落とす。
         if RawFusedVerify.RawFusedForward.fuseGU || ProcessInfo.processInfo.environment["QWISP_PROF_AB"] == "1" {
-            let saved = RawFusedVerify.RawFusedForward.fuseGU
-            out += "\n  [fuseGU A/B paired] (off→on 交互, delta=off−on, +が fused 速; cache長は rollback で固定)"
-            for M in [1, 8, 17] {
-                let toks = (0 ..< M).map { _ in cur }
-                // ★cache 長を全 step で同一に固定(snapshot→毎 step 後 rollback)。
-                // これ無しでは SDPA コストが reps 中に伸び、ペア内バイアス+ドリフトで σ~ms 級になる。
-                let snap = fwd.snapshot()
-                func stepFixed() -> Double {
-                    _ = fwd.stepArgmax(toks)
-                    let g = RawFusedVerify.RawFusedForward.profLastGPUMs
-                    fwd.rollbackOneStep(snap)   // len 戻し(timing 用途: 数値状態は無関係、shape のみ)
-                    return g
+            // 汎用 paired A/B: 任意の fusion flag を off→on 交互で測る(campaign G5 gate 計測器)。
+            func pairedAB(_ label: String, set: (Bool) -> Void, restore: Bool) {
+                out += "\n  [\(label) A/B paired] (off→on 交互, delta=off−on, +が fused 速; cache長 rollback 固定, median 主読み)"
+                for M in [1, 8, 17] {
+                    let toks = (0 ..< M).map { _ in cur }
+                    // ★cache 長を全 step で同一に固定(snapshot→毎 step 後 rollback)。
+                    // これ無しでは SDPA コストが reps 中に伸び、ペア内バイアス+ドリフトで σ~ms 級になる。
+                    let snap = fwd.snapshot()
+                    func stepFixed() -> Double {
+                        _ = fwd.stepArgmax(toks)
+                        let g = RawFusedVerify.RawFusedForward.profLastGPUMs
+                        fwd.rollbackOneStep(snap)   // len 戻し(timing 用途: 数値状態は無関係、shape のみ)
+                        return g
+                    }
+                    set(false)
+                    for _ in 0 ..< 3 { _ = stepFixed() }   // warm
+                    var deltas: [Double] = []
+                    for _ in 0 ..< 15 {
+                        set(false)
+                        _ = stepFixed()                     // settle
+                        let off = stepFixed()
+                        set(true)
+                        _ = stepFixed()
+                        let on = stepFixed()
+                        deltas.append(off - on)
+                    }
+                    set(restore)
+                    deltas.sort()
+                    let mean = deltas.reduce(0, +) / Double(deltas.count)
+                    let med = deltas[deltas.count / 2]
+                    let sd = (deltas.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(deltas.count - 1)).squareRoot()
+                    out += String(format: "\n    M=%2d: delta mean=%+.0fµs med=%+.0fµs ± %.0fµs (n=%d)", M, mean * 1000, med * 1000, sd * 1000, deltas.count)
                 }
-                RawFusedVerify.RawFusedForward.fuseGU = false
-                for _ in 0 ..< 3 { _ = stepFixed() }   // warm
-                var deltas: [Double] = []
-                for _ in 0 ..< 15 {
-                    RawFusedVerify.RawFusedForward.fuseGU = false
-                    _ = stepFixed()                     // settle
-                    let off = stepFixed()
-                    RawFusedVerify.RawFusedForward.fuseGU = true
-                    _ = stepFixed()
-                    let on = stepFixed()
-                    deltas.append(off - on)
-                }
-                RawFusedVerify.RawFusedForward.fuseGU = saved
-                deltas.sort()
-                let mean = deltas.reduce(0, +) / Double(deltas.count)
-                let med = deltas[deltas.count / 2]
-                let sd = (deltas.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(deltas.count - 1)).squareRoot()
-                out += String(format: "\n    M=%2d: delta mean=%+.0fµs med=%+.0fµs ± %.0fµs (n=%d)", M, mean * 1000, med * 1000, sd * 1000, deltas.count)
             }
+            let savedGU = RawFusedVerify.RawFusedForward.fuseGU
+            pairedAB("fuseGU", set: { RawFusedVerify.RawFusedForward.fuseGU = $0 }, restore: savedGU)
+            let savedGDN = RawFusedVerify.RawFusedForward.fuseGDN
+            pairedAB("fuseGDN", set: { RawFusedVerify.RawFusedForward.fuseGDN = $0 }, restore: savedGDN)
         }
 
         // segment 分解(M=1): forwardRows(40層+norm)GPU vs stepArgmax(全体)GPU の差 = lm_head+head

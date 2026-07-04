@@ -214,6 +214,13 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _computeGBetaRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _embedRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _argmaxRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _convShiftFusedRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _normGateFusedPipeline: MTLComputePipelineState?        // f16 weight (non-promote)
+    nonisolated(unsafe) static var _normGateFusedF32Pipeline: MTLComputePipelineState?    // f32 weight (promote)
+    // ── Wave 1 GDN fusion re-design (notes/07 §6) — F1 demux + F4 true fused norm+gate ──
+    nonisolated(unsafe) static var _qmmInProjDemuxRowsPipeline: MTLComputePipelineState?   // F1: 1 qmm4 over concat weights → 4 out buffers
+    nonisolated(unsafe) static var _gdnNormGateRowsPipeline: MTLComputePipelineState?      // F4: f16 weight (non-promote)
+    nonisolated(unsafe) static var _gdnNormGateRowsF32Pipeline: MTLComputePipelineState?   // F4: f32 weight (promote)
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
@@ -222,7 +229,11 @@ public enum RawFusedVerify {
         if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil
             && _convHistRowsPipeline != nil && _shiftConvRowsPipeline != nil
             && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil
-            && _embedRowsPipeline != nil && _argmaxRowsPipeline != nil { return true }
+            && _embedRowsPipeline != nil && _argmaxRowsPipeline != nil
+            && _convShiftFusedRowsPipeline != nil
+            && _normGateFusedPipeline != nil && _normGateFusedF32Pipeline != nil
+            && _qmmInProjDemuxRowsPipeline != nil
+            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -375,8 +386,297 @@ public enum RawFusedVerify {
             _computeGBetaRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_g_beta_rows")!)
             _embedRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "embed_rows_q4")!)
             _argmaxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_rows")!)
+            // ── Wave 1 GDN fusion kernels (notes/07 §3) — separate library(f32 weight variant) ──
+            try ensureGdnFusionPipelines(device)
             return true
         } catch { print("[raw-fused-aux] compile: \(error)"); return false }
+    }
+
+    /// ── Wave 1 GDN fusion pipelines (notes/07 §3) — separate compile(bilingual weight dtype) ──
+    /// conv_shift_fused_rows: 1 dispatch producing BOTH convOut[M,C] (= conv1d_silu_hist_rows
+    ///   arithmetic replicated verbatim) AND histOut[K-1,C] (= shift_conv_rows arithmetic).
+    ///   Single 2D grid C×(M+1) packed: rows [0,M) compute convOut, row M sweeps histOut.
+    /// norm_gate_fused / norm_gate_fused_f32: per-head rmsnorm(reduction tree identical to the
+    ///   existing rmsnorm kernel incl. N_READS=4 + simd_sum two-stage + precise::rsqrt, fully
+    ///   templated on WT) then silu(z)·normed applied in registers.
+    static func ensureGdnFusionPipelines(_ device: MTLDevice) throws {
+        if _convShiftFusedRowsPipeline != nil
+            && _normGateFusedPipeline != nil && _normGateFusedF32Pipeline != nil
+            && _qmmInProjDemuxRowsPipeline != nil
+            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil { return }
+        let srcStatic = """
+        #include <metal_stdlib>
+        #include <metal_simdgroup>
+        using namespace metal;
+        // conv1d_silu_hist + shift_conv in one packed 2D dispatch.
+        // Arithmetic is byte-for-byte the existing two kernels (same order/precision).
+        kernel void conv_shift_fused_rows(device const half* hist  [[buffer(0)]],
+                                          device const half* qkv   [[buffer(1)]],
+                                          device const float* w    [[buffer(2)]],
+                                          device half* convOut     [[buffer(3)]],
+                                          device half* histOut     [[buffer(4)]],
+                                          constant uint& K [[buffer(5)]], constant uint& C [[buffer(6)]],
+                                          constant uint& M [[buffer(7)]],
+                                          uint2 pos [[thread_position_in_grid]]) {
+            uint c = pos.x;
+            if (c >= C) return;
+            if (pos.y < M) {
+                uint m = pos.y;
+                float acc = 0.0f;
+                for (uint k = 0; k < K; ++k) {
+                    uint idx = m + k;
+                    float xv = (idx < K - 1) ? (float)hist[idx*C + c] : (float)qkv[(idx - (K-1))*C + c];
+                    acc += xv * w[c*K + k];
+                }
+                float ax = metal::abs(acc);
+                float y = 1.0f / (1.0f + precise::exp(ax));
+                float s = (acc < 0.0f) ? y : (1.0f - y);
+                convOut[m*C + c] = (half)(acc * s);
+            } else if (pos.y == M) {
+                // shift_conv_rows: histOut[j*C+c] = (hist‖qkv)[M+j][c], j∈[0,K-1)
+                for (uint j = 0; j + 1 < K; ++j) {
+                    uint src = M + j;
+                    histOut[j*C + c] = (src < K - 1) ? hist[src*C + c] : qkv[(src - (K-1))*C + c];
+                }
+            }
+        }
+        // ── F1 re-design (§6): qmm4_inproj_demux_rows — ONE qmm4 over concatenated weights
+        //   [totalN, K] 4-bit; each threadgroup (8 output cols, multiples-of-8 boundaries) selects
+        //   which of FOUR output buffers (qkv/z/bP/aP) to write at the right local offset.
+        //   Dot arithmetic / accumulation order is byte-identical to qmm4_rows → bit-exact.
+        inline float ld16_demux(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) {
+                sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                xt[i]   = x[i];
+                xt[i+1] = x[i+1] / 16.0f;
+                xt[i+2] = x[i+2] / 256.0f;
+                xt[i+3] = x[i+3] / 4096.0f;
+            }
+            return sum;
+        }
+        inline float qd4_demux(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                          xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                          xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                          xt[4*i+3] * (float)(ws[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void qmm4_inproj_demux_rows(device const uint32_t* w   [[buffer(0)]],
+                                           device const half*  scales [[buffer(1)]],
+                                           device const half*  biases [[buffer(2)]],
+                                           device const half*  x      [[buffer(3)]],
+                                           device half*  yQkv         [[buffer(4)]],
+                                           device half*  yZ           [[buffer(5)]],
+                                           device half*  yB           [[buffer(6)]],
+                                           device half*  yA           [[buffer(7)]],
+                                           constant int& in_vec_size  [[buffer(8)]],   // K
+                                           constant int& out_vec_size [[buffer(9)]],   // totalN
+                                           constant int& qkvN         [[buffer(10)]],
+                                           constant int& zN           [[buffer(11)]],
+                                           constant int& bN           [[buffer(12)]],
+                                           device const int* stopFlag [[buffer(16)]],
+                                           uint3 tid      [[threadgroup_position_in_grid]],
+                                           uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                                           uint  simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 4;
+            constexpr int pack_factor = 8;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = 512;
+            constexpr int scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[16];
+            thread U result[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            // Demux: 8-col threadgroup block never straddles a boundary (all dims %8==0).
+            // ws/scales/biases use the absolute out_row (concat layout); y is remapped to local.
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            device half* y; int bufN; int localRow;
+            int zEnd = qkvN + zN, bEnd = zEnd + bN;
+            if (out_row < qkvN)      { y = yQkv; bufN = qkvN;  localRow = out_row; }
+            else if (out_row < zEnd) { y = yZ;   bufN = zN;    localRow = out_row - qkvN; }
+            else if (out_row < bEnd) { y = yB;   bufN = bN;    localRow = out_row - zEnd; }
+            else                     { y = yA;   bufN = out_vec_size - bEnd; localRow = out_row - bEnd; }
+            x += tid.x * in_vec_size + simd_lid * values_per_thread;
+            y += tid.x * bufN + localRow;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16_demux(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U b = bl[0];
+                    result[row] += qd4_demux(wl, x_thread, s, b, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
+        // ── F4 re-design (§6): gdn_norm_gate_rows — TRUE single-dispatch kernel.
+        //   1 threadgroup per (m, head): per-head rmsnorm over Dv with reduction tree
+        //   byte-identical to the existing rmsnorm kernel (N_READS=4, simd_sum two-stage,
+        //   precise::rsqrt, same eps handling, same threadgroup size), then silu(z)⊙ applied
+        //   in registers. f16 (non-promote) + promoteF32 (f32 weight) variants.
+        //   Reproduces rmsnorm→gate[/gate16] chain bit-exactly: normed = w·(WT)(x·inv_mean)
+        //   then outV = (half)(silu(z) · (float)normed).
+        """
+        // Generate two concrete kernel variants (half / float weight) from one body template
+        // via Swift string interpolation — avoids C-preprocessor macro backslash pitfalls in
+        // Swift multiline string literals.
+        func normGateKernel(_ NAME: String, _ WT: String) -> String {
+            return """
+            kernel void \(NAME)(device const half* x   [[buffer(0)]],
+                                device const half* z   [[buffer(1)]],
+                                device const \(WT)*  w    [[buffer(2)]],
+                                device half* outV      [[buffer(3)]],
+                                constant float&  eps        [[buffer(4)]],
+                                constant uint&   axis_size  [[buffer(5)]],
+                                constant uint&   w_stride   [[buffer(6)]],
+                                device const int* stopFlag [[buffer(16)]],
+                                uint gid [[threadgroup_position_in_grid]],
+                                uint lid [[thread_position_in_threadgroup]],
+                                uint simd_lane_id  [[thread_index_in_simdgroup]],
+                                uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+                if (stopFlag[0] != 0) return;
+                constexpr int N_READS = 4;
+                constexpr int SIMD_SIZE = 32;
+                threadgroup float local_inv_mean[1];
+                threadgroup float local_sums[SIMD_SIZE];
+                float acc = 0;
+                x += gid * (size_t)axis_size + lid * N_READS;
+                w += (size_t)w_stride * lid * N_READS;
+                if (lid * N_READS + N_READS <= axis_size) {
+                    for (int i = 0; i < N_READS; i++) { float xi = x[i]; acc += xi * xi; }
+                } else {
+                    for (int i = 0; i < N_READS; i++) { if ((lid*N_READS+i) < axis_size) { float xi = x[i]; acc += xi*xi; } }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / axis_size + eps);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                z += gid * (size_t)axis_size + lid * N_READS;
+                outV += gid * (size_t)axis_size + lid * N_READS;
+                float inv = local_inv_mean[0];
+                if (lid * N_READS + N_READS <= axis_size) {
+                    for (int i = 0; i < N_READS; i++) {
+                        float nrm = (float)(w[w_stride*i] * (\(WT))((float)x[i] * inv));
+                        float zf = (float)z[i];
+                        float y = 1.0f / (1.0f + exp(metal::abs(zf)));
+                        float s = (zf < 0.0f) ? y : (1.0f - y);
+                        outV[i] = (half)((zf * s) * nrm);
+                    }
+                } else {
+                    for (int i = 0; i < N_READS; i++) {
+                        if ((lid*N_READS+i) < axis_size) {
+                            float nrm = (float)(w[w_stride*i] * (\(WT))((float)x[i] * inv));
+                            float zf = (float)z[i];
+                            float y = 1.0f / (1.0f + exp(metal::abs(zf)));
+                            float s = (zf < 0.0f) ? y : (1.0f - y);
+                            outV[i] = (half)((zf * s) * nrm);
+                        }
+                    }
+                }
+            }
+            """
+        }
+        let src = srcStatic + "\n" + normGateKernel("gdn_norm_gate_rows", "half") + "\n" + normGateKernel("gdn_norm_gate_rows_f32", "float")
+        // ── Wave 1 conv+shift fused kernel only. norm+gate fusion is realised at the encode level
+        // (chaining the existing _rmsPipeline[_F32] and _gate[_16] in one encoder = bit-exact by
+        // construction and reduces the wave-1 dispatch count by 1 with no kernel duplication).
+        let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+        _convShiftFusedRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv_shift_fused_rows")!)
+        _qmmInProjDemuxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_inproj_demux_rows")!)
+        _gdnNormGateRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_norm_gate_rows")!)
+        _gdnNormGateRowsF32Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_norm_gate_rows_f32")!)
+        // norm+gate: reuse existing per-op kernels chained in one encoder (bit-exact by construction).
+        _normGateFusedPipeline = RawMetalForward._rmsPipeline
+        _normGateFusedF32Pipeline = RawMetalForward._rmsPipelineF32
+    }
+
+    /// encodeGdnFusionConvShift: drive conv_shift_fused_rows in a single command buffer record.
+    static func encodeGdnFusionConvShift(_ enc: MTLComputeCommandEncoder, hist: MTLBuffer, qkv: MTLBuffer,
+                                         w: MTLBuffer, convOut: MTLBuffer, histOut: MTLBuffer,
+                                         M: Int, K: Int, C: Int) {
+        let p = _convShiftFusedRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(hist, offset: 0, index: 0); enc.setBuffer(qkv, offset: 0, index: 1)
+        enc.setBuffer(w, offset: 0, index: 2); enc.setBuffer(convOut, offset: 0, index: 3)
+        enc.setBuffer(histOut, offset: 0, index: 4)
+        var kk = UInt32(K), cc = UInt32(C), mm = UInt32(M)
+        enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&cc, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+        enc.dispatchThreads(MTLSize(width: C, height: M + 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    /// F1 re-design (§6): encode qmm4_inproj_demux_rows — ONE qmm4 dispatch over the concatenated
+    /// in-proj weights [totalN, K] 4-bit, demuxing the 8-col threadgroup output blocks into FOUR
+    /// separate output buffers (qkv/z/bP/aP) at the right local offset. Bit-exact with 4 qmm4_rows.
+    /// Downstream kernels read the separate buffers unchanged. Dispatch grid = (M, totalN/8, 1).
+    static func encodeQmmInProjDemuxRows(_ enc: MTLComputeCommandEncoder,
+                                         w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                                         x: MTLBuffer,
+                                         outQkv: MTLBuffer, outZ: MTLBuffer, outB: MTLBuffer, outA: MTLBuffer,
+                                         M: Int, K: Int,
+                                         dims: (qkv: Int, z: Int, b: Int, a: Int)) {
+        let totalN = dims.qkv + dims.z + dims.b + dims.a
+        enc.setComputePipelineState(_qmmInProjDemuxRowsPipeline!)
+        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(outQkv, offset: 0, index: 4); enc.setBuffer(outZ, offset: 0, index: 5)
+        enc.setBuffer(outB, offset: 0, index: 6); enc.setBuffer(outA, offset: 0, index: 7)
+        var kk = Int32(K), nn = Int32(totalN)
+        var qkvN = Int32(dims.qkv), zN = Int32(dims.z), bN = Int32(dims.b)
+        enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&nn, length: 4, index: 9)
+        enc.setBytes(&qkvN, length: 4, index: 10); enc.setBytes(&zN, length: 4, index: 11); enc.setBytes(&bN, length: 4, index: 12)
+        RawMetalForward.bindStop(enc, 16)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: totalN / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    /// F4 re-design (§6): encode gdn_norm_gate_rows — ONE dispatch, 1 threadgroup per (m, head).
+    /// per-head rmsnorm over Dv (reduction tree identical to existing rmsnorm kernel) then
+    /// silu(z)⊙normed applied in registers, writing outV. Bit-exact with rmsNormRows + gate chain.
+    /// grid = M*Hv threadgroups; threadgroup size matches rmsnorm ((Dv/4 ceil 32)).
+    static func encodeGdnNormGateRows(_ enc: MTLComputeCommandEncoder,
+                                      coreOut: MTLBuffer, z: MTLBuffer, normWeight: MTLBuffer,
+                                      outV: MTLBuffer, M: Int, Hv: Int, Dv: Int,
+                                      eps: Float, promoteF32: Bool) {
+        let p = promoteF32 ? _gdnNormGateRowsF32Pipeline! : _gdnNormGateRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(coreOut, offset: 0, index: 0); enc.setBuffer(z, offset: 0, index: 1)
+        enc.setBuffer(normWeight, offset: 0, index: 2); enc.setBuffer(outV, offset: 0, index: 3)
+        var ee = eps, asz = UInt32(Dv), ws = UInt32(1)
+        enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&asz, length: 4, index: 5); enc.setBytes(&ws, length: 4, index: 6)
+        RawMetalForward.bindStop(enc, 16)
+        let tgNeeded = (Dv + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
+        enc.dispatchThreadgroups(MTLSize(width: M * Hv, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     }
 
     /// qmm8(router gate / shared gate logits)を encode-only で提供。qmm8 と同一 pipeline/dispatch。
@@ -637,8 +937,9 @@ public enum RawFusedVerify {
             RawMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
                                                 table: st, count: Mc * Ktop)
         }
-        // gather g/u + swiglu: flag-on で 1-dispatch 融合、flag-off で既存 3-kernel 連鎖(byte 不変)
-        if RawFusedForward.fuseGU {
+        // gather g/u + swiglu: flag-on で 1-dispatch 融合(但し M=1 のみ=register 圧迫退行)、
+        // flag-off or M>1 で既存 3-kernel 連鎖(byte 不変)。fuseGUActive(M) == (fuseGU && M==1)。
+        if RawFusedForward.fuseGUActive(M: Mc) ?? false {
             encodeGatherQmmSwigluRows(enc, wG: w.swGW, sG: w.swGS, bG: w.swGB,
                                       wU: w.swUW, sU: w.swUS, bU: w.swUB,
                                       x: x, inds: sc.inds, out: sc.h,
@@ -1199,6 +1500,11 @@ public enum RawFusedVerify {
         let promoteRMS: Bool
         let aLog: MTLBuffer, dtBias: MTLBuffer   // f32 [Hv]
         let onesDk: MTLBuffer           // f16 ones [Dk](qk-norm no-weight 用)
+        // ── Wave 1 GDN fusion(notes/07 §3)事前連結 in-proj 重み。QWISP_FUSE_GDN=1 時のみ使用。
+        //   prepareGdnLayerBufs で各 4-bit trio(qkv/z/b/a)を N 軸で連結し 1 本の qmm4_rows で撃つ。
+        //   gs=64 行独立性で bit-exact by construction。flag-off 時は nil(既存 4 dispatch 経路不変)。
+        let catInProjW: MTLBuffer?, catInProjS: MTLBuffer?, catInProjB: MTLBuffer?
+        let totalInProjN: Int        // convDim+valueDim+numVH+numVH(連結 N 軸幅)
         let retained: [MLXArray]        // zero-copy buffer の裏 array 保持(寿命規約)
     }
 
@@ -1226,10 +1532,32 @@ public enum RawFusedVerify {
               let al = RawMetalForward.mtlBuf(alA, device),
               let dt = RawMetalForward.mtlBuf(dtA, device),
               let od = RawMetalForward.mtlBuf(ones, device) else { return nil }
+        // ── Wave 1 GDN fusion: 連結 in-proj 4-bit trio(qkv‖z‖b‖a)を prepare 時に 1 回 build。
+        //   gs=64 行独立性で連結は bit-exact by construction。flag-on 時のみ使用(nil なら flag-off 経路)。
+        //   gdnInProjConcat は MLXArray 連結→retained に保持し noCopy buffer の寿命を守る。
+        //   ★§6 追加修正: ~190MB 無条件確保は 8GB tier に有害 → fuseGDN || QWISP_PROF_AB 時のみ build。
+        let profAB = ProcessInfo.processInfo.environment["QWISP_PROF_AB"] == "1"
+        var catWBuf: MTLBuffer? = nil, catSBuf: MTLBuffer? = nil, catBBuf: MTLBuffer? = nil
+        var totalInProjN = 0
+        if RawFusedForward.fuseGDN || profAB {
+            if let cat = gdnInProjConcat(qkvW: w.qkvWq, qkvS: w.qkvSc, qkvB: w.qkvBi,
+                                           zW: w.zWq,   zS: w.zSc,   zB: w.zBi,
+                                           bW: w.bWq,   bS: w.bSc,   bB: w.bBi,
+                                           aW: w.aWq,   aS: w.aSc,   aB: w.aBi) {
+                keep.append(contentsOf: [cat.w, cat.s, cat.b])
+                totalInProjN = cat.w.shape[0]
+                catWBuf = RawMetalForward.mtlBuf(cat.w, device)
+                catSBuf = RawMetalForward.mtlBuf(cat.s.asType(.float16), device)
+                catBBuf = RawMetalForward.mtlBuf(cat.b.asType(.float16), device)
+            }
+        }
+
         return GdnLayerBufs(qkvW: qkv.0, qkvS: qkv.1, qkvB: qkv.2, zW: z.0, zS: z.1, zB: z.2,
                             bW: b.0, bS: b.1, bB: b.2, aW: a.0, aS: a.1, aB: a.2,
                             outW: o.0, outS: o.1, outB: o.2,
                             conv1dW: cw, normWeight: nw, promoteRMS: promote, aLog: al, dtBias: dt, onesDk: od,
+                            catInProjW: catWBuf, catInProjS: catSBuf, catInProjB: catBBuf,
+                            totalInProjN: totalInProjN,
                             retained: keep)
     }
 
@@ -1321,15 +1649,36 @@ public enum RawFusedVerify {
         let valueDim = headVDim * numVHeads
         let convDim = keyDim * 2 + valueDim
         // ① in_proj ×4
-        encodeQmmRows(enc, w: w.qkvW, scales: w.qkvS, biases: w.qkvB, x: x, out: sc.qkv, M: M, K: H, N: convDim)
-        encodeQmmRows(enc, w: w.zW, scales: w.zS, biases: w.zB, x: x, out: sc.z, M: M, K: H, N: valueDim)
-        encodeQmmRows(enc, w: w.bW, scales: w.bS, biases: w.bB, x: x, out: sc.bP, M: M, K: H, N: numVHeads)
-        encodeQmmRows(enc, w: w.aW, scales: w.aS, biases: w.aB, x: x, out: sc.aP, M: M, K: H, N: numVHeads)
+        // F1 re-design (notes/07 §6): fuseGDN 時は concat 重み [totalN, H] に対し
+        // qmm4_inproj_demux_rows 1 dispatch で qkv/z/bP/aP の 4 buffer に書き分ける(−3/層)。
+        // dot 演算は既存 qmm4_rows と同一順 = bit-exact by construction。catInProjW は
+        // prepareGdnLayerBufs が fuseGDN||QWISP_PROF_AB 時のみ build(nil なら flag-off 4 dispatch へ)。
+        if RawFusedForward.fuseGDN, let cw = w.catInProjW, let cs = w.catInProjS, let cb = w.catInProjB,
+           w.totalInProjN == convDim + valueDim + numVHeads + numVHeads {
+            encodeQmmInProjDemuxRows(enc, w: cw, scales: cs, biases: cb, x: x,
+                                     outQkv: sc.qkv, outZ: sc.z, outB: sc.bP, outA: sc.aP,
+                                     M: M, K: H,
+                                     dims: (qkv: convDim, z: valueDim, b: numVHeads, a: numVHeads))
+        } else {
+            encodeQmmRows(enc, w: w.qkvW, scales: w.qkvS, biases: w.qkvB, x: x, out: sc.qkv, M: M, K: H, N: convDim)
+            encodeQmmRows(enc, w: w.zW, scales: w.zS, biases: w.zB, x: x, out: sc.z, M: M, K: H, N: valueDim)
+            encodeQmmRows(enc, w: w.bW, scales: w.bS, biases: w.bB, x: x, out: sc.bP, M: M, K: H, N: numVHeads)
+            encodeQmmRows(enc, w: w.aW, scales: w.aS, biases: w.aB, x: x, out: sc.aP, M: M, K: H, N: numVHeads)
+        }
         // ② conv(hist 直読み)→ hist shift 更新(ping-pong: In を読み Out へ)
-        encodeConvHistRows(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW, out: sc.convOut,
-                           K: convKernel, C: convDim, M: M)
-        encodeShiftConvRows(enc, histOut: cache.convHistOut, histIn: cache.convHist, qkv: sc.qkv,
-                            K: convKernel, C: convDim, M: M)
+        // F3(notes/07 §3 Wave 1): fuseGDN 時に 2→1 dispatch 融合。conv_shift_fused_rows は
+        // conv1d_silu_hist_rows + shift_conv_rows と bit-exact by construction(RAWTESTS test35)。
+        // ensureGdnPipelines が init 時に _convShiftFusedRowsPipeline を保証する。
+        if RawFusedForward.fuseGDN {
+            encodeGdnFusionConvShift(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW,
+                                     convOut: sc.convOut, histOut: cache.convHistOut,
+                                     M: M, K: convKernel, C: convDim)
+        } else {
+            encodeConvHistRows(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW, out: sc.convOut,
+                               K: convKernel, C: convDim, M: M)
+            encodeShiftConvRows(enc, histOut: cache.convHistOut, histIn: cache.convHist, qkv: sc.qkv,
+                                K: convKernel, C: convDim, M: M)
+        }
         // ③ split q/k/v(純コピー)
         encodeSliceRows(enc, input: sc.convOut, out: sc.q1, off: 0, W: keyDim, stride: convDim, M: M)
         encodeSliceRows(enc, input: sc.convOut, out: sc.k1, off: keyDim, W: keyDim, stride: convDim, M: M)
@@ -1347,9 +1696,18 @@ public enum RawFusedVerify {
                                  stateIn: cache.state, stateOut: cache.stateOut, y: sc.coreOut,
                                  T: M, B: 1, Hv: numVHeads, Dv: headVDim)
         // ⑥ RMSNormGated → silu(z)·normed
-        encodeRmsNormRows(enc, x: sc.coreOut, w: w.normWeight, out: sc.normed,
-                          rows: M * numVHeads, D: headVDim, eps: eps, promoteF32: w.promoteRMS)
-        encodeGate(enc, z: sc.z, normed: sc.normed, outV: sc.outV, total: M * valueDim, promote: w.promoteRMS)
+        // F4 re-design (notes/07 §6): fuseGDN 時は gdn_norm_gate_rows 1 dispatch で
+        // per-head rmsnorm(coreOut) + silu(z)⊙normed を融合(−1/層)。reduction tree は既存
+        // rmsnorm kernel と同一(N_READS=4 + simd_sum 二段 + precise::rsqrt)= bit-exact。
+        if RawFusedForward.fuseGDN, _gdnNormGateRowsPipeline != nil {
+            encodeGdnNormGateRows(enc, coreOut: sc.coreOut, z: sc.z, normWeight: w.normWeight,
+                                  outV: sc.outV, M: M, Hv: numVHeads, Dv: headVDim,
+                                  eps: eps, promoteF32: w.promoteRMS)
+        } else {
+            encodeRmsNormRows(enc, x: sc.coreOut, w: w.normWeight, out: sc.normed,
+                              rows: M * numVHeads, D: headVDim, eps: eps, promoteF32: w.promoteRMS)
+            encodeGate(enc, z: sc.z, normed: sc.normed, outV: sc.outV, total: M * valueDim, promote: w.promoteRMS)
+        }
         // ⑦ out_proj
         encodeQmmRows(enc, w: w.outW, scales: w.outS, biases: w.outB, x: sc.outV, out: out, M: M, K: valueDim, N: H)
     }
@@ -1449,6 +1807,20 @@ public enum RawFusedVerify {
         /// flag-on でも演算順同一なので bit-exact(G2 gate)。flag-off で byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseGU =
             ProcessInfo.processInfo.environment["QWISP_FUSE_GU"] == "1"
+
+        /// GDN 層融合(notes/07 §3 Wave 1)へ分岐。既定 off。QWISP_FUSE_GDN=1 で on。
+        /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
+        /// flag-off で encodeGdnLayerRows は既存経路のままで byte 不変(G3 gate)。
+        nonisolated(unsafe) public static var fuseGDN =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] == "1"
+
+        /// M-branch predicate for the fuseGU path.
+        /// Contract: fuseGUActive(M) == (fuseGU && M == 1)
+        ///   — the fused gather+swiglu kernel is activated for M=1 only (register pressure guard).
+        ///   verify batches (M>1) use the unfused 3-kernel path (measured regression at M=8).
+        public static func fuseGUActive(M: Int) -> Bool? {
+            return fuseGU && M == 1
+        }
 
         // ── streaming mode ─────────────────────────────────────────────────────────────
         public enum RawStreamMode { case resident, strict, bolt }
@@ -1908,6 +2280,160 @@ public enum RawFusedVerify {
     //
     // Note: integration-level flag QWISP_FUSE_GU (encodeMoEGatherRowsRange branch) is gated
     // separately by G2 real-weight identity and does NOT depend on these unit tests.
+
+    // ── Wave 1 GDN fusion stubs (notes/07 §3) — FUSE_GDN STUB — implementation pending ──
+
+    /// F1: N-axis concatenation of the 4 GDN in-proj 4-bit weight triples.
+    /// qkv: [convDim, H/2] 4-bit quantised — projects hidden → conv input (qkv for delta-net)
+    /// z:   [valueDim, H/2] 4-bit — projects hidden → z (gate for output)
+    /// b:   [numVHeads, H/2] 4-bit — projects hidden → β sigmoid input
+    /// a:   [numVHeads, H/2] 4-bit — projects hidden → α log input
+    /// Returns (w, s, b) where each is the N-axis (axis-0) concatenation of the four respective
+    /// components: w.shape = [convDim+valueDim+numVHeads+numVHeads, H/2], and similarly for s, b.
+    /// gs=64 row-independence guarantees that each 64-row scale/bias group stays self-contained
+    /// across the concat boundary, making a single qmmRows call bit-exact by construction.
+    public static func gdnInProjConcat(
+        qkvW: MLXArray, qkvS: MLXArray, qkvB: MLXArray,
+        zW: MLXArray,   zS: MLXArray,   zB: MLXArray,
+        bW: MLXArray,   bS: MLXArray,   bB: MLXArray,
+        aW: MLXArray,   aS: MLXArray,   aB: MLXArray
+    ) -> (w: MLXArray, s: MLXArray, b: MLXArray)? {
+        // N 軸(axis 0)連結: qkv ‖ z ‖ b ‖ a。gs=64 の行独立性で各 scale/bias group は
+        // 連結境界を跨がない → 1 本の qmm4_rows で 4 回個別 qmm と bit 一致(by construction)。
+        let catW = MLX.concatenated([qkvW, zW, bW, aW], axis: 0)
+        let catS = MLX.concatenated([qkvS, zS, bS, aS], axis: 0)
+        let catB = MLX.concatenated([qkvB, zB, bB, aB], axis: 0)
+        MLX.eval([catW, catS, catB])
+        return (catW, catS, catB)
+    }
+
+    /// F3: Fused ⑥conv1d_silu_hist_rows + ⑦shift_conv_rows in one command buffer.
+    /// histIn: [K-1, C] f16 — current conv history (read-only input).
+    /// qkv:    [M, C]   f16 — current M-row in-proj output.
+    /// w:      [C, K]   f16 — conv1d kernel weights (promoted to f32 inside kernel).
+    /// Returns (convOut: [M, C] f16, histOut: [K-1, C] f16) where:
+    ///   convOut = per-row silu(sum_k w[c,k] · (hist‖qkv)[m+k, c]) — same as conv1d_silu_hist_rows
+    ///   histOut = (hist‖qkv)[M .. M+K-2, :] — same as shift_conv_rows (pure data movement)
+    /// M∈{1,8} must be bit-exact with the two-kernel reference.
+    public static func gdnConvShiftFused(
+        histIn: MLXArray, qkv: MLXArray, w: MLXArray,
+        M: Int, K: Int, C: Int
+    ) -> (convOut: MLXArray, histOut: MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        // fused pipeline を compile（既存 rows aux の後に呼ばれる; rms pipeline は gateRaw 側で要る）
+        if _convShiftFusedRowsPipeline == nil {
+            do { try ensureGdnFusionPipelines(device) } catch { print("[gdn-fusion] compile: \(error)"); return nil }
+        }
+        guard _convShiftFusedRowsPipeline != nil else { return nil }
+        guard let bHist = RawMetalForward.mtlBuf(histIn.asType(.float16), device),
+              let bqkv = RawMetalForward.mtlBuf(qkv.asType(.float16), device),
+              let bw = RawMetalForward.mtlBuf(w.asType(.float32), device),
+              let bConv = device.makeBuffer(length: M * C * 2, options: .storageModeShared),
+              let bHistOut = device.makeBuffer(length: (K - 1) * C * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGdnFusionConvShift(enc, hist: bHist, qkv: bqkv, w: bw, convOut: bConv, histOut: bHistOut, M: M, K: K, C: C)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let pc = bConv.contents().bindMemory(to: Float16.self, capacity: M * C)
+        let ph = bHistOut.contents().bindMemory(to: Float16.self, capacity: (K - 1) * C)
+        return (MLXArray(Array(UnsafeBufferPointer(start: pc, count: M * C)), [M, C]),
+                MLXArray(Array(UnsafeBufferPointer(start: ph, count: (K - 1) * C)), [K - 1, C]))
+    }
+
+    /// F4: Fused ⑰per-head rmsnorm(coreOut) + ⑱gate(silu(z)⊙normed) in one command buffer.
+    /// coreOut:    [M*Hv, Dv] f16 — recurrent core output (M*numVHeads rows, each headVDim wide).
+    /// z:          [M, Hv*Dv] f16 — z in-proj output used as the silu gate.
+    /// normWeight: [Dv] f16 or f32 — per-head rmsnorm weight; dtype determines promoteF32.
+    /// promoteF32: when true, rmsnorm intermediate is f32 (matching _rmsPipelineF32 path); must
+    ///             equal (normWeight.dtype == .float32) to stay bit-exact with gateRaw.
+    /// Returns outV: [M, Hv*Dv] f16 — bit-identical to rmsNormRows then gateRaw chain.
+    /// F4: per-head rmsnorm(coreOut) + silu(z)· 1 CB 連係化 = bit-exact by construction、dispatch 数を 1 削減。
+    /// rmsnorm reduction tree は既存 _rmsPipeline[_F32] そのまま、gate は既存 _gate[_gate16] そのまま。
+    /// promoteF32: normWeight.dtype==.float32 経路。outV: [M, Hv*Dv] f16。
+    public static func gdnNormGateFused(
+        coreOut: MLXArray, z: MLXArray, normWeight: MLXArray,
+        M: Int, Hv: Int, Dv: Int,
+        eps: Float = 1e-6, promoteF32: Bool = false
+    ) -> MLXArray? {
+        let valueDim = Hv * Dv
+        guard let normed = RawMetalForward.rmsNormRows(coreOut, normWeight, M: M * Hv, eps: eps, D: Dv, promoteF32: promoteF32)
+        else { return nil }
+        guard let outV = RawFusedVerify.gateRaw(z, normed, promote: promoteF32, total: M * valueDim)
+        else { return nil }
+        return outV.reshaped([M, valueDim])
+    }
+
+    // ── Wave 1 GDN fusion re-design stubs (notes/07 §6) — FUSE_GDN2 STUB — implementation pending ──
+
+    /// F1 re-design (demux type, §6 Wave1 review): ONE qmm4 dispatch over the concatenated
+    /// weights [totalN, K] 4-bit; the kernel demuxes output columns into FOUR separate output
+    /// buffers (qkv/z/bP/aP) according to dim boundaries. Downstream kernels read the separate
+    /// buffers unchanged — no dispatch after this one.
+    /// dims: (qkv, z, b, a) each must be multiples of 8 (threadgroup column alignment).
+    /// dot arithmetic is identical to existing qmm4_rows → bit-exact by construction.
+    /// Returns nil until implemented (stub gates the test RED).
+    public static func gdnInProjDemux(
+        x: MLXArray,
+        catW: MLXArray, catS: MLXArray, catB: MLXArray,
+        M: Int, K: Int,
+        dims: (qkv: Int, z: Int, b: Int, a: Int)
+    ) -> (qkv: MLXArray, z: MLXArray, bP: MLXArray, aP: MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(),
+              ensureRowsAuxPipelines() else { return nil }
+        // warm the demux pipeline (compiled inside ensureGdnFusionPipelines via ensureRowsAuxPipelines)
+        guard _qmmInProjDemuxRowsPipeline != nil else { return nil }
+        guard dims.qkv % 8 == 0, dims.z % 8 == 0, dims.b % 8 == 0, dims.a % 8 == 0,
+              K % 512 == 0 else { print("[gdn-demux] 非fast / 非8整列"); return nil }
+        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bw = RawMetalForward.mtlBuf(catW, device),
+              let bs = RawMetalForward.mtlBuf(catS.asType(.float16), device),
+              let bb = RawMetalForward.mtlBuf(catB.asType(.float16), device),
+              let bQkv = device.makeBuffer(length: M * dims.qkv * 2, options: .storageModeShared),
+              let bZ   = device.makeBuffer(length: M * dims.z   * 2, options: .storageModeShared),
+              let bB   = device.makeBuffer(length: M * dims.b   * 2, options: .storageModeShared),
+              let bA   = device.makeBuffer(length: M * dims.a   * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeQmmInProjDemuxRows(enc, w: bw, scales: bs, biases: bb, x: bx,
+                                 outQkv: bQkv, outZ: bZ, outB: bB, outA: bA,
+                                 M: M, K: K, dims: dims)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let pq = bQkv.contents().bindMemory(to: Float16.self, capacity: M * dims.qkv)
+        let pz = bZ.contents().bindMemory(to: Float16.self, capacity: M * dims.z)
+        let pb = bB.contents().bindMemory(to: Float16.self, capacity: M * dims.b)
+        let pa = bA.contents().bindMemory(to: Float16.self, capacity: M * dims.a)
+        return (MLXArray(Array(UnsafeBufferPointer(start: pq, count: M * dims.qkv)), [M, dims.qkv]),
+                MLXArray(Array(UnsafeBufferPointer(start: pz, count: M * dims.z)), [M, dims.z]),
+                MLXArray(Array(UnsafeBufferPointer(start: pb, count: M * dims.b)), [M, dims.b]),
+                MLXArray(Array(UnsafeBufferPointer(start: pa, count: M * dims.a)), [M, dims.a]))
+    }
+
+    /// F4 re-design (true fused single-dispatch kernel, §6 Wave1 review):
+    /// ONE kernel, 1 threadgroup per (m, head): rmsnorm reduction (identical to existing
+    /// rmsnorm kernel incl. N_READS=4 + simd_sum two-stage + precise::rsqrt) then
+    /// silu(z)⊙ applied in registers. f16 + promoteF32 variants.
+    /// This is distinct from gdnNormGateFused which merely chains two existing dispatches.
+    /// Returns outV: [M, Hv*Dv] f16.
+    /// Returns nil until implemented (stub gates the test RED).
+    public static func gdnNormGateRows(
+        coreOut: MLXArray, z: MLXArray, normWeight: MLXArray,
+        M: Int, Hv: Int, Dv: Int,
+        eps: Float, promoteF32: Bool
+    ) -> MLXArray? {
+        let valueDim = Hv * Dv
+        guard let (device, queue) = RawMetalForward.ensure(),
+              ensureRowsAuxPipelines() else { return nil }
+        guard _gdnNormGateRowsPipeline != nil else { return nil }
+        let wType: DType = promoteF32 ? .float32 : .float16
+        guard let bx = RawMetalForward.mtlBuf(coreOut.asType(.float16), device),
+              let bz = RawMetalForward.mtlBuf(z.asType(.float16), device),
+              let bw = RawMetalForward.mtlBuf(normWeight.asType(wType), device),
+              let bOut = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeGdnNormGateRows(enc, coreOut: bx, z: bz, normWeight: bw, outV: bOut,
+                              M: M, Hv: Hv, Dv: Dv, eps: eps, promoteF32: promoteF32)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = bOut.contents().bindMemory(to: Float16.self, capacity: M * valueDim)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * valueDim)), [M, valueDim])
+    }
 
     /// Test-entry wrapper: drives gqmm4_swiglu_rows in a self-contained command buffer.
     /// x[M,K] f16, inds[M*Ktop] int32, wG/wU [E,N,K/2] 4-bit, sG/sU/bG/bU [E,N,K/64] f16.

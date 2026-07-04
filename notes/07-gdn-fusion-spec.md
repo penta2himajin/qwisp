@@ -52,3 +52,37 @@ post: ⑳resid_add ㉑rmsnorm(post)。
   glm-code 委譲、各 wave 後に Fable が build+RAWTESTS+G2 smoke。idle-kill されても編集は保存済み
   → まず driver が build+test してから再開判断。
 - lock dir: `$CLAUDE_JOB_DIR/tmp/locked4`。commit 毎 push・auto-commit 禁止。
+
+---
+
+## 6. Wave 1 レビュー結果(2026-07-04)と F1/F4 再設計
+
+敵対レビュー(Sonnet): G1 37/37・G2 全 identity(code/longctx/両flag同時)・M分岐 M=8 delta≈0 ✓。
+**G5 FAIL(+118µs < 250µs)**: F3 のみ稼働(レビューが未配線を発見し修正、+118µs は F3 理論値どおり)。
+F1 は helper のみで本番未配線かつ **concat+slice×4=5 dispatch の自滅設計**。F4 は既存 2 kernel の
+wrapper で dispatch 削減ゼロ。**教訓: unit テストは helper を gate するが本番配線は gate しない →
+G5 が本番の真実**(RAWTESTS 37/37 は必要条件にすぎない)。
+
+### F1 再設計(demux 型・下流無変更)
+`qmm4_inproj_demux_rows`: concat 重み [totalN, H] で qmm する 1 kernel が、**列 n の範囲で出力先を
+qkv/z/bP/aP の 4 buffer に書き分ける**(境界は convDim/valueDim/Hv 境界、N/8 threadgroup 境界に整列)。
+下流 kernel(conv/gate/compute_g_beta)は従来 buffer をそのまま読む=変更ゼロ。dot 演算は既存
+qmm4_rows と同一順=bit-exact。4→1(−3/層)。
+### F4 再設計(真融合)
+`gdn_norm_gate_rows`: 1 threadgroup per (m, head): coreOut[m,head,:Dv] を既存 rmsnorm と同一の
+reduction tree で正規化 → normWeight 適用 → silu(z)⊙ を register で → outV へ。f16/promoteF32 両変種。
+2→1(−1/層)。
+### 追加修正
+- concat/demux 用 buffer 構築は `fuseGDN || QWISP_PROF_AB` 時のみ(現状 ~190MB 無条件確保は 8GB tier に有害)。
+- gate: G5 wave1 M=1 median ≥ +250µs(F3+F1+F4 = −5/層 × 30 = −150 dispatch ≈ 330µs 理論)。
+
+## 7. Wave 1 最終判定(Fable gate, 2026-07-04)— 全ゲート GREEN
+- G1 39/39(lock byte-identical)/ G2 code+longctx+全flag同時 byte-identical + 128/128 LOSSLESS。
+- **G5 fuseGDN M=1 median-of-medians +459µs ≥ 250µs PASS**(prof 2回: +435/+483µs。理論 330µs +
+  encoder 側 CPU 削減の上乗せ)。M=8 は noise(σ>>|delta|)=demux/norm_gate に register 退行なし →
+  fuseGDN の M 分岐不要。fuseGU M 分岐は M=8 delta≈0 で正常。
+- faithfulness: demux dot=qmm4_rows verbatim・境界 straddle なし(1024/1536/1540 全て 8 整列)・
+  F4 reduction tree=既存 rmsnorm と byte 一致・flag-off 不変・lazy concat 済。
+- 実装=GLM-5.2(redesign は試行2で完遂)。残 concern: F4 pipeline nil 時の silent fallback(将来
+  fuseGDN の速度が消えたら最初に疑う)/ A/B prof は M=1 lane のみ gate に使用可。
+- **累計(fuseGU M=1 +156µs + fuseGDN +459µs ≈ 0.6ms/step ≈ +4-5%)。次 = Wave 2(F2 gdn_prep 8→1, F5)**。

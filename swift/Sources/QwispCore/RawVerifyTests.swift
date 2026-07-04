@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 33
+        let total = 39
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1697,6 +1697,275 @@ public enum RawVerifyTests {
             }
             let hLoop = MLX.concatenated(refParts, axis: 0); hLoop.eval()
             return bitEqual(hBatch, hLoop)
+        }
+
+        // ── Wave 1 GDN fusion tests (34-37) ──────────────────────────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/07-gdn-fusion-spec.md §3 Wave 1.
+        //
+        // All four tests use random quantised weights with the canonical GDN geometry
+        // (H=2048, Hk=16, Dk=128, Hv=32, Dv=128, convKernel=4) matching test 13.
+        // References use ONLY existing production kernels (qmmRows, conv1dSiluRows,
+        // rmsNormRows, gateRaw) — never CPU/MLX computation reimplementations.
+        // Tests are RED (FAIL with "not implemented") until Wave 1 is implemented.
+
+        // Test 34 (F1): gdnInProjConcat — single qmmRows on N-axis-concatenated in-proj
+        //   weights ≡ four separate qmmRows calls, outputs bit-identical at all offsets.
+        //   Validates: (a) concat build is correct, (b) offsets slice right, (c) M∈{1,8}.
+        run("fuse_gdn_inproj_concat") {
+            let H = 2048, Hk = 16, Dk = 128, Hv = 32, Dv = 128
+            let convDim  = Hk * Dk * 2 + Hv * Dv    // 8192
+            let valueDim = Hv * Dv                    // 4096
+            let numVH    = Hv                         // 32
+            func quant(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (qkvW, qkvS, qkvB) = quant(convDim,  H)
+            let (zW,   zS,   zB)   = quant(valueDim, H)
+            let (bW,   bS,   bB)   = quant(numVH,    H)
+            let (aW,   aS,   aB)   = quant(numVH,    H)
+            MLX.eval([qkvW, qkvS, qkvB, zW, zS, zB, bW, bS, bB, aW, aS, aB])
+            // Fused: build concatenated in-proj triple (stub under test)
+            guard let (catW, catS, catB) = RawFusedVerify.gdnInProjConcat(
+                qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+                zW:   zW,   zS:   zS,   zB:   zB,
+                bW:   bW,   bS:   bS,   bB:   bB,
+                aW:   aW,   aS:   aS,   aB:   aB)
+            else { return (false, "not implemented") }
+            MLX.eval([catW, catS, catB])
+            let totalN = convDim + valueDim + numVH + numVH   // 12352
+            for M in [1, 8] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                // Reference: 4 separate qmmRows (existing production kernel)
+                guard let refQkv = RawMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
+                                                            M: M, K: H, N: convDim),
+                      let refZ   = RawMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
+                                                            M: M, K: H, N: valueDim),
+                      let refB   = RawMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
+                                                            M: M, K: H, N: numVH),
+                      let refA   = RawMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
+                                                            M: M, K: H, N: numVH)
+                else { return (false, "ref qmmRows nil M=\(M)") }
+                MLX.eval([refQkv, refZ, refB, refA])
+                // Fused: single qmmRows on concatenated weight, sliced at offsets
+                guard let fused = RawMetalForward.qmmRows(x, catW, scales: catS, biases: catB,
+                                                           M: M, K: H, N: totalN)
+                else { return (false, "fused qmmRows nil M=\(M)") }
+                fused.eval()
+                var off = 0
+                let gotQkv = fused[0..., off ..< off + convDim];  off += convDim
+                let gotZ   = fused[0..., off ..< off + valueDim]; off += valueDim
+                let gotB   = fused[0..., off ..< off + numVH];    off += numVH
+                let gotA   = fused[0..., off ..< off + numVH]
+                MLX.eval([gotQkv, gotZ, gotB, gotA])
+                for (nm, got, ref) in [("qkv", gotQkv, refQkv), ("z", gotZ, refZ),
+                                       ("b", gotB, refB), ("a", gotA, refA)] {
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) \(nm): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 35 (F3): gdnConvShiftFused — fused conv1d_silu_hist + shift_conv
+        //   ≡ conv1dSiluRows (production kernel) + tail-slice (pure data movement).
+        //   Validates both convOut and histOut are bit-exact, M∈{1,8}.
+        run("fuse_gdn_conv_shift") {
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, K = 4
+            let C = Hk * Dk * 2 + Hv * Dv    // convDim = 8192
+            let convW = MLXRandom.normal([C, K]).asType(.float16); convW.eval()
+            for M in [1, 8] {
+                let histIn = MLXRandom.normal([K - 1, C]).asType(.float16)   // [K-1, C]
+                let qkv    = MLXRandom.normal([M, C]).asType(.float16)        // [M, C]
+                MLX.eval([histIn, qkv])
+                // Reference convOut: conv1dSiluRows with explicit windows (existing production kernel).
+                // conv1d_silu_hist_rows and conv1dSiluRows compute identical silu(conv1d(.)) —
+                // test 22 (fused_gdn_layer_bitexact) proves them bit-identical for this data layout.
+                let convInput = MLX.concatenated([histIn, qkv], axis: 0); convInput.eval()
+                let windowParts = (0 ..< M).map { convInput[$0 ..< $0 + K].reshaped([1, K, C]) }
+                let windows = MLX.concatenated(windowParts, axis: 0); windows.eval()
+                guard let convOutRef = RawMetalForward.conv1dSiluRows(windows, convW, M: M, K: K, C: C)
+                else { return (false, "ref conv1dSiluRows nil M=\(M)") }
+                // Reference histOut: tail K-1 frames of (histIn‖qkv) — pure data movement,
+                // same bytes shift_conv_rows copies; not a computation reimplementation.
+                let histOutRef = convInput[M ..< M + K - 1].asType(.float16)
+                MLX.eval([convOutRef, histOutRef])
+                // Fused: stub under test
+                guard let (convOutGot, histOutGot) = RawFusedVerify.gdnConvShiftFused(
+                    histIn: histIn, qkv: qkv, w: convW, M: M, K: K, C: C)
+                else { return (false, "not implemented (M=\(M))") }
+                MLX.eval([convOutGot, histOutGot])
+                let (ok1, d1) = bitEqual(convOutGot, convOutRef)
+                if !ok1 { return (false, "convOut M=\(M): \(d1)") }
+                let (ok2, d2) = bitEqual(histOutGot, histOutRef)
+                if !ok2 { return (false, "histOut M=\(M): \(d2)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 36 (F4): gdnNormGateFused — fused per-head rmsnorm + gate
+        //   ≡ rmsNormRows (production kernel) then gateRaw (production kernel).
+        //   Sweeps M∈{1,8} × promoteF32∈{false,true}.
+        run("fuse_gdn_norm_gate") {
+            let Hv = 32, Dv = 128
+            let valueDim = Hv * Dv   // 4096
+            for M in [1, 8] {
+                let coreOut = MLXRandom.normal([M * Hv, Dv]).asType(.float16)   // [M*Hv, Dv]
+                let z       = MLXRandom.normal([M, valueDim]).asType(.float16)   // [M, valueDim]
+                MLX.eval([coreOut, z])
+                for promote in [false, true] {
+                    let normW = MLXRandom.normal([Dv]).asType(promote ? .float32 : .float16)
+                    normW.eval()
+                    // Reference: rmsNormRows (existing production kernel)
+                    guard let normedRef = RawMetalForward.rmsNormRows(coreOut, normW,
+                                                                        M: M * Hv, eps: 1e-6, D: Dv,
+                                                                        promoteF32: promote)
+                    else { return (false, "ref rmsNormRows nil M=\(M) promote=\(promote)") }
+                    normedRef.eval()
+                    // then gateRaw (existing production kernel wrapping encodeGate)
+                    guard let outVRef = RawFusedVerify.gateRaw(z, normedRef,
+                                                                promote: promote, total: M * valueDim)
+                    else { return (false, "ref gateRaw nil M=\(M) promote=\(promote)") }
+                    outVRef.eval()
+                    // Fused: stub under test
+                    guard let outVGot = RawFusedVerify.gdnNormGateFused(
+                        coreOut: coreOut, z: z, normWeight: normW,
+                        M: M, Hv: Hv, Dv: Dv, eps: 1e-6, promoteF32: promote)
+                    else { return (false, "not implemented (M=\(M) promote=\(promote))") }
+                    outVGot.eval()
+                    let (ok, d) = bitEqual(outVGot, outVRef.reshaped([M, valueDim]))
+                    if !ok { return (false, "M=\(M) promote=\(promote): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 37 (fuseGU M-branch): structural predicate gate for the fuseGU M-branch.
+        // Asserts that RawFusedForward.fuseGUActive(M:) is implemented and returns:
+        //   true  iff QWISP_FUSE_GU=1 AND M==1   (fused gather+swiglu, M=1 only)
+        //   false iff QWISP_FUSE_GU=1 AND M>1    (register-pressure fallback)
+        //   false iff QWISP_FUSE_GU=0             (flag disabled)
+        // Stub returns nil → RED. Behavioral correctness (actual tokens) is gated by G2.
+        run("fuse_gu_m_branch") {
+            guard let active1 = RawFusedVerify.RawFusedForward.fuseGUActive(M: 1)
+            else { return (false, "not implemented") }
+            guard let active8 = RawFusedVerify.RawFusedForward.fuseGUActive(M: 8)
+            else { return (false, "not implemented M=8") }
+            let fuseOn = RawFusedVerify.RawFusedForward.fuseGU
+            if fuseOn {
+                if !active1 { return (false, "fuseGU=1: expected fuseGUActive(1)=true, got false") }
+                if  active8 { return (false, "fuseGU=1: expected fuseGUActive(8)=false, got true") }
+            } else {
+                if  active1 { return (false, "fuseGU=0: expected fuseGUActive(1)=false, got true") }
+                if  active8 { return (false, "fuseGU=0: expected fuseGUActive(8)=false, got true") }
+            }
+            return (true, "ok")
+        }
+
+        // ── Wave 1 GDN fusion re-design tests (38-39) — §6 F1/F4 re-design ──
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They gate the redesigned F1 (demux-type single dispatch) and F4 (true fused
+        // single-dispatch kernel) from the §6 adversarial review verdict.
+        // F1 old design: concat+slice×4=5 dispatch self-defeat. New: 1 dispatch demux.
+        // F4 old design: 2-kernel wrapper = 0 dispatch reduction. New: 1 true kernel.
+        // Tests are RED (FAIL with "not implemented") until the production kernels are implemented.
+
+        // Test 38 (F1-demux): gdnInProjDemux — single qmm4 dispatch over concatenated in-proj
+        //   weights writes DIRECTLY into 4 separate output buffers (no downstream concat+slice).
+        //   Reference: 4 separate RawMetalForward.qmmRows (existing production kernel).
+        //   Dims: qkv=1024, z=512, b=64, a=64 (all multiples of 8, threadgroup column alignment),
+        //   K=512. Build triples via the existing gdnInProjConcat helper. M∈{1,8}.
+        run("fuse_gdn_inproj_demux") {
+            let K = 512
+            let dims = (qkv: 1024, z: 512, b: 64, a: 64)   // all multiples of 8 (threadgroup alignment)
+            func quant(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (qkvW, qkvS, qkvB) = quant(dims.qkv, K)
+            let (zW,   zS,   zB)   = quant(dims.z,   K)
+            let (bW,   bS,   bB)   = quant(dims.b,   K)
+            let (aW,   aS,   aB)   = quant(dims.a,   K)
+            MLX.eval([qkvW, qkvS, qkvB, zW, zS, zB, bW, bS, bB, aW, aS, aB])
+            // Build concatenated weight triple via existing gdnInProjConcat helper
+            guard let (catW, catS, catB) = RawFusedVerify.gdnInProjConcat(
+                qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+                zW:   zW,   zS:   zS,   zB:   zB,
+                bW:   bW,   bS:   bS,   bB:   bB,
+                aW:   aW,   aS:   aS,   aB:   aB)
+            else { return (false, "gdnInProjConcat nil") }
+            MLX.eval([catW, catS, catB])
+            for M in [1, 8] {
+                let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
+                // Reference: 4 separate qmmRows (existing production kernel)
+                guard let refQkv = RawMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
+                                                            M: M, K: K, N: dims.qkv),
+                      let refZ   = RawMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
+                                                            M: M, K: K, N: dims.z),
+                      let refB   = RawMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
+                                                            M: M, K: K, N: dims.b),
+                      let refA   = RawMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
+                                                            M: M, K: K, N: dims.a)
+                else { return (false, "ref qmmRows nil M=\(M)") }
+                MLX.eval([refQkv, refZ, refB, refA])
+                // Stub under test: single dispatch demuxing into 4 output buffers
+                guard let (gotQkv, gotZ, gotB, gotA) = RawFusedVerify.gdnInProjDemux(
+                    x: x, catW: catW, catS: catS, catB: catB,
+                    M: M, K: K, dims: dims)
+                else { return (false, "not implemented (M=\(M))") }
+                MLX.eval([gotQkv, gotZ, gotB, gotA])
+                for (nm, got, ref) in [("qkv", gotQkv, refQkv), ("z", gotZ, refZ),
+                                       ("b", gotB, refB), ("a", gotA, refA)] {
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) \(nm): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 39 (F4-true): gdnNormGateRows — TRUE single-dispatch fused kernel (per-(m,head)
+        //   threadgroup: rmsnorm reduction identical to existing rmsnorm kernel, then silu(z)⊙
+        //   in registers). This is DISTINCT from the existing fuse_gdn_norm_gate test which gates
+        //   the wrapper gdnNormGateFused (2 separate dispatches chained). This test gates the
+        //   single-dispatch production kernel that actually reduces dispatch count.
+        //   Reference: rmsNormRows (existing production kernel) + gateRaw chain.
+        //   Bit-equal for M∈{1,8} × promoteF32∈{false,true}.
+        run("fuse_gdn_norm_gate_true") {
+            let Hv = 32, Dv = 128
+            let valueDim = Hv * Dv   // 4096
+            for M in [1, 8] {
+                let coreOut = MLXRandom.normal([M * Hv, Dv]).asType(.float16)   // [M*Hv, Dv]
+                let z       = MLXRandom.normal([M, valueDim]).asType(.float16)   // [M, valueDim]
+                MLX.eval([coreOut, z])
+                for promote in [false, true] {
+                    let normW = MLXRandom.normal([Dv]).asType(promote ? .float32 : .float16)
+                    normW.eval()
+                    // Reference: rmsNormRows (existing production kernel) then gateRaw
+                    guard let normedRef = RawMetalForward.rmsNormRows(coreOut, normW,
+                                                                       M: M * Hv, eps: 1e-6, D: Dv,
+                                                                       promoteF32: promote)
+                    else { return (false, "ref rmsNormRows nil M=\(M) promote=\(promote)") }
+                    normedRef.eval()
+                    guard let outVRef = RawFusedVerify.gateRaw(z, normedRef,
+                                                                promote: promote, total: M * valueDim)
+                    else { return (false, "ref gateRaw nil M=\(M) promote=\(promote)") }
+                    outVRef.eval()
+                    // Stub under test: single-dispatch production kernel (distinct from wrapper)
+                    guard let outVGot = RawFusedVerify.gdnNormGateRows(
+                        coreOut: coreOut, z: z, normWeight: normW,
+                        M: M, Hv: Hv, Dv: Dv, eps: 1e-6, promoteF32: promote)
+                    else { return (false, "not implemented (M=\(M) promote=\(promote))") }
+                    outVGot.eval()
+                    let (ok, d) = bitEqual(outVGot, outVRef.reshaped([M, valueDim]))
+                    if !ok { return (false, "M=\(M) promote=\(promote): \(d)") }
+                }
+            }
+            return (true, "ok")
         }
 
         // ── Summary ───────────────────────────────────────────────────────
