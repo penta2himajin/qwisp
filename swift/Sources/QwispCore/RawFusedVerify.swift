@@ -2669,18 +2669,18 @@ public enum RawFusedVerify {
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
-        /// gate+up gather+swiglu 融合(1 dispatch)へ分岐。既定 off。QWISP_FUSE_GU=1 で on。
+        /// gate+up gather+swiglu 融合(1 dispatch)へ分岐。既定 ON。QWISP_FUSE_GU=0 で opt-out。
         /// flag-on でも演算順同一なので bit-exact(G2 gate)。flag-off で byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseGU =
-            ProcessInfo.processInfo.environment["QWISP_FUSE_GU"] == "1"
+            ProcessInfo.processInfo.environment["QWISP_FUSE_GU"] != "0"
 
-        /// GDN 層融合(notes/07 §3 Wave 1)へ分岐。既定 off。QWISP_FUSE_GDN=1 で on。
+        /// GDN 層融合(notes/07 §3 Wave 1)へ分岐。既定 ON。QWISP_FUSE_GDN=0 で opt-out。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
         /// flag-off で encodeGdnLayerRows は既存経路のままで byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseGDN =
-            ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] == "1"
+            ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] != "0"
 
-        /// attn 層融合(notes/08 §3)へ分岐。既定 off。QWISP_FUSE_ATTN=1 で on。
+        /// attn 層融合(notes/08 §3)へ分岐。既定 ON。QWISP_FUSE_ATTN=0 で opt-out。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
         /// flag-off で encodeAttnLayerRows は既存経路のままで byte 不変(G3 gate)。
         /// 原子別 kill-switch のキャッシュ(per-encode の ProcessInfo.environment 読みは 18.8µs/回で
@@ -2690,13 +2690,20 @@ public enum RawFusedVerify {
         nonisolated(unsafe) public static let fuseA1Enabled =
             ProcessInfo.processInfo.environment["QWISP_FUSE_A1"] != "0"
         nonisolated(unsafe) public static var fuseATTN =
-            ProcessInfo.processInfo.environment["QWISP_FUSE_ATTN"] == "1"
+            ProcessInfo.processInfo.environment["QWISP_FUSE_ATTN"] != "0"
 
-        /// MoE shared expert 融合(notes/08 §3)へ分岐。既定 off。QWISP_FUSE_SHEXP=1 で on。
+        /// MoE shared expert 融合(notes/08 §3)へ分岐。既定 ON。QWISP_FUSE_SHEXP=0 で opt-out。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
         /// flag-off で encodeMoESharedRows は既存経路のままで byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseSHEXP =
-            ProcessInfo.processInfo.environment["QWISP_FUSE_SHEXP"] == "1"
+            ProcessInfo.processInfo.environment["QWISP_FUSE_SHEXP"] != "0"
+
+        /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
+        /// for the chained GPU token-feedback decode default. RawSpecRunner resolves the
+        /// chain length as Tell.envInt("QWISP_CHAIN_K", RawFusedForward.chainKDefault),
+        /// so this constant is the sole source of the unset default. QWISP_CHAIN_K=0
+        /// still disables (envInt returns 0).
+        public static let chainKDefault = 8
 
         /// M-branch predicate for the fuseGU path.
         /// Contract: fuseGUActive(M) == (fuseGU && M == 1)

@@ -339,7 +339,7 @@ public enum RawSpecRunner {
         // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
         // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
         // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
-        let chainK = Tell.envInt("QWISP_CHAIN_K", 0)
+        let chainK = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
 
         let t0 = DispatchTime.now()
 
