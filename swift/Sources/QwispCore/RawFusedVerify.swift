@@ -206,6 +206,10 @@ public enum RawFusedVerify {
     // ── Stage A(P3 続き): fused MoE block — moeBlockRows(metalRoute) 全段を単一 encoder 化 ──
 
     nonisolated(unsafe) static var _combineRowsPipeline: MTLComputePipelineState?
+    /// Testable seam: incremented each time encodeCombineRows dispatches a combine_rows kernel.
+    /// When the MOE2 fold is active, encodeMoEGatherRowsRange skips the separate combine dispatch
+    /// and the count stays at 0 for that block call.
+    nonisolated(unsafe) public static var _combineRowsDispatchCount: Int = 0
     nonisolated(unsafe) static var _finalCombineRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _writeKVRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _convHistRowsPipeline: MTLComputePipelineState?
@@ -228,6 +232,7 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _sharedGateCombineRowsPipeline: MTLComputePipelineState?  // S2: qmm8(8 dots)+final_combine → 1 dispatch (safe-math)
     nonisolated(unsafe) static var _attnQPrepRowsPipeline: MTLComputePipelineState?          // A2: extract+rmsnorm+rope → 1 dispatch (fast-math, matches rope_rows)
     nonisolated(unsafe) static var _attnKPrepRowsPipeline: MTLComputePipelineState?          // A3: rmsnorm+rope+write_kv → 1 dispatch (fast-math, matches rope_rows)
+    nonisolated(unsafe) static var _sharedGateCombineRowsFoldPipeline: MTLComputePipelineState?  // S2 fold (MOE2): qmm8 + inlined combine_rows → 1 dispatch (safe-math)
     // ── Wave 3 attn+shexp: helpers ──
     /// S1 production wiring: dummy inds=[0] for gqmm4_swiglu_rows plain-qmm (no gather) path.
     nonisolated(unsafe) static var _zeroOneInds: MTLBuffer?
@@ -826,7 +831,7 @@ public enum RawFusedVerify {
     ///   exact in float32 (≤22 mantissa bits < 24), so fma(xi,xi,acc) == (float)(xi*xi)+acc.
     static func ensureWave3Pipelines() -> Bool {
         guard let (device, _) = RawMetalForward.ensure() else { return false }
-        if _sharedGateCombineRowsPipeline != nil && _attnQPrepRowsPipeline != nil && _attnKPrepRowsPipeline != nil { return true }
+        if _sharedGateCombineRowsPipeline != nil && _sharedGateCombineRowsFoldPipeline != nil && _attnQPrepRowsPipeline != nil && _attnKPrepRowsPipeline != nil { return true }
         // S2 kernel: safe-math (matches qmm8 + final_combine_rows)
         let s2Src = """
         #include <metal_stdlib>
@@ -906,6 +911,67 @@ public enum RawFusedVerify {
             uint n = tid.y * 256 + tid_in_tg;
             if (n < (uint)H_)
                 out[base + n] = y[base + n] + s * sharedY[base + n];
+        }
+        kernel void shared_gate_combine_rows_fold(
+            device const uint32_t* sgW     [[buffer(0)]],
+            device const half*     sgS     [[buffer(1)]],
+            device const half*     sgB     [[buffer(2)]],
+            device const half*     x       [[buffer(3)]],
+            device const half*     d       [[buffer(4)]],
+            device const half*     scores  [[buffer(5)]],
+            device const half*     sharedY [[buffer(6)]],
+            device half*           out     [[buffer(7)]],
+            constant int&          K_      [[buffer(8)]],
+            constant int&          H_      [[buffer(9)]],
+            constant int&          Ktop_   [[buffer(10)]],
+            device const int*      stopFlag [[buffer(16)]],
+            uint3 tid      [[threadgroup_position_in_grid]],
+            uint  simd_gid [[simdgroup_index_in_threadgroup]],
+            uint  simd_lid [[thread_index_in_simdgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            constexpr int packs_per_thread = 2;
+            constexpr int pack_factor = 4;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 8;
+            constexpr int block_size = 256;
+            constexpr int scale_step_per_thread = 8;
+            const device uint8_t* ws = (const device uint8_t*)sgW;
+            threadgroup half sgl_shared[1];
+            typedef float U;
+            thread U x_thread[8];
+            thread U result0 = 0;
+            if (simd_gid == 0) {
+                const device uint8_t* wl = ws + simd_lid * packs_per_thread * bytes_per_pack;
+                const device half* sl = sgS + simd_lid / scale_step_per_thread;
+                const device half* bl = sgB + simd_lid / scale_step_per_thread;
+                const device half* xr = x + tid.x * K_ + simd_lid * values_per_thread;
+                for (int k = 0; k < K_; k += block_size) {
+                    U sum = ld8(xr, x_thread);
+                    U s = sl[0]; U b = bl[0];
+                    result0 += qd8(wl, x_thread, s, b, sum);
+                    wl += block_size * bytes_per_pack / pack_factor;
+                    sl += block_size / 64;
+                    bl += block_size / 64;
+                    xr += block_size;
+                }
+                result0 = simd_sum(result0);
+                if (simd_lid == 0) sgl_shared[0] = (half)result0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            half gv = sgl_shared[0];
+            half yv = (half)1 / ((half)1 + exp(metal::abs(gv)));
+            half s = (gv < (half)0) ? yv : ((half)1 - yv);
+            uint tid_in_tg = simd_gid * 32 + simd_lid;
+            uint base_row = tid.x;
+            uint n = tid.y * 256 + tid_in_tg;
+            if (n < (uint)H_) {
+                half acc = (half)0;
+                for (int k = 0; k < Ktop_; k++) {
+                    acc += d[(base_row * Ktop_ + k) * H_ + n] * scores[base_row * Ktop_ + k];
+                }
+                out[base_row * H_ + n] = acc + s * sharedY[base_row * H_ + n];
+            }
         }
         """
         // A2/A3 kernels: fast-math (options:nil) to match rope_rows transcendentals.
@@ -1100,6 +1166,7 @@ public enum RawFusedVerify {
         do {
             let libSafe = try device.makeLibrary(source: s2Src, options: RawMetalForward.mlxMatchCompileOpts())
             _sharedGateCombineRowsPipeline = try device.makeComputePipelineState(function: libSafe.makeFunction(name: "shared_gate_combine_rows")!)
+            _sharedGateCombineRowsFoldPipeline = try device.makeComputePipelineState(function: libSafe.makeFunction(name: "shared_gate_combine_rows_fold")!)
             let libFast = try device.makeLibrary(source: a23Src, options: nil)
             _attnQPrepRowsPipeline = try device.makeComputePipelineState(function: libFast.makeFunction(name: "attn_q_prep_rows")!)
             _attnKPrepRowsPipeline = try device.makeComputePipelineState(function: libFast.makeFunction(name: "attn_k_prep_rows")!)
@@ -1265,6 +1332,7 @@ public enum RawFusedVerify {
     static func encodeCombineRows(_ enc: MTLComputeCommandEncoder, d: MTLBuffer, scores: MTLBuffer, y: MTLBuffer,
                                   Ktop: Int, N: Int, M: Int,
                                   dByteOffset: Int = 0, scoresOffset: Int = 0, yByteOffset: Int = 0) {
+        _combineRowsDispatchCount += 1   // testable seam: MOE2 fold skips this call (count stays 0)
         let p = _combineRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(d, offset: dByteOffset, index: 0)
@@ -1504,15 +1572,19 @@ public enum RawFusedVerify {
                             M: Mc, Ktop: Ktop, K: I, N: H, lhsPer: true,
                             xByteOffset: guOff, indsOffset: indsOff, outByteOffset: dOff)
         // combine → sc.y[r0*H .. r1*H]
-        encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y,
-                          Ktop: Ktop, N: H, M: Mc,
-                          dByteOffset: dOff, scoresOffset: scOff, yByteOffset: yOff)
+        // MOE2 fold: fuseMOE2Enabled && fuseSHEXP && Mc==1 → S2 inlines combine; skip separate dispatch.
+        // M>1 (verify batches) keeps the separate combine_rows dispatch (fold inactive at M>1).
+        if !(RawFusedForward.fuseMOE2Enabled && RawFusedForward.fuseSHEXP && Mc == 1) {
+            encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y,
+                              Ktop: Ktop, N: H, M: Mc,
+                              dByteOffset: dOff, scoresOffset: scOff, yByteOffset: yOff)
+        }
     }
 
     /// ③④ shared expert + final combine → out[M,H]。
     /// S1(fuseSHEXP, M==1): shG+shU+swiglu 3 dispatch → 1 gqmm4_swiglu_rows dispatch(−2/MoEブロック)。
     static func encodeMoESharedRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
-                                     w: MoEBlockBufs, sc: MoEScratch, M: Int, I: Int, H: Int) {
+                                     w: MoEBlockBufs, sc: MoEScratch, M: Int, I: Int, H: Int, Ktop: Int) {
         // S1: M==1 branch only (register-pressure gate, same doctrine as fuseGU).
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_S1=0 で S1 のみ無効。
         if RawFusedForward.fuseSHEXPActive(M: M) ?? false,
@@ -1531,10 +1603,19 @@ public enum RawFusedVerify {
         }
         encodeQmmRows(enc, w: w.shDW, scales: w.shDS, biases: w.shDB, x: sc.shAct, out: sc.sharedY, M: M, K: I, N: H)
         // S2(fuseSHEXP): qmm8(N=8)+final_combine → ONE dispatch (safe-math, bit-exact, −1/MoEブロック)。
+        // MOE2 fold-ON: S2 inlines combine_rows (encodeCombineRows was skipped in encodeMoEGatherRowsRange).
+        // Fold applies only at M==1 (same M==1 gate as fuseGU/fuseSHEXP-S1): M>1 uses non-fold S2 path.
         if RawFusedForward.fuseSHEXP && ensureWave3Pipelines() {
-            encodeSharedGateCombineRows(enc, sgW: w.sgW, sgS: w.sgS, sgB: w.sgB,
-                                        x: x, y: sc.y, sharedY: sc.sharedY, out: out,
-                                        K: H, H: H, M: M)
+            if RawFusedForward.fuseMOE2Enabled && M == 1 {
+                encodeSharedGateCombineRowsFold(enc, sgW: w.sgW, sgS: w.sgS, sgB: w.sgB,
+                                                x: x, d: sc.d, scores: sc.scores,
+                                                sharedY: sc.sharedY, out: out,
+                                                K: H, H: H, M: M, Ktop: Ktop)
+            } else {
+                encodeSharedGateCombineRows(enc, sgW: w.sgW, sgS: w.sgS, sgB: w.sgB,
+                                            x: x, y: sc.y, sharedY: sc.sharedY, out: out,
+                                            K: H, H: H, M: M)
+            }
         } else {
             encodeQmm8Rows(enc, w: w.sgW, scales: w.sgS, biases: w.sgB, x: x, out: sc.sgl, M: M, K: H, N: 8)
             encodeFinalCombineRows(enc, y: sc.y, sharedY: sc.sharedY, sgl: sc.sgl, out: out, N: H, M: M)
@@ -1550,7 +1631,7 @@ public enum RawFusedVerify {
                                    slotTable: MTLBuffer? = nil) {
         encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop)
         encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
-        encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H)
+        encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H, Ktop: Ktop)
     }
 
     /// 全 pipeline を warm(compile)。fused 経路の前提(encode 時に force-unwrap するため)。
@@ -1788,6 +1869,28 @@ public enum RawFusedVerify {
         RawMetalForward.bindStop(enc, 9)
         // ★grid 再設計: (M, ceil(H/256)) × 256 threads(8 simdgroups)。tg ごとに row-0 dot を
         // 冗長計算し、combine を H 全並列で行う(旧 (M,1)×64 は combine 直列化で −384µs)。
+        enc.dispatchThreadgroups(MTLSize(width: M, height: (H + 255) / 256, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+    }
+
+    /// S2 fold (MOE2): encode shared_gate_combine_rows_fold — ONE dispatch replacing
+    /// qmm8(N=8) + combine_rows + final_combine. Reads d/scores directly (combine inlined).
+    /// fold-ON (fuseMOE2Enabled && fuseSHEXP) path; bit-exact with the 3-dispatch chain.
+    static func encodeSharedGateCombineRowsFold(_ enc: MTLComputeCommandEncoder,
+                                                 sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
+                                                 x: MTLBuffer, d: MTLBuffer, scores: MTLBuffer,
+                                                 sharedY: MTLBuffer, out: MTLBuffer,
+                                                 K: Int, H: Int, M: Int, Ktop: Int) {
+        let p = _sharedGateCombineRowsFoldPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(sgW,     offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
+        enc.setBuffer(sgB,     offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
+        enc.setBuffer(d,       offset: 0, index: 4); enc.setBuffer(scores,  offset: 0, index: 5)
+        enc.setBuffer(sharedY, offset: 0, index: 6); enc.setBuffer(out,     offset: 0, index: 7)
+        var kk = Int32(K), hh = Int32(H), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&hh, length: 4, index: 9)
+        enc.setBytes(&kt, length: 4, index: 10)
+        RawMetalForward.bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: (H + 255) / 256, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
     }
@@ -2698,6 +2801,14 @@ public enum RawFusedVerify {
         nonisolated(unsafe) public static var fuseSHEXP =
             ProcessInfo.processInfo.environment["QWISP_FUSE_SHEXP"] != "0"
 
+        /// MoE combine_rows→S2 fold (notes/10 §3). 既定 ON。QWISP_FUSE_MOE2=0 で opt-out。
+        /// fold-ON(MOE2=1 かつ fuseSHEXP かつ M==1): S2 が combine をインライン実行し encodeCombineRows dispatch を skip。
+        /// fold-OFF: 現行経路 combine_rows 別 dispatch + S2 が sc.y 読み。byte 不変。
+        /// ★既定 OFF(opt-in): bit-exact だが利得 sub-noise(paired A/B M=1 +68µs=+0.5%、wall 計測不能)。
+        /// stage-1 recon の +3-4% は fuseSHEXP proxy の過大評価(proxy は compute も畳んでいた)。QWISP_FUSE_MOE2=1 で有効。
+        nonisolated(unsafe) public static var fuseMOE2Enabled =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_MOE2"] == "1"
+
         /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
         /// for the chained GPU token-feedback decode default. RawSpecRunner resolves the
         /// chain length as Tell.envInt("QWISP_CHAIN_K", RawFusedForward.chainKDefault),
@@ -3002,7 +3113,7 @@ public enum RawFusedVerify {
 
                 // 最後 chunk の CB にそのまま shared + resid を連結
                 RawFusedVerify.encodeMoESharedRows(curEnc!, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
-                                                    M: M, I: L.I, H: H)
+                                                    M: M, I: L.I, H: H, Ktop: L.Ktop)
                 RawFusedVerify.encodeResidAdd(curEnc!, h: hBuf, r: moeOut, total: M * H)
 
                 if li + 1 < layers.count {

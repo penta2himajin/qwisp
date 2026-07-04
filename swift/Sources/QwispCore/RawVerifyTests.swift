@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 51
+        let total = 52
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2756,6 +2756,128 @@ public enum RawVerifyTests {
             if chainAll != refAll {
                 return (false, "chain tokens \(chainAll) != sequential \(refAll)")
             }
+            return (true, "ok")
+        }
+
+        // ── II-C G1: MoE combine_rows → S2 fold, M==1-GATED (test 52) ──────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify this test.
+        // Encodes the M==1 gate for fuseMOE2 (same register-pressure doctrine as
+        // fuseGU / fuseSHEXP-S1, which already gate on M==1): the combine→S2 fold
+        // saves a dispatch at M==1 (decode / code / agentic regimes) but REGRESSES
+        // the M>1 verify batches (inlining combine into S2's grid loses the
+        // parallelism combine_rows had at M>1). GOAL: fold applies ONLY at M==1;
+        // verify batches (M>1) keep the separate combine_rows + non-fold S2 path.
+        //
+        // Reference = fold-OFF path (combine_rows separate + S2 reads sc.y) via the
+        // production encodeMoEBlockRows (fuseMOE2Enabled=false). Candidate = fold-ON
+        // flag (fuseMOE2Enabled=true). The test sweeps M∈{1,8} and asserts the
+        // M-DEPENDENT dispatch contract below.
+        //
+        // Dispatch contract (encodeMoEGatherRowsRange fires combine exactly once per
+        // fusedMoEBlockRows call — single range r0:0..r1:M):
+        //   M==1 fold-ON  → combine dispatch SKIPPED  → _combineRowsDispatchCount == 0
+        //   M==8 fold-ON  → combine dispatch RUNS      → _combineRowsDispatchCount == 1
+        //                   (fold INACTIVE at M>1; separate path preserved)
+        // AND: moeOut byte-identical to the fold-OFF reference in BOTH M cases
+        //   (M==1 via the fold kernel; M==8 via the unchanged separate combine path).
+        //
+        // RED gate: the CURRENT tree folds at ALL M (encodeMoEGatherRowsRange skips
+        // combine whenever fuseMOE2Enabled && fuseSHEXP, with no M==1 guard; S2
+        // dispatches the fold kernel at every M). So at M==8 fold-ON the current code
+        // yields _combineRowsDispatchCount == 0, but this test requires 1 → FAIL.
+        // GREEN when the implementer adds M==1 to BOTH the combine-skip guard
+        // (encodeMoEGatherRowsRange) and the S2 fold-kernel selection (encodeMoESharedRows).
+        //
+        // Adversarial cases:
+        //   M=1: exercises fuseSHEXP M=1 path (S1 fused swiglu) + S2 fold; combine fold
+        //        must not corrupt the sc.d/sc.scores→moeOut pipeline (bit-exact).
+        //   M=8: exercises the M>1 verify batch — fold MUST NOT fire; separate
+        //        combine_rows + non-fold S2 must run and stay bit-exact.
+        //
+        // Seam: fuseMOE2Enabled (flag, default ON from env) + _combineRowsDispatchCount
+        //       (incremented in encodeCombineRows; M-dependent expected value).
+        run("moe_combine_fold_bitexact") {
+            let H = 2048, E = 16, I = 512, Ktop = 8
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            let (gW, gS, gB)   = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+            let (a0, a1, a2)   = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+            let (d0, d1, d2)   = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+
+            // Snapshot of flags we toggle, restored unconditionally at the end.
+            let savedMOE2  = RawFusedVerify.RawFusedForward.fuseMOE2Enabled
+            let savedSHEXP = RawFusedVerify.RawFusedForward.fuseSHEXP
+
+            // Ensure S2 path is active for both arms (fold applies only when fuseSHEXP is ON).
+            RawFusedVerify.RawFusedForward.fuseSHEXP = true
+
+            for M in [1, 8] {
+                // M==1 folds (dispatch skipped); M>1 keeps the separate combine dispatch.
+                let expectedCount = (M == 1) ? 0 : 1
+
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+
+                // ── Reference (fold-OFF): combine_rows separate dispatch + S2 reads sc.y ──
+                RawFusedVerify.RawFusedForward.fuseMOE2Enabled = false
+                guard let ref = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                else {
+                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
+                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    return (false, "fold-OFF ref nil M=\(M)")
+                }
+                ref.eval()
+
+                // ── Candidate (fold-ON flag): M==1 folds, M>1 keeps the separate path ──
+                RawFusedVerify.RawFusedForward.fuseMOE2Enabled = true
+                RawFusedVerify._combineRowsDispatchCount = 0   // reset before fold-ON call
+                guard let got = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                else {
+                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
+                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    return (false, "fold-ON nil M=\(M)")
+                }
+                got.eval()
+                let dispatchCount = RawFusedVerify._combineRowsDispatchCount
+
+                // (a) moeOut byte-identical to fold-OFF reference (both M cases).
+                //     M==1: through the fold kernel. M==8: through the unchanged path.
+                let (okOut, dOut) = bitEqual(got, ref)
+                if !okOut {
+                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
+                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    return (false, "M=\(M) out mismatch: \(dOut)")
+                }
+
+                // (b) M-dependent combine_rows dispatch count.
+                //     RED on current tree: M==8 folds (count 0) but contract wants 1.
+                //     GREEN when fold is M==1-gated (skip at M==1, keep at M>1).
+                if dispatchCount != expectedCount {
+                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
+                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    return (false,
+                            "M=\(M) combine_rows dispatch count=\(dispatchCount) want \(expectedCount) " +
+                            "(fold must be M==1-gated: skip at M==1, keep separate combine at M>1)")
+                }
+            }
+
+            RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
+            RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
             return (true, "ok")
         }
 
