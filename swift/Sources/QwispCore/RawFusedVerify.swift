@@ -1516,7 +1516,7 @@ public enum RawFusedVerify {
         // S1: M==1 branch only (register-pressure gate, same doctrine as fuseGU).
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_S1=0 で S1 のみ無効。
         if RawFusedForward.fuseSHEXPActive(M: M) ?? false,
-           ProcessInfo.processInfo.environment["QWISP_FUSE_S1"] != "0",
+           RawFusedForward.fuseS1Enabled,
            let zeroInds = zeroOneIndsBuf(),
            RawMetalForward._gqmmSwigluRowsPipeline != nil {
             // gqmm4_swiglu_rows with Ktop=1, inds=[0]: bit-exact with qmmRows×2+swiglu (no gather)
@@ -1948,7 +1948,7 @@ public enum RawFusedVerify {
         // Cat weights built at prepare time; bit-exact by qmm4_inproj_demux_rows construction.
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_A1=0 で A1 のみ無効。
         if RawFusedForward.fuseATTN,
-           ProcessInfo.processInfo.environment["QWISP_FUSE_A1"] != "0",
+           RawFusedForward.fuseA1Enabled,
            let cw = w.catQkvW, let cs = w.catQkvS, let cb = w.catQkvB, let dummy = w.catQkvDummy {
             let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
             encodeQmmInProjDemuxRows(enc, w: cw, scales: cs, biases: cb, x: x,
@@ -2683,6 +2683,12 @@ public enum RawFusedVerify {
         /// attn 層融合(notes/08 §3)へ分岐。既定 off。QWISP_FUSE_ATTN=1 で on。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
         /// flag-off で encodeAttnLayerRows は既存経路のままで byte 不変(G3 gate)。
+        /// 原子別 kill-switch のキャッシュ(per-encode の ProcessInfo.environment 読みは 18.8µs/回で
+        /// chain 時 K×層 倍化し fusion 利得を食う — recon 2026-07-04 実測。必ず static で一度だけ読む)
+        nonisolated(unsafe) public static let fuseS1Enabled =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_S1"] != "0"
+        nonisolated(unsafe) public static let fuseA1Enabled =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_A1"] != "0"
         nonisolated(unsafe) public static var fuseATTN =
             ProcessInfo.processInfo.environment["QWISP_FUSE_ATTN"] == "1"
 
