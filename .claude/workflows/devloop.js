@@ -1,6 +1,6 @@
 export const meta = {
   name: 'devloop',
-  description: 'Generic TDD dev loop (project-agnostic): (phase=recon) Opus deep-dive OR (phase=loop) Sonnet locked tests → GLM-5.2 implement (Pi harness, Sonnet-driven with fallback) → Sonnet adversarial review, iterate ≤maxRounds. Steps 1 (spec) and 5 (final audit) belong to the driver (Fable) outside this workflow.',
+  description: 'Generic TDD dev loop (project-agnostic): (phase=recon) Opus deep-dive OR (phase=loop) Sonnet locked tests → GLM-5.2 implement (Pi harness, Sonnet-driven with fallback) → Sonnet adversarial review, iterate ≤maxRounds. Steps 1 (spec) and 5 (final audit) belong to the driver (Opus) outside this workflow.',
   whenToUse: '任意プロジェクトの recon→spec(driver)→locked tests→GLM実装(fallback付)→敵対レビューのループ。args.project={repo,buildCmd,testCmd,testFile,doctrine} 必須。args: {phase:"recon", reconPrompt, reconModel?} で事前調査、{phase:"loop", spec, lockDir, expectedTotalBefore, testBrief, implBrief?, maxRounds?} で TDD ループ。',
   phases: [
     { title: 'Recon', detail: 'phase=recon のみ: Opus 事前調査' },
