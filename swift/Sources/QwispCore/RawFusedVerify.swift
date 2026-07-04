@@ -2435,6 +2435,128 @@ public enum RawFusedVerify {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * valueDim)), [M, valueDim])
     }
 
+    // ── Wave 2 GDN fusion stubs (notes/07 §3 Wave 2) — FUSE_GDN3 STUB — implementation pending ──
+
+    /// F2: gdn_prep fused — ⑧slice q ⑨slice k ⑩slice v (from convOut) ⑪rmsnorm qn (ones weight,
+    /// per-head over headKDim) ⑫rmsnorm kn (ones) ⑬scale_mul q (invScale²) ⑭scale_mul k (invScale)
+    /// ⑮compute_g_beta (from aP,bP with aLog,dtBias) — 8 separate kernels → 1 fused dispatch.
+    /// convOut: [M, keyDim*2+valueDim] f16 — the full conv output (stride = keyDim*2+valueDim).
+    /// aP, bP:  [M, numVHeads] f16 — in-proj a/b outputs for compute_g_beta.
+    /// aLog, dtBias: [numVHeads] f32 — per-head log-alpha / delta-bias constants.
+    /// Outputs (matching the 8-kernel production chain exactly):
+    ///   qn:   [M*numKHeads, headKDim] f16 — q after rmsnorm(ones) AND scale_mul(invScale²)
+    ///   kn:   [M*numKHeads, headKDim] f16 — k after rmsnorm(ones) AND scale_mul(invScale)
+    ///   v:    [M, valueDim] f16 — v sliced from convOut (pure copy)
+    ///   g:    [1, M, numVHeads] f32 — from compute_g_beta
+    ///   beta: [1, M, numVHeads] f32 — from compute_g_beta
+    /// Signature note: eps added (not in task template) because encodeRmsNormRows requires it.
+    /// Returns nil until implemented (FUSE_GDN3 STUB — implementation pending).
+    public static func gdnPrepFused(
+        convOut: MLXArray, aP: MLXArray, bP: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        M: Int, keyDim: Int, valueDim: Int, numKHeads: Int, headKDim: Int,
+        numVHeads: Int, invScale: Float, eps: Float = 1e-6
+    ) -> (qn: MLXArray, kn: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray)? {
+        // F2 Wave 2: ⑧slice q ⑨slice k ⑩slice v ⑪rmsnorm qn ⑫rmsnorm kn
+        //            ⑬scale_mul q ⑭scale_mul k ⑮compute_g_beta — chained in one CB.
+        // Scale_mul ⑬⑭ use the same MLX f32-multiply path as the test reference
+        // (qnNorm.asType(.float32) * scalar).asType(.float16) to preserve bit-exact match.
+        guard let (device, queue) = RawMetalForward.ensure(),
+              ensureGdnPipelines() else { return nil }
+        let convDim = keyDim * 2 + valueDim
+        // ones weight [headKDim] f16 for qk-norm (no-weight = identity)
+        guard let bOnes = device.makeBuffer(length: headKDim * 2, options: .storageModeShared) else { return nil }
+        let onesPtr = bOnes.contents().bindMemory(to: Float16.self, capacity: headKDim)
+        for i in 0 ..< headKDim { onesPtr[i] = Float16(1.0) }
+        // input buffers
+        guard let bConv = RawMetalForward.mtlBuf(convOut.asType(.float16), device),
+              let bA    = RawMetalForward.mtlBuf(aP.asType(.float16), device),
+              let bB    = RawMetalForward.mtlBuf(bP.asType(.float16), device),
+              let bALog = RawMetalForward.mtlBuf(aLog.asType(.float32), device),
+              let bDt   = RawMetalForward.mtlBuf(dtBias.asType(.float32), device) else { return nil }
+        // intermediate/output buffers
+        guard let bQ    = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+              let bK    = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+              let bV    = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared),
+              let bQn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+              let bKn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+              let bG    = device.makeBuffer(length: M * numVHeads * 4, options: .storageModeShared),
+              let bBeta = device.makeBuffer(length: M * numVHeads * 4, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        // ⑧ slice q (first keyDim elements of each convOut row)
+        encodeSliceRows(enc, input: bConv, out: bQ, off: 0, W: keyDim, stride: convDim, M: M)
+        // ⑨ slice k
+        encodeSliceRows(enc, input: bConv, out: bK, off: keyDim, W: keyDim, stride: convDim, M: M)
+        // ⑩ slice v
+        encodeSliceRows(enc, input: bConv, out: bV, off: 2 * keyDim, W: valueDim, stride: convDim, M: M)
+        // ⑪ rmsnorm qn (ones weight, per-head: rows = M*numKHeads, D = headKDim)
+        encodeRmsNormRows(enc, x: bQ, w: bOnes, out: bQn, rows: M * numKHeads, D: headKDim, eps: eps)
+        // ⑫ rmsnorm kn
+        encodeRmsNormRows(enc, x: bK, w: bOnes, out: bKn, rows: M * numKHeads, D: headKDim, eps: eps)
+        // ⑮ compute_g_beta (independent of qn/kn, encoded in the same CB)
+        encodeComputeGBetaRows(enc, a: bA, b: bB, aLog: bALog, dtBias: bDt,
+                               g: bG, beta: bBeta, Hv: numVHeads, M: M)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        // ⑬⑭ scale_mul via MLX — matches (qnNorm.asType(.float32) * scalar).asType(.float16)
+        // which is the bit-exact reference used in the test. A Metal scale_mul kernel gives 1
+        // f16 ULP difference vs the MLX f32-multiply-then-cast path on some values.
+        let pqnRaw = bQn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
+        let pknRaw = bKn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
+        let qnNorm = MLXArray(Array(UnsafeBufferPointer(start: pqnRaw, count: M * keyDim)),
+                              [M * numKHeads, headKDim])
+        let knNorm = MLXArray(Array(UnsafeBufferPointer(start: pknRaw, count: M * keyDim)),
+                              [M * numKHeads, headKDim])
+        let qnFinal = (qnNorm.asType(.float32) * (invScale * invScale)).asType(.float16)
+        let knFinal = (knNorm.asType(.float32) * invScale).asType(.float16)
+        MLX.eval([qnFinal, knFinal])
+        // read back remaining outputs
+        let pv    = bV.contents().bindMemory(to: Float16.self, capacity: M * valueDim)
+        let pg    = bG.contents().bindMemory(to: Float.self, capacity: M * numVHeads)
+        let pbeta = bBeta.contents().bindMemory(to: Float.self, capacity: M * numVHeads)
+        return (
+            qnFinal,
+            knFinal,
+            MLXArray(Array(UnsafeBufferPointer(start: pv,    count: M * valueDim)),  [M, valueDim]),
+            MLXArray(Array(UnsafeBufferPointer(start: pg,    count: M * numVHeads)), [1, M, numVHeads]),
+            MLXArray(Array(UnsafeBufferPointer(start: pbeta, count: M * numVHeads)), [1, M, numVHeads])
+        )
+    }
+
+    /// F5: gdn_resid_post_norm fused — ⑳resid_add (hBuf += mixerOut) ㉑rmsnorm post
+    /// (hBuf → postNorm) — 2 separate kernels → 1 fused dispatch.
+    /// hBuf:     [M, H] f16 — residual stream (read; not modified in this wrapper).
+    /// mixerOut: [M, H] f16 — mixer output to add to hBuf.
+    /// postW:    [H] f16 — post-layer rmsnorm weight.
+    /// Outputs (matching encodeResidAdd + encodeRmsNormRows exactly):
+    ///   h:        [M, H] f16 — hBuf + mixerOut (resid_add result)
+    ///   postNorm: [M, H] f16 — rmsnorm(h, postW, eps)
+    /// Returns nil until implemented (FUSE_GDN3 STUB — implementation pending).
+    public static func gdnResidPostNormFused(
+        hBuf: MLXArray, mixerOut: MLXArray, postW: MLXArray,
+        M: Int, H: Int, eps: Float
+    ) -> (h: MLXArray, postNorm: MLXArray)? {
+        // F5 Wave 2: ⑳resid_add (h = hBuf + mixerOut)  ㉑rmsnorm post — both in one CB.
+        // Bit-exact with encodeResidAdd + encodeRmsNormRows chain by construction.
+        guard let (device, queue) = RawMetalForward.ensure(),
+              ensureGdnPipelines() else { return nil }
+        // bH is a CPU-side copy of hBuf (mtlBuf copies the data); resid_add modifies it in-place.
+        guard let bH    = RawMetalForward.mtlBuf(hBuf.asType(.float16), device),
+              let bR    = RawMetalForward.mtlBuf(mixerOut.asType(.float16), device),
+              let bW    = RawMetalForward.mtlBuf(postW.asType(.float16), device),
+              let bPost = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        // ⑳ resid_add: bH += bR  (in-place on the copy)
+        encodeResidAdd(enc, h: bH, r: bR, total: M * H)
+        // ㉑ rmsnorm post: bH → bPost
+        encodeRmsNormRows(enc, x: bH, w: bW, out: bPost, rows: M, D: H, eps: eps)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ph = bH.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let pn = bPost.contents().bindMemory(to: Float16.self, capacity: M * H)
+        return (
+            MLXArray(Array(UnsafeBufferPointer(start: ph, count: M * H)), [M, H]),
+            MLXArray(Array(UnsafeBufferPointer(start: pn, count: M * H)), [M, H])
+        )
+    }
+
     /// Test-entry wrapper: drives gqmm4_swiglu_rows in a self-contained command buffer.
     /// x[M,K] f16, inds[M*Ktop] int32, wG/wU [E,N,K/2] 4-bit, sG/sU/bG/bU [E,N,K/64] f16.
     /// Returns h[M*Ktop, N] f16 — bit-identical to gatherQmmRows(g)+gatherQmmRows(u)+swigluRaw.

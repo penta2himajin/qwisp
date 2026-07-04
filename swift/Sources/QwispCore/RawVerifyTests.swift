@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 39
+        let total = 41
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -1964,6 +1964,116 @@ public enum RawVerifyTests {
                     let (ok, d) = bitEqual(outVGot, outVRef.reshaped([M, valueDim]))
                     if !ok { return (false, "M=\(M) promote=\(promote): \(d)") }
                 }
+            }
+            return (true, "ok")
+        }
+
+        // ── Wave 2 GDN fusion tests (40-41) ──────────────────────────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/07-gdn-fusion-spec.md §3 Wave 2.
+        //
+        // Canonical GDN geometry: Hk=16, Dk=128, Hv=32, Dv=128.
+        // References use ONLY existing production kernel wrappers (rmsNormRows,
+        // computeGBetaRowsRaw) and pure MLX data-movement for slices — no CPU
+        // reimplementations.  Tests are RED until Wave 2 implementation is complete.
+
+        // ── Test 40 (F2): gdnPrepFused ───────────────────────────────────
+        // Fused ⑧slice q ⑨slice k ⑩slice v ⑪rmsnorm qn ⑫rmsnorm kn
+        //       ⑬scale_mul q ⑭scale_mul k ⑮compute_g_beta
+        // ≡ 8-kernel reference chain.  5 outputs (qn/kn/v/g/beta) bit-exact.
+        run("fuse_gdn_prep") {
+            let numKHeads = 16, headKDim = 128, numVHeads = 32
+            let keyDim   = numKHeads * headKDim    // 2048
+            let valueDim = numVHeads * headKDim    // 4096  (headVDim == headKDim == 128)
+            let convDim  = keyDim * 2 + valueDim   // 8192
+            let invScale = Float(pow(Double(headKDim), -0.5))
+            let eps: Float = 1e-6
+            let onesQ = MLXArray.ones([headKDim]).asType(.float16); onesQ.eval()
+            for M in [1, 8] {
+                let convOut = MLXRandom.normal([M, convDim]).asType(.float16)
+                let aP      = MLXRandom.normal([M, numVHeads]).asType(.float16)
+                let bP      = MLXRandom.normal([M, numVHeads]).asType(.float16)
+                let aLog    = MLXRandom.normal([numVHeads]).asType(.float32)
+                let dtBias  = MLXRandom.normal([numVHeads]).asType(.float32)
+                MLX.eval([convOut, aP, bP, aLog, dtBias])
+                // ── Reference: 8-kernel chain ──
+                // ⑧ slice q  ⑨ slice k  ⑩ slice v  (pure data movement)
+                let q1 = convOut[0..., 0 ..< keyDim]
+                    .asType(.float16).reshaped([M * numKHeads, headKDim])
+                let k1 = convOut[0..., keyDim ..< 2 * keyDim]
+                    .asType(.float16).reshaped([M * numKHeads, headKDim])
+                let v1 = convOut[0..., 2 * keyDim ..< 2 * keyDim + valueDim].asType(.float16)
+                MLX.eval([q1, k1, v1])
+                // ⑪ rmsnorm qn (ones weight, per-head over headKDim)
+                guard let qnNorm = RawMetalForward.rmsNormRows(
+                        q1, onesQ, M: M * numKHeads, eps: eps, D: headKDim)
+                else { return (false, "ref rmsNorm qn nil M=\(M)") }
+                // ⑫ rmsnorm kn (ones weight, per-head over headKDim)
+                guard let knNorm = RawMetalForward.rmsNormRows(
+                        k1, onesQ, M: M * numKHeads, eps: eps, D: headKDim)
+                else { return (false, "ref rmsNorm kn nil M=\(M)") }
+                qnNorm.eval(); knNorm.eval()
+                // ⑬ scale_mul q (invScale²): (half)(invScale² × (float)qn[i]) — matches Metal kernel
+                let qnRef = (qnNorm.asType(.float32) * (invScale * invScale)).asType(.float16)
+                // ⑭ scale_mul k (invScale)
+                let knRef = (knNorm.asType(.float32) * invScale).asType(.float16)
+                qnRef.eval(); knRef.eval()
+                // ⑮ compute_g_beta (per-op production wrapper)
+                guard let (gRef, betaRef) = RawFusedVerify.computeGBetaRowsRaw(
+                        aP, bP, aLog, dtBias, M: M, Hv: numVHeads)
+                else { return (false, "ref computeGBeta nil M=\(M)") }
+                gRef.eval(); betaRef.eval()
+                // ── Fused stub ──
+                guard let (qnGot, knGot, vGot, gGot, betaGot) = RawFusedVerify.gdnPrepFused(
+                    convOut: convOut, aP: aP, bP: bP, aLog: aLog, dtBias: dtBias,
+                    M: M, keyDim: keyDim, valueDim: valueDim,
+                    numKHeads: numKHeads, headKDim: headKDim, numVHeads: numVHeads,
+                    invScale: invScale, eps: eps)
+                else { return (false, "not implemented (M=\(M))") }
+                MLX.eval([qnGot, knGot, vGot, gGot, betaGot])
+                // ── Bit-exact check: all 5 outputs ──
+                let checks: [(String, MLXArray, MLXArray)] = [
+                    ("qn",   qnGot,   qnRef),
+                    ("kn",   knGot,   knRef),
+                    ("v",    vGot,    v1),
+                    ("g",    gGot,    gRef),
+                    ("beta", betaGot, betaRef)]
+                for (nm, got, ref) in checks {
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) \(nm): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // ── Test 41 (F5): gdnResidPostNormFused ──────────────────────────
+        // Fused ⑳resid_add (hBuf += mixerOut) ㉑rmsnorm post (hBuf → postNorm)
+        // ≡ resid_add then rmsNormRows reference.  Both outputs (h, postNorm) bit-exact.
+        run("fuse_gdn_resid_postnorm") {
+            let H = 2048, eps: Float = 1e-6
+            for M in [1, 8] {
+                let hBuf     = MLXRandom.normal([M, H]).asType(.float16)
+                let mixerOut = MLXRandom.normal([M, H]).asType(.float16)
+                let postW    = MLXRandom.normal([H]).asType(.float16)
+                MLX.eval([hBuf, mixerOut, postW])
+                // ── Reference: resid_add then rmsnorm ──
+                // resid_add: (half)((float)h[i] + (float)r[i]) — matches Metal kernel semantics
+                let hRef = (hBuf.asType(.float32) + mixerOut.asType(.float32)).asType(.float16)
+                hRef.eval()
+                guard let postNormRef = RawMetalForward.rmsNormRows(hRef, postW, M: M, eps: eps, D: H)
+                else { return (false, "ref rmsNormRows nil M=\(M)") }
+                postNormRef.eval()
+                // ── Fused stub ──
+                guard let (hGot, postNormGot) = RawFusedVerify.gdnResidPostNormFused(
+                    hBuf: hBuf, mixerOut: mixerOut, postW: postW, M: M, H: H, eps: eps)
+                else { return (false, "not implemented (M=\(M))") }
+                MLX.eval([hGot, postNormGot])
+                // ── Bit-exact check: both outputs ──
+                let (ok1, d1) = bitEqual(hGot, hRef)
+                if !ok1 { return (false, "h M=\(M): \(d1)") }
+                let (ok2, d2) = bitEqual(postNormGot, postNormRef)
+                if !ok2 { return (false, "postNorm M=\(M): \(d2)") }
             }
             return (true, "ok")
         }
