@@ -60,6 +60,27 @@ public enum RawVerifyTests {
             if ok { passed += 1 }
         }
 
+        // Production Metal scale_mul kernel driver (copy-based, no alias with MLX memory).
+        // References for test 40 steps ⑬⑭ MUST use this instead of MLX f32 arithmetic:
+        // the Metal kernel computes x[i] = (half)s * x[i] (half·half mul), which can
+        // differ from the f32-multiply path by 1 f16 ULP on ~1/2048 elements when `s`
+        // is not exactly representable in f16 (e.g. invScale = 1/sqrt(headKDim)).
+        func scaleMulKernel(_ input: MLXArray, s: Float, total: Int) -> MLXArray? {
+            guard let (device, queue) = RawMetalForward.ensure(),
+                  RawMetalForward.ensureAuxPipelines() else { return nil }
+            let f16 = input.reshaped([-1]).asType(.float16); f16.eval()
+            let arr = f16.asArray(Float16.self)
+            guard let buf = arr.withUnsafeBytes({ ptr in
+                device.makeBuffer(bytes: ptr.baseAddress!, length: total * 2, options: .storageModeShared)
+            }) else { return nil }
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            RawFusedVerify.encodeScaleMul(enc, x: buf, s: s, total: total)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ptr = buf.contents().bindMemory(to: Float16.self, capacity: total)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), input.shape)
+        }
+
         // ── PASS baselines ────────────────────────────────────────────────
         // Verify that the harness itself is correct: existing M=1 kernels are
         // deterministic (same inputs → bit-identical outputs on two calls).
@@ -2014,10 +2035,14 @@ public enum RawVerifyTests {
                         k1, onesQ, M: M * numKHeads, eps: eps, D: headKDim)
                 else { return (false, "ref rmsNorm kn nil M=\(M)") }
                 qnNorm.eval(); knNorm.eval()
-                // ⑬ scale_mul q (invScale²): (half)(invScale² × (float)qn[i]) — matches Metal kernel
-                let qnRef = (qnNorm.asType(.float32) * (invScale * invScale)).asType(.float16)
-                // ⑭ scale_mul k (invScale)
-                let knRef = (knNorm.asType(.float32) * invScale).asType(.float16)
+                // ⑬⑭ scale_mul q/k — PRODUCTION Metal scale_mul kernel (encodeScaleMul).
+                // NOT MLX f32-multiply: Metal x[i]=(half)s·x[i] (half·half mul) can differ
+                // from f32-multiply by 1 f16 ULP on ~1/2048 elements when s is not exactly
+                // representable in f16 (invScale = 1/sqrt(headKDim) is not exact in f16).
+                let qkDim = M * numKHeads * headKDim
+                guard let qnRef = scaleMulKernel(qnNorm, s: invScale * invScale, total: qkDim),
+                      let knRef = scaleMulKernel(knNorm, s: invScale, total: qkDim)
+                else { return (false, "scale_mul kernel failed M=\(M)") }
                 qnRef.eval(); knRef.eval()
                 // ⑮ compute_g_beta (per-op production wrapper)
                 guard let (gRef, betaRef) = RawFusedVerify.computeGBetaRowsRaw(

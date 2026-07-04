@@ -221,6 +221,9 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _qmmInProjDemuxRowsPipeline: MTLComputePipelineState?   // F1: 1 qmm4 over concat weights → 4 out buffers
     nonisolated(unsafe) static var _gdnNormGateRowsPipeline: MTLComputePipelineState?      // F4: f16 weight (non-promote)
     nonisolated(unsafe) static var _gdnNormGateRowsF32Pipeline: MTLComputePipelineState?   // F4: f32 weight (promote)
+    // ── Wave 2 GDN fusion (notes/07 §3 Wave 2) — F2 gdn_prep_rows + F5 gdn_resid_postnorm_rows ──
+    nonisolated(unsafe) static var _gdnPrepRowsPipeline: MTLComputePipelineState?           // F2: 8→1 dispatch (slice+rmsnorm+scale+gbeta)
+    nonisolated(unsafe) static var _gdnResidPostNormRowsPipeline: MTLComputePipelineState?  // F5: 2→1 dispatch (resid_add+postNorm)
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
@@ -233,7 +236,8 @@ public enum RawFusedVerify {
             && _convShiftFusedRowsPipeline != nil
             && _normGateFusedPipeline != nil && _normGateFusedF32Pipeline != nil
             && _qmmInProjDemuxRowsPipeline != nil
-            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil { return true }
+            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil
+            && _gdnPrepRowsPipeline != nil && _gdnResidPostNormRowsPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -403,7 +407,8 @@ public enum RawFusedVerify {
         if _convShiftFusedRowsPipeline != nil
             && _normGateFusedPipeline != nil && _normGateFusedF32Pipeline != nil
             && _qmmInProjDemuxRowsPipeline != nil
-            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil { return }
+            && _gdnNormGateRowsPipeline != nil && _gdnNormGateRowsF32Pipeline != nil
+            && _gdnPrepRowsPipeline != nil && _gdnResidPostNormRowsPipeline != nil { return }
         let srcStatic = """
         #include <metal_stdlib>
         #include <metal_simdgroup>
@@ -604,7 +609,184 @@ public enum RawFusedVerify {
             }
             """
         }
-        let src = srcStatic + "\n" + normGateKernel("gdn_norm_gate_rows", "half") + "\n" + normGateKernel("gdn_norm_gate_rows_f32", "float")
+        // ── Wave 2 GDN fusion kernel sources (notes/07 §3 Wave 2) ──
+        let wave2Src = """
+        // F2: gdn_prep_rows — fused ⑧slice q ⑨slice k ⑩slice v ⑪rmsnorm qn(ones)
+        // ⑫rmsnorm kn(ones) ⑬scale_mul q(qScale=invScale²) ⑭scale_mul k(kScale=invScale)
+        // ⑮compute_g_beta in ONE dispatch.
+        // Grid: M*(numKH*2+numVH) threadgroups × tgSize threads (tgSize=ceil(headKD/4,32)).
+        // Seg Q [0, M*numKH):           rmsnorm(ones)+scale_mul(qScale) → qn
+        // Seg K [M*numKH, 2*M*numKH):   rmsnorm(ones)+scale_mul(kScale) → kn
+        // Seg G [2*M*numKH, ...+M*numVH): v copy (all threads) + compute_g_beta (thread 0)
+        // Reduction tree = byte-identical to existing rmsnorm kernel (N_READS=4, SIMD_SIZE=32).
+        // scale_mul semantics: x[i]=(half)s*x[i] where (half)s rounds s to f16 FIRST.
+        kernel void gdn_prep_rows(
+            device const half*  convOut  [[buffer(0)]],
+            device const half*  aP       [[buffer(1)]],
+            device const half*  bP       [[buffer(2)]],
+            device const float* aLog     [[buffer(3)]],
+            device const float* dtBias   [[buffer(4)]],
+            device half*        qn       [[buffer(5)]],
+            device half*        kn       [[buffer(6)]],
+            device half*        v        [[buffer(7)]],
+            device float*       g        [[buffer(8)]],
+            device float*       beta     [[buffer(9)]],
+            constant uint&      M_       [[buffer(10)]],
+            constant uint&      numKH    [[buffer(11)]],
+            constant uint&      headKD   [[buffer(12)]],
+            constant uint&      numVH    [[buffer(13)]],
+            constant uint&      keyDim   [[buffer(14)]],
+            constant uint&      valDim   [[buffer(15)]],
+            device const int*   stopFlag [[buffer(16)]],
+            constant float&     eps      [[buffer(17)]],
+            constant float&     qScale   [[buffer(18)]],
+            constant float&     kScale   [[buffer(19)]],
+            uint gid [[threadgroup_position_in_grid]],
+            uint lid [[thread_position_in_threadgroup]],
+            uint simd_lane_id  [[thread_index_in_simdgroup]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint convDim = keyDim * 2 + valDim;
+            const uint qkEnd = M_ * numKH;
+            const uint kEnd  = 2 * M_ * numKH;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            if (gid < kEnd) {
+                // Segments Q and K: rmsnorm(ones-weight) + scale_mul
+                const bool isK = (gid >= qkEnd);
+                const uint segGid = isK ? (gid - qkEnd) : gid;
+                const uint m   = segGid / numKH;
+                const uint hd  = segGid % numKH;
+                const uint srcOff = m * convDim + (isK ? keyDim : 0u) + hd * headKD;
+                const device half* xp = convOut + srcOff + lid * N_READS;
+                float acc = 0;
+                if (lid * N_READS + N_READS <= headKD) {
+                    for (int i = 0; i < N_READS; i++) { float xi = (float)xp[i]; acc += xi * xi; }
+                } else {
+                    for (int i = 0; i < N_READS; i++) { if (lid*N_READS+i < headKD) { float xi=(float)xp[i]; acc+=xi*xi; } }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / headKD + eps);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Apply: out[i] = (half)scale * (half)(x[i]*inv_mean)
+                // (half)scale rounds s to f16 first — matches scale_mul kernel x[i]=(half)s*x[i].
+                const half hs = isK ? (half)kScale : (half)qScale;
+                float inv = local_inv_mean[0];
+                device half* outp = isK ? (kn + segGid * headKD) : (qn + segGid * headKD);
+                if (lid * N_READS + N_READS <= headKD) {
+                    for (int i = 0; i < N_READS; i++)
+                        outp[lid * N_READS + i] = hs * (half)((float)xp[i] * inv);
+                } else {
+                    for (int i = 0; i < N_READS; i++)
+                        if (lid * N_READS + i < headKD)
+                            outp[lid * N_READS + i] = hs * (half)((float)xp[i] * inv);
+                }
+            } else {
+                // Segment G/Beta + V
+                const uint segGid = gid - kEnd;
+                const uint m  = segGid / numVH;
+                const uint hv = segGid % numVH;
+                // V copy: headKD elements per (m,hv)
+                const uint vsrc = m * convDim + 2 * keyDim + hv * headKD;
+                const uint vdst = m * valDim  + hv * headKD;
+                if (lid * N_READS + N_READS <= headKD) {
+                    for (int i = 0; i < N_READS; i++)
+                        v[vdst + lid * N_READS + i] = convOut[vsrc + lid * N_READS + i];
+                } else {
+                    for (int i = 0; i < N_READS; i++)
+                        if (lid * N_READS + i < headKD)
+                            v[vdst + lid * N_READS + i] = convOut[vsrc + lid * N_READS + i];
+                }
+                // compute_g_beta: thread 0 only (byte-identical to compute_g_beta_rows kernel)
+                if (lid == 0) {
+                    const uint idx = m * numVH + hv;
+                    half bh = bP[idx];
+                    half y = (half)1 / ((half)1 + exp(metal::abs(bh)));
+                    half sb = (bh < (half)0) ? y : ((half)1 - y);
+                    beta[idx] = (float)sb;
+                    float x = (float)aP[idx] + dtBias[hv];
+                    float sp = max(x, 0.0f) + precise::log(1.0f + precise::exp(-metal::abs(x)));
+                    g[idx] = precise::exp(-precise::exp(aLog[hv]) * sp);
+                }
+            }
+        }
+        // F5: gdn_resid_postnorm_rows — fused ⑳resid_add ㉑rmsnorm(post) in ONE dispatch.
+        // resid_add: h[i]=(half)((float)h[i]+(float)r[i])  (matches existing resid_add kernel).
+        // rmsnorm uses the updated h (half-precision) with the production reduction tree.
+        // Grid: M threadgroups × tgSize threads (tgSize=ceil(H/4,32)).
+        kernel void gdn_resid_postnorm_rows(
+            device half*        h        [[buffer(0)]],
+            device const half*  r        [[buffer(1)]],
+            device const half*  w        [[buffer(2)]],
+            device half*        postNorm [[buffer(3)]],
+            constant float&     eps      [[buffer(4)]],
+            constant uint&      H_       [[buffer(5)]],
+            device const int*   stopFlag [[buffer(16)]],
+            uint gid [[threadgroup_position_in_grid]],
+            uint lid [[thread_position_in_threadgroup]],
+            uint simd_lane_id  [[thread_index_in_simdgroup]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            h        += gid * (size_t)H_;
+            r        += gid * (size_t)H_;
+            postNorm += gid * (size_t)H_;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            // Phase 1: resid_add in-place and accumulate h_new^2 for rmsnorm
+            float acc = 0;
+            const uint base = lid * N_READS;
+            if (base + N_READS <= H_) {
+                for (int i = 0; i < N_READS; i++) {
+                    half hn = (half)((float)h[base+i] + (float)r[base+i]);
+                    h[base+i] = hn;
+                    acc += (float)hn * (float)hn;
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if (base+i < H_) {
+                        half hn = (half)((float)h[base+i] + (float)r[base+i]);
+                        h[base+i] = hn;
+                        acc += (float)hn * (float)hn;
+                    }
+                }
+            }
+            // Reduction (identical to existing rmsnorm kernel)
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / H_ + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Phase 2: rmsnorm → postNorm (reads h which now has resid_add result)
+            float inv = local_inv_mean[0];
+            if (base + N_READS <= H_) {
+                for (int i = 0; i < N_READS; i++)
+                    postNorm[base+i] = w[base+i] * (half)((float)h[base+i] * inv);
+            } else {
+                for (int i = 0; i < N_READS; i++)
+                    if (base+i < H_)
+                        postNorm[base+i] = w[base+i] * (half)((float)h[base+i] * inv);
+            }
+        }
+        """
+        let src = srcStatic + "\n" + normGateKernel("gdn_norm_gate_rows", "half") + "\n" + normGateKernel("gdn_norm_gate_rows_f32", "float") + "\n" + wave2Src
         // ── Wave 1 conv+shift fused kernel only. norm+gate fusion is realised at the encode level
         // (chaining the existing _rmsPipeline[_F32] and _gate[_16] in one encoder = bit-exact by
         // construction and reduces the wave-1 dispatch count by 1 with no kernel duplication).
@@ -613,9 +795,62 @@ public enum RawFusedVerify {
         _qmmInProjDemuxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_inproj_demux_rows")!)
         _gdnNormGateRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_norm_gate_rows")!)
         _gdnNormGateRowsF32Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_norm_gate_rows_f32")!)
+        _gdnPrepRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_prep_rows")!)
+        _gdnResidPostNormRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_resid_postnorm_rows")!)
         // norm+gate: reuse existing per-op kernels chained in one encoder (bit-exact by construction).
         _normGateFusedPipeline = RawMetalForward._rmsPipeline
         _normGateFusedF32Pipeline = RawMetalForward._rmsPipelineF32
+    }
+
+    /// F2 (Wave 2): encode gdn_prep_rows — ONE dispatch replacing ⑧slice q/k/v ⑪⑫rmsnorm ⑬⑭scale_mul ⑮compute_g_beta.
+    /// convOut[M, convDim] → qn[M*numKH, headKD], kn[M*numKH, headKD], v[M, valDim], g[M*numVH] f32, beta[M*numVH] f32.
+    /// Reduction tree byte-identical to existing rmsnorm kernel. scale_mul: (half)scale * (half)(x*inv_mean).
+    static func encodeGdnPrepRows(_ enc: MTLComputeCommandEncoder,
+                                  convOut: MTLBuffer, aP: MTLBuffer, bP: MTLBuffer,
+                                  aLog: MTLBuffer, dtBias: MTLBuffer,
+                                  qn: MTLBuffer, kn: MTLBuffer, v: MTLBuffer,
+                                  g: MTLBuffer, beta: MTLBuffer,
+                                  M: Int, numKH: Int, headKD: Int, numVH: Int,
+                                  keyDim: Int, valDim: Int, eps: Float, qScale: Float, kScale: Float) {
+        let p = _gdnPrepRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(convOut, offset: 0, index: 0); enc.setBuffer(aP,   offset: 0, index: 1)
+        enc.setBuffer(bP,      offset: 0, index: 2); enc.setBuffer(aLog, offset: 0, index: 3)
+        enc.setBuffer(dtBias,  offset: 0, index: 4); enc.setBuffer(qn,   offset: 0, index: 5)
+        enc.setBuffer(kn,      offset: 0, index: 6); enc.setBuffer(v,    offset: 0, index: 7)
+        enc.setBuffer(g,       offset: 0, index: 8); enc.setBuffer(beta, offset: 0, index: 9)
+        var mm = UInt32(M), nkh = UInt32(numKH), hkd = UInt32(headKD)
+        var nvh = UInt32(numVH), kd = UInt32(keyDim), vd = UInt32(valDim)
+        enc.setBytes(&mm,  length: 4, index: 10); enc.setBytes(&nkh, length: 4, index: 11)
+        enc.setBytes(&hkd, length: 4, index: 12); enc.setBytes(&nvh, length: 4, index: 13)
+        enc.setBytes(&kd,  length: 4, index: 14); enc.setBytes(&vd,  length: 4, index: 15)
+        RawMetalForward.bindStop(enc, 16)
+        var ee = eps, qs = qScale, ks = kScale
+        enc.setBytes(&ee, length: 4, index: 17); enc.setBytes(&qs, length: 4, index: 18)
+        enc.setBytes(&ks, length: 4, index: 19)
+        let tgNeeded = (headKD + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
+        let numTG = M * (numKH * 2 + numVH)
+        enc.dispatchThreadgroups(MTLSize(width: numTG, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+
+    /// F5 (Wave 2): encode gdn_resid_postnorm_rows — ONE dispatch replacing ⑳resid_add ㉑rmsnorm(post).
+    /// h[M,H] is updated in-place (resid_add), postNorm[M,H] receives the rmsnorm result.
+    static func encodeGdnResidPostNormRows(_ enc: MTLComputeCommandEncoder,
+                                           h: MTLBuffer, r: MTLBuffer, w: MTLBuffer,
+                                           postNorm: MTLBuffer, M: Int, H: Int, eps: Float) {
+        let p = _gdnResidPostNormRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(h,        offset: 0, index: 0); enc.setBuffer(r,        offset: 0, index: 1)
+        enc.setBuffer(w,        offset: 0, index: 2); enc.setBuffer(postNorm, offset: 0, index: 3)
+        var ee = eps, hh = UInt32(H)
+        enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hh, length: 4, index: 5)
+        RawMetalForward.bindStop(enc, 16)
+        let tgNeeded = (H + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     }
 
     /// encodeGdnFusionConvShift: drive conv_shift_fused_rows in a single command buffer record.
@@ -1679,19 +1914,31 @@ public enum RawFusedVerify {
             encodeShiftConvRows(enc, histOut: cache.convHistOut, histIn: cache.convHist, qkv: sc.qkv,
                                 K: convKernel, C: convDim, M: M)
         }
-        // ③ split q/k/v(純コピー)
-        encodeSliceRows(enc, input: sc.convOut, out: sc.q1, off: 0, W: keyDim, stride: convDim, M: M)
-        encodeSliceRows(enc, input: sc.convOut, out: sc.k1, off: keyDim, W: keyDim, stride: convDim, M: M)
-        encodeSliceRows(enc, input: sc.convOut, out: sc.v1, off: 2 * keyDim, W: valueDim, stride: convDim, M: M)
-        // ④ qk-norm(no-weight)+ scalar scale
+        // ③-⑤ F2 (notes/07 §3 Wave 2): fuseGDN 時は gdn_prep_rows 1 dispatch で
+        // split q/k/v + rmsnorm qn/kn + scale_mul q/k + compute_g_beta を融合(−7/層)。
+        // scale_mul semantics: (half)s * x[i] — 既存 encodeScaleMul kernel と bit-exact。
         let invScale = Float(pow(Double(headKDim), -0.5))
-        encodeRmsNormRows(enc, x: sc.q1, w: w.onesDk, out: sc.qn, rows: M * numKHeads, D: headKDim, eps: eps)
-        encodeRmsNormRows(enc, x: sc.k1, w: w.onesDk, out: sc.kn, rows: M * numKHeads, D: headKDim, eps: eps)
-        encodeScaleMul(enc, x: sc.qn, s: invScale * invScale, total: M * keyDim)
-        encodeScaleMul(enc, x: sc.kn, s: invScale, total: M * keyDim)
-        // ⑤ g/β → recurrence(in-kernel T=M 逐次)
-        encodeComputeGBetaRows(enc, a: sc.aP, b: sc.bP, aLog: w.aLog, dtBias: w.dtBias,
-                               g: sc.g, beta: sc.beta, Hv: numVHeads, M: M)
+        if RawFusedForward.fuseGDN, _gdnPrepRowsPipeline != nil {
+            encodeGdnPrepRows(enc, convOut: sc.convOut, aP: sc.aP, bP: sc.bP,
+                              aLog: w.aLog, dtBias: w.dtBias,
+                              qn: sc.qn, kn: sc.kn, v: sc.v1, g: sc.g, beta: sc.beta,
+                              M: M, numKH: numKHeads, headKD: headKDim, numVH: numVHeads,
+                              keyDim: keyDim, valDim: valueDim, eps: eps,
+                              qScale: invScale * invScale, kScale: invScale)
+        } else {
+            // ③ split q/k/v(純コピー)
+            encodeSliceRows(enc, input: sc.convOut, out: sc.q1, off: 0, W: keyDim, stride: convDim, M: M)
+            encodeSliceRows(enc, input: sc.convOut, out: sc.k1, off: keyDim, W: keyDim, stride: convDim, M: M)
+            encodeSliceRows(enc, input: sc.convOut, out: sc.v1, off: 2 * keyDim, W: valueDim, stride: convDim, M: M)
+            // ④ qk-norm(no-weight)+ scalar scale
+            encodeRmsNormRows(enc, x: sc.q1, w: w.onesDk, out: sc.qn, rows: M * numKHeads, D: headKDim, eps: eps)
+            encodeRmsNormRows(enc, x: sc.k1, w: w.onesDk, out: sc.kn, rows: M * numKHeads, D: headKDim, eps: eps)
+            encodeScaleMul(enc, x: sc.qn, s: invScale * invScale, total: M * keyDim)
+            encodeScaleMul(enc, x: sc.kn, s: invScale, total: M * keyDim)
+            // ⑤ g/β → recurrence(in-kernel T=M 逐次)
+            encodeComputeGBetaRows(enc, a: sc.aP, b: sc.bP, aLog: w.aLog, dtBias: w.dtBias,
+                                   g: sc.g, beta: sc.beta, Hv: numVHeads, M: M)
+        }
         encodeGatedDeltaStepRows(enc, q: sc.qn, k: sc.kn, v: sc.v1, g: sc.g, beta: sc.beta,
                                  stateIn: cache.state, stateOut: cache.stateOut, y: sc.coreOut,
                                  T: M, B: 1, Hv: numVHeads, Dv: headVDim)
@@ -1951,8 +2198,16 @@ public enum RawFusedVerify {
                                                    ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
                 kv.len += M
             }
-            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
-            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
+            // F5 (notes/07 §3 Wave 2): fuseGDN 時は gdn_resid_postnorm_rows 1 dispatch で
+            // resid_add ⑳ + rmsnorm post ㉑ を融合(−1/層)。全層型(GDN/Attn)に適用。
+            if RawFusedForward.fuseGDN, RawFusedVerify._gdnResidPostNormRowsPipeline != nil {
+                RawFusedVerify.encodeGdnResidPostNormRows(enc, h: hBuf, r: mixerOut,
+                                                          w: L.postLN, postNorm: postNorm,
+                                                          M: M, H: H, eps: eps)
+            } else {
+                RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
+                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
+            }
         }
 
         // ── streaming helpers ─────────────────────────────────────────────────────────
@@ -2435,86 +2690,47 @@ public enum RawFusedVerify {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * valueDim)), [M, valueDim])
     }
 
-    // ── Wave 2 GDN fusion stubs (notes/07 §3 Wave 2) — FUSE_GDN3 STUB — implementation pending ──
+    // ── Wave 2 GDN fusion (notes/07 §3 Wave 2) — real single-kernel implementations ──
 
     /// F2: gdn_prep fused — ⑧slice q ⑨slice k ⑩slice v (from convOut) ⑪rmsnorm qn (ones weight,
     /// per-head over headKDim) ⑫rmsnorm kn (ones) ⑬scale_mul q (invScale²) ⑭scale_mul k (invScale)
     /// ⑮compute_g_beta (from aP,bP with aLog,dtBias) — 8 separate kernels → 1 fused dispatch.
-    /// convOut: [M, keyDim*2+valueDim] f16 — the full conv output (stride = keyDim*2+valueDim).
-    /// aP, bP:  [M, numVHeads] f16 — in-proj a/b outputs for compute_g_beta.
-    /// aLog, dtBias: [numVHeads] f32 — per-head log-alpha / delta-bias constants.
-    /// Outputs (matching the 8-kernel production chain exactly):
-    ///   qn:   [M*numKHeads, headKDim] f16 — q after rmsnorm(ones) AND scale_mul(invScale²)
-    ///   kn:   [M*numKHeads, headKDim] f16 — k after rmsnorm(ones) AND scale_mul(invScale)
-    ///   v:    [M, valueDim] f16 — v sliced from convOut (pure copy)
-    ///   g:    [1, M, numVHeads] f32 — from compute_g_beta
-    ///   beta: [1, M, numVHeads] f32 — from compute_g_beta
-    /// Signature note: eps added (not in task template) because encodeRmsNormRows requires it.
-    /// Returns nil until implemented (FUSE_GDN3 STUB — implementation pending).
+    /// Uses gdn_prep_rows: a TRUE single Metal kernel dispatch (not a chain).
+    /// scale_mul semantics: (half)s * (half)(x*inv_mean) — s rounded to f16 FIRST, matching
+    /// the production scale_mul kernel x[i]=(half)s*x[i] and the test oracle's scaleMulKernel.
     public static func gdnPrepFused(
         convOut: MLXArray, aP: MLXArray, bP: MLXArray, aLog: MLXArray, dtBias: MLXArray,
         M: Int, keyDim: Int, valueDim: Int, numKHeads: Int, headKDim: Int,
         numVHeads: Int, invScale: Float, eps: Float = 1e-6
     ) -> (qn: MLXArray, kn: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray)? {
-        // F2 Wave 2: ⑧slice q ⑨slice k ⑩slice v ⑪rmsnorm qn ⑫rmsnorm kn
-        //            ⑬scale_mul q ⑭scale_mul k ⑮compute_g_beta — chained in one CB.
-        // Scale_mul ⑬⑭ use the same MLX f32-multiply path as the test reference
-        // (qnNorm.asType(.float32) * scalar).asType(.float16) to preserve bit-exact match.
         guard let (device, queue) = RawMetalForward.ensure(),
-              ensureGdnPipelines() else { return nil }
-        let convDim = keyDim * 2 + valueDim
-        // ones weight [headKDim] f16 for qk-norm (no-weight = identity)
-        guard let bOnes = device.makeBuffer(length: headKDim * 2, options: .storageModeShared) else { return nil }
-        let onesPtr = bOnes.contents().bindMemory(to: Float16.self, capacity: headKDim)
-        for i in 0 ..< headKDim { onesPtr[i] = Float16(1.0) }
-        // input buffers
+              ensureGdnPipelines(), _gdnPrepRowsPipeline != nil else { return nil }
         guard let bConv = RawMetalForward.mtlBuf(convOut.asType(.float16), device),
               let bA    = RawMetalForward.mtlBuf(aP.asType(.float16), device),
               let bB    = RawMetalForward.mtlBuf(bP.asType(.float16), device),
               let bALog = RawMetalForward.mtlBuf(aLog.asType(.float32), device),
               let bDt   = RawMetalForward.mtlBuf(dtBias.asType(.float32), device) else { return nil }
-        // intermediate/output buffers
-        guard let bQ    = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
-              let bK    = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
-              let bV    = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared),
-              let bQn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+        guard let bQn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
               let bKn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
+              let bV    = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared),
               let bG    = device.makeBuffer(length: M * numVHeads * 4, options: .storageModeShared),
               let bBeta = device.makeBuffer(length: M * numVHeads * 4, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        // ⑧ slice q (first keyDim elements of each convOut row)
-        encodeSliceRows(enc, input: bConv, out: bQ, off: 0, W: keyDim, stride: convDim, M: M)
-        // ⑨ slice k
-        encodeSliceRows(enc, input: bConv, out: bK, off: keyDim, W: keyDim, stride: convDim, M: M)
-        // ⑩ slice v
-        encodeSliceRows(enc, input: bConv, out: bV, off: 2 * keyDim, W: valueDim, stride: convDim, M: M)
-        // ⑪ rmsnorm qn (ones weight, per-head: rows = M*numKHeads, D = headKDim)
-        encodeRmsNormRows(enc, x: bQ, w: bOnes, out: bQn, rows: M * numKHeads, D: headKDim, eps: eps)
-        // ⑫ rmsnorm kn
-        encodeRmsNormRows(enc, x: bK, w: bOnes, out: bKn, rows: M * numKHeads, D: headKDim, eps: eps)
-        // ⑮ compute_g_beta (independent of qn/kn, encoded in the same CB)
-        encodeComputeGBetaRows(enc, a: bA, b: bB, aLog: bALog, dtBias: bDt,
-                               g: bG, beta: bBeta, Hv: numVHeads, M: M)
+        // ONE dispatch — gdn_prep_rows fuses all 8 ops
+        encodeGdnPrepRows(enc, convOut: bConv, aP: bA, bP: bB, aLog: bALog, dtBias: bDt,
+                          qn: bQn, kn: bKn, v: bV, g: bG, beta: bBeta,
+                          M: M, numKH: numKHeads, headKD: headKDim, numVH: numVHeads,
+                          keyDim: keyDim, valDim: valueDim, eps: eps,
+                          qScale: invScale * invScale, kScale: invScale)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        // ⑬⑭ scale_mul via MLX — matches (qnNorm.asType(.float32) * scalar).asType(.float16)
-        // which is the bit-exact reference used in the test. A Metal scale_mul kernel gives 1
-        // f16 ULP difference vs the MLX f32-multiply-then-cast path on some values.
-        let pqnRaw = bQn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
-        let pknRaw = bKn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
-        let qnNorm = MLXArray(Array(UnsafeBufferPointer(start: pqnRaw, count: M * keyDim)),
-                              [M * numKHeads, headKDim])
-        let knNorm = MLXArray(Array(UnsafeBufferPointer(start: pknRaw, count: M * keyDim)),
-                              [M * numKHeads, headKDim])
-        let qnFinal = (qnNorm.asType(.float32) * (invScale * invScale)).asType(.float16)
-        let knFinal = (knNorm.asType(.float32) * invScale).asType(.float16)
-        MLX.eval([qnFinal, knFinal])
-        // read back remaining outputs
+        let pqn   = bQn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
+        let pkn   = bKn.contents().bindMemory(to: Float16.self, capacity: M * keyDim)
         let pv    = bV.contents().bindMemory(to: Float16.self, capacity: M * valueDim)
         let pg    = bG.contents().bindMemory(to: Float.self, capacity: M * numVHeads)
         let pbeta = bBeta.contents().bindMemory(to: Float.self, capacity: M * numVHeads)
         return (
-            qnFinal,
-            knFinal,
+            MLXArray(Array(UnsafeBufferPointer(start: pqn,   count: M * keyDim)),    [M * numKHeads, headKDim]),
+            MLXArray(Array(UnsafeBufferPointer(start: pkn,   count: M * keyDim)),    [M * numKHeads, headKDim]),
             MLXArray(Array(UnsafeBufferPointer(start: pv,    count: M * valueDim)),  [M, valueDim]),
             MLXArray(Array(UnsafeBufferPointer(start: pg,    count: M * numVHeads)), [1, M, numVHeads]),
             MLXArray(Array(UnsafeBufferPointer(start: pbeta, count: M * numVHeads)), [1, M, numVHeads])
@@ -2523,31 +2739,21 @@ public enum RawFusedVerify {
 
     /// F5: gdn_resid_post_norm fused — ⑳resid_add (hBuf += mixerOut) ㉑rmsnorm post
     /// (hBuf → postNorm) — 2 separate kernels → 1 fused dispatch.
-    /// hBuf:     [M, H] f16 — residual stream (read; not modified in this wrapper).
-    /// mixerOut: [M, H] f16 — mixer output to add to hBuf.
-    /// postW:    [H] f16 — post-layer rmsnorm weight.
-    /// Outputs (matching encodeResidAdd + encodeRmsNormRows exactly):
-    ///   h:        [M, H] f16 — hBuf + mixerOut (resid_add result)
-    ///   postNorm: [M, H] f16 — rmsnorm(h, postW, eps)
-    /// Returns nil until implemented (FUSE_GDN3 STUB — implementation pending).
+    /// Uses gdn_resid_postnorm_rows: a TRUE single Metal kernel dispatch (not a chain).
     public static func gdnResidPostNormFused(
         hBuf: MLXArray, mixerOut: MLXArray, postW: MLXArray,
         M: Int, H: Int, eps: Float
     ) -> (h: MLXArray, postNorm: MLXArray)? {
-        // F5 Wave 2: ⑳resid_add (h = hBuf + mixerOut)  ㉑rmsnorm post — both in one CB.
-        // Bit-exact with encodeResidAdd + encodeRmsNormRows chain by construction.
         guard let (device, queue) = RawMetalForward.ensure(),
-              ensureGdnPipelines() else { return nil }
+              ensureGdnPipelines(), _gdnResidPostNormRowsPipeline != nil else { return nil }
         // bH is a CPU-side copy of hBuf (mtlBuf copies the data); resid_add modifies it in-place.
         guard let bH    = RawMetalForward.mtlBuf(hBuf.asType(.float16), device),
               let bR    = RawMetalForward.mtlBuf(mixerOut.asType(.float16), device),
               let bW    = RawMetalForward.mtlBuf(postW.asType(.float16), device),
               let bPost = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        // ⑳ resid_add: bH += bR  (in-place on the copy)
-        encodeResidAdd(enc, h: bH, r: bR, total: M * H)
-        // ㉑ rmsnorm post: bH → bPost
-        encodeRmsNormRows(enc, x: bH, w: bW, out: bPost, rows: M, D: H, eps: eps)
+        // ONE dispatch — gdn_resid_postnorm_rows fuses resid_add + rmsnorm
+        encodeGdnResidPostNormRows(enc, h: bH, r: bR, w: bW, postNorm: bPost, M: M, H: H, eps: eps)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ph = bH.contents().bindMemory(to: Float16.self, capacity: M * H)
         let pn = bPost.contents().bindMemory(to: Float16.self, capacity: M * H)
