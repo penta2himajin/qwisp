@@ -91,9 +91,10 @@ log(`tests: total→${tests?.newTotal}, RED=${tests?.redConfirmed}`)
 phase('Implement+Review')
 let feedback = ''
 let last = null
+let lastImplReport = null
 for (let round = 1; round <= MAXR; round++) {
   // Step 3: implementation — GLM-5.2 on Pi harness, driven by a Sonnet driver agent with fallback.
-  const implReport = await agent(
+  lastImplReport = await agent(
     `${COMMON}
 YOU ARE THE IMPLEMENTATION DRIVER (Sonnet), round ${round}. The preferred implementer is GLM-5.2 via the Pi-harness glm-code CLI (per ~/.claude/CLAUDE.md). Contract: ${SPEC}. Stub signatures (fixed): ${tests?.stubSignatures}
 ${A.implBrief ?? ''}
@@ -129,4 +130,4 @@ Fix implementation defects yourself (never tests), rebuild, re-verify. Return th
   ].join('\n')
 }
 
-return { tests, implReport: (typeof implReport !== 'undefined' ? String(implReport).slice(0, 2000) : null), finalReview: last, passed: !!(last?.pass && last?.testIntegrityOk) }
+return { tests, implReport: lastImplReport ? String(lastImplReport).slice(0, 2000) : null, finalReview: last, passed: !!(last?.pass && last?.testIntegrityOk) }
