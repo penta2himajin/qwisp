@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 50
+        let total = 51
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2613,6 +2613,148 @@ public enum RawVerifyTests {
             let resolvedUnset = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
             if resolvedUnset != 8 {
                 return (false, "unset QWISP_CHAIN_K expected 8, got \(resolvedUnset)")
+            }
+            return (true, "ok")
+        }
+
+        // ── Phase II-b G1 gate: bolt-tier chain wiring (test 51) ─────────────
+        //
+        // WRITE-LOCKED (locked8): implementer MUST NOT modify this test.
+        // Encodes the goal: the BOLT decode loop must be able to advance its D==0 greedy
+        // span through the GPU token-feedback chain (chainedStepArgmax) when chainK>0,
+        // and doing so MUST be bit-identical to per-step greedy (bolt = deterministic
+        // buddy-greedy → chain must never change tokens).
+        //
+        // Seam under test: RawSpecRunner.boltGreedyChainSpan (STUB → nil → RED). It is the
+        // shared span decoder that runBoltMode delegates its D==0 branch to. The backend's
+        // chainedStepArgmax / stepArgmax here are the PRODUCTION RawFusedForward methods on a
+        // real bolt engine (providers + setBoltTables + attachHead) — no reimplemented oracle.
+        //
+        // References:
+        //   • bolt engine construction = stream_fused_bolt_exact_table idiom (test with
+        //     TestExpertProvider warm-all + frozen slot tables + setBoltTables).
+        //   • head + chainedStepArgmax = chained_greedy_bitexact idiom (test 47).
+        //   • reference token sequence = K sequential PRODUCTION stepArgmax on a second,
+        //     identically-seeded bolt engine.
+        //
+        // Assertions:
+        //   (a) boltGreedyChainSpan returns non-nil (stub nil → RED here).
+        //   (b) it USED the chain (per-step stepArgmax NOT called for the chained tail).
+        //   (c) packing is correct: emitted[0]==u, emitted.count==chainK.
+        //   (d) determinism: emitted + [nextU] == [u] + K sequential bolt greedy tokens
+        //       (chain-on OUT_TOKENS byte-identical to chain-off).
+        run("bolt_chain_span_wired") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let V = 256
+            let C = stE                    // C = E: all experts fit, deterministic slot table
+            let chainK = 4
+            let firstToken = Int32(7)
+
+            // Shared layer weights (same objects → chain and ref engines are identical models).
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let iLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let iLN1 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN1 = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([iLN0, pLN0, iLN1, pLN1])
+            let layerSpecs = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0, postLN: pLN0,
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1, postLN: pLN1,
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            // Initial cache state (8 KV positions) — each engine gets its own copy.
+            let cs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([cs0, rs0, kc0, vc0])
+            func freshC() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 RawVerifyForward.LayerCaches(kCache: kc0, vCache: vc0)]
+            }
+            // Shared head weights (embed = lm_head = 4-bit q), same objects for both engines.
+            let ewf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewq, esc, ebiOpt) = MLX.quantized(ewf, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebi = ebiOpt else { return (false, "embed biases nil") }
+            let lwf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwq, lsc, lbiOpt) = MLX.quantized(lwf, groupSize: 64, bits: 4, mode: .affine)
+            guard let lbi = lbiOpt else { return (false, "lm biases nil") }
+            let fnW = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewq, esc, ebi, lwq, lsc, lbi, fnW])
+            let maxSeq = 32
+
+            // Build a bolt engine: providers (warm all E) + frozen slot tables + head.
+            func mkBoltEngine() -> RawFusedVerify.RawFusedForward? {
+                guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                        gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
+                        uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
+                        dW: moe0.dW, dSf16: moe0.dSf16, dBf16: moe0.dBf16, device: device),
+                      let tp1 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
+                        gW: moe1.gW, gSf16: moe1.gSf16, gBf16: moe1.gBf16,
+                        uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
+                        dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
+                else { return nil }
+                let sm0 = tp0.ensure(Array(0..<stE)), sm1 = tp1.ensure(Array(0..<stE))
+                var tbl0 = [Int32](repeating: 0, count: stE), tbl1 = [Int32](repeating: 0, count: stE)
+                for (e, s) in sm0 { tbl0[e] = Int32(s) }
+                for (e, s) in sm1 { tbl1[e] = Int32(s) }
+                guard let eng = RawFusedVerify.RawFusedForward(
+                        layers: layerSpecs, caches: freshC(), maxM: 4, H: stH,
+                        maxSeqLen: maxSeq, providers: [tp0, tp1])
+                else { return nil }
+                eng.setBoltTables([tbl0, tbl1])   // → streamMode == .bolt
+                guard eng.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                     lmW: lwq, lmS: lsc, lmB: lbi,
+                                     fnW: fnW, vocab: V)
+                else { return nil }
+                return eng
+            }
+            guard let bltEng = mkBoltEngine() else { return (false, "bolt chain engine nil") }
+            guard let refEng = mkBoltEngine() else { return (false, "bolt ref engine nil") }
+
+            // Reference: K sequential PRODUCTION stepArgmax on the ref bolt engine.
+            var refSeq: [Int] = []
+            var cur = firstToken
+            for _ in 0 ..< chainK {
+                guard let t = refEng.stepArgmax([cur]) else { return (false, "ref stepArgmax nil") }
+                refSeq.append(t[0]); cur = Int32(t[0])
+            }
+
+            // Instrument a SpecBackend wrapping the chain bolt engine. stepArgmax counts
+            // per-step calls so we can prove the chained tail did NOT go per-step.
+            var perStepCalls = 0
+            var backend = RawSpecRunner.SpecBackend(
+                forward: { _ in nil },     // not used by the greedy chain span
+                stepArgmax: { toks in perStepCalls += 1; return bltEng.stepArgmax(toks) },
+                snapshot: { bltEng.snapshot() },
+                rollback: { _ in })
+            backend.chainedStepArgmax = { token, k in bltEng.chainedStepArgmax(token, K: k) }
+
+            // Under test: bolt-runner greedy span with budget = chainK (emit u + K-1 tail).
+            guard let (emitted, nextU) = RawSpecRunner.boltGreedyChainSpan(
+                backend: backend, u: Int(firstToken), chainK: chainK, budget: chainK)
+            else { return (false, "not implemented (boltGreedyChainSpan nil)") }
+
+            // (b) chain used — no per-step fallback for the chained tail.
+            if perStepCalls != 0 {
+                return (false, "chain not used: perStepCalls=\(perStepCalls) (want 0)")
+            }
+            // (c) packing.
+            if emitted.first != Int(firstToken) {
+                return (false, "emitted[0]=\(String(describing: emitted.first)) want u=\(firstToken)")
+            }
+            if emitted.count != chainK {
+                return (false, "emitted.count=\(emitted.count) want chainK=\(chainK)")
+            }
+            // (d) determinism: chain-on tokens == chain-off sequential tokens.
+            let chainAll = emitted + [nextU]
+            let refAll = [Int(firstToken)] + refSeq
+            if chainAll != refAll {
+                return (false, "chain tokens \(chainAll) != sequential \(refAll)")
             }
             return (true, "ok")
         }

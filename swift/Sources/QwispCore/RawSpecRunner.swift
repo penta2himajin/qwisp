@@ -120,6 +120,49 @@ public enum RawSpecRunner {
         return (backend, fwd, providers)
     }
 
+    // ── Phase II-b: bolt-tier chain wiring seam ─────────────────────────────
+    //
+    // The BOLT decode loop (runBoltMode, phase 6) is a self-contained spec loop that,
+    // in its D==0 greedy span, calls `backend.stepArgmax([u])` once per token — it never
+    // touches the chain path, so QWISP_CHAIN_K has no effect on bolt runs (they are pure
+    // per-step greedy after freeze). This is the highest-benefit chain regime.
+    //
+    // `boltGreedyChainSpan` is the shared seam the bolt loop delegates its D==0 span to.
+    // Contract (mirrors the standard-path chain block in `run`, lines ~358–368):
+    //   • When chainK > 0 AND backend.chainedStepArgmax is non-nil (bolt tables active →
+    //     1-CB head path → non-nil chain), it calls chainedStepArgmax(u, chainK) and packs
+    //     the result as: emitted = [u] + chainResult[0 ..< min(chainResult.count-1, budget-1)],
+    //     nextU = chainResult.last.  (`budget` caps how many tokens the span may emit,
+    //     including u, so the caller stays within its remaining N.)
+    //   • Because bolt chainedStepArgmax is bit-exact to `chainK` sequential stepArgmax
+    //     calls, emitted + [nextU] is byte-identical to [u] + K sequential greedy tokens.
+    //     Bolt is deterministic buddy-greedy → chain MUST NOT change OUT_TOKENS.
+    //   • Returns nil when chainK <= 0 or the backend exposes no chain fn (caller then
+    //     falls back to per-step) OR on backend error.
+    //
+    // Note: strict streaming intentionally exposes NO chain fn (RawFusedForward.
+    // chainedStepArgmax guards `streamMode == .resident || .bolt`), because strict needs
+    // a CPU turn between steps to ensure/pread the next expert union — so this seam
+    // returns nil there and the strict path stays per-step by construction.
+    //
+    // Phase II-b implementation: delegate the D==0 greedy span to chainedStepArgmax when
+    // chainK>0 and the backend exposes the chain fn (bolt tables active → non-nil).
+    // Packing: emitted = [u] + chainResult[0 ..< min(chainResult.count-1, budget-1)],
+    //          nextU   = chainResult.last.
+    // Returns nil when chainK<=0, no chain fn, or the chain call fails (caller falls back
+    // to per-step greedy). Strict streaming returns nil here by construction because its
+    // chainedStepArgmax is never wired (strict needs a CPU turn between steps to ensure/pread
+    // the next expert union).
+    static func boltGreedyChainSpan(backend: SpecBackend, u: Int, chainK: Int, budget: Int)
+        -> (emitted: [Int], nextU: Int)? {
+        guard chainK > 0, let chainFn = backend.chainedStepArgmax else { return nil }
+        guard let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty else { return nil }
+        let tailEnd = Swift.min(chainResult.count - 1, budget - 1)
+        let emitted = [u] + Array(chainResult[0 ..< tailEnd])
+        let nextU = chainResult.last!
+        return (emitted: emitted, nextU: nextU)
+    }
+
     // ── Prefill helper ────────────────────────────────────────────────────
 
     /// Chunked prefill: runs all prompt tokens through the backend, chunk=64.
@@ -602,6 +645,11 @@ public enum RawSpecRunner {
         var accTok = 0, steps = 0
         var u = u0
 
+        // Phase II-b: chain wiring for the D==0 greedy span.
+        // chainedStepArgmax is bit-exact to K sequential stepArgmax calls (bolt = deterministic
+        // buddy-greedy), so OUT_TOKENS is byte-identical with chain on or off.
+        let boltChainK = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+
         let t0 = DispatchTime.now()
 
         while out.count < N {
@@ -610,6 +658,14 @@ public enum RawSpecRunner {
             let snap   = backend2.snapshot()
 
             if D == 0 {
+                // Phase II-b: delegate to boltGreedyChainSpan when chainK>0 and head is wired.
+                if let (emitted, nextU) = boltGreedyChainSpan(
+                    backend: backend2, u: u, chainK: boltChainK,
+                    budget: N - out.count) {
+                    for t in emitted { out.append(t); hist.append(t) }
+                    u = nextU; steps += 1; continue
+                }
+                // chain unavailable or disabled → per-step fallback.
                 guard let evals = backend2.stepArgmax([Int32(u)])
                 else { return "[raw-spec bolt] ERROR: step(D=0) nil" }
                 out.append(u); hist.append(u)
