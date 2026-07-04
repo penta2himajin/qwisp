@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 41
+        let total = 46
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2099,6 +2099,228 @@ public enum RawVerifyTests {
                 if !ok1 { return (false, "h M=\(M): \(d1)") }
                 let (ok2, d2) = bitEqual(postNormGot, postNormRef)
                 if !ok2 { return (false, "postNorm M=\(M): \(d2)") }
+            }
+            return (true, "ok")
+        }
+
+        // ── Wave 3: attn + shared-expert fusion tests (42-46) ────────────
+        //
+        // WRITE-LOCKED: implementer (Haiku) MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/08-wave3-attn-shexp-spec.md §3-§4.
+        //
+        // References use ONLY existing production kernel wrappers (qmmRows, rmsNormRows,
+        // ropeRows, qmm8, finalCombineRowsRaw, swigluRaw) and pure data-movement MLX
+        // ops (slice/reshape/transpose/concatenate — no arithmetic reimplementation).
+        // All 5 tests are RED (FAIL "not implemented") until the stubs are implemented.
+        //
+        // A4 (sdpa+sigmoid_mul epilogue) is a stretch atom gated only by G2 (no unit stub).
+
+        // Test 42 (A1): attn_qkv_demux_bitexact
+        // attnQkvDemux ≡ 3 × qmmRows (q/k/v proj), bit-exact for all 3 outputs.
+        // Demux N boundaries (all multiples of 8): q=8192, k=512, v=512.
+        // Sweeps M∈{1,8}.
+        run("attn_qkv_demux_bitexact") {
+            let H = 2048, numHeads = 16, numKV = 2, headDim = 256
+            let qd2 = 2 * headDim   // 512
+            let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (qW, qS, qB) = q4(Nq, H)
+            let (kW, kS, kB) = q4(Nk, H)
+            let (vW, vS, vB) = q4(Nv, H)
+            MLX.eval([qW, qS, qB, kW, kS, kB, vW, vS, vB])
+            for M in [1, 8] {
+                let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                // Reference: 3 separate qmmRows calls (existing production kernel)
+                guard let qRef = RawMetalForward.qmmRows(x, qW, scales: qS, biases: qB, M: M, K: H, N: Nq),
+                      let kRef = RawMetalForward.qmmRows(x, kW, scales: kS, biases: kB, M: M, K: H, N: Nk),
+                      let vRef = RawMetalForward.qmmRows(x, vW, scales: vS, biases: vB, M: M, K: H, N: Nv)
+                else { return (false, "ref qmmRows nil M=\(M)") }
+                MLX.eval([qRef, kRef, vRef])
+                // Stub under test
+                guard let (qGot, kGot, vGot) = RawFusedVerify.attnQkvDemux(x,
+                        qW: qW, qS: qS, qB: qB,
+                        kW: kW, kS: kS, kB: kB,
+                        vW: vW, vS: vS, vB: vB,
+                        M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim)
+                else { return (false, "not implemented (M=\(M))") }
+                MLX.eval([qGot, kGot, vGot])
+                for (nm, got, ref) in [("qOut", qGot, qRef), ("kOut", kGot, kRef), ("vOut", vGot, vRef)] {
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) \(nm): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 43 (A2): attn_q_prep_fused_bitexact
+        // attnQPrepFused ≡ extract(lower-headDim slice) + rmsNormRows + ropeRows, bit-exact.
+        // extract is pure data movement (MLX slice); rmsNorm/rope use production kernels.
+        // Uses startOffset=37 (non-zero) to exercise non-trivial rope angle computation.
+        // Sweeps M∈{1,8}.
+        run("attn_q_prep_fused_bitexact") {
+            let numHeads = 16, headDim = 256, ropeDim = 64
+            let qd2 = 2 * headDim   // 512
+            let ropeBase: Float = 1e7, eps: Float = 1e-6
+            let startOffset = 37   // non-zero: exercises rope angle
+            let qNorm = MLXRandom.normal([headDim]).asType(.float16); qNorm.eval()
+            for M in [1, 8] {
+                // qOut[M*numHeads, qd2]: gate in upper headDim, query in lower headDim
+                let qOut = MLXRandom.normal([M * numHeads, qd2]).asType(.float16); qOut.eval()
+                // Reference chain:
+                // ④ extract q: pure data movement — lower headDim slice of each q head
+                let qX = qOut[0..., 0..<headDim].asType(.float16)   // [M*numHeads, headDim]
+                qX.eval()
+                // ⑤ rmsnorm q (per-head, weight qNorm[headDim])
+                guard let qN = RawMetalForward.rmsNormRows(qX, qNorm,
+                                                            M: M * numHeads, eps: eps, D: headDim)
+                else { return (false, "ref rmsNormRows nil M=\(M)") }
+                qN.eval()
+                // ⑦ rope q (numHeads lanes, position = startOffset + m)
+                guard let qRot = RawMetalForward.ropeRows(qN, headDim: headDim, ropeDim: ropeDim,
+                                                           base: ropeBase, startOffset: startOffset,
+                                                           M: M, numHeads: numHeads)
+                else { return (false, "ref ropeRows nil M=\(M)") }
+                qRot.eval()
+                // Stub under test
+                guard let qRotGot = RawFusedVerify.attnQPrepFused(qOut, qNorm: qNorm,
+                        startOffset: startOffset, M: M,
+                        numHeads: numHeads, headDim: headDim,
+                        ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
+                else { return (false, "not implemented (M=\(M))") }
+                qRotGot.eval()
+                let (ok, d) = bitEqual(qRotGot, qRot)
+                if !ok { return (false, "M=\(M) qRot: \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 44 (A3): attn_k_prep_fused_bitexact
+        // attnKPrepFused ≡ rmsNormRows + ropeRows + write_kv cache scatter, both outputs bit-exact.
+        // Verifies BOTH the rotated kRot output AND the kCache scatter contents after write.
+        // Cache scatter: src[M*KV, D] → cache[KV, baseLen+M, D]; pure data movement
+        //   (kRot[m*KV+h, :] → cache[h, baseLen+m, :]).
+        // Uses startOffset=12 (non-zero). Sweeps M∈{1,8}.
+        run("attn_k_prep_fused_bitexact") {
+            let numKV = 2, headDim = 256, ropeDim = 64
+            let ropeBase: Float = 1e7, eps: Float = 1e-6
+            let baseLen = 12   // non-zero: exercises pos offset in rope + cache scatter
+            let kNorm = MLXRandom.normal([headDim]).asType(.float16)
+            let kCacheInit = MLXRandom.normal([numKV, baseLen, headDim]).asType(.float16)
+            MLX.eval([kNorm, kCacheInit])
+            for M in [1, 8] {
+                let kOut = MLXRandom.normal([M * numKV, headDim]).asType(.float16); kOut.eval()
+                // Reference chain:
+                // ⑥ rmsnorm k (per-kv-head, weight kNorm[headDim])
+                guard let kN = RawMetalForward.rmsNormRows(kOut, kNorm,
+                                                            M: M * numKV, eps: eps, D: headDim)
+                else { return (false, "ref rmsNormRows nil M=\(M)") }
+                kN.eval()
+                // ⑧ rope k (numHeads=numKV for k-path, position = baseLen + m)
+                guard let kRot = RawMetalForward.ropeRows(kN, headDim: headDim, ropeDim: ropeDim,
+                                                           base: ropeBase, startOffset: baseLen,
+                                                           M: M, numHeads: numKV)
+                else { return (false, "ref ropeRows nil M=\(M)") }
+                kRot.eval()
+                // ⑨ write_kv cache scatter: pure data movement — no arithmetic.
+                // write_kv_rows: src[M*KV, D] → cache[KV, maxLen, D] at [pos..pos+M).
+                // Memory: src[(m*KV+h)*D+dd] → cache[h*maxLen*D + (pos+m)*D + dd].
+                // Equivalent reshape+transpose: kRot[M*KV,D] → [M,KV,D] → [KV,M,D].
+                let kRotFC = kRot.reshaped([M, numKV, headDim])
+                                  .transposed(1, 0, 2)   // [KV, M, headDim]
+                kRotFC.eval()
+                let kCacheRef = MLX.concatenated([kCacheInit, kRotFC], axis: 1)   // [KV, baseLen+M, D]
+                kCacheRef.eval()
+                // Stub under test
+                let maxLen = baseLen + M + 4
+                guard let (kRotGot, kCacheGot) = RawFusedVerify.attnKPrepFused(kOut, kNorm: kNorm,
+                        kCacheInit: kCacheInit, startOffset: baseLen, maxLen: maxLen, M: M,
+                        numKV: numKV, headDim: headDim,
+                        ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
+                else { return (false, "not implemented (M=\(M))") }
+                kRotGot.eval(); kCacheGot.eval()
+                let (ok1, d1) = bitEqual(kRotGot, kRot)
+                if !ok1 { return (false, "M=\(M) kRot: \(d1)") }
+                let (ok2, d2) = bitEqual(kCacheGot, kCacheRef)
+                if !ok2 { return (false, "M=\(M) kCache: \(d2)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 45 (S1): shared_gu_swiglu_fused_bitexact
+        // sharedGUSwigluFused ≡ qmmRows(shG) + qmmRows(shU) + swigluRaw, bit-exact.
+        // Plain-qmm variant (no gather): x[M,H] → shAct[M,I].
+        // M==1 only: fuseSHEXPActive predicate gate (register-pressure, same as fuseGU doctrine).
+        run("shared_gu_swiglu_fused_bitexact") {
+            let H = 2048, I = 512
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+                return (q, s, b!)
+            }
+            let (shGW, shGS, shGB) = q4(I, H)
+            let (shUW, shUS, shUB) = q4(I, H)
+            MLX.eval([shGW, shGS, shGB, shUW, shUS, shUB])
+            let M = 1   // M==1 branch only (S1 fuseSHEXPActive gate)
+            let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+            // Reference: 3 existing production kernels (qmmRows×2 + swigluRaw)
+            guard let sg = RawMetalForward.qmmRows(x, shGW, scales: shGS, biases: shGB,
+                                                    M: M, K: H, N: I),
+                  let su = RawMetalForward.qmmRows(x, shUW, scales: shUS, biases: shUB,
+                                                    M: M, K: H, N: I)
+            else { return (false, "ref qmmRows nil") }
+            sg.eval(); su.eval()
+            guard let shActRef = RawMetalForward.swigluRaw(sg, su)
+            else { return (false, "ref swigluRaw nil") }
+            shActRef.eval()
+            // Stub under test
+            guard let shActGot = RawFusedVerify.sharedGUSwigluFused(x,
+                    shGW: shGW, shGS: shGS, shGB: shGB,
+                    shUW: shUW, shUS: shUS, shUB: shUB,
+                    M: M, H: H, I: I)
+            else { return (false, "not implemented (M=\(M))") }
+            shActGot.eval()
+            return bitEqual(shActGot, shActRef)
+        }
+
+        // Test 46 (S2): shared_gate_combine_fused_bitexact
+        // sharedGateCombineFused ≡ qmm8(x→sgl N=8) + finalCombineRowsRaw(y,sharedY,sgl),
+        // bit-exact for both steps.
+        // qmm8: 8-bit weights, group_size=64, N=8, K=H=2048 (K%512==0 ✓, N%8==0 ✓).
+        // final_combine: out[i] = y[i] + stable_sigmoid_f16(sgl[m*8]) * sharedY[i].
+        // Sweeps M∈{1,8}.
+        run("shared_gate_combine_fused_bitexact") {
+            let H = 2048
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine)
+                return (q, s, b!)
+            }
+            let (sgW, sgS, sgB) = q8(8, H)
+            MLX.eval([sgW, sgS, sgB])
+            for M in [1, 8] {
+                let x       = MLXRandom.normal([M, H]).asType(.float16)
+                let y       = MLXRandom.normal([M, H]).asType(.float16)
+                let sharedY = MLXRandom.normal([M, H]).asType(.float16)
+                MLX.eval([x, y, sharedY])
+                // Reference: qmm8 then finalCombineRowsRaw (both production kernels)
+                guard let sgl = RawMetalForward.qmm8(x, sgW, scales: sgS, biases: sgB,
+                                                      M: M, K: H, N: 8)
+                else { return (false, "ref qmm8 nil M=\(M)") }
+                sgl.eval()
+                guard let outRef = RawFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
+                else { return (false, "ref finalCombineRowsRaw nil M=\(M)") }
+                outRef.eval()
+                // Stub under test
+                guard let outGot = RawFusedVerify.sharedGateCombineFused(x, y: y, sharedY: sharedY,
+                        sgW: sgW, sgS: sgS, sgB: sgB, M: M, H: H)
+                else { return (false, "not implemented (M=\(M))") }
+                outGot.eval()
+                let (ok, d) = bitEqual(outGot, outRef)
+                if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
         }

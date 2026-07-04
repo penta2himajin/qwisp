@@ -83,6 +83,10 @@ public enum RawFusedProf {
             pairedAB("fuseGU", set: { RawFusedVerify.RawFusedForward.fuseGU = $0 }, restore: savedGU)
             let savedGDN = RawFusedVerify.RawFusedForward.fuseGDN
             pairedAB("fuseGDN", set: { RawFusedVerify.RawFusedForward.fuseGDN = $0 }, restore: savedGDN)
+            let savedATTN = RawFusedVerify.RawFusedForward.fuseATTN
+            pairedAB("fuseATTN", set: { RawFusedVerify.RawFusedForward.fuseATTN = $0 }, restore: savedATTN)
+            let savedSHEXP = RawFusedVerify.RawFusedForward.fuseSHEXP
+            pairedAB("fuseSHEXP", set: { RawFusedVerify.RawFusedForward.fuseSHEXP = $0 }, restore: savedSHEXP)
         }
 
         // segment 分解(M=1): forwardRows(40層+norm)GPU vs stepArgmax(全体)GPU の差 = lm_head+head

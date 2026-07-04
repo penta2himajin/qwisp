@@ -224,6 +224,21 @@ public enum RawFusedVerify {
     // ── Wave 2 GDN fusion (notes/07 §3 Wave 2) — F2 gdn_prep_rows + F5 gdn_resid_postnorm_rows ──
     nonisolated(unsafe) static var _gdnPrepRowsPipeline: MTLComputePipelineState?           // F2: 8→1 dispatch (slice+rmsnorm+scale+gbeta)
     nonisolated(unsafe) static var _gdnResidPostNormRowsPipeline: MTLComputePipelineState?  // F5: 2→1 dispatch (resid_add+postNorm)
+    // ── Wave 3 attn+shexp fusion (notes/08 §3) — A2/A3/S2 single-dispatch kernels ──
+    nonisolated(unsafe) static var _sharedGateCombineRowsPipeline: MTLComputePipelineState?  // S2: qmm8(8 dots)+final_combine → 1 dispatch (safe-math)
+    nonisolated(unsafe) static var _attnQPrepRowsPipeline: MTLComputePipelineState?          // A2: extract+rmsnorm+rope → 1 dispatch (fast-math, matches rope_rows)
+    nonisolated(unsafe) static var _attnKPrepRowsPipeline: MTLComputePipelineState?          // A3: rmsnorm+rope+write_kv → 1 dispatch (fast-math, matches rope_rows)
+    // ── Wave 3 attn+shexp: helpers ──
+    /// S1 production wiring: dummy inds=[0] for gqmm4_swiglu_rows plain-qmm (no gather) path.
+    nonisolated(unsafe) static var _zeroOneInds: MTLBuffer?
+    static func zeroOneIndsBuf() -> MTLBuffer? {
+        if _zeroOneInds == nil, let (device, _) = RawMetalForward.ensure() {
+            let buf = device.makeBuffer(length: 4, options: .storageModeShared)!
+            buf.contents().bindMemory(to: Int32.self, capacity: 1)[0] = 0
+            _zeroOneInds = buf
+        }
+        return _zeroOneInds
+    }
 
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
@@ -802,6 +817,296 @@ public enum RawFusedVerify {
         _normGateFusedF32Pipeline = RawMetalForward._rmsPipelineF32
     }
 
+    /// ── Wave 3 attn+shexp fusion pipelines (notes/08 §3) ──
+    /// S2 (shared_gate_combine_rows): compiled with mlxMatchCompileOpts (safe-math) — both
+    ///   qmm8 and final_combine_rows use safe-math, so the fused kernel matches bit-exactly.
+    /// A2 (attn_q_prep_rows) / A3 (attn_k_prep_rows): compiled with options:nil (fast-math)
+    ///   to match rope_rows transcendentals. rmsnorm reduction uses precise::rsqrt
+    ///   (option-independent). FMA contraction of `xi*xi` is harmless: float16 squared is
+    ///   exact in float32 (≤22 mantissa bits < 24), so fma(xi,xi,acc) == (float)(xi*xi)+acc.
+    static func ensureWave3Pipelines() -> Bool {
+        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        if _sharedGateCombineRowsPipeline != nil && _attnQPrepRowsPipeline != nil && _attnKPrepRowsPipeline != nil { return true }
+        // S2 kernel: safe-math (matches qmm8 + final_combine_rows)
+        let s2Src = """
+        #include <metal_stdlib>
+        #include <metal_simdgroup>
+        using namespace metal;
+        #define SIMD_SIZE 32
+        inline float ld8(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 8; i++) { float v = x[i]; sum += v; xt[i] = v; }
+            return sum;
+        }
+        inline float qd8(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            for (int i = 0; i < 8; i++) accum += xt[i] * (float)w[i];
+            return scale * accum + sum * bias;
+        }
+        // S2: fuses qmm8(x→sgl N=8) + final_combine(y,sharedY,sgl→out) into ONE dispatch.
+        // Phase 1: qmm8 accumulation byte-identical to qmm8 kernel (same thread layout, same
+        //   block_size=256, same simd_sum). Phase 2: final_combine byte-identical to
+        //   final_combine_rows (half sigmoid, half multiply-add).
+        kernel void shared_gate_combine_rows(
+            device const uint32_t* sgW     [[buffer(0)]],
+            device const half*     sgS     [[buffer(1)]],
+            device const half*     sgB     [[buffer(2)]],
+            device const half*     x       [[buffer(3)]],
+            device const half*     y       [[buffer(4)]],
+            device const half*     sharedY [[buffer(5)]],
+            device half*           out     [[buffer(6)]],
+            constant int&          K_      [[buffer(7)]],
+            constant int&          H_      [[buffer(8)]],
+            device const int*      stopFlag [[buffer(9)]],
+            uint3 tid      [[threadgroup_position_in_grid]],
+            uint  simd_gid [[simdgroup_index_in_threadgroup]],
+            uint  simd_lid [[thread_index_in_simdgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            // ★perf 再設計(bit 不変): combine が読むのは sgl[row 0] の 1 dot のみ。
+            // grid = (M, ceil(H/256)) × 256 threads。各 tg は row-0 dot を既存 qmm8 と同一の
+            // 演算順で冗長計算(2048 MAC=無視可)→ barrier → 256 thread 並列で H を combine。
+            // 旧版は (M,1)×64 threads で H=2048 を 64 thread 直列 → −384µs 退行の真因だった。
+            constexpr int packs_per_thread = 2;
+            constexpr int pack_factor = 4;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 8;
+            constexpr int block_size = 256;
+            constexpr int scale_step_per_thread = 8;
+            const device uint8_t* ws = (const device uint8_t*)sgW;
+            threadgroup half sgl_shared[1];
+            typedef float U;
+            thread U x_thread[8];
+            thread U result0 = 0;
+            const int in_vec_size_g = K_ / 64;
+            if (simd_gid == 0) {
+                // row 0 の dot(既存 qmm8 の lane 割当・block 走査・qd8 累積と同一順)
+                const device uint8_t* wl = ws + simd_lid * packs_per_thread * bytes_per_pack;
+                const device half* sl = sgS + simd_lid / scale_step_per_thread;
+                const device half* bl = sgB + simd_lid / scale_step_per_thread;
+                const device half* xr = x + tid.x * K_ + simd_lid * values_per_thread;
+                for (int k = 0; k < K_; k += block_size) {
+                    U sum = ld8(xr, x_thread);
+                    U s = sl[0]; U b = bl[0];
+                    result0 += qd8(wl, x_thread, s, b, sum);
+                    wl += block_size * bytes_per_pack / pack_factor;
+                    sl += block_size / 64;
+                    bl += block_size / 64;
+                    xr += block_size;
+                }
+                result0 = simd_sum(result0);
+                if (simd_lid == 0) sgl_shared[0] = (half)result0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            half gv = sgl_shared[0];
+            half yv = (half)1 / ((half)1 + exp(metal::abs(gv)));
+            half s = (gv < (half)0) ? yv : ((half)1 - yv);
+            uint tid_in_tg = simd_gid * 32 + simd_lid;
+            uint base = tid.x * (uint)H_;
+            uint n = tid.y * 256 + tid_in_tg;
+            if (n < (uint)H_)
+                out[base + n] = y[base + n] + s * sharedY[base + n];
+        }
+        """
+        // A2/A3 kernels: fast-math (options:nil) to match rope_rows transcendentals.
+        //   rmsnorm uses precise::rsqrt (option-independent → matches rmsnorm kernel).
+        let a23Src = """
+        #include <metal_stdlib>
+        #include <metal_simdgroup>
+        using namespace metal;
+        // A2: fuses extract_q(lower headDim slice) + rmsnorm(q,qNorm) + rope(q) into ONE dispatch.
+        // 1 threadgroup per (m, head). rmsnorm reduction tree byte-identical to rmsnorm kernel
+        // (N_READS=4, simd_sum two-stage, precise::rsqrt). rope angle byte-identical to rope_rows.
+        // Shared memory bridges rmsnorm output → rope pairing (d ↔ d+hd2 cross-thread access).
+        kernel void attn_q_prep_rows(
+            device const half* qOut     [[buffer(0)]],
+            device const half* qNorm    [[buffer(1)]],
+            device half*       qRot     [[buffer(2)]],
+            constant uint&     qd2_     [[buffer(3)]],
+            constant uint&     headDim_ [[buffer(4)]],
+            constant uint&     ropeDim_ [[buffer(5)]],
+            constant float&    base     [[buffer(6)]],
+            constant uint&     startOff [[buffer(7)]],
+            constant uint&     numHeads_ [[buffer(8)]],
+            constant float&    eps      [[buffer(9)]],
+            device const int*  stopFlag [[buffer(16)]],
+            uint gid [[threadgroup_position_in_grid]],
+            uint lid [[thread_position_in_threadgroup]],
+            uint simd_lane_id  [[thread_index_in_simdgroup]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            threadgroup half normed[256];
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            uint m = gid / numHeads_;
+            device const half* xp = qOut + (size_t)gid * qd2_;
+            float acc = 0;
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++) { float xi = (float)xp[lid*N_READS+i]; acc += xi * xi; }
+            } else {
+                for (int i = 0; i < N_READS; i++) { if (lid*N_READS+i < headDim_) { float xi = (float)xp[lid*N_READS+i]; acc += xi*xi; } }
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / (float)headDim_ + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv = local_inv_mean[0];
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++)
+                    normed[lid*N_READS+i] = qNorm[lid*N_READS+i] * (half)((float)xp[lid*N_READS+i] * inv);
+            } else {
+                for (int i = 0; i < N_READS; i++)
+                    if (lid*N_READS+i < headDim_)
+                        normed[lid*N_READS+i] = qNorm[lid*N_READS+i] * (half)((float)xp[lid*N_READS+i] * inv);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            device half* outp = qRot + (size_t)gid * headDim_;
+            uint hd2 = ropeDim_ >> 1;
+            float pos = (float)(startOff + m);
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++) {
+                    uint d = lid*N_READS + i;
+                    if (d >= ropeDim_) { outp[d] = normed[d]; }
+                    else {
+                        uint ii = (d < hd2) ? d : (d - hd2);
+                        float freq = exp(-2.0f * (float)ii / (float)ropeDim_ * log(base));
+                        float ang = pos * freq;
+                        float c = cos(ang), s = sin(ang);
+                        float x0 = (float)normed[ii], x1 = (float)normed[ii + hd2];
+                        outp[d] = (half)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+                    }
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    uint d = lid*N_READS + i;
+                    if (d < headDim_) {
+                        if (d >= ropeDim_) { outp[d] = normed[d]; }
+                        else {
+                            uint ii = (d < hd2) ? d : (d - hd2);
+                            float freq = exp(-2.0f * (float)ii / (float)ropeDim_ * log(base));
+                            float ang = pos * freq;
+                            float c = cos(ang), s = sin(ang);
+                            float x0 = (float)normed[ii], x1 = (float)normed[ii + hd2];
+                            outp[d] = (half)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+                        }
+                    }
+                }
+            }
+        }
+        // A3: fuses rmsnorm(k,kNorm) + rope(k) + write_kv scatter into ONE dispatch.
+        // 1 threadgroup per (m, kv-head). Writes BOTH kRot[gid,headDim] and
+        // kCache[h, startOff+m, headDim] (scatter byte-identical to write_kv_rows).
+        kernel void attn_k_prep_rows(
+            device const half* kOut     [[buffer(0)]],
+            device const half* kNorm    [[buffer(1)]],
+            device half*       kRot     [[buffer(2)]],
+            device half*       kCache   [[buffer(3)]],
+            constant uint&     headDim_ [[buffer(4)]],
+            constant uint&     ropeDim_ [[buffer(5)]],
+            constant float&    base     [[buffer(6)]],
+            constant uint&     startOff [[buffer(7)]],
+            constant uint&     numKV_   [[buffer(8)]],
+            constant uint&     maxLen_  [[buffer(9)]],
+            constant float&    eps      [[buffer(10)]],
+            device const int*  stopFlag [[buffer(16)]],
+            uint gid [[threadgroup_position_in_grid]],
+            uint lid [[thread_position_in_threadgroup]],
+            uint simd_lane_id  [[thread_index_in_simdgroup]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]])
+        {
+            if (stopFlag[0] != 0) return;
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            threadgroup half normed[256];
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            uint m = gid / numKV_;
+            uint h = gid % numKV_;
+            device const half* xp = kOut + (size_t)gid * headDim_;
+            float acc = 0;
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++) { float xi = (float)xp[lid*N_READS+i]; acc += xi * xi; }
+            } else {
+                for (int i = 0; i < N_READS; i++) { if (lid*N_READS+i < headDim_) { float xi = (float)xp[lid*N_READS+i]; acc += xi*xi; } }
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) local_inv_mean[0] = precise::rsqrt(acc / (float)headDim_ + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv = local_inv_mean[0];
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++)
+                    normed[lid*N_READS+i] = kNorm[lid*N_READS+i] * (half)((float)xp[lid*N_READS+i] * inv);
+            } else {
+                for (int i = 0; i < N_READS; i++)
+                    if (lid*N_READS+i < headDim_)
+                        normed[lid*N_READS+i] = kNorm[lid*N_READS+i] * (half)((float)xp[lid*N_READS+i] * inv);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            device half* outp = kRot + (size_t)gid * headDim_;
+            device half* cachep = kCache + (size_t)h * maxLen_ * headDim_ + (size_t)(startOff + m) * headDim_;
+            uint hd2 = ropeDim_ >> 1;
+            float pos = (float)(startOff + m);
+            if (lid * N_READS + N_READS <= headDim_) {
+                for (int i = 0; i < N_READS; i++) {
+                    uint d = lid*N_READS + i;
+                    half val;
+                    if (d >= ropeDim_) { val = normed[d]; }
+                    else {
+                        uint ii = (d < hd2) ? d : (d - hd2);
+                        float freq = exp(-2.0f * (float)ii / (float)ropeDim_ * log(base));
+                        float ang = pos * freq;
+                        float c = cos(ang), s = sin(ang);
+                        float x0 = (float)normed[ii], x1 = (float)normed[ii + hd2];
+                        val = (half)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+                    }
+                    outp[d] = val; cachep[d] = val;
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    uint d = lid*N_READS + i;
+                    if (d < headDim_) {
+                        half val;
+                        if (d >= ropeDim_) { val = normed[d]; }
+                        else {
+                            uint ii = (d < hd2) ? d : (d - hd2);
+                            float freq = exp(-2.0f * (float)ii / (float)ropeDim_ * log(base));
+                            float ang = pos * freq;
+                            float c = cos(ang), s = sin(ang);
+                            float x0 = (float)normed[ii], x1 = (float)normed[ii + hd2];
+                            val = (half)(d < hd2 ? (x0*c - x1*s) : (x0*s + x1*c));
+                        }
+                        outp[d] = val; cachep[d] = val;
+                    }
+                }
+            }
+        }
+        """
+        do {
+            let libSafe = try device.makeLibrary(source: s2Src, options: RawMetalForward.mlxMatchCompileOpts())
+            _sharedGateCombineRowsPipeline = try device.makeComputePipelineState(function: libSafe.makeFunction(name: "shared_gate_combine_rows")!)
+            let libFast = try device.makeLibrary(source: a23Src, options: nil)
+            _attnQPrepRowsPipeline = try device.makeComputePipelineState(function: libFast.makeFunction(name: "attn_q_prep_rows")!)
+            _attnKPrepRowsPipeline = try device.makeComputePipelineState(function: libFast.makeFunction(name: "attn_k_prep_rows")!)
+            return true
+        } catch { print("[wave3] compile: \(error)"); return false }
+    }
+
     /// F2 (Wave 2): encode gdn_prep_rows — ONE dispatch replacing ⑧slice q/k/v ⑪⑫rmsnorm ⑬⑭scale_mul ⑮compute_g_beta.
     /// convOut[M, convDim] → qn[M*numKH, headKD], kn[M*numKH, headKD], v[M, valDim], g[M*numVH] f32, beta[M*numVH] f32.
     /// Reduction tree byte-identical to existing rmsnorm kernel. scale_mul: (half)scale * (half)(x*inv_mean).
@@ -1205,14 +1510,35 @@ public enum RawFusedVerify {
     }
 
     /// ③④ shared expert + final combine → out[M,H]。
+    /// S1(fuseSHEXP, M==1): shG+shU+swiglu 3 dispatch → 1 gqmm4_swiglu_rows dispatch(−2/MoEブロック)。
     static func encodeMoESharedRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
                                      w: MoEBlockBufs, sc: MoEScratch, M: Int, I: Int, H: Int) {
-        encodeQmmRows(enc, w: w.shGW, scales: w.shGS, biases: w.shGB, x: x, out: sc.sg, M: M, K: H, N: I)
-        encodeQmmRows(enc, w: w.shUW, scales: w.shUS, biases: w.shUB, x: x, out: sc.su, M: M, K: H, N: I)
-        encodeSwiglu(enc, g: sc.sg, u: sc.su, h: sc.shAct, total: M * I)
+        // S1: M==1 branch only (register-pressure gate, same doctrine as fuseGU).
+        // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_S1=0 で S1 のみ無効。
+        if RawFusedForward.fuseSHEXPActive(M: M) ?? false,
+           ProcessInfo.processInfo.environment["QWISP_FUSE_S1"] != "0",
+           let zeroInds = zeroOneIndsBuf(),
+           RawMetalForward._gqmmSwigluRowsPipeline != nil {
+            // gqmm4_swiglu_rows with Ktop=1, inds=[0]: bit-exact with qmmRows×2+swiglu (no gather)
+            encodeGatherQmmSwigluRows(enc, wG: w.shGW, sG: w.shGS, bG: w.shGB,
+                                      wU: w.shUW, sU: w.shUS, bU: w.shUB,
+                                      x: x, inds: zeroInds, out: sc.shAct,
+                                      M: 1, Ktop: 1, K: H, N: I)
+        } else {
+            encodeQmmRows(enc, w: w.shGW, scales: w.shGS, biases: w.shGB, x: x, out: sc.sg, M: M, K: H, N: I)
+            encodeQmmRows(enc, w: w.shUW, scales: w.shUS, biases: w.shUB, x: x, out: sc.su, M: M, K: H, N: I)
+            encodeSwiglu(enc, g: sc.sg, u: sc.su, h: sc.shAct, total: M * I)
+        }
         encodeQmmRows(enc, w: w.shDW, scales: w.shDS, biases: w.shDB, x: sc.shAct, out: sc.sharedY, M: M, K: I, N: H)
-        encodeQmm8Rows(enc, w: w.sgW, scales: w.sgS, biases: w.sgB, x: x, out: sc.sgl, M: M, K: H, N: 8)
-        encodeFinalCombineRows(enc, y: sc.y, sharedY: sc.sharedY, sgl: sc.sgl, out: out, N: H, M: M)
+        // S2(fuseSHEXP): qmm8(N=8)+final_combine → ONE dispatch (safe-math, bit-exact, −1/MoEブロック)。
+        if RawFusedForward.fuseSHEXP && ensureWave3Pipelines() {
+            encodeSharedGateCombineRows(enc, sgW: w.sgW, sgS: w.sgS, sgB: w.sgB,
+                                        x: x, y: sc.y, sharedY: sc.sharedY, out: out,
+                                        K: H, H: H, M: M)
+        } else {
+            encodeQmm8Rows(enc, w: w.sgW, scales: w.sgS, biases: w.sgB, x: x, out: sc.sgl, M: M, K: H, N: 8)
+            encodeFinalCombineRows(enc, y: sc.y, sharedY: sc.sharedY, sgl: sc.sgl, out: out, N: H, M: M)
+        }
     }
 
     /// MoE block 全段(3 フェーズ連続 encode)。resident 経路(slotTable:nil)と bolt 経路(slotTable:非nil)を兼ねる。
@@ -1394,6 +1720,78 @@ public enum RawFusedVerify {
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 
+    /// A2 (Wave 3): encode attn_q_prep_rows — ONE dispatch replacing ④extract_q + ⑤rmsnorm_q + ⑦rope_q.
+    /// Input qOut[M*numHeads, qd2]; output qRot[M*numHeads, headDim].
+    /// 1 threadgroup per (m, head); rmsnorm reduction tree byte-identical to rmsnorm kernel.
+    static func encodeAttnQPrepRows(_ enc: MTLComputeCommandEncoder,
+                                    qOut: MTLBuffer, qNorm: MTLBuffer, qRot: MTLBuffer,
+                                    qd2: Int, headDim: Int, ropeDim: Int, base: Float,
+                                    startOffset: Int, numHeads: Int, M: Int, eps: Float) {
+        let p = _attnQPrepRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(qOut,  offset: 0, index: 0)
+        enc.setBuffer(qNorm, offset: 0, index: 1)
+        enc.setBuffer(qRot,  offset: 0, index: 2)
+        var qd2v = UInt32(qd2), hd = UInt32(headDim), rd = UInt32(ropeDim)
+        var bs = base, so = UInt32(startOffset), nh = UInt32(numHeads), ee = eps
+        enc.setBytes(&qd2v, length: 4, index: 3); enc.setBytes(&hd, length: 4, index: 4)
+        enc.setBytes(&rd, length: 4, index: 5); enc.setBytes(&bs, length: 4, index: 6)
+        enc.setBytes(&so, length: 4, index: 7); enc.setBytes(&nh, length: 4, index: 8)
+        enc.setBytes(&ee, length: 4, index: 9)
+        RawMetalForward.bindStop(enc, 16)
+        let tgNeeded = (headDim + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
+        enc.dispatchThreadgroups(MTLSize(width: M * numHeads, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+
+    /// A3 (Wave 3): encode attn_k_prep_rows — ONE dispatch replacing ⑥rmsnorm_k + ⑧rope_k + ⑨write_kv_k.
+    /// Input kOut[M*numKV, headDim]; writes kRot[M*numKV, headDim] and kCache[h, startOff+m, headDim].
+    /// 1 threadgroup per (m, kv-head); rmsnorm + rope + scatter all in registers.
+    static func encodeAttnKPrepRows(_ enc: MTLComputeCommandEncoder,
+                                    kOut: MTLBuffer, kNorm: MTLBuffer, kRot: MTLBuffer, kCache: MTLBuffer,
+                                    headDim: Int, ropeDim: Int, base: Float,
+                                    startOffset: Int, numKV: Int, maxLen: Int, M: Int, eps: Float) {
+        let p = _attnKPrepRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(kOut,   offset: 0, index: 0)
+        enc.setBuffer(kNorm,  offset: 0, index: 1)
+        enc.setBuffer(kRot,   offset: 0, index: 2)
+        enc.setBuffer(kCache, offset: 0, index: 3)
+        var hd = UInt32(headDim), rd = UInt32(ropeDim), bs = base
+        var so = UInt32(startOffset), nkv = UInt32(numKV), ml = UInt32(maxLen), ee = eps
+        enc.setBytes(&hd, length: 4, index: 4); enc.setBytes(&rd, length: 4, index: 5)
+        enc.setBytes(&bs, length: 4, index: 6); enc.setBytes(&so, length: 4, index: 7)
+        enc.setBytes(&nkv, length: 4, index: 8); enc.setBytes(&ml, length: 4, index: 9)
+        enc.setBytes(&ee, length: 4, index: 10)
+        RawMetalForward.bindStop(enc, 16)
+        let tgNeeded = (headDim + 3) / 4
+        let tgSize = ((tgNeeded + 31) / 32) * 32
+        enc.dispatchThreadgroups(MTLSize(width: M * numKV, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+
+    /// S2 (Wave 3): encode shared_gate_combine_rows — ONE dispatch replacing qmm8(N=8)+final_combine.
+    /// Compiled with safe-math (mlxMatchCompileOpts) to match both source kernels bit-exactly.
+    static func encodeSharedGateCombineRows(_ enc: MTLComputeCommandEncoder,
+                                             sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
+                                             x: MTLBuffer, y: MTLBuffer, sharedY: MTLBuffer,
+                                             out: MTLBuffer, K: Int, H: Int, M: Int) {
+        let p = _sharedGateCombineRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(sgW,    offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
+        enc.setBuffer(sgB,    offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
+        enc.setBuffer(y,      offset: 0, index: 4); enc.setBuffer(sharedY, offset: 0, index: 5)
+        enc.setBuffer(out,    offset: 0, index: 6)
+        var kk = Int32(K), hh = Int32(H)
+        enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&hh, length: 4, index: 8)
+        RawMetalForward.bindStop(enc, 9)
+        // ★grid 再設計: (M, ceil(H/256)) × 256 threads(8 simdgroups)。tg ごとに row-0 dot を
+        // 冗長計算し、combine を H 全並列で行う(旧 (M,1)×64 は combine 直列化で −384µs)。
+        enc.dispatchThreadgroups(MTLSize(width: M, height: (H + 255) / 256, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+    }
+
     /// per-op wrapper: sigmoid_mul を単発 CB で実行(composed attnLayerRows が使い fused と数値系共有)。
     /// attnOut[R, headDim] × qOut[R, qd2](gate 部 strided 読み)→ gated[R, headDim]。
     public static func sigmoidMulRaw(_ attnOut: MLXArray, _ qOut: MLXArray,
@@ -1417,6 +1815,9 @@ public enum RawFusedVerify {
         let oW: MTLBuffer, oS: MTLBuffer, oB: MTLBuffer
         let qNorm: MTLBuffer, kNorm: MTLBuffer
         let retained: [MLXArray]   // zero-copy buffer の裏 array 保持(寿命規約)
+        // Wave 3 A1: q/k/v 結合 in-proj(fuseATTN || QWISP_PROF_AB 時に build)
+        let catQkvW: MTLBuffer?, catQkvS: MTLBuffer?, catQkvB: MTLBuffer?
+        let catQkvDummy: MTLBuffer?   // aN=0 placeholder(4th demux output, never written)
     }
 
     static func prepareAttnLayerBufs(_ w: RawVerifyForward.AttnLayerW, _ device: MTLDevice) -> AttnLayerBufs? {
@@ -1435,9 +1836,26 @@ public enum RawFusedVerify {
               let v = trio(w.vWq, w.vSc, w.vBi), let o = trio(w.oWq, w.oSc, w.oBi),
               let qn = RawMetalForward.mtlBuf(qnA, device),
               let kn = RawMetalForward.mtlBuf(knA, device) else { return nil }
+        // Wave 3 A1: build concat q/k/v in-proj weights when fuseATTN or PROF_AB is active.
+        let profAB = ProcessInfo.processInfo.environment["QWISP_PROF_AB"] == "1"
+        var catQkvW: MTLBuffer? = nil, catQkvS: MTLBuffer? = nil, catQkvB: MTLBuffer? = nil
+        var catQkvDummy: MTLBuffer? = nil
+        if RawFusedForward.fuseATTN || profAB {
+            let catWArr = MLX.concatenated([w.qWq, w.kWq, w.vWq], axis: 0)
+            let catSArr = MLX.concatenated([w.qSc.asType(.float16), w.kSc.asType(.float16), w.vSc.asType(.float16)], axis: 0)
+            let catBArr = MLX.concatenated([w.qBi.asType(.float16), w.kBi.asType(.float16), w.vBi.asType(.float16)], axis: 0)
+            MLX.eval([catWArr, catSArr, catBArr])
+            keep.append(contentsOf: [catWArr, catSArr, catBArr])
+            catQkvW = RawMetalForward.mtlBuf(catWArr, device)
+            catQkvS = RawMetalForward.mtlBuf(catSArr, device)
+            catQkvB = RawMetalForward.mtlBuf(catBArr, device)
+            catQkvDummy = device.makeBuffer(length: 4, options: .storageModeShared)
+        }
         return AttnLayerBufs(qW: q.0, qS: q.1, qB: q.2, kW: k.0, kS: k.1, kB: k.2,
                              vW: v.0, vS: v.1, vB: v.2, oW: o.0, oS: o.1, oB: o.2,
-                             qNorm: qn, kNorm: kn, retained: keep)
+                             qNorm: qn, kNorm: kn, retained: keep,
+                             catQkvW: catQkvW, catQkvS: catQkvS, catQkvB: catQkvB,
+                             catQkvDummy: catQkvDummy)
     }
 
     /// attention 層の常駐 scratch(fused 中間)。
@@ -1526,20 +1944,45 @@ public enum RawFusedVerify {
         let qd2 = 2 * headDim
         let scale = Float(pow(Double(headDim), -0.5))
         // ① q(+gate)/k/v projection
-        encodeQmmRows(enc, w: w.qW, scales: w.qS, biases: w.qB, x: x, out: sc.qOut, M: M, K: H, N: numHeads * qd2)
-        encodeQmmRows(enc, w: w.kW, scales: w.kS, biases: w.kB, x: x, out: sc.kOut, M: M, K: H, N: numKV * headDim)
-        encodeQmmRows(enc, w: w.vW, scales: w.vS, biases: w.vB, x: x, out: sc.vOut, M: M, K: H, N: numKV * headDim)
-        // ② queries 抽出(純コピー)→ qk-norm
-        encodeExtractQ(enc, qOut: sc.qOut, q: sc.qX, headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
-        encodeRmsNormRows(enc, x: sc.qX, w: w.qNorm, out: sc.qN, rows: M * numHeads, D: headDim, eps: eps)
-        encodeRmsNormRows(enc, x: sc.kOut, w: w.kNorm, out: sc.kN, rows: M * numKV, D: headDim, eps: eps)
-        // ③ RoPE(行 m の位置 = baseLen + m)
-        encodeRopeRows(enc, x: sc.qN, out: sc.qRot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
-                       startOffset: baseLen, M: M, numHeads: numHeads)
-        encodeRopeRows(enc, x: sc.kN, out: sc.kRot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
-                       startOffset: baseLen, M: M, numHeads: numKV)
-        // ④ cache 散布(post-RoPE k / raw v)
-        encodeWriteKVRows(enc, src: sc.kRot, cache: kv.kCache, KV: numKV, D: headDim, maxLen: kv.maxLen, pos: baseLen, M: M)
+        // A1(fuseATTN): 3 separate qmm4 dispatches → 1 demux dispatch(−2 per attn layer).
+        // Cat weights built at prepare time; bit-exact by qmm4_inproj_demux_rows construction.
+        // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_A1=0 で A1 のみ無効。
+        if RawFusedForward.fuseATTN,
+           ProcessInfo.processInfo.environment["QWISP_FUSE_A1"] != "0",
+           let cw = w.catQkvW, let cs = w.catQkvS, let cb = w.catQkvB, let dummy = w.catQkvDummy {
+            let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
+            encodeQmmInProjDemuxRows(enc, w: cw, scales: cs, biases: cb, x: x,
+                                     outQkv: sc.qOut, outZ: sc.kOut, outB: sc.vOut, outA: dummy,
+                                     M: M, K: H, dims: (qkv: Nq, z: Nk, b: Nv, a: 0))
+        } else {
+            encodeQmmRows(enc, w: w.qW, scales: w.qS, biases: w.qB, x: x, out: sc.qOut, M: M, K: H, N: numHeads * qd2)
+            encodeQmmRows(enc, w: w.kW, scales: w.kS, biases: w.kB, x: x, out: sc.kOut, M: M, K: H, N: numKV * headDim)
+            encodeQmmRows(enc, w: w.vW, scales: w.vS, biases: w.vB, x: x, out: sc.vOut, M: M, K: H, N: numKV * headDim)
+        }
+        // ②③④ qk-norm + RoPE + cache scatter / A2+A3(fuseATTN): ONE dispatch each(−4 dispatches per attn layer)
+        if RawFusedForward.fuseATTN && ensureWave3Pipelines() {
+            // A2: extract_q + rmsnorm_q + rope_q → qRot (ONE dispatch, bit-exact)
+            encodeAttnQPrepRows(enc, qOut: sc.qOut, qNorm: w.qNorm, qRot: sc.qRot,
+                                qd2: qd2, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                startOffset: baseLen, numHeads: numHeads, M: M, eps: eps)
+            // A3: rmsnorm_k + rope_k + write_kv_k → kRot + kCache (ONE dispatch, bit-exact)
+            encodeAttnKPrepRows(enc, kOut: sc.kOut, kNorm: w.kNorm, kRot: sc.kRot, kCache: kv.kCache,
+                                headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                startOffset: baseLen, numKV: numKV, maxLen: kv.maxLen, M: M, eps: eps)
+        } else {
+            // ② queries 抽出(純コピー)→ qk-norm
+            encodeExtractQ(enc, qOut: sc.qOut, q: sc.qX, headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
+            encodeRmsNormRows(enc, x: sc.qX, w: w.qNorm, out: sc.qN, rows: M * numHeads, D: headDim, eps: eps)
+            encodeRmsNormRows(enc, x: sc.kOut, w: w.kNorm, out: sc.kN, rows: M * numKV, D: headDim, eps: eps)
+            // ③ RoPE(行 m の位置 = baseLen + m)
+            encodeRopeRows(enc, x: sc.qN, out: sc.qRot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                           startOffset: baseLen, M: M, numHeads: numHeads)
+            encodeRopeRows(enc, x: sc.kN, out: sc.kRot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                           startOffset: baseLen, M: M, numHeads: numKV)
+            // ④ cache 散布(post-RoPE k)
+            encodeWriteKVRows(enc, src: sc.kRot, cache: kv.kCache, KV: numKV, D: headDim, maxLen: kv.maxLen, pos: baseLen, M: M)
+        }
+        // v-cache 散布(raw v, always unfused)
         encodeWriteKVRows(enc, src: sc.vOut, cache: kv.vCache, KV: numKV, D: headDim, maxLen: kv.maxLen, pos: baseLen, M: M)
         // ⑤ SDPA(行 m は先頭 baseLen+m+1 key)
         encodeSdpaRows(enc, q: sc.qRot, k: kv.kCache, v: kv.vCache, out: sc.attnOut,
@@ -1596,6 +2039,182 @@ public enum RawFusedVerify {
         let out = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
         let (kc, vc) = readKVCache(kv)
         return (out, kc, vc)
+    }
+
+    // ── Wave 3: attn + shared-expert fusion atom stubs (notes/08) ──────────────
+    //
+    // ── Wave 3: attn + shared-expert fusion atom implementations (notes/08) ───────
+    //
+    // A4 (sdpa+sigmoid_mul epilogue) is a stretch atom gated only by G2; it has
+    // no unit stub here.
+
+    /// A1: QKV demux — fuses the 3 in-proj dispatches (q/k/v qmm4) into 1 dispatch.
+    /// Demux N-axis boundaries (all multiples of 8):
+    ///   q: numHeads×qd2 = 16×512 = 8192 (8192/8 = 1024 ✓)
+    ///   k: numKV×headDim = 2×256 = 512   (512/8  = 64  ✓)
+    ///   v: numKV×headDim = 512            (same         ✓)
+    /// Returns (qOut[M,Nq], kOut[M,Nk], vOut[M,Nv]) — bit-identical to 3 × qmmRows.
+    public static func attnQkvDemux(_ x: MLXArray,
+                                     qW: MLXArray, qS: MLXArray, qB: MLXArray,
+                                     kW: MLXArray, kS: MLXArray, kB: MLXArray,
+                                     vW: MLXArray, vS: MLXArray, vB: MLXArray,
+                                     M: Int, H: Int,
+                                     numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256)
+        -> (qOut: MLXArray, kOut: MLXArray, vOut: MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        let qd2 = 2 * headDim
+        let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
+        // Concatenate q/k/v weights for the demux kernel (same logic as prepareAttnLayerBufs)
+        let catW = MLX.concatenated([qW, kW, vW], axis: 0)
+        let catS = MLX.concatenated([qS.asType(.float16), kS.asType(.float16), vS.asType(.float16)], axis: 0)
+        let catB = MLX.concatenated([qB.asType(.float16), kB.asType(.float16), vB.asType(.float16)], axis: 0)
+        MLX.eval([catW, catS, catB])
+        guard let bx    = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bw    = RawMetalForward.mtlBuf(catW, device),
+              let bs    = RawMetalForward.mtlBuf(catS, device),
+              let bb    = RawMetalForward.mtlBuf(catB, device),
+              let qOutBuf = device.makeBuffer(length: M * Nq * 2, options: .storageModeShared),
+              let kOutBuf = device.makeBuffer(length: M * Nk * 2, options: .storageModeShared),
+              let vOutBuf = device.makeBuffer(length: M * Nv * 2, options: .storageModeShared),
+              let dummy   = device.makeBuffer(length: 4, options: .storageModeShared) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeQmmInProjDemuxRows(enc, w: bw, scales: bs, biases: bb, x: bx,
+                                 outQkv: qOutBuf, outZ: kOutBuf, outB: vOutBuf, outA: dummy,
+                                 M: M, K: H, dims: (qkv: Nq, z: Nk, b: Nv, a: 0))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let qp = qOutBuf.contents().bindMemory(to: Float16.self, capacity: M * Nq)
+        let kp = kOutBuf.contents().bindMemory(to: Float16.self, capacity: M * Nk)
+        let vp = vOutBuf.contents().bindMemory(to: Float16.self, capacity: M * Nv)
+        return (MLXArray(Array(UnsafeBufferPointer(start: qp, count: M * Nq)), [M, Nq]),
+                MLXArray(Array(UnsafeBufferPointer(start: kp, count: M * Nk)), [M, Nk]),
+                MLXArray(Array(UnsafeBufferPointer(start: vp, count: M * Nv)), [M, Nv]))
+    }
+
+    /// A2: Q-prep — fuses extract_q(④) + rmsNorm_q(⑤) + rope_q(⑦) into 1 dispatch.
+    /// Input qOut[M×numHeads, 2×headDim]; output qRot[M×numHeads, headDim].
+    /// Extract: pure copy of lower headDim slice per head.
+    /// RMSNorm: per-head over headDim, weight=qNorm.
+    /// RoPE: startOffset carries the baseLen position; numHeads lanes share same M.
+    public static func attnQPrepFused(_ qOut: MLXArray, qNorm: MLXArray,
+                                       startOffset: Int, M: Int,
+                                       numHeads: Int = 16, headDim: Int = 256,
+                                       ropeDim: Int = 64, ropeBase: Float = 1e7,
+                                       eps: Float = 1e-6)
+        -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
+        let qd2 = 2 * headDim
+        let rows = M * numHeads
+        guard let bqOut  = RawMetalForward.mtlBuf(qOut.asType(.float16), device),
+              let bqNorm = RawMetalForward.mtlBuf(qNorm.asType(.float16), device),
+              let qRotBuf = device.makeBuffer(length: rows * headDim * 2, options: .storageModeShared)
+        else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeAttnQPrepRows(enc, qOut: bqOut, qNorm: bqNorm, qRot: qRotBuf,
+                            qd2: qd2, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                            startOffset: startOffset, numHeads: numHeads, M: M, eps: eps)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = qRotBuf.contents().bindMemory(to: Float16.self, capacity: rows * headDim)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: rows * headDim)), [rows, headDim])
+    }
+
+    /// A3: K-prep — fuses rmsNorm_k(⑥) + rope_k(⑧) + write_kv_k(⑨) into 1 dispatch.
+    /// Input kOut[M×numKV, headDim].
+    /// Returns (kRot[M×numKV, headDim], kCache[KV, baseLen+M, headDim]).
+    /// kCache is the filled portion of the [KV, maxLen, D] buffer after the scatter.
+    /// The write_kv scatter is: src[m×KV+h, :] → cache[h, pos+m, :] (pure copy).
+    ///
+    /// A4 (sdpa+sigmoid_mul epilogue) gets NO unit stub — stretch atom gated only by G2.
+    public static func attnKPrepFused(_ kOut: MLXArray, kNorm: MLXArray,
+                                       kCacheInit: MLXArray,
+                                       startOffset: Int, maxLen: Int, M: Int,
+                                       numKV: Int = 2, headDim: Int = 256,
+                                       ropeDim: Int = 64, ropeBase: Float = 1e7,
+                                       eps: Float = 1e-6)
+        -> (kRot: MLXArray, kCache: MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
+        let rows = M * numKV
+        let baseLen = startOffset  // positions [0..baseLen) are pre-filled; kernel writes [baseLen..baseLen+M)
+        guard let bkOut   = RawMetalForward.mtlBuf(kOut.asType(.float16), device),
+              let bkNorm  = RawMetalForward.mtlBuf(kNorm.asType(.float16), device),
+              let kRotBuf   = device.makeBuffer(length: rows * headDim * 2, options: .storageModeShared),
+              let kCacheBuf = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)
+        else { return nil }
+        // Preload kCacheInit [numKV, baseLen, headDim] into kCacheBuf (stride = maxLen)
+        let kInitF = kCacheInit.asType(.float16).reshaped([-1]); kInitF.eval()
+        let kInitArr = kInitF.asArray(Float16.self)
+        let kcp = kCacheBuf.contents().bindMemory(to: Float16.self, capacity: numKV * maxLen * headDim)
+        for h in 0..<numKV {
+            for t in 0..<baseLen {
+                for d in 0..<headDim {
+                    kcp[h * maxLen * headDim + t * headDim + d] = kInitArr[(h * baseLen + t) * headDim + d]
+                }
+            }
+        }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeAttnKPrepRows(enc, kOut: bkOut, kNorm: bkNorm, kRot: kRotBuf, kCache: kCacheBuf,
+                            headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                            startOffset: startOffset, numKV: numKV, maxLen: maxLen, M: M, eps: eps)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let rp = kRotBuf.contents().bindMemory(to: Float16.self, capacity: rows * headDim)
+        let kRot = MLXArray(Array(UnsafeBufferPointer(start: rp, count: rows * headDim)), [rows, headDim])
+        // Read back kCache [numKV, baseLen+M, headDim] (the filled portion)
+        let totalLen = baseLen + M
+        var kCacheArr = [Float16](repeating: 0, count: numKV * totalLen * headDim)
+        for h in 0..<numKV {
+            for t in 0..<totalLen {
+                for d in 0..<headDim {
+                    kCacheArr[(h * totalLen + t) * headDim + d] = kcp[h * maxLen * headDim + t * headDim + d]
+                }
+            }
+        }
+        return (kRot, MLXArray(kCacheArr, [numKV, totalLen, headDim]))
+    }
+
+    /// S1: shG+shU+swiglu — fuses the 3 shared-expert gate/up/swiglu dispatches into 1.
+    /// Plain-qmm variant (no gather): x[M,H] → shAct[M,I].
+    /// M==1 branch only (register-pressure gate, same doctrine as fuseGU):
+    ///   fuseSHEXPActive(M: m) = (fuseSHEXP && m == 1)
+    public static func sharedGUSwigluFused(_ x: MLXArray,
+                                            shGW: MLXArray, shGS: MLXArray, shGB: MLXArray,
+                                            shUW: MLXArray, shUS: MLXArray, shUB: MLXArray,
+                                            M: Int, H: Int, I: Int)
+        -> MLXArray? {
+        guard M == 1 else { return nil }  // S1 M==1 gate (register-pressure, fuseSHEXPActive doctrine)
+        // gqmm4_swiglu_rows with Ktop=1, inds=[0]: bit-exact with qmmRows×2+swigluRaw (no gather)
+        let inds = MLXArray([Int32(0)], [1]); inds.eval()
+        return gatherQmmSwigluRows(x: x, inds: inds,
+                                   wG: shGW, sG: shGS, bG: shGB,
+                                   wU: shUW, sU: shUS, bU: shUB,
+                                   M: M, Ktop: 1, K: H, N: I)
+    }
+
+    /// S2: sgl+final_combine — fuses qmm8(x→sgl N=8) + final_combine(y,sharedY,sgl→out).
+    /// 8-bit dequant for sgl: group_size=64, K%512==0 required (K=H=2048 ✓, N=8 ✓).
+    /// final_combine: out[i] = y[i] + sigmoid_h16(sgl[m*8]) * sharedY[i]  (stable f16 sigmoid).
+    public static func sharedGateCombineFused(_ x: MLXArray, y: MLXArray, sharedY: MLXArray,
+                                               sgW: MLXArray, sgS: MLXArray, sgB: MLXArray,
+                                               M: Int, H: Int)
+        -> MLXArray? {
+        guard let (device, queue) = RawMetalForward.ensure(),
+              RawMetalForward.compileQmm8(),
+              ensureWave3Pipelines() else { return nil }
+        guard H % 512 == 0 else { return nil }
+        let sgSF = sgS.asType(.float16), sgBF = sgB.asType(.float16)
+        guard let bsgW = RawMetalForward.mtlBuf(sgW, device),
+              let bsgS = RawMetalForward.mtlBuf(sgSF, device),
+              let bsgB = RawMetalForward.mtlBuf(sgBF, device),
+              let bx   = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let by   = RawMetalForward.mtlBuf(y.asType(.float16), device),
+              let bsY  = RawMetalForward.mtlBuf(sharedY.asType(.float16), device),
+              let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared)
+        else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeSharedGateCombineRows(enc, sgW: bsgW, sgS: bsgS, sgB: bsgB,
+                                    x: bx, y: by, sharedY: bsY, out: outBuf,
+                                    K: H, H: H, M: M)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
     }
 
     // ── Stage C(P3 続き): fused GDN 層 — gdnLayerRows 全段を単一 encoder 化 ──
@@ -2061,12 +2680,32 @@ public enum RawFusedVerify {
         nonisolated(unsafe) public static var fuseGDN =
             ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] == "1"
 
+        /// attn 層融合(notes/08 §3)へ分岐。既定 off。QWISP_FUSE_ATTN=1 で on。
+        /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
+        /// flag-off で encodeAttnLayerRows は既存経路のままで byte 不変(G3 gate)。
+        nonisolated(unsafe) public static var fuseATTN =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_ATTN"] == "1"
+
+        /// MoE shared expert 融合(notes/08 §3)へ分岐。既定 off。QWISP_FUSE_SHEXP=1 で on。
+        /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
+        /// flag-off で encodeMoESharedRows は既存経路のままで byte 不変(G3 gate)。
+        nonisolated(unsafe) public static var fuseSHEXP =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_SHEXP"] == "1"
+
         /// M-branch predicate for the fuseGU path.
         /// Contract: fuseGUActive(M) == (fuseGU && M == 1)
         ///   — the fused gather+swiglu kernel is activated for M=1 only (register pressure guard).
         ///   verify batches (M>1) use the unfused 3-kernel path (measured regression at M=8).
         public static func fuseGUActive(M: Int) -> Bool? {
             return fuseGU && M == 1
+        }
+
+        /// M-branch predicate for the fuseSHEXP path.
+        /// Contract: fuseSHEXPActive(M) == (fuseSHEXP && M == 1)
+        ///   — the fused shared-expert gate+up+swiglu kernel is activated for M=1 only
+        ///   (register pressure guard, same doctrine as fuseGU).
+        public static func fuseSHEXPActive(M: Int) -> Bool? {
+            return fuseSHEXP && M == 1
         }
 
         // ── streaming mode ─────────────────────────────────────────────────────────────
