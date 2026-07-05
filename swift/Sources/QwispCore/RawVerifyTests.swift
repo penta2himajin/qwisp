@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 54
+        let total = 56
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2950,6 +2950,157 @@ public enum RawVerifyTests {
                 envC: ProcessInfo.processInfo.environment["QWISP_RAW_C"], defaultC: tierC)
             if live != tierC {
                 return (false, "live unset QWISP_RAW_C must resolve to defaultC=\(tierC), got \(live)")
+            }
+            return (true, "ok")
+        }
+
+        // ── gqmm3 correctness gate (tests 55-56) — notes/11 §Locked test ─────────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They encode the G1 acceptance gate from notes/11-gqmm3-3bit-tier-spec.md §'Locked test'.
+        //
+        // Oracle = MLX.quantizedMatmul(bits:3, mode:.affine, groupSize:64) per selected expert row
+        // — NOT a self-loop. Both tests gate the two stub APIs:
+        //   gqmm3      (M=1 single-row, analogous to gatherQmm)
+        //   gqmm3Rows  (M∈{1,2,9,17,25} multi-row, analogous to gatherQmmRows)
+        //
+        // TWO mandatory dtype cases (spec §'Locked test' item 4):
+        //   Test 55 (f16):  wf/scales/biases = float16  (standard path)
+        //   Test 56 (bf16): wf = bfloat16 → scales/biases come out bfloat16
+        //                   (real UD-model path — forces templated scale dtype in kernel; the
+        //                    #1 correctness lever per spec §Ground truth)
+        //
+        // Geometry: E=64, K=2048, N=512, Ktop=4 (matches real expert shapes).
+        // Expert-index pool: max index = 62 < E=64 ✓ (same pool as gqmm4_rows_bitexact).
+        // Both tests RED because gqmm3 / gqmm3Rows return nil (STUB).
+
+        // Helper: fixed expert-index pool (all < E=64, same as gqmm4_rows_bitexact).
+        let gqmm3Pool: [Int32] = [3, 17, 40, 62,  0, 10, 25, 50, 33,  7,
+                                   55, 20, 41, 15,  2, 60,  8, 30, 11, 45,
+                                   22, 38, 61,  5, 18, 44, 29,  1, 36, 52,
+                                    6, 19,  9, 27, 48, 14, 37,  4, 23, 53,
+                                   12, 16, 31, 39, 47, 57, 13, 21, 32, 49]
+
+        // Test 55: gqmm3 + gqmm3Rows bit-exact against MLX oracle — float16 scales.
+        // Oracle: MLX.quantizedMatmul(bits:3) per expert (one call per (row,expert) slot).
+        // Goes RED at first gqmm3 nil check.
+        run("gqmm3_rows_bitexact_f16") {
+            let E = 64, K = 2048, N = 512, Ktop = 4
+            // f16 weights → f16 scales/biases from MLX.quantized
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 3, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            MLX.eval([wq, sc, bi])
+
+            // ── gqmm3 (M=1) vs MLX oracle ──
+            let x1 = MLXRandom.normal([1, K]).asType(.float16); x1.eval()
+            let inds1Arr: [Int32] = [3, 17, 40, 62]   // Ktop=4, all < E
+            let inds1 = MLXArray(inds1Arr, [Ktop]); inds1.eval()
+            // Oracle: one MLX.quantizedMatmul call per expert slot → concat [Ktop, N]
+            var oracle1Parts: [MLXArray] = []
+            for ki in 0..<Ktop {
+                let e = Int(inds1Arr[ki])
+                let r = MLX.quantizedMatmul(x1, wq[e], scales: sc[e], biases: bi[e],
+                                            transpose: true, groupSize: 64, bits: 3, mode: .affine)
+                r.eval(); oracle1Parts.append(r)
+            }
+            let oracle1 = MLX.concatenated(oracle1Parts, axis: 0); oracle1.eval()   // [Ktop, N]
+            // Stub — goes RED here (gqmm3 returns nil)
+            guard let got1 = RawMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
+                                                     inds: inds1, Ktop: Ktop, K: K, N: N)
+            else { return (false, "gqmm3 not implemented (M=1 f16)") }
+            got1.eval()
+            let (ok1, d1) = bitEqual(got1, oracle1)
+            if !ok1 { return (false, "gqmm3 M=1 f16: \(d1)") }
+
+            // ── gqmm3Rows (M∈{1,2,9,17,25}) vs MLX oracle ──
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0..<M*Ktop).map { gqmm3Pool[$0 % gqmm3Pool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                // Oracle: per-(row,expert) MLX quantizedMatmul → concat [M*Ktop, N]
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    let xm = x[m ..< m+1]   // [1, K]
+                    xm.eval()
+                    for ki in 0..<Ktop {
+                        let e = Int(indsFlat[m * Ktop + ki])
+                        let r = MLX.quantizedMatmul(xm, wq[e], scales: sc[e], biases: bi[e],
+                                                    transpose: true, groupSize: 64, bits: 3, mode: .affine)
+                        r.eval(); refParts.append(r)   // [1, N]
+                    }
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
+                guard let got = RawMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
+                                                           inds: inds, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "gqmm3Rows not implemented (M=\(M) f16)") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "gqmm3Rows M=\(M) f16: \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 56: gqmm3 + gqmm3Rows bit-exact against MLX oracle — bfloat16 scales.
+        // wf=bfloat16 → MLX.quantized returns bfloat16 scales/biases (real UD-model path).
+        // This case forces the kernel to template scale dtype (NOT downcast bf16→f16).
+        // Structure is identical to test 55 — differs ONLY in the dtype of wf.
+        // Goes RED at first gqmm3 nil check.
+        run("gqmm3_rows_bitexact_bf16") {
+            let E = 64, K = 2048, N = 512, Ktop = 4
+            // bf16 weights → bf16 scales/biases from MLX.quantized (real UD-model dtype path)
+            let wf = MLXRandom.normal([E, N, K]).asType(.bfloat16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 3, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            MLX.eval([wq, sc, bi])
+
+            // ── gqmm3 (M=1) vs MLX oracle ──
+            let x1 = MLXRandom.normal([1, K]).asType(.float16); x1.eval()
+            let inds1Arr: [Int32] = [3, 17, 40, 62]   // Ktop=4, all < E
+            let inds1 = MLXArray(inds1Arr, [Ktop]); inds1.eval()
+            // Oracle: MLX.quantizedMatmul handles bf16 scales natively — pins kernel to MLX
+            var oracle1Parts: [MLXArray] = []
+            for ki in 0..<Ktop {
+                let e = Int(inds1Arr[ki])
+                let r = MLX.quantizedMatmul(x1, wq[e], scales: sc[e], biases: bi[e],
+                                            transpose: true, groupSize: 64, bits: 3, mode: .affine)
+                r.eval(); oracle1Parts.append(r)
+            }
+            let oracle1 = MLX.concatenated(oracle1Parts, axis: 0); oracle1.eval()   // [Ktop, N]
+            // Stub — goes RED here (gqmm3 returns nil)
+            guard let got1 = RawMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
+                                                     inds: inds1, Ktop: Ktop, K: K, N: N)
+            else { return (false, "gqmm3 not implemented (M=1 bf16)") }
+            got1.eval()
+            let (ok1, d1) = bitEqual(got1, oracle1)
+            if !ok1 { return (false, "gqmm3 M=1 bf16: \(d1)") }
+
+            // ── gqmm3Rows (M∈{1,2,9,17,25}) vs MLX oracle ──
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0..<M*Ktop).map { gqmm3Pool[$0 % gqmm3Pool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                // Oracle: per-(row,expert) MLX quantizedMatmul — bf16 scales natively handled
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    let xm = x[m ..< m+1]   // [1, K]
+                    xm.eval()
+                    for ki in 0..<Ktop {
+                        let e = Int(indsFlat[m * Ktop + ki])
+                        let r = MLX.quantizedMatmul(xm, wq[e], scales: sc[e], biases: bi[e],
+                                                    transpose: true, groupSize: 64, bits: 3, mode: .affine)
+                        r.eval(); refParts.append(r)   // [1, N]
+                    }
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
+                guard let got = RawMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
+                                                           inds: inds, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "gqmm3Rows not implemented (M=\(M) bf16)") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "gqmm3Rows M=\(M) bf16: \(d)") }
             }
             return (true, "ok")
         }

@@ -4035,6 +4035,185 @@ public enum RawMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
     }
 
+    // ── gqmm3 / gqmm3Rows — 3-bit affine gather-qmv ─────────────────────────────────
+    //
+    // Port of gqmm4_rows with 3 deltas: ld16_b3 (load_vector<3>), qd3 (qdot<3> w/ *256 straddle),
+    // and constant bytes_per_pack 4→3 (→ per-thread offset simd_lid*6, per-block advance +192).
+    // Everything else (grid, block_size=512, scale_step, simd_sum) is byte-identical to gqmm4_rows.
+    //
+    // Dtype templating (XT = half|float): MLX quantized_matmul(affine) promotes to
+    //   promote_types(x.dtype, scales.dtype), casting x/scales/biases/out ALL to that dtype
+    //   (ops.cpp:20-50).  The real UD model stores scales/biases as BF16, so with f16/f32 x the
+    //   promoted compute+output dtype is f32.  We replicate: useF32 unless x AND scales are both f16.
+    //   This is the #1 correctness lever (spec §Ground truth) — a half-only kernel diverges on the
+    //   bf16 model because MLX outputs f32 there (no final f16 rounding).
+    // gqmm3 is ADDITIVE: gqmm4/qmm8/gqmm4_swiglu remain byte-identical and are NOT modified.
+
+    nonisolated(unsafe) static var _gqmm3RowsPipeline: MTLComputePipelineState?      // half
+    nonisolated(unsafe) static var _gqmm3RowsF32Pipeline: MTLComputePipelineState?   // float
+
+    /// MLX promote_types over the float domain we support (f16/bf16/f32).
+    /// f16⊕f16→f16 ; anything else (bf16 or f32 present) → f32.  Matches ops.cpp affine promotion
+    /// for the tested/real dtypes (bf16⊕bf16→bf16 is neither tested nor a real-model path).
+    private static func gqmm3UseF32(_ xdt: DType, _ sdt: DType) -> Bool {
+        return !(xdt == .float16 && sdt == .float16)
+    }
+
+    /// 3-bit MoE gather-qmv (M=1).  Thin wrapper over gqmm3Rows(M=1, lhsPerExpert:false) — the
+    /// M=1 rows kernel maps all Ktop slots to x-row 0 (mk/Ktop==0), so this is gather_qmv<3> exactly
+    /// and is order-stable-by-construction identical to the M-row path.
+    /// x[1,K], wq[E,N,3K/32], scales/biases[E,N,K/64], inds[Ktop] → out[Ktop,N].
+    public static func gqmm3(_ x: MLXArray, _ wq: MLXArray,
+                              scales: MLXArray, biases: MLXArray,
+                              inds: MLXArray,
+                              Ktop: Int, K: Int, N: Int, gs: Int = 64) -> MLXArray? {
+        return gqmm3Rows(x, wq, scales: scales, biases: biases, inds: inds,
+                         M: 1, Ktop: Ktop, K: K, N: N, gs: gs, lhsPerExpert: false)
+    }
+
+    /// 3-bit MoE gather-qmv rows (M≥1).  Mirrors gatherQmmRows with bits=3: tid.z=mk=m*Ktop+ki,
+    /// per-row internal dot column identical to gqmm3 (M-invariant order-stable).
+    /// x[M,K], wq[E,N,3K/32], inds[M*Ktop] row-major → out[M*Ktop,N].
+    /// lhsPerExpert: x indexed by mk (down-proj) vs mk/Ktop (gate/up, shared across Ktop).
+    public static func gqmm3Rows(_ x: MLXArray, _ wq: MLXArray,
+                                  scales: MLXArray, biases: MLXArray,
+                                  inds: MLXArray,
+                                  M: Int, Ktop: Int, K: Int, N: Int,
+                                  gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
+            print("[raw-gqmm3-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
+        }
+        let useF32 = gqmm3UseF32(x.dtype, scales.dtype)
+        let XT = useF32 ? "float" : "half"
+        let needCompile = useF32 ? (_gqmm3RowsF32Pipeline == nil) : (_gqmm3RowsPipeline == nil)
+        if needCompile {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            #define SIMD_SIZE 32
+            // MLX load_vector<bits=3>: 8-value blocks, per-position pre-divide (8/64/2/16/128/4/32).
+            inline float ld16_b3(const device \(XT)* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 8) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3] + x[i+4] + x[i+5] + x[i+6] + x[i+7];
+                    xt[i]   = x[i];
+                    xt[i+1] = x[i+1] / 8.0f;
+                    xt[i+2] = x[i+2] / 64.0f;
+                    xt[i+3] = x[i+3] / 2.0f;
+                    xt[i+4] = x[i+4] / 16.0f;
+                    xt[i+5] = x[i+5] / 128.0f;
+                    xt[i+6] = x[i+6] / 4.0f;
+                    xt[i+7] = x[i+7] / 32.0f;
+                }
+                return sum;
+            }
+            // MLX qdot<bits=3>: 3 bytes / 8 values, cross-byte straddles v2(b0/b1) & v5(b1/b2) via *256.
+            inline float qd3(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                for (int i = 0; i < 2; i++) {          // values_per_thread(16)/8 = 2 packs
+                    const thread float* xt8 = xt + 8 * i;
+                    const device uint8_t* w3 = w + 3 * i;
+                    accum += (float)(w3[0] & 0x07) * xt8[0];
+                    accum += (float)(w3[0] & 0x38) * xt8[1];
+                    accum += (float)(w3[0] & 0xc0) * xt8[2];
+                    accum += (float)(w3[1] & 0x01) * (xt8[2] * 256.0f);
+                    accum += (float)(w3[1] & 0x0e) * xt8[3];
+                    accum += (float)(w3[1] & 0x70) * xt8[4];
+                    accum += (float)(w3[1] & 0x80) * xt8[5];
+                    accum += (float)(w3[2] & 0x03) * (xt8[5] * 256.0f);
+                    accum += (float)(w3[2] & 0x1c) * xt8[6];
+                    accum += (float)(w3[2] & 0xe0) * xt8[7];
+                }
+                return scale * accum + sum * bias;
+            }
+            // gqmm4_rows の bits=3 版: 演算列は gqmm3(=gather_qmv_fast<3>)と完全同一 → M 非依存 order-stable。
+            kernel void gqmm3_rows(device const uint32_t* w      [[buffer(0)]],   // [E, N, 3K/32]
+                              device const \(XT)*    scales [[buffer(1)]],   // [E, N, K/64]
+                              device const \(XT)*    biases [[buffer(2)]],
+                              device const \(XT)*    x      [[buffer(3)]],   // [M, K]
+                              device const int*      inds   [[buffer(4)]],   // [M*Ktop]
+                              device \(XT)*          y      [[buffer(5)]],   // [M*Ktop, N]
+                              constant int& in_vec_size  [[buffer(6)]],
+                              constant int& out_vec_size [[buffer(7)]],
+                              constant int& ktop         [[buffer(8)]],
+                              device const int* stopFlag [[buffer(9)]],
+                              constant uint& lhsPer      [[buffer(10)]],
+                              uint3 tid      [[threadgroup_position_in_grid]],
+                              uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                              uint  simd_lid [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;
+                constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+                constexpr int pack_factor = 8, bytes_per_pack = 3, values_per_thread = 16;
+                constexpr int block_size = 512, scale_step_per_thread = 4;
+                const device uint8_t* ws = (const device uint8_t*)w;
+                typedef float U;
+                thread U x_thread[16];
+                thread U result[4] = {0};
+                const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;   // K*3/8 bytes
+                const int in_vec_size_g = in_vec_size / 64;
+                uint mk = tid.z;
+                uint e = (uint)inds[mk];
+                ws     += (size_t)e * out_vec_size * in_vec_size_w;
+                scales += (size_t)e * out_vec_size * in_vec_size_g;
+                biases += (size_t)e * out_vec_size * in_vec_size_g;
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;   // simd_lid*6
+                scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+                y += (size_t)mk * out_vec_size + out_row;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    U sum = ld16_b3(x, x_thread);
+                    for (int row = 0; row < results_per_simdgroup; row++) {
+                        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                        const device \(XT)* sl = scales + row * in_vec_size_g;
+                        const device \(XT)* bl = biases + row * in_vec_size_g;
+                        U s = sl[0]; U b = bl[0];
+                        result[row] += qd3(wl, x_thread, s, b, sum);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;   // +192 bytes
+                    scales += block_size / 64; biases += block_size / 64; x += block_size;
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    result[row] = simd_sum(result[row]);
+                    if (simd_lid == 0) y[row] = (\(XT))result[row];
+                }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm3_rows")!)
+                 if useF32 { _gqmm3RowsF32Pipeline = p } else { _gqmm3RowsPipeline = p }
+            } catch { print("[raw-gqmm3-rows] compile: \(error)"); return nil }
+        }
+        let dt: DType = useF32 ? .float32 : .float16
+        let elem = useF32 ? 4 : 2
+        guard let bx = mtlBuf(x.asType(dt), device),
+              let bwq = mtlBuf(wq, device),
+              let bsc = mtlBuf(scales.asType(dt), device),
+              let bbi = mtlBuf(biases.asType(dt), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * Ktop * N * elem, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(useF32 ? _gqmm3RowsF32Pipeline! : _gqmm3RowsPipeline!)
+        enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+        enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+        enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
+        bindStop(enc, 9)
+        var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 10)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        if useF32 {
+            let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: M * Ktop * N)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
+        }
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
+    }
+
     nonisolated(unsafe) static var _sdpaRowsPipeline: MTLComputePipelineState?
     /// D1-3: M-row SDPA decode（causal: 行 m は先頭 baseLen+m key を見る）。
     /// sdpa(M=1)と同一の per-row 演算列（simd 分担・online softmax・combine 順序が N のみに依存）を
