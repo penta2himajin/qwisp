@@ -283,18 +283,45 @@ public enum RawSpecRunner {
         return Array(out.prefix(N))
     }
 
+    // ── Tier-gating resolution seams (pure/testable) ───────────────────────
+    //
+    // recon #16 fix: two default-path wiring changes, both lossless (output
+    // byte-identical; only default selection differs). Factored as pure helpers
+    // so the resolved defaults are unit-testable via the production seam without
+    // a real model (RawVerifyTests 52/53). run() MUST call these.
+    //
+    // STUB (RED): implementer wires the real logic here. Stubs return failing
+    // sentinels and MUST NOT delegate to existing env-parsing code.
+
+    /// Resolve the resident `useFused` default from the raw QWISP_RAW_FUSED value
+    /// (nil = unset). Contract: unset → true (fused 1-CB ON, the fast default);
+    /// "0" → false (composed, debug); any other int → its `!= 0` truth. Mirrors
+    /// `Tell.envInt("QWISP_RAW_FUSED", 1) != 0`.
+    static func resolveUseFused(env raw: String?) -> Bool {
+        guard let raw else { return true }          // unset → fused ON (fast default)
+        return (Int(raw) ?? 1) != 0
+    }
+
+    /// Resolve raw-spec C from the raw QWISP_RAW_C value (nil = unset) and the
+    /// device-tier default. Contract: unset → `defaultC` (RAM tier via
+    /// DeviceCalibration.defaultC()); explicit value overrides (incl. "0" = resident).
+    static func resolveRawC(envC raw: String?, defaultC: Int) -> Int {
+        guard let raw else { return defaultC }      // unset → RAM-tier default
+        return Int(raw) ?? defaultC
+    }
+
     // ── Main runner ───────────────────────────────────────────────────────
 
     public static func run(modelDir: String, refPath: String) throws -> String {
         // ── streaming tier detection ──────────────────────────────────────
-        let rawC = Tell.envInt("QWISP_RAW_C", 0)
+        let env = ProcessInfo.processInfo.environment
+        let rawC = resolveRawC(envC: env["QWISP_RAW_C"], defaultC: DeviceCalibration.defaultC())
         let isStreaming = rawC > 0 && rawC < 256
         let isBolt = isStreaming && Tell.envFlag("QWISP_RAW_BOLT")
-        var useFused = Tell.envFlag("QWISP_RAW_FUSED")
+        let useFused = resolveUseFused(env: env["QWISP_RAW_FUSED"])
         let useA3 = Tell.envFlag("QWISP_RAW_A3")
         if isStreaming && !useFused {
-            print("[raw-spec] QWISP_RAW_C=\(rawC) → streaming tier; enabling fused implicitly (set QWISP_RAW_FUSED=1 to suppress this note)")
-            useFused = true
+            print("[raw-spec] QWISP_RAW_C=\(rawC) → streaming tier; fused OFF (QWISP_RAW_FUSED=0)")
         }
 
         print("[raw-spec] loading model from \(modelDir) ...")

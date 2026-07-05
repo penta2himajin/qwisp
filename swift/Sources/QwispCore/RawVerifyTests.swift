@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 52
+        let total = 54
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -2878,6 +2878,79 @@ public enum RawVerifyTests {
 
             RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
             RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+            return (true, "ok")
+        }
+
+        // ── recon #16 tier-gating product-correctness (tests 52-53) ─────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify tests 52-53.
+        //
+        // Goal: two lossless default-path wiring fixes in RawSpecRunner —
+        //   (1) resident useFused defaults ON (fused 1-CB ~92 tok/s), not the
+        //       composedBackend footgun (~1.3 tok/s); QWISP_RAW_FUSED=0 restores
+        //       composed for debug.
+        //   (2) raw-spec C, when QWISP_RAW_C is unset, consults the RAM tier via
+        //       DeviceCalibration.defaultC() (8→64/16→128/24→192/32+→256); an
+        //       explicit QWISP_RAW_C still overrides.
+        // Both are output-invariant (fused ≡ composed greedy byte-identical; C only
+        // changes streaming footprint, not tokens). Encoded via pure production
+        // seams RawSpecRunner.resolveUseFused / resolveRawC (STUB → RED now).
+
+        // Test 52: resident useFused default resolves ON when QWISP_RAW_FUSED unset.
+        // Seam = RawSpecRunner.resolveUseFused (STUB returns false → RED). Also pins
+        // the opt-out contract ("0" → composed) and the pass-through ("1" → fused),
+        // and binds to the live production env value (raw-tests sets no QWISP_RAW_FUSED
+        // → unset → must be true).
+        run("raw_resident_fused_default_on") {
+            // unset → fused ON (the fix; STUB false → RED here)
+            if RawSpecRunner.resolveUseFused(env: nil) != true {
+                return (false, "unset QWISP_RAW_FUSED must resolve useFused=true (fused default ON)")
+            }
+            // explicit "0" → composed (debug opt-out preserved)
+            if RawSpecRunner.resolveUseFused(env: "0") != false {
+                return (false, "QWISP_RAW_FUSED=0 must resolve useFused=false (composed)")
+            }
+            // explicit "1" → fused
+            if RawSpecRunner.resolveUseFused(env: "1") != true {
+                return (false, "QWISP_RAW_FUSED=1 must resolve useFused=true (fused)")
+            }
+            // live production env (raw-tests sets no QWISP_RAW_FUSED → unset → true)
+            let live = RawSpecRunner.resolveUseFused(
+                env: ProcessInfo.processInfo.environment["QWISP_RAW_FUSED"])
+            if live != true {
+                return (false, "live unset QWISP_RAW_FUSED must resolve useFused=true, got \(live)")
+            }
+            return (true, "ok")
+        }
+
+        // Test 53: raw-spec C consults DeviceCalibration.defaultC() when QWISP_RAW_C
+        // unset, and an explicit value overrides. Seam = RawSpecRunner.resolveRawC
+        // (STUB returns -1 → RED). References the PRODUCTION tier fn (no reimplemented
+        // oracle): the unset result must equal DeviceCalibration.defaultC().
+        run("raw_c_tier_default_wired") {
+            let tierC = DeviceCalibration.defaultC()
+            // unset → tiered default (the fix; STUB -1 → RED here)
+            if RawSpecRunner.resolveRawC(envC: nil, defaultC: tierC) != tierC {
+                return (false, "unset QWISP_RAW_C must consult DeviceCalibration.defaultC()=\(tierC)")
+            }
+            // arbitrary tier default is honored when unset (not hard-coded to resident)
+            if RawSpecRunner.resolveRawC(envC: nil, defaultC: 128) != 128 {
+                return (false, "unset QWISP_RAW_C must return the passed defaultC (128)")
+            }
+            // explicit streaming C overrides the tier default
+            if RawSpecRunner.resolveRawC(envC: "64", defaultC: 256) != 64 {
+                return (false, "explicit QWISP_RAW_C=64 must override defaultC")
+            }
+            // explicit "0" (resident) overrides too (distinct from unset)
+            if RawSpecRunner.resolveRawC(envC: "0", defaultC: 128) != 0 {
+                return (false, "explicit QWISP_RAW_C=0 must override to resident (0), not defaultC")
+            }
+            // live production env (raw-tests sets no QWISP_RAW_C → unset → tiered)
+            let live = RawSpecRunner.resolveRawC(
+                envC: ProcessInfo.processInfo.environment["QWISP_RAW_C"], defaultC: tierC)
+            if live != tierC {
+                return (false, "live unset QWISP_RAW_C must resolve to defaultC=\(tierC), got \(live)")
+            }
             return (true, "ok")
         }
 
