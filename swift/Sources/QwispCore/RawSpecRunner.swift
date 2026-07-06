@@ -713,6 +713,18 @@ public enum RawSpecRunner {
         fwd2.setBoltTables(tables)
         print("[raw-spec bolt] tables set, bolt mode active.")
 
+        // ── Stage 1 案B: gate-score residency bias ────────────────────────
+        // QWISP_ROUTE_BIAS_EPS > 0: 各層の常駐 expert(buddyExpertCPU[e]==e)に eps を加算して優先選択。
+        // eps=0(既定)は byte-identical(bias dispatch 追加ゼロ)。
+        let boltBiasEps = Float(Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0))
+        if boltBiasEps > 0 {
+            let biasMasks: [[Int32]] = providers.map { p in
+                (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
+            }
+            fwd2.setRouteBias(masks: biasMasks, eps: boltBiasEps)
+            print(String(format: "[raw-spec bolt] route bias eps=%.3f active.", boltBiasEps))
+        }
+
         // ── QWISP_BOLT_DIAG=1: routing telemetry (notes/11 案B Stage 0, measurement-only) ──
         // 層別 side-buffer に route 直後(remap 前)の inds/gl をコピーし、greedy step 毎に CPU 読出。
         // cold-selection 率と near-tie margin(常駐が +ε で置換に必要な量)を集計する。
@@ -870,6 +882,12 @@ public enum RawSpecRunner {
                 engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
                 existingProviders: providers) {
                 fwdTF.setBoltTables(tables)   // same frozen bolt tables
+                if boltBiasEps > 0 {
+                    let biasMasks: [[Int32]] = providers.map { p in
+                        (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
+                    }
+                    fwdTF.setRouteBias(masks: biasMasks, eps: boltBiasEps)
+                }
                 if let lastNormedTF = prefill(promptIds: promptIds, backend: backendTF),
                    let lg0TF = engine.logits(lastNormedTF, M: 1) {
                     MLX.eval([lg0TF])

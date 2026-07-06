@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 62
+        let total = 64
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -744,6 +744,108 @@ public enum RawVerifyTests {
                 let (oks, ds) = bitEqual(gs, refS)
                 if !oks { return (false, "scores M=\(M): \(ds)") }
             }
+            return (true, "ok")
+        }
+
+
+        // Test 63 (G-A.1 — 案B Stage 1): route_bias eps=0 恒等 + all-resident 等シフト恒等。
+        // Reference = 本番 routeTop8Rows(CPU 再実装 oracle なし)。
+        //  Part A: eps=0 なら mask 不問で bias kernel ≡ routeTop8Rows(inds+scores bit 一致)。
+        //  Part B(adversarial): all-resident mask + eps>0 は全 logit 等シフト=選択不変
+        //          → inds bit 一致・scores bit 一致(bias が score に漏れない & 順序不変)。
+        run("route_bias_eps0_identity") {
+            let N = 256, K = 8
+            for M in [1, 2] {
+                // well-separated logits so a uniform +eps never collides two selected values
+                let logits = (MLXRandom.normal([M, N]).asType(.float16) * MLXArray(Float16(4)))
+                    .asType(.float16); logits.eval()
+                guard let (refI, refS) = RawFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
+                else { return (false, "ref routeTop8Rows nil M=\(M)") }
+                refI.eval(); refS.eval()
+
+                // Part A: eps=0, several masks (all-cold, pattern) → must equal unbiased exactly.
+                let masks: [[Int32]] = [
+                    [Int32](repeating: 0, count: N),
+                    (0..<N).map { Int32($0 % 3 == 0 ? 1 : 0) },
+                ]
+                for mask in masks {
+                    guard let (gi, gs) = RawFusedVerify.routeTop8RowsBias(
+                        logits, residentMask: mask, eps: 0, M: M, N: N, K: K)
+                    else { return (false, "not implemented (eps0 M=\(M))") }
+                    gi.eval(); gs.eval()
+                    let (oki, di) = bitEqual(gi.asType(.float32), refI.asType(.float32))
+                    if !oki { return (false, "eps0 inds M=\(M): \(di)") }
+                    let (oks, ds) = bitEqual(gs, refS)
+                    if !oks { return (false, "eps0 scores M=\(M): \(ds)") }
+                }
+
+                // Part B: all-resident + eps>0 → uniform shift → selection & scores unchanged.
+                let allRes = [Int32](repeating: 1, count: N)
+                guard let (bi, bs) = RawFusedVerify.routeTop8RowsBias(
+                    logits, residentMask: allRes, eps: 0.5, M: M, N: N, K: K)
+                else { return (false, "not implemented (allres M=\(M))") }
+                bi.eval(); bs.eval()
+                let (oki, di) = bitEqual(bi.asType(.float32), refI.asType(.float32))
+                if !oki { return (false, "allres inds M=\(M): \(di)") }
+                let (oks, ds) = bitEqual(bs, refS)
+                if !oks { return (false, "allres scores M=\(M): \(ds)") }
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 64 (G-A.2 — 案B Stage 1): near-tie flip。手作り合成で resident R が cold C を
+        // margin だけ下回る(top-8 集合は eps に依らず固定=R,C,と 6 個の中位 expert)。
+        //  margin < eps → 選択が flip(R が rank0 に、集合は不変)。scores は「選ばれた expert 自身の
+        //     unbiased gate 値」= bias が score に漏れない(集合不変ゆえ renorm 分母も不変で per-id bit 一致)。
+        //  margin > eps → 選択不変(inds+scores bit 一致)。
+        // Reference = 本番 routeTop8Rows(unbiased)。CPU 再実装 oracle なし。
+        run("route_bias_neartie_flip") {
+            let N = 256, K = 8
+            let R = 100, C = 50                 // resident / cold near-tie pair
+            let others = [10, 20, 30, 40, 60, 70]   // 6 mid experts, guaranteed in top-8
+            // logits: C=5.2 (highest, cold), R=5.0 (resident), others=3.0, rest=0.
+            // f16(5.2)≈5.19921875 → effective margin ≈ 0.199.
+            var lg = [Float](repeating: 0, count: N)
+            lg[C] = 5.2; lg[R] = 5.0
+            for e in others { lg[e] = 3.0 }
+            let logits = MLXArray(lg, [1, N]).asType(.float16); logits.eval()
+            var mask = [Int32](repeating: 0, count: N); mask[R] = 1   // only R resident
+
+            guard let (uI, uS) = RawFusedVerify.routeTop8Rows(logits, M: 1, N: N, K: K)
+            else { return (false, "ref routeTop8Rows nil") }
+            uI.eval(); uS.eval()
+            let ui = uI.asType(.int32).asArray(Int32.self)
+            let us = uS.asType(.float32).asArray(Float.self)
+            // sanity on the reference: unbiased top-1 is the cold expert C
+            if Int(ui[0]) != C { return (false, "ref top-1 expected C=\(C), got \(ui[0])") }
+
+            // flip: eps=0.5 > margin(≈0.199) → R promoted to rank 0, set unchanged.
+            guard let (fI, fS) = RawFusedVerify.routeTop8RowsBias(
+                logits, residentMask: mask, eps: 0.5, M: 1, N: N, K: K)
+            else { return (false, "not implemented (flip)") }
+            fI.eval(); fS.eval()
+            let fi = fI.asType(.int32).asArray(Int32.self)
+            let fs = fS.asType(.float32).asArray(Float.self)
+            if Int(fi[0]) != R { return (false, "flip: rank0 expected R=\(R), got \(fi[0])") }
+            if Set(fi) != Set(ui) { return (false, "flip: top-8 set changed \(fi) vs \(ui)") }
+            // score non-contamination: each expert keeps its unbiased gate value (match by id).
+            for (bIdx, e) in fi.enumerated() {
+                guard let uIdx = ui.firstIndex(of: e) else { return (false, "flip: id \(e) not in ref") }
+                if fs[bIdx] != us[uIdx] {
+                    return (false, "flip: score leak for e=\(e): biased \(fs[bIdx]) vs unbiased \(us[uIdx])")
+                }
+            }
+
+            // no-flip: eps=0.1 < margin(≈0.199) → selection identical to unbiased (inds+scores bit-exact).
+            guard let (nI, nS) = RawFusedVerify.routeTop8RowsBias(
+                logits, residentMask: mask, eps: 0.1, M: 1, N: N, K: K)
+            else { return (false, "not implemented (noflip)") }
+            nI.eval(); nS.eval()
+            let (oki, di) = bitEqual(nI.asType(.float32), uI.asType(.float32))
+            if !oki { return (false, "noflip inds: \(di)") }
+            let (oks, ds) = bitEqual(nS, uS)
+            if !oks { return (false, "noflip scores: \(ds)") }
             return (true, "ok")
         }
 

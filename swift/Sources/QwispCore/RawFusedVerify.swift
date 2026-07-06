@@ -101,6 +101,7 @@ public enum RawFusedVerify {
     }
 
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _routeRowsBiasPipeline: MTLComputePipelineState?
     /// M-row route_top8: 各 threadgroup が 1 token の top-8 を独立に選ぶ(route_top8 と同一の
     /// per-token reduction — precise::exp softmax + 決定的 K 回 argmax)。grid.x=M でトークン offset
     /// するだけ → M 不変。MLX argPartition の sync 島を Metal に置換(routing の中間は argPartition と
@@ -159,6 +160,80 @@ public enum RawFusedVerify {
         enc.setComputePipelineState(_routeRowsPipeline!)
         enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1); enc.setBuffer(bScores, offset: 0, index: 2)
         var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ip = bInds.contents().bindMemory(to: Int32.self, capacity: M * K)
+        let sp = bScores.contents().bindMemory(to: Float16.self, capacity: M * K)
+        return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: M * K)), [M, K]),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: M * K)), [M, K]))
+    }
+
+    /// Stage 1 案B(gate-score residency bias): route_top8_rows のコピー + resident mask + eps。
+    /// 選択のみに bias(`work[tid] = lg + (resident[tid]!=0 ? eps : 0)`)、gates/softmax/renorm は無改変。
+    /// routeTop8Rows と同 idiom の単発 dispatch wrapper(G-A テストが呼ぶ)。resident=1/cold=0 の
+    /// int32 mask を長さ N で渡す。返り値は routeTop8Rows と同一形状 (inds[M,K] int32, scores[M,K] f16)。
+    public static func routeTop8RowsBias(_ logits: MLXArray, residentMask: [Int32], eps: Float,
+                                         M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
+        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        if _routeRowsBiasPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void route_top8_rows_bias(device const half* logits [[buffer(0)]],
+                                             device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                                             constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                                             device const int* resident [[buffer(5)]], constant float& eps [[buffer(6)]],
+                                             uint tgid [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {
+                const device half* lgrow = logits + tgid * N;
+                device int* indrow = inds + tgid * K;
+                device half* scrow = scores + tgid * K;
+                threadgroup float red[256]; threadgroup int redi[256];
+                threadgroup float gates[256]; threadgroup float work[256];
+                threadgroup float bcast[1];
+                float lg = (tid < N) ? (float)lgrow[tid] : -INFINITY;
+                red[tid] = lg; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+                float m = bcast[0];
+                float e = (tid < N) ? precise::exp(lg - m) : 0.0f;
+                red[tid] = e; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (tid == 0) bcast[0] = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+                float Z = bcast[0];
+                // ponytail: gates uses unbiased lg (softmax from original logits); work adds eps to resident only.
+                if (tid < N) { gates[tid] = (float)(half)(e / Z); work[tid] = lg + (resident[tid] != 0 ? eps : 0.0f); }
+                else { work[tid] = -INFINITY; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint k = 0; k < K; k++) {
+                    red[tid] = work[tid]; redi[tid] = (int)tid; threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint s = tgs/2; s > 0; s >>= 1) {
+                        if (tid < s) { if (red[tid+s] > red[tid]) { red[tid] = red[tid+s]; redi[tid] = redi[tid+s]; } }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                    if (tid == 0) { int bi = redi[0]; indrow[k] = bi; scrow[k] = (half)gates[bi]; work[bi] = -INFINITY; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+                 _routeRowsBiasPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows_bias")!)
+            } catch { print("[raw-route-rows-bias] compile: \(error)"); return nil }
+        }
+        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        let bInds   = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
+        guard let bRes = residentMask.withUnsafeBytes({ ptr in
+            device.makeBuffer(bytes: ptr.baseAddress!, length: N * 4, options: .storageModeShared)
+        }) else { return nil }
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_routeRowsBiasPipeline!)
+        enc.setBuffer(bl, offset: 0, index: 0); enc.setBuffer(bInds, offset: 0, index: 1)
+        enc.setBuffer(bScores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K); enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.setBuffer(bRes, offset: 0, index: 5)
+        var epsF = eps; enc.setBytes(&epsF, length: 4, index: 6)
         enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ip = bInds.contents().bindMemory(to: Int32.self, capacity: M * K)
@@ -1314,6 +1389,23 @@ public enum RawFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
+    /// route_top8_rows_bias を encode-only で提供(Stage 1 案B)。bolt 経路のみ使用。
+    /// resident mask(int32[N], GPU 常駐)と eps を渡す。pipeline は _routeRowsBiasPipeline。
+    static func encodeRouteTop8RowsBias(_ enc: MTLComputeCommandEncoder,
+                                        logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+                                        resident: MTLBuffer, eps: Float,
+                                        M: Int, N: Int, K: Int) {
+        enc.setComputePipelineState(_routeRowsBiasPipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K)
+        enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.setBuffer(resident, offset: 0, index: 5)
+        var epsF = eps; enc.setBytes(&epsF, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
     /// swiglu(既存 aux kernel, per-element 独立=M 不変)を encode-only で提供。
     /// byteOffset: streaming chunk で g/u/h の共通バイトオフセット(3 バッファとも同一)。
     static func encodeSwiglu(_ enc: MTLComputeCommandEncoder, g: MTLBuffer, u: MTLBuffer, h: MTLBuffer,
@@ -1519,11 +1611,18 @@ public enum RawFusedVerify {
     // encode し、最後に ③④(shared) をまとめて encode する。resident/bolt は 3 つを連続 encode。
 
     /// ① routing: gate qmm8 → route_top8_rows(inds+renorm scores)。
+    /// bias 非 nil の場合は route_top8_rows_bias を使い resident 常駐 expert を eps だけ優先選択する(Stage 1 案B)。
     static func encodeMoERouteRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer,
                                     w: MoEBlockBufs, sc: MoEScratch,
-                                    M: Int, E: Int, H: Int, Ktop: Int) {
+                                    M: Int, E: Int, H: Int, Ktop: Int,
+                                    bias: (mask: MTLBuffer, eps: Float)? = nil) {
         encodeQmm8Rows(enc, w: w.gW, scales: w.gS, biases: w.gB, x: x, out: sc.gl, M: M, K: H, N: E)
-        encodeRouteTop8Rows(enc, logits: sc.gl, inds: sc.inds, scores: sc.scores, M: M, N: E, K: Ktop)
+        if let b = bias, _routeRowsBiasPipeline != nil {
+            encodeRouteTop8RowsBias(enc, logits: sc.gl, inds: sc.inds, scores: sc.scores,
+                                    resident: b.mask, eps: b.eps, M: M, N: E, K: Ktop)
+        } else {
+            encodeRouteTop8Rows(enc, logits: sc.gl, inds: sc.inds, scores: sc.scores, M: M, N: E, K: Ktop)
+        }
     }
 
     /// ② routed experts gather フェーズ (行 [r0, r1) のみ)。
@@ -1625,12 +1724,14 @@ public enum RawFusedVerify {
     /// MoE block 全段(3 フェーズ連続 encode)。resident 経路(slotTable:nil)と bolt 経路(slotTable:非nil)を兼ねる。
     /// resident 時: slotTable=nil → remap なし、sw* は常駐 buffer。
     /// bolt 時: slotTable=frozen table → GPU remap、sw* は arena buffer(expertOverride 済み)。
+    /// bias 非 nil の場合は Stage 1 案B route_top8_rows_bias を使う(全 M に適用)。
     static func encodeMoEBlockRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
                                    w: MoEBlockBufs, sc: MoEScratch,
                                    M: Int, E: Int, I: Int, Ktop: Int, H: Int,
                                    slotTable: MTLBuffer? = nil,
-                                   diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? = nil) {
-        encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop)
+                                   diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? = nil,
+                                   bias: (mask: MTLBuffer, eps: Float)? = nil) {
+        encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop, bias: bias)
         // diag_copy_route (notes/11 Stage 0): route 直後・slot_remap 前に expert-id inds と raw gl を
         // 層別 side-buffer へコピー(measurement-only、diag=nil で dispatch ゼロ=既存 byte-identical)。
         if let d = diag, RawMetalForward._diagCopyRoutePipeline != nil {
@@ -3012,9 +3113,14 @@ public enum RawFusedVerify {
             encodePreMoE(enc, L, M: M)
             let diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? =
                 (M == 1 && diagRouteBufs != nil) ? (diagRouteBufs!.inds, diagRouteBufs!.gl, li) : nil
+            // Stage 1 案B: bias 非 nil かつ eps>0 のとき全 M に適用(spec≡greedy 自己整合のため M==1 限定にしない)。
+            let biasTuple: (mask: MTLBuffer, eps: Float)? = {
+                guard routeBiasEps > 0, let masks = routeBiasMasks, li < masks.count else { return nil }
+                return (masks[li], routeBiasEps)
+            }()
             RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
-                                              slotTable: slotTables[li], diag: diag)
+                                              slotTable: slotTables[li], diag: diag, bias: biasTuple)
             RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
@@ -3083,6 +3189,34 @@ public enum RawFusedVerify {
 
         /// bolt → strict に戻す(slot table は保持)。
         public func setStrictStreaming() { streamMode = .strict }
+
+        // ── Stage 1 案B: gate-score residency bias ───────────────────────────────────────
+        // routeBiasMasks[li]: per-layer int32 resident mask(N=256 elements, resident=1/cold=0)。
+        // eps=0(既定)で byte-identical(bias カーネルは呼ばれない=encodeRouteTop8Rows 従来経路)。
+        var routeBiasMasks: [MTLBuffer]? = nil
+        var routeBiasEps: Float = 0
+
+        /// per-layer residency mask を設定。masks[li] は int32 配列(長さ E = experts count)。
+        /// eps=0 なら既存 bolt と byte-identical(bias dispatch を追加しない)。bolt 経路のみ使用。
+        public func setRouteBias(masks: [[Int32]], eps: Float) {
+            guard eps > 0, !masks.isEmpty else { routeBiasMasks = nil; routeBiasEps = 0; return }
+            // bias kernel の確実なコンパイル(wrapper 経由で pipeline をキャッシュ)
+            if RawFusedVerify._routeRowsBiasPipeline == nil {
+                let dummy = MLXArray([Float16](repeating: 0, count: 256), [1, 256])
+                _ = RawFusedVerify.routeTop8RowsBias(dummy, residentMask: [Int32](repeating: 0, count: 256),
+                                                     eps: eps, M: 1, N: 256, K: 8)
+            }
+            guard RawFusedVerify._routeRowsBiasPipeline != nil else { return }
+            var bufs: [MTLBuffer] = []
+            for m in masks {
+                guard let buf = m.withUnsafeBytes({ ptr in
+                    device.makeBuffer(bytes: ptr.baseAddress!, length: m.count * 4, options: .storageModeShared)
+                }) else { return }
+                bufs.append(buf)
+            }
+            routeBiasMasks = bufs
+            routeBiasEps = eps
+        }
 
         /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
         /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
