@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 56
+        let total = 60
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3101,6 +3101,182 @@ public enum RawVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "gqmm3Rows M=\(M) bf16: \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // ── G-A: expert-reuse rerank unit tests (57-60) ──────────────────────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // They encode the §3 G-A acceptance gate from notes/10-expert-reuse-rerank-spec.md.
+        //
+        // All 4 tests are model-free (no weights loaded). They gate the stub APIs:
+        //   ReuseContext.observe  (row→token expert attribution, mutating)
+        //   ReuseContext.reuseScore  (resident-overlap score)
+        //   Tell.suffixDraft(…, reuseCtx:)  (rerank-aware draft selection)
+        //
+        // Stubs (implementation pending):
+        //   ReuseContext.observe = no-op
+        //   ReuseContext.reuseScore = 0.0 (neutral)
+        //   suffixDraft(reuseCtx: nonNil) = [] (not implemented)
+        // All 4 tests are RED on the stub tree and GREEN after correct implementation.
+        // Existing 56 tests are additive-only and unchanged.
+
+        // Test 57 (G-A-1): suffixDraft α=0 恒等 (identity).
+        // reuseCtx:nil and reuseCtx:(…, alpha:0) must return byte-identical draft arrays.
+        // Verifies α=0 is a strict generalisation of nil — reranking is exactly disabled.
+        // Seq [5,7,11,5,7,13,5,7]: pattern [5,7] matches at pos 0(→11) and pos 3(→13);
+        // tie-break picks 13 (most recent), nil draft = [13,5]. Stub non-nil → [] → RED.
+        run("rerank_alpha_zero_identity") {
+            let seq = [5, 7, 11, 5, 7, 13, 5, 7]
+            let maxMatch = 3, draftK = 2, minMatch = 2
+            // nil path — reference result (must be non-empty for the test to be meaningful)
+            let draftNil = Tell.suffixDraft(seq, maxMatch: maxMatch, draftK: draftK,
+                                            minMatch: minMatch, reuseCtx: nil)
+            if draftNil.isEmpty {
+                return (false, "nil draft unexpectedly empty on canonical seq \(seq)")
+            }
+            // alpha=0 path — must be byte-identical to nil
+            var ctx = ReuseContext()
+            ctx.observe(rowTokens: [11, 13], layer: 0, inds: [0, 1, 2, 3, 4, 5, 6, 7], Ktop: 4)
+            let residentAny: [Set<Int>] = [Set([0, 1, 2, 3])]
+            let draftAlpha0 = Tell.suffixDraft(seq, maxMatch: maxMatch, draftK: draftK,
+                                               minMatch: minMatch,
+                                               reuseCtx: (ctx: ctx,
+                                                          residentPerLayer: residentAny,
+                                                          alpha: 0.0))
+            if draftNil != draftAlpha0 {
+                return (false, "α=0 not byte-identical to nil: nil=\(draftNil) α0=\(draftAlpha0)")
+            }
+            return (true, "ok")
+        }
+
+        // Test 58 (G-A-2): reuseScore 単調性 (monotonicity and exact value).
+        // reuseScore(t, residentPerLayer) = Σ_li |tokenExperts[t][li] ∩ residentPerLayer[li]|.
+        // Token 42: layer 0 experts {0,1,2,3}, layer 1 experts {8,9,10,11}.
+        //   full resident: score = Ktop*nLayers = 8; partial: 4; none: 0.
+        // Stub reuseScore=0.0 → 0==0 → monotonicity fails → RED.
+        run("reuse_score_monotonic") {
+            let Ktop = 4, nLayers = 2
+            var ctx = ReuseContext()
+            ctx.observe(rowTokens: [42], layer: 0, inds: [0, 1, 2, 3], Ktop: Ktop)
+            ctx.observe(rowTokens: [42], layer: 1, inds: [8, 9, 10, 11], Ktop: Ktop)
+            // Full overlap: resident exactly equals observed experts
+            let resFull: [Set<Int>] = [Set([0, 1, 2, 3]), Set([8, 9, 10, 11])]
+            let scoreFull = ctx.reuseScore(token: 42, residentPerLayer: resFull)
+            // Partial overlap: half experts match per layer (2+2=4)
+            let resPartial: [Set<Int>] = [Set([0, 1, 20, 21]), Set([8, 9, 30, 31])]
+            let scorePartial = ctx.reuseScore(token: 42, residentPerLayer: resPartial)
+            // No overlap: entirely disjoint resident sets
+            let resNone: [Set<Int>] = [Set([50, 51, 52, 53]), Set([60, 61, 62, 63])]
+            let scoreNone = ctx.reuseScore(token: 42, residentPerLayer: resNone)
+            // Monotonicity: full > partial > none
+            if scoreFull <= scorePartial {
+                return (false,
+                        "monotonicity fail: full(\(scoreFull)) not > partial(\(scorePartial))")
+            }
+            if scorePartial <= scoreNone {
+                return (false,
+                        "monotonicity fail: partial(\(scorePartial)) not > none(\(scoreNone))")
+            }
+            // Exact-value correctness
+            let expected = Double(Ktop * nLayers)   // 8
+            if scoreFull != expected {
+                return (false,
+                        "full-overlap score=\(scoreFull) expected \(expected) " +
+                        "(Ktop=\(Ktop) × nLayers=\(nLayers))")
+            }
+            if scoreNone != 0.0 {
+                return (false, "no-overlap score=\(scoreNone) expected 0.0")
+            }
+            return (true, "ok")
+        }
+
+        // Test 59 (G-A-3): tie-break — α=0 defers to existing most-recent tie-break;
+        //   α>0 promotes the high-reuseScore token.
+        // Seq [10,20,100,10,20,200,10,20]: pattern [10,20] matches at pos 0(→100) and
+        //   pos 3(→200). counts: 100=1, 200=1 (exact tie). Most-recent=pos 3 → nil picks 200.
+        //   reuseScore(100)=4 (full resident), reuseScore(200)=0 → α>0 picks 100.
+        // Stub non-nil → [] → all assertions fail → RED.
+        run("rerank_tie_break") {
+            let seq = [10, 20, 100, 10, 20, 200, 10, 20]
+            let Ktop = 4
+            // Verify nil gives [200] (most-recent tie-break: pos 3 is newer than pos 0)
+            let nilDraft = Tell.suffixDraft(seq, maxMatch: 3, draftK: 1, minMatch: 2,
+                                            reuseCtx: nil)
+            if nilDraft != [200] {
+                return (false,
+                        "nil draft expected [200] (most-recent tie-break), got \(nilDraft)")
+            }
+            // ReuseContext: token 100 → full resident overlap; token 200 → none
+            var ctx = ReuseContext()
+            ctx.observe(rowTokens: [100], layer: 0, inds: [0, 1, 2, 3], Ktop: Ktop)
+            ctx.observe(rowTokens: [200], layer: 0, inds: [10, 11, 12, 13], Ktop: Ktop)
+            let resident: [Set<Int>] = [Set([0, 1, 2, 3])]   // overlaps 100 fully, 200 not at all
+            // α=0: must be byte-identical to nil → [200]
+            let alpha0Draft = Tell.suffixDraft(seq, maxMatch: 3, draftK: 1, minMatch: 2,
+                                               reuseCtx: (ctx: ctx,
+                                                          residentPerLayer: resident,
+                                                          alpha: 0.0))
+            if alpha0Draft != [200] {
+                return (false,
+                        "α=0 expected [200] (identical to nil tie-break), got \(alpha0Draft)")
+            }
+            // α>0: high-reuse token 100 must win
+            let alpha1Draft = Tell.suffixDraft(seq, maxMatch: 3, draftK: 1, minMatch: 2,
+                                               reuseCtx: (ctx: ctx,
+                                                          residentPerLayer: resident,
+                                                          alpha: 1.0))
+            if alpha1Draft.isEmpty || alpha1Draft[0] != 100 {
+                return (false,
+                        "α=1 expected [100] (high-reuse wins tie), got \(alpha1Draft)")
+            }
+            return (true, "ok")
+        }
+
+        // Test 60 (G-A-4): observe 帰属 (attribution).
+        // After observe(rowTokens:[t0,t1,t2], layer:li, inds:[M*Ktop]), reuseScore must
+        // attribute inds[m*Ktop ..< (m+1)*Ktop] to rowTokens[m] per layer — not to other tokens.
+        // Verified via reuseScore: each token with its own observed experts → Ktop*nLayers;
+        //   each token with another token's experts → 0 (no cross-attribution).
+        // Stub reuseScore=0 → attribution checks fail → RED.
+        run("observe_attribution") {
+            let Ktop = 4, nLayers = 2
+            // Token 10: layer 0 experts {1,2,3,4}, layer 1 experts {21,22,23,24}
+            // Token 20: layer 0 experts {5,6,7,8}, layer 1 experts {25,26,27,28}
+            // Token 30: layer 0 experts {9,10,11,12}, layer 1 experts {29,30,31,32}
+            var ctx = ReuseContext()
+            ctx.observe(rowTokens: [10, 20, 30], layer: 0,
+                        inds: [1,2,3,4, 5,6,7,8, 9,10,11,12], Ktop: Ktop)
+            ctx.observe(rowTokens: [10, 20, 30], layer: 1,
+                        inds: [21,22,23,24, 25,26,27,28, 29,30,31,32], Ktop: Ktop)
+            let expectedOwn = Double(Ktop * nLayers)   // 8: full overlap on both layers
+            // Each token with its own observed experts → expectedOwn
+            let res10own: [Set<Int>] = [Set([1,2,3,4]), Set([21,22,23,24])]
+            let score10own = ctx.reuseScore(token: 10, residentPerLayer: res10own)
+            if score10own != expectedOwn {
+                return (false,
+                        "token 10 own-expert score=\(score10own) expected \(expectedOwn)")
+            }
+            let res20own: [Set<Int>] = [Set([5,6,7,8]), Set([25,26,27,28])]
+            let score20own = ctx.reuseScore(token: 20, residentPerLayer: res20own)
+            if score20own != expectedOwn {
+                return (false,
+                        "token 20 own-expert score=\(score20own) expected \(expectedOwn)")
+            }
+            let res30own: [Set<Int>] = [Set([9,10,11,12]), Set([29,30,31,32])]
+            let score30own = ctx.reuseScore(token: 30, residentPerLayer: res30own)
+            if score30own != expectedOwn {
+                return (false,
+                        "token 30 own-expert score=\(score30own) expected \(expectedOwn)")
+            }
+            // Cross-attribution: token 10 vs token 20's experts → 0 (no overlap)
+            let res10cross: [Set<Int>] = [Set([5,6,7,8]), Set([25,26,27,28])]
+            let score10cross = ctx.reuseScore(token: 10, residentPerLayer: res10cross)
+            if score10cross != 0.0 {
+                return (false,
+                        "token 10 cross-expert score=\(score10cross) expected 0.0 " +
+                        "(wrong attribution: token 10 should not match token 20 experts)")
             }
             return (true, "ok")
         }

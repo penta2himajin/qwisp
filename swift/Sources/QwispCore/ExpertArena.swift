@@ -84,6 +84,7 @@ public final class LayerExpertCache {
     nonisolated(unsafe) public static var ensureNanos: UInt64 = 0   // ensure(CPU+IO) 累積時間（全層）
     nonisolated(unsafe) public static var preadNanos: UInt64 = 0    // loadMany(pread IO) のみ
     nonisolated(unsafe) public static var missTotal: Int = 0        // 累積 miss 数
+nonisolated(unsafe) public static var chunkTotal: Int = 0       // 累積 chunk 数 (partitionChunks 返し)
     // ★ issue#7 Step 0: per-layer all-resident 計測（ensure 前=no-sync が exact になる層か）。raw 作業用診断。
     nonisolated(unsafe) public static var measureResident = false
     nonisolated(unsafe) public static var residAllHit: [Int: Int] = [:]   // 層→(top-8 全常駐だった token 数)
@@ -240,7 +241,7 @@ public final class LayerExpertCache {
 
     /// ★ T1 batch bench: プロセス fresh 相当へ static 状態を戻す（accounting + overflow guard）。
     public static func resetGlobals() {
-        ensureNanos = 0; preadNanos = 0; missTotal = 0
+        ensureNanos = 0; preadNanos = 0; missTotal = 0; chunkTotal = 0
         overflowCheck = false; overflowMaxUnion = 0; overflowSafeRows = Int.max
         boltFetchBudgetLeft = 0; boltFetchTotal = 0   // B3
     }

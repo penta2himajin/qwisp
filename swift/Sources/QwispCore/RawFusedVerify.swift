@@ -3096,6 +3096,7 @@ public enum RawFusedVerify {
                 indsCaptureHook?(li, inds)
                 let chunks = partitionChunks(inds, M: M, Ktop: L.Ktop, C: provider.C)
                 maxChunks = max(maxChunks, chunks.count)
+                LayerExpertCache.chunkTotal += chunks.count
 
                 let stPtr = slotTables[li].contents().bindMemory(to: Int32.self, capacity: L.E)
 

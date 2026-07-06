@@ -370,6 +370,11 @@ public enum RawSpecRunner {
         LayerExpertCache.ensureNanos = 0
         LayerExpertCache.preadNanos  = 0
         LayerExpertCache.missTotal   = 0
+        LayerExpertCache.chunkTotal  = 0
+
+        // reuse-rerank: capture streaming fwd/providers for expert-aware draft (notes/10)
+        var _reuseStreamFwd: RawFusedVerify.RawFusedForward? = nil
+        var _reuseStreamProviders: [ArenaExpertProvider]? = nil
 
         let mkBackend: () -> SpecBackend? = {
             if isStreaming {
@@ -381,8 +386,35 @@ public enum RawSpecRunner {
                 return composedBackend(engine: engine)
             }
         }
-        guard let backend = mkBackend()
-        else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
+        // Build main backend; for streaming, capture fwd/providers for optional rerank.
+        let backend: SpecBackend
+        if isStreaming {
+            guard let (b, fwd, providers) = streamingBackend(engine: engine, modelDir: modelDir,
+                                                              maxM: maxM, maxSeqLen: maxSeqLen, C: rawC)
+            else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
+            _reuseStreamFwd = fwd
+            _reuseStreamProviders = providers
+            backend = b
+        } else {
+            guard let b = mkBackend()
+            else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
+            backend = b
+        }
+
+        // reuse-rerank setup (flag-off = zero-cost nil path, notes/10 §1c-1e)
+        let _useRerank = isStreaming && Tell.envFlag("QWISP_REUSE_RERANK")
+        let _reuseAlpha = Double(Tell.envFloat("QWISP_REUSE_ALPHA", 0.0))
+        var _reuseCtx = ReuseContext()
+        var _reuseVerifyToks: [Int] = []   // updated before each stepArgmax; hook reads this
+        if let fwd = _reuseStreamFwd, _useRerank {
+            fwd.indsCaptureHook = { li, inds in
+                let toks = _reuseVerifyToks
+                guard !toks.isEmpty, !inds.isEmpty else { return }
+                let ktop = inds.count / toks.count
+                guard ktop > 0 else { return }
+                _reuseCtx.observe(rowTokens: toks, layer: li, inds: inds, Ktop: ktop)
+            }
+        }
 
         // streaming stats 追跡は LayerExpertCache の static counters 経由(リセット済み)。
         // stream-vs-resident check は別途 resident backend を構築する。
@@ -414,7 +446,12 @@ public enum RawSpecRunner {
         let t0 = DispatchTime.now()
 
         while out.count < N {
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let _reuseArg: (ctx: ReuseContext, residentPerLayer: [Set<Int>], alpha: Double)? = _useRerank ? {
+                let resPerLayer = _reuseStreamProviders?.map { Set($0.cache.slotOf.keys) } ?? []
+                return (ctx: _reuseCtx, residentPerLayer: resPerLayer, alpha: _reuseAlpha)
+            }() : nil
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4,
+                                          reuseCtx: _reuseArg)
             let D      = drafts.count
 
             // Snapshot before the batched verify (backend-specific representation).
@@ -441,6 +478,7 @@ public enum RawSpecRunner {
                 if useA3 && !pending.isEmpty {
                     // A3 D==0 path: stepArgmax on [pending, u] (batched)
                     let stepTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)]
+                    if _useRerank { _reuseVerifyToks = stepTokens.map { Int($0) } }
                     guard let evals = backend.stepArgmax(stepTokens)
                     else { return "[raw-spec] ERROR: A3 step(D=0) nil" }
                     out.append(u); hist.append(u)
@@ -448,6 +486,7 @@ public enum RawSpecRunner {
                     pending = []
                 } else {
                     // Non-A3 or empty pending: simple single step
+                    if _useRerank { _reuseVerifyToks = [Int(u)] }
                     guard let evals = backend.stepArgmax([Int32(u)])
                     else { return "[raw-spec] ERROR: step(D=0) nil" }
                     out.append(u); hist.append(u)
@@ -462,6 +501,7 @@ public enum RawSpecRunner {
                 // A3: fuse pending + [u] + drafts into ONE verify batch (no flush-before-verify)
                 let pk = pending.count
                 let verifyTokens: [Int32] = pending.map { Int32($0) } + [Int32(u)] + drafts.map { Int32($0) }
+                if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
                 guard let evals = backend.stepArgmax(verifyTokens)
                 else { return "[raw-spec] ERROR: A3 verify step nil" }
 
@@ -495,6 +535,7 @@ public enum RawSpecRunner {
                     // Cap flush: only if pending exceeds 24 (safety to bound M)
                     if pending.count >= pendingCap {
                         let pendingTokens: [Int32] = pending.map { Int32($0) }
+                        if _useRerank { _reuseVerifyToks = [] }
                         guard let _ = backend.forward(pendingTokens)
                         else { return "[raw-spec] ERROR: A3 pending flush nil" }
                         pending = []
@@ -503,6 +544,7 @@ public enum RawSpecRunner {
             } else {
                 // ── Non-A3 path (unchanged) ──────────────────────────────
                 let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
                 guard let evals = backend.stepArgmax(verifyTokens)
                 else { return "[raw-spec] ERROR: verify step nil" }
 
@@ -524,6 +566,7 @@ public enum RawSpecRunner {
                     accTok += p
                     steps  += 1
                     let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                    if _useRerank { _reuseVerifyToks = [] }
                     guard let _ = backend.forward(rebuildTokens)
                     else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
                     u = evals[p]
@@ -547,8 +590,11 @@ public enum RawSpecRunner {
         if isStreaming {
             let ensMs  = Double(LayerExpertCache.ensureNanos) / 1e6
             let preadMs = Double(LayerExpertCache.preadNanos) / 1e6
-            statsLine = String(format: "\n[RawSpec] streaming stats: ensure=%.1fms pread=%.1fms misses=%d",
-                               ensMs, preadMs, LayerExpertCache.missTotal)
+            statsLine = String(format: "\n[RawSpec] streaming stats: ensure=%.1fms pread=%.1fms misses=%d chunks=%d",
+                               ensMs, preadMs, LayerExpertCache.missTotal, LayerExpertCache.chunkTotal)
+            if _useRerank {
+                statsLine += "\n[RawSpec] reuse diag: votes=\(Tell.reuseVotes) forks=\(Tell.reuseForks) flips=\(Tell.reuseFlips)"
+            }
         }
 
         let tierTag = isStreaming ? "streaming C=\(rawC)" : "resident"

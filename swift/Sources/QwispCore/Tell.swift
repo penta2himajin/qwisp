@@ -516,7 +516,18 @@ public enum Tell {
     /// 3) 長さ cap = min(draftK, suffixAlpha·m)（draftK=caller の容量 cap: min(maxK, safeMaxK) 等）。
     /// コスト: alive-set loop は O(出現数 × draft長)。最長 m での出現数は通常少なく、hist が大きい
     /// 場合は既存の走査コストが支配的（既知・許容。longctx index は別 task）。
-    static func suffixDraft(_ seq: [Int], maxMatch: Int, draftK: Int, minMatch: Int) -> [Int] {
+    ///
+    ///
+    /// reuseCtx 引数 (notes/10 §1c): nil で既存挙動と byte-identical。
+    /// 非 nil かつ alpha=0 でも既存挙動と byte-identical（strict generalisation、G-A-1 で pin）。
+    /// 非 nil かつ alpha>0 で weight(t) = counts[t] × (1 + alpha × reuseScore(t)) で rerank。
+    // diag counters for reuse-rerank go/no-go (accumulated only when reuseCtx != nil)
+    nonisolated(unsafe) static var reuseVotes = 0   // total vote iterations
+    nonisolated(unsafe) static var reuseForks = 0   // votes with >1 distinct candidate
+    nonisolated(unsafe) static var reuseFlips = 0   // votes where rerank picked ≠ count-majority
+
+    static func suffixDraft(_ seq: [Int], maxMatch: Int, draftK: Int, minMatch: Int,
+                            reuseCtx: (ctx: ReuseContext, residentPerLayer: [Set<Int>], alpha: Double)? = nil) -> [Int] {
         let n = seq.count
         if n < minMatch + 1 { return [] }
         var m = Swift.min(maxMatch, n - 1)
@@ -542,12 +553,29 @@ public enum Tell {
                         if idx < n { let t = seq[idx]; next.append(t); counts[t, default: 0] += 1 }
                         else { next.append(-1) }
                     }
-                    // 多数決。同数 tie は「最も最近の alive 位置の token」が勝つ（alive は最近順、
-                    // strict > 比較で最初に最大 count に達した token=最近位置の提案が確定）。
-                    var best = -1, bestCnt = 0
+                    // Weight-based voting. Iterate alive in most-recent-first order.
+                    // Strict > comparison: first token to reach the max weight wins (most-recent tie-break).
+                    // When alpha=0 or reuseCtx==nil, weight = Double(counts[t]) → identical to old path.
+                    var best = -1
+                    var bestWeight = -1.0   // counts >= 1, so any valid token beats this
+                    var countBest = -1, countBestCnt = 0   // diag: what pure count-majority would pick
                     for k in 0 ..< alive.count {
                         let t = next[k]
-                        if t >= 0, let c = counts[t], c > bestCnt { best = t; bestCnt = c }
+                        guard t >= 0, let c = counts[t] else { continue }
+                        let w: Double
+                        if let rc = reuseCtx {
+                            w = Double(c) * (1.0 + rc.alpha * rc.ctx.reuseScore(token: t, residentPerLayer: rc.residentPerLayer))
+                        } else {
+                            w = Double(c)
+                        }
+                        if w > bestWeight { best = t; bestWeight = w }
+                        if c > countBestCnt { countBest = t; countBestCnt = c }
+                    }
+                    // diag counters (reuseCtx runs only): fork = >1 distinct candidate, flip = rerank changed pick
+                    if reuseCtx != nil, best >= 0 {
+                        reuseVotes += 1
+                        if counts.count > 1 { reuseForks += 1 }
+                        if best != countBest { reuseFlips += 1 }
                     }
                     if best < 0 { break }                      // 全 alive が末尾到達
                     draft.append(best)
@@ -560,5 +588,46 @@ public enum Tell {
             m -= 1
         }
         return []
+    }
+}
+
+// ── ReuseContext: expert-reuse draft rerank context (notes/10 §2) ─────────────
+// Accumulates per-token per-layer expert usage from streaming verify rows and
+// provides reuseScore for suffixDraft candidate reranking.
+// observe: row m of rowTokens maps to inds[m*Ktop ..< (m+1)*Ktop] at the given layer.
+// reuseScore: returns Σ_li |tokenExperts[t][li] ∩ residentPerLayer[li]|
+// Flag-off (QWISP_REUSE_RERANK unset) and alpha=0 are byte-identical to nil (no rerank).
+public struct ReuseContext {
+    // token -> layer -> Set of expert indices (accumulated across observe calls)
+    private var tokenExperts: [Int: [Int: Set<Int>]] = [:]
+
+    public init() {}
+
+    /// Accumulate per-row expert routing. Row m of rowTokens routes to
+    /// inds[m*Ktop ..< (m+1)*Ktop] at the given layer.
+    public mutating func observe(rowTokens: [Int], layer: Int, inds: [Int32], Ktop: Int) {
+        for (m, token) in rowTokens.enumerated() {
+            let start = m * Ktop
+            guard start + Ktop <= inds.count else { continue }
+            var expertSet = tokenExperts[token]?[layer] ?? Set<Int>()
+            for k in 0 ..< Ktop {
+                expertSet.insert(Int(inds[start + k]))
+            }
+            if tokenExperts[token] == nil { tokenExperts[token] = [:] }
+            tokenExperts[token]![layer] = expertSet
+        }
+    }
+
+    /// Resident-overlap score: Σ_li |tokenExperts[t][li] ∩ residentPerLayer[li]|
+    /// Unknown tokens return 0.0 (neutral — no bias toward or away from resident experts).
+    public func reuseScore(token: Int, residentPerLayer: [Set<Int>]) -> Double {
+        guard let layerMap = tokenExperts[token] else { return 0.0 }
+        var score = 0.0
+        for (li, residentSet) in residentPerLayer.enumerated() {
+            if let observed = layerMap[li] {
+                score += Double(observed.intersection(residentSet).count)
+            }
+        }
+        return score
     }
 }
