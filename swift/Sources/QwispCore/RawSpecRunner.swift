@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXFast
 
@@ -712,6 +713,55 @@ public enum RawSpecRunner {
         fwd2.setBoltTables(tables)
         print("[raw-spec bolt] tables set, bolt mode active.")
 
+        // ── QWISP_BOLT_DIAG=1: routing telemetry (notes/11 案B Stage 0, measurement-only) ──
+        // 層別 side-buffer に route 直後(remap 前)の inds/gl をコピーし、greedy step 毎に CPU 読出。
+        // cold-selection 率と near-tie margin(常駐が +ε で置換に必要な量)を集計する。
+        // diag 中は chain を無効化(1 CB=1 step にして step 毎読出を可能に)。OUT_TOKENS は不変。
+        let boltDiag = Tell.envFlag("QWISP_BOLT_DIAG")
+        let Ktop = 8
+        var diagResidents: [Set<Int>] = [], diagBuddyExp: [[Int32]] = []
+        var diagIBuf: MTLBuffer? = nil, diagGBuf: MTLBuffer? = nil
+        if boltDiag {
+            guard RawMetalForward.compileDiagCopyRoute(),
+                  let (device, _) = RawMetalForward.ensure(),
+                  let ib = device.makeBuffer(length: nLayers * Ktop * 4, options: .storageModeShared),
+                  let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared)
+            else { return "[raw-spec bolt] ERROR: diag setup failed" }
+            diagIBuf = ib; diagGBuf = gb
+            fwd2.diagRouteBufs = (ib, gb)
+            for p in providers {
+                diagResidents.append(Set(p.cache.slotOf.keys))
+                diagBuddyExp.append(p.cache.buddyExpertCPU)
+            }
+            print("[raw-spec bolt] diag mode: telemetry on, chain disabled")
+        }
+        // group(li): early 0-12 / mid 13-26 / late 27-39
+        struct DiagAcc { var cold = 0; var routed = 0; var stepsWithCold = 0; var margins: [Float] = [] }
+        var diagAcc = [DiagAcc(), DiagAcc(), DiagAcc()]
+        var diagSteps = 0
+        func diagReadStep() {
+            guard let ib = diagIBuf, let gb = diagGBuf else { return }
+            diagSteps += 1
+            var groupHadCold = [false, false, false]
+            for li in 0 ..< nLayers {
+                let indsArr = Array(UnsafeBufferPointer(
+                    start: ib.contents().advanced(by: li * Ktop * 4).assumingMemoryBound(to: Int32.self),
+                    count: Ktop))
+                let glArr = Array(UnsafeBufferPointer(
+                    start: gb.contents().advanced(by: li * nE * 2).assumingMemoryBound(to: Float16.self),
+                    count: nE))
+                let (cold, mar) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+                    inds: indsArr, gl: glArr, resident: diagResidents[li],
+                    buddyExpert: diagBuddyExp[li], Ktop: Ktop)
+                let g = li <= 12 ? 0 : (li <= 26 ? 1 : 2)
+                diagAcc[g].cold += cold.count
+                diagAcc[g].routed += Ktop
+                diagAcc[g].margins.append(contentsOf: mar)
+                if !cold.isEmpty { groupHadCold[g] = true }
+            }
+            for g in 0 ..< 3 where groupHadCold[g] { diagAcc[g].stepsWithCold += 1 }
+        }
+
         // ── phase 6: bolt spec decode loop ────────────────────────────────
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
@@ -721,7 +771,7 @@ public enum RawSpecRunner {
         // Phase II-b: chain wiring for the D==0 greedy span.
         // chainedStepArgmax is bit-exact to K sequential stepArgmax calls (bolt = deterministic
         // buddy-greedy), so OUT_TOKENS is byte-identical with chain on or off.
-        let boltChainK = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+        let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
 
         let t0 = DispatchTime.now()
 
@@ -741,6 +791,7 @@ public enum RawSpecRunner {
                 // chain unavailable or disabled → per-step fallback.
                 guard let evals = backend2.stepArgmax([Int32(u)])
                 else { return "[raw-spec bolt] ERROR: step(D=0) nil" }
+                if boltDiag { diagReadStep() }   // M==1 greedy step: side-buffers fresh
                 out.append(u); hist.append(u)
                 u = evals[0]; steps += 1; continue
             }
@@ -782,6 +833,31 @@ public enum RawSpecRunner {
             "[RawSpec] bolt(L3 near-lossless) C=\(C): %.1f tok/s  accept/step=%.2f  品質(vs ref) %d/%d=%.0f%%",
             tokps, Double(accTok) / Double(Swift.max(steps, 1)), match, N, Double(match) / Double(N) * 100)
         print("[RawSpec] NOTE: bolt is L3 near-lossless (buddy remap, not strict). Quality vs ref is informational.")
+
+        // [BoltDiag] telemetry report (notes/11 案B Stage 0): greedy-step のみ集計(M==1)。
+        if boltDiag {
+            let groupNames = ["early(0-12)", "mid(13-26)", "late(27-39)"]
+            print("[BoltDiag] greedy-steps=\(diagSteps) of \(steps) total steps, Ktop=\(Ktop), C=\(C)")
+            for g in 0 ..< 3 {
+                let a = diagAcc[g]
+                let coldRate = a.routed > 0 ? Double(a.cold) / Double(a.routed) * 100 : 0
+                let stepPct = diagSteps > 0 ? Double(a.stepsWithCold) / Double(diagSteps) * 100 : 0
+                let fin = a.margins.filter { $0.isFinite }.sorted()
+                let infN = a.margins.count - fin.count
+                func pct(_ p: Double) -> Float {
+                    fin.isEmpty ? Float.nan : fin[Swift.min(fin.count - 1, Int(Double(fin.count) * p))]
+                }
+                let flips = [0.5, 1.0, 2.0, 4.0].map { eps in
+                    a.margins.isEmpty ? 0.0
+                        : Double(a.margins.filter { $0 < Float(eps) }.count) / Double(a.margins.count) * 100
+                }
+                print(String(format: "[BoltDiag] group=%@ coldRate=%d/%d=%.1f%% stepsWithCold=%.0f%% " +
+                             "marginP10/50/90=%.2f/%.2f/%.2f inf=%d flip@eps{0.5:%.0f%% 1:%.0f%% 2:%.0f%% 4:%.0f%%}",
+                             groupNames[g], a.cold, a.routed, coldRate, stepPct,
+                             pct(0.10), pct(0.50), pct(0.90), infN,
+                             flips[0], flips[1], flips[2], flips[3]))
+            }
+        }
 
         // ── SELF-CHECK (bolt): spec vs bolt greedy (same frozen tables = self-consistent) ──
         // ── TEACHER-FORCED FIDELITY (bolt vs strict canonical): QWISP_RAW_TF=1 ──

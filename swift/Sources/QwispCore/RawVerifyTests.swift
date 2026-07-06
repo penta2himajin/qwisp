@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 60
+        let total = 62
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3278,6 +3278,70 @@ public enum RawVerifyTests {
                         "token 10 cross-expert score=\(score10cross) expected 0.0 " +
                         "(wrong attribution: token 10 should not match token 20 experts)")
             }
+            return (true, "ok")
+        }
+
+        // Test 61 (G-A.1): diag_copy_route copy correctness (notes/11 案B Stage 0)
+        // The bolt routing-telemetry kernel copies per-layer routing state into a layer-
+        // indexed side-buffer: inds[Ktop] int32 → offset li*Ktop, gl[E] half → offset li*E.
+        // Reference = identity copy (the kernel's own definition), NOT a reimplemented oracle:
+        // the returned li-slice must bit-match the source inds/gl. Exercising li∈{0,2,1}
+        // (numLayers=3) proves the layer-offset math, not just the trivial li=0 case.
+        run("diag_copy_route_bitexact") {
+            let E = 8, Ktop = 4, numLayers = 3
+            let inds: [Int32] = [4, 1, 6, 2]
+            // f16-exact gate logits so the half round-trip is lossless.
+            let gl: [Float16] = [1.0, 5.0, 3.0, 2.0, 9.0, 0.5, 7.0, 4.0]
+            for li in [0, 2, 1] {
+                guard let (gotI, gotG) = RawFusedVerify.RawFusedForward.diagCopyRouteSelfTest(
+                    inds: inds, gl: gl, Ktop: Ktop, E: E, numLayers: numLayers, li: li)
+                else { return (false, "not implemented (li=\(li))") }
+                if gotI != inds { return (false, "li=\(li) inds \(gotI) != \(inds)") }
+                if gotG.count != E { return (false, "li=\(li) gl count \(gotG.count) != \(E)") }
+                for e in 0..<E where gotG[e] != gl[e] {
+                    return (false, "li=\(li) gl[\(e)]=\(gotG[e]) != \(gl[e])")
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 62 (G-A.2): computeRouteDiag synthetic hand-check (notes/11 案B Stage 0)
+        // Pure CPU aggregation. resident = pinned top-C; cold iff buddyExpert[e] != e;
+        // cold e's margin = gl[e] − max{gl[r] : r ∈ resident, r ∉ routed}; empty ⇒ +inf.
+        run("compute_route_diag_synthetic") {
+            let Ktop = 4
+            // buddyExpert: hot(self) for 0-3, cold(remapped) for 4-7.
+            let buddyExpert: [Int32] = [0, 1, 2, 3, 0, 1, 2, 3]
+            let gl: [Float16] = [1.0, 5.0, 3.0, 2.0, 9.0, 0.5, 7.0, 4.0]
+
+            // Case A: routed=[4,1,6,2]; resident={0,1,2,3}; resident∉routed={0,3}.
+            //   cold selected = {4,6}. max{gl[0],gl[3]} = max(1,2) = 2.
+            //   margin[4]=9-2=7, margin[6]=7-2=5.
+            let (coldA, marA) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+                inds: [4, 1, 6, 2], gl: gl, resident: Set([0, 1, 2, 3]),
+                buddyExpert: buddyExpert, Ktop: Ktop)
+            if Set(coldA) != Set([4, 6]) { return (false, "A coldSelected=\(coldA) want {4,6}") }
+            if coldA.count != marA.count { return (false, "A parallel len \(coldA.count)!=\(marA.count)") }
+            // map expert→margin for order-independent check
+            var mA: [Int: Float] = [:]
+            for (i, e) in coldA.enumerated() { mA[e] = marA[i] }
+            if mA[4] != 7.0 { return (false, "A margin[4]=\(String(describing: mA[4])) want 7.0") }
+            if mA[6] != 5.0 { return (false, "A margin[6]=\(String(describing: mA[6])) want 5.0") }
+
+            // Case B (+inf): resident={0,1}, routed=[0,1,5], resident∉routed={} → margin[5]=+inf.
+            let (coldB, marB) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+                inds: [0, 1, 5], gl: gl, resident: Set([0, 1]),
+                buddyExpert: buddyExpert, Ktop: 3)
+            if coldB != [5] { return (false, "B coldSelected=\(coldB) want [5]") }
+            if marB.count != 1 || !marB[0].isInfinite || marB[0] < 0 {
+                return (false, "B margins=\(marB) want [+inf]")
+            }
+
+            // Case C (no cold): all routed experts hot → empty.
+            let (coldC, marC) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+                inds: [0, 1, 2, 3], gl: gl, resident: Set([0, 1, 2, 3]),
+                buddyExpert: buddyExpert, Ktop: Ktop)
+            if !coldC.isEmpty || !marC.isEmpty { return (false, "C cold=\(coldC) mar=\(marC) want empty") }
             return (true, "ok")
         }
 

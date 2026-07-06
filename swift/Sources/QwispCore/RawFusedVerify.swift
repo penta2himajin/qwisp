@@ -1628,8 +1628,17 @@ public enum RawFusedVerify {
     static func encodeMoEBlockRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
                                    w: MoEBlockBufs, sc: MoEScratch,
                                    M: Int, E: Int, I: Int, Ktop: Int, H: Int,
-                                   slotTable: MTLBuffer? = nil) {
+                                   slotTable: MTLBuffer? = nil,
+                                   diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? = nil) {
         encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop)
+        // diag_copy_route (notes/11 Stage 0): route 直後・slot_remap 前に expert-id inds と raw gl を
+        // 層別 side-buffer へコピー(measurement-only、diag=nil で dispatch ゼロ=既存 byte-identical)。
+        if let d = diag, RawMetalForward._diagCopyRoutePipeline != nil {
+            RawMetalForward.encodeDiagCopyRoute(enc, inds: sc.inds, gl: sc.gl,
+                                                indsDst: d.inds, indsDstByteOffset: d.li * Ktop * 4,
+                                                glDst: d.gl, glDstByteOffset: d.li * E * 2,
+                                                Ktop: Ktop, E: E)
+        }
         encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
         encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H, Ktop: Ktop)
     }
@@ -2832,6 +2841,62 @@ public enum RawFusedVerify {
             return fuseSHEXP && M == 1
         }
 
+        // ── bolt routing telemetry (notes/11 案B Stage 0) ───────────────────────────────
+        // Measurement-only. diagRouteBufs (GREEN) + the two stubs below. All additive:
+        // diag-off (diagRouteBufs == nil) keeps every existing path byte-identical.
+
+        /// G-A self-test hook for the `diag_copy_route` kernel: allocate side-buffers for
+        /// `numLayers` layers, dispatch the PRODUCTION kernel for layer `li` (inds[Ktop] int32 +
+        /// gl[E] half → layer offset inds:li*Ktop / gl:li*E), and read the li-offset slice back.
+        /// Reference (identity copy = kernel definition) lives in the test.
+        public static func diagCopyRouteSelfTest(inds: [Int32], gl: [Float16],
+                                                 Ktop: Int, E: Int, numLayers: Int, li: Int)
+            -> (inds: [Int32], gl: [Float16])? {
+            guard let (device, queue) = RawMetalForward.ensure(),
+                  RawMetalForward.compileDiagCopyRoute() else { return nil }
+            guard let srcI = inds.withUnsafeBytes({ p in
+                      device.makeBuffer(bytes: p.baseAddress!, length: Ktop * 4, options: .storageModeShared) }),
+                  let srcG = gl.withUnsafeBytes({ p in
+                      device.makeBuffer(bytes: p.baseAddress!, length: E * 2, options: .storageModeShared) }),
+                  let iBuf = device.makeBuffer(length: numLayers * Ktop * 4, options: .storageModeShared),
+                  let gBuf = device.makeBuffer(length: numLayers * E * 2,    options: .storageModeShared),
+                  let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder()
+            else { return nil }
+            RawMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: srcG,
+                                                indsDst: iBuf, indsDstByteOffset: li * Ktop * 4,
+                                                glDst: gBuf, glDstByteOffset: li * E * 2,
+                                                Ktop: Ktop, E: E)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let gotI = Array(UnsafeBufferPointer(
+                start: iBuf.contents().advanced(by: li * Ktop * 4).assumingMemoryBound(to: Int32.self),
+                count: Ktop))
+            let gotG = Array(UnsafeBufferPointer(
+                start: gBuf.contents().advanced(by: li * E * 2).assumingMemoryBound(to: Float16.self),
+                count: E))
+            return (gotI, gotG)
+        }
+
+        /// Per-token cold-selection + near-tie margin (bolt routing telemetry).
+        /// For each routed expert e (in `inds`), cold iff buddyExpert[e] != e. Cold e's
+        /// margin = gl[e] − max{gl[r] : r ∈ resident, r ∉ routed}; if that resident set is
+        /// empty the margin is +inf. coldSelected and margins are parallel arrays.
+        public static func computeRouteDiag(inds: [Int32], gl: [Float16], resident: Set<Int>,
+                                            buddyExpert: [Int32], Ktop: Int)
+            -> (coldSelected: [Int], margins: [Float]) {
+            let routed = Set(inds.prefix(Ktop).map { Int($0) })
+            let residentNotRouted = resident.subtracting(routed)
+            let maxResGL: Float? = residentNotRouted.isEmpty ? nil :
+                residentNotRouted.map { Float(gl[$0]) }.max()
+            var cold: [Int] = [], mar: [Float] = []
+            for i in 0..<Ktop {
+                let e = Int(inds[i])
+                guard Int32(e) != buddyExpert[e] else { continue }
+                cold.append(e)
+                mar.append(maxResGL.map { Float(gl[e]) - $0 } ?? .infinity)
+            }
+            return (cold, mar)
+        }
+
         // ── streaming mode ─────────────────────────────────────────────────────────────
         public enum RawStreamMode { case resident, strict, bolt }
         public private(set) var streamMode: RawStreamMode = .resident
@@ -2937,12 +3002,19 @@ public enum RawFusedVerify {
             RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
+        /// bolt routing telemetry (notes/11 案B Stage 0): 非 nil かつ M==1 のとき encodeLayerBolt が
+        /// route 直後の inds/gl を層別 side-buffer(inds: li*Ktop / gl: li*E offset)へコピーする。
+        /// nil(既定)で dispatch 追加ゼロ=既存 bolt 経路 byte-identical。measurement-only。
+        public var diagRouteBufs: (inds: MTLBuffer, gl: MTLBuffer)? = nil
+
         /// bolt 層: resident と同一だが MoE gather 前に全 inds を GPU remap する。
         func encodeLayerBolt(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, li: Int) {
             encodePreMoE(enc, L, M: M)
+            let diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? =
+                (M == 1 && diagRouteBufs != nil) ? (diagRouteBufs!.inds, diagRouteBufs!.gl, li) : nil
             RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
-                                              slotTable: slotTables[li])
+                                              slotTable: slotTables[li], diag: diag)
             RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 

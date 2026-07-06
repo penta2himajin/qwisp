@@ -571,6 +571,51 @@ public enum RawMetalForward {
                             threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 
+    // ── diag_copy_route (notes/11 案B Stage 0, measurement-only) ─────────────────────
+    // route_top8 直後(slot_remap 前)の inds[Ktop](expert id)と gl[E](raw gate logits)を
+    // 層別 side-buffer へコピーする telemetry kernel。数値経路に一切触れない(read-only src)。
+    nonisolated(unsafe) static var _diagCopyRoutePipeline: MTLComputePipelineState?
+    static func compileDiagCopyRoute() -> Bool {
+        guard let (device, _) = ensure() else { return false }
+        if _diagCopyRoutePipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void diag_copy_route(device const int* inds    [[buffer(0)]],
+                                    device const half* gl     [[buffer(1)]],
+                                    device int* indsDst       [[buffer(2)]],
+                                    device half* glDst        [[buffer(3)]],
+                                    constant uint2& kE        [[buffer(4)]],
+                                    uint tid [[thread_position_in_grid]]) {
+            if (tid < kE.x) indsDst[tid] = inds[tid];
+            if (tid < kE.y) glDst[tid] = gl[tid];
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _diagCopyRoutePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "diag_copy_route")!)
+             return true
+        } catch { print("[raw-diag-copy-route] compile: \(error)"); return false }
+    }
+
+    /// diag_copy_route を encode-only で提供。dst は層 offset を byte offset で bind。
+    static func encodeDiagCopyRoute(_ enc: MTLComputeCommandEncoder,
+                                    inds: MTLBuffer, gl: MTLBuffer,
+                                    indsDst: MTLBuffer, indsDstByteOffset: Int,
+                                    glDst: MTLBuffer, glDstByteOffset: Int,
+                                    Ktop: Int, E: Int) {
+        let p = _diagCopyRoutePipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(inds, offset: 0, index: 0)
+        enc.setBuffer(gl, offset: 0, index: 1)
+        enc.setBuffer(indsDst, offset: indsDstByteOffset, index: 2)
+        enc.setBuffer(glDst, offset: glDstByteOffset, index: 3)
+        var kE = SIMD2<UInt32>(UInt32(Ktop), UInt32(E))
+        enc.setBytes(&kE, length: 8, index: 4)
+        let n = max(Ktop, E)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
     // ★ A4 in-kernel stop flag: streaming resume で miss 検出後、suffix の重い MoE gather(gqmm4/gqmm4_swiglu)を
     //   no-op 化し suffix 再計算 GPU コストを削減。activeStopFlag 非 nil(streaming)時のみ guard 発火、
     //   nil(通常/テスト)は zeroStopBuf を bind ＝guard 不発で bit-exact 不変。
