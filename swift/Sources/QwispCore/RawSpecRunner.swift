@@ -717,12 +717,17 @@ public enum RawSpecRunner {
         // QWISP_ROUTE_BIAS_EPS > 0: 各層の常駐 expert(buddyExpertCPU[e]==e)に eps を加算して優先選択。
         // eps=0(既定)は byte-identical(bias dispatch 追加ゼロ)。
         let boltBiasEps = Float(Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0))
+        // 案B experiment-3: horizon-decay。staleness 仮説(resident set は calib 48tok で freeze され
+        // 生成が進むほど prior が陳腐化→bias が後半で有害)に基づき、ε(t) = ε0·max(0, 1 − t/H) で
+        // 線形減衰(t=生成済み token 数)。H=0(既定)= decay 無し=Stage 1 挙動と完全一致。
+        let boltBiasDecayH = Tell.envInt("QWISP_ROUTE_BIAS_DECAY_H", 0)
         if boltBiasEps > 0 {
             let biasMasks: [[Int32]] = providers.map { p in
                 (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
             }
             fwd2.setRouteBias(masks: biasMasks, eps: boltBiasEps)
-            print(String(format: "[raw-spec bolt] route bias eps=%.3f active.", boltBiasEps))
+            print(String(format: "[raw-spec bolt] route bias eps=%.3f active%@.", boltBiasEps,
+                         boltBiasDecayH > 0 ? " (decay H=\(boltBiasDecayH))" : ""))
         }
 
         // ── QWISP_BOLT_DIAG=1: routing telemetry (notes/11 案B Stage 0, measurement-only) ──
@@ -788,6 +793,10 @@ public enum RawSpecRunner {
         let t0 = DispatchTime.now()
 
         while out.count < N {
+            // experiment-3 horizon-decay: 生成位置で ε を線形減衰(H=0 で無効=常時 ε0)。
+            if boltBiasEps > 0 && boltBiasDecayH > 0 {
+                fwd2.setRouteBiasEps(boltBiasEps * Swift.max(0, 1 - Float(out.count) / Float(boltBiasDecayH)))
+            }
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
             let snap   = backend2.snapshot()
@@ -888,6 +897,67 @@ public enum RawSpecRunner {
                     }
                     fwdTF.setRouteBias(masks: biasMasks, eps: boltBiasEps)
                 }
+                // ── experiment-1 rolling re-calib (staleness 根本治療, TF loop 限定の実験配線) ──
+                // QWISP_BOLT_RECALIB_R=<R>: R token 毎に「直近窓の routing 観測(side-buffer)」から
+                // counts/coact を再集計し、top-C ensure(pread=io>0!)+ buddy table + bias mask を
+                // re-freeze する。窓はリセット(直近分布)。free-run 側は未配線(実験は TF が測定系)。
+                let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 0)
+                var winCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
+                var winCoact  = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
+                                          count: recalibR > 0 ? nLayers : 0)
+                var tfIBuf: MTLBuffer? = nil
+                var tfRefreshes = 0
+                let missBase = LayerExpertCache.missTotal
+                if recalibR > 0 {
+                    if RawMetalForward.compileDiagCopyRoute(),
+                       let (device, _) = RawMetalForward.ensure(),
+                       let ib = device.makeBuffer(length: nLayers * Ktop * 4, options: .storageModeShared),
+                       let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared) {
+                        tfIBuf = ib
+                        fwdTF.diagRouteBufs = (ib, gb)
+                        print("[raw-spec bolt] TF recalib mode: R=\(recalibR)")
+                    }
+                }
+                func tfRecalibRead() {
+                    guard let ib = tfIBuf else { return }
+                    for li in 0 ..< nLayers {
+                        let inds = UnsafeBufferPointer(
+                            start: ib.contents().advanced(by: li * Ktop * 4).assumingMemoryBound(to: Int32.self),
+                            count: Ktop)
+                        let distinct = Array(Set(inds.map { Int($0) }))
+                        for e in distinct { winCounts[li][e] += 1 }
+                        for ai in 0 ..< distinct.count {
+                            for bi in (ai + 1) ..< distinct.count {
+                                let a = distinct[ai], b = distinct[bi]
+                                winCoact[li][a][b] += 1; winCoact[li][b][a] += 1
+                            }
+                        }
+                    }
+                }
+                func tfRecalibRefresh() {
+                    guard tfIBuf != nil else { return }
+                    var newTables: [[Int32]] = []
+                    for (li, provider) in providers.enumerated() {
+                        let top = winCounts[li].enumerated()
+                            .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                            .prefix(C)
+                            .map { $0.offset }
+                        _ = provider.cache.ensure(Array(top))   // pread misses = recalib の io コスト
+                        provider.cache.buildBuddyTable(coact: winCoact[li], numExperts: nE)
+                        newTables.append(provider.cache.buddyTableCPU)
+                    }
+                    fwdTF.setBoltTables(newTables)
+                    if boltBiasEps > 0 {
+                        let masks: [[Int32]] = providers.map { p in
+                            (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
+                        }
+                        fwdTF.setRouteBias(masks: masks, eps: boltBiasEps)
+                    }
+                    for li in 0 ..< nLayers {
+                        for e in 0 ..< nE { winCounts[li][e] = 0; winCoact[li][e] = [Int](repeating: 0, count: nE) }
+                    }
+                    tfRefreshes += 1
+                }
                 if let lastNormedTF = prefill(promptIds: promptIds, backend: backendTF),
                    let lg0TF = engine.logits(lastNormedTF, M: 1) {
                     MLX.eval([lg0TF])
@@ -897,14 +967,28 @@ public enum RawSpecRunner {
                     for i in 0 ..< (nTF - 1) {
                         if predTF == gRefIds[i] { tfMatch += 1 }   // 位置 i の予測 vs canonical[i]
                         tfTotal += 1
+                        // experiment-3 horizon-decay: free-run と同じ ε(位置) を TF にも適用。
+                        // recalib 併用時は refresh からの相対位置で decay(窓毎に ε が蘇生)。
+                        if boltBiasEps > 0 && boltBiasDecayH > 0 {
+                            let tPos = recalibR > 0 ? (i % recalibR) : i
+                            fwdTF.setRouteBiasEps(boltBiasEps * Swift.max(0, 1 - Float(tPos) / Float(boltBiasDecayH)))
+                        }
                         // teacher-force: canonical トークン gRefIds[i] を入力して次位置の予測を得る
                         guard let ev = backendTF.stepArgmax([Int32(gRefIds[i])]) else { break }
                         predTF = ev[0]
+                        // experiment-1: routing 観測の累積 + R 境界で re-freeze
+                        if recalibR > 0 {
+                            tfRecalibRead()
+                            if (i + 1) % recalibR == 0 { tfRecalibRefresh() }
+                        }
                     }
                     if predTF == gRefIds[nTF - 1] { tfMatch += 1 }; tfTotal += 1
                     let tfPct = Double(tfMatch) / Double(Swift.max(tfTotal, 1)) * 100
                     print(String(format: "[RawSpec] bolt TF fidelity vs strict-canonical: %d/%d=%.1f%% (chaos-free)",
                                  tfMatch, tfTotal, tfPct))
+                    if recalibR > 0 {
+                        print("[RawSpec] TF recalib: refreshes=\(tfRefreshes) preadMisses=\(LayerExpertCache.missTotal - missBase)")
+                    }
                 }
             }
         }

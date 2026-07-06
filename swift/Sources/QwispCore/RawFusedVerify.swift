@@ -3218,6 +3218,12 @@ public enum RawFusedVerify {
             routeBiasEps = eps
         }
 
+        /// horizon-decay 用: eps のみ更新(masks は保持)。eps<=0 で bias 停止=非bias kernel 経路
+        /// (encode guard は routeBiasEps > 0)。decay が 0 に到達した後は baseline routing と同一規則。
+        public func setRouteBiasEps(_ eps: Float) {
+            routeBiasEps = Swift.max(0, eps)
+        }
+
         /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
         /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
         public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
