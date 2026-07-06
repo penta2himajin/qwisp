@@ -715,8 +715,9 @@ public enum RawSpecRunner {
 
         // ── Stage 1 案B: gate-score residency bias ────────────────────────
         // QWISP_ROUTE_BIAS_EPS > 0: 各層の常駐 expert(buddyExpertCPU[e]==e)に eps を加算して優先選択。
-        // eps=0(既定)は byte-identical(bias dispatch 追加ゼロ)。
-        let boltBiasEps = Float(Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0))
+        // ★notes/13 採用(owner 2026-07-06): 既定 0.25(recalib とセットで default 昇格)。0 で opt-out
+        //   =旧 bolt と byte-identical(bias dispatch 追加ゼロ)。
+        let boltBiasEps = Float(Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0.25))
         // 案B experiment-3: horizon-decay。staleness 仮説(resident set は calib 48tok で freeze され
         // 生成が進むほど prior が陳腐化→bias が後半で有害)に基づき、ε(t) = ε0·max(0, 1 − t/H) で
         // 線形減衰(t=生成済み token 数)。H=0(既定)= decay 無し=Stage 1 挙動と完全一致。
@@ -736,21 +737,86 @@ public enum RawSpecRunner {
         // diag 中は chain を無効化(1 CB=1 step にして step 毎読出を可能に)。OUT_TOKENS は不変。
         let boltDiag = Tell.envFlag("QWISP_BOLT_DIAG")
         let Ktop = 8
+
+        // ── notes/13 採用: free-run rolling re-calib(既定 ON, R=128。0 で opt-out=旧 bolt)──
+        // R token 毎に「直近窓の観測 routing」から counts/coact を再集計し top-C ensure(pread)+
+        // buddy table + bias mask を re-freeze。観測は diag_copy_route の slot/M 一般化 layout
+        // (chain 全 step = slot 別 / verify M 行 = kE.x=M*Ktop)で全 coverage。
+        let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
+
+        // chain: diag 単独時は step 毎読出のため無効化。recalib は slot 観測で chain と共存。
+        let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+
+        // 観測 buffer(diag/recalib 共用, 一般 layout)。obsMaxM/obsSlots は recalib 有効時のみ拡張。
+        let obsMaxM = boltRecalibR > 0 ? maxM : 1
+        let obsSlots = boltRecalibR > 0 ? Swift.max(1, boltChainK) : 1
         var diagResidents: [Set<Int>] = [], diagBuddyExp: [[Int32]] = []
         var diagIBuf: MTLBuffer? = nil, diagGBuf: MTLBuffer? = nil
-        if boltDiag {
+        if boltDiag || boltRecalibR > 0 {
             guard RawMetalForward.compileDiagCopyRoute(),
                   let (device, _) = RawMetalForward.ensure(),
-                  let ib = device.makeBuffer(length: nLayers * Ktop * 4, options: .storageModeShared),
+                  let ib = device.makeBuffer(length: obsSlots * nLayers * obsMaxM * Ktop * 4,
+                                             options: .storageModeShared),
                   let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared)
-            else { return "[raw-spec bolt] ERROR: diag setup failed" }
+            else { return "[raw-spec bolt] ERROR: diag/recalib setup failed" }
             diagIBuf = ib; diagGBuf = gb
+            fwd2.diagObsMaxM = obsMaxM
             fwd2.diagRouteBufs = (ib, gb)
+        }
+        if boltDiag {
             for p in providers {
                 diagResidents.append(Set(p.cache.slotOf.keys))
                 diagBuddyExp.append(p.cache.buddyExpertCPU)
             }
             print("[raw-spec bolt] diag mode: telemetry on, chain disabled")
+        }
+        // free-run recalib 窓・集計
+        var frWinCounts: [[Int]] = [], frWinCoact: [[[Int]]] = []
+        var frRefreshes = 0, frNextRefresh = boltRecalibR
+        let frMissBase = LayerExpertCache.missTotal
+        if boltRecalibR > 0 {
+            frWinCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
+            frWinCoact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
+                                   count: nLayers)
+            print("[raw-spec bolt] recalib active: R=\(boltRecalibR) eps=\(boltBiasEps) chainK=\(boltChainK)")
+        }
+        /// 観測読出: slot(chain 位置)と M(行数)を指定して全層分を窓に累積。
+        func frAccumulate(slot: Int, M: Int) {
+            guard boltRecalibR > 0, let ib = diagIBuf else { return }
+            for li in 0 ..< nLayers {
+                let off = ((slot * nLayers + li) * obsMaxM) * Ktop * 4
+                let inds = Array(UnsafeBufferPointer(
+                    start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
+                    count: M * Ktop))
+                _ = RawFusedVerify.RawFusedForward.recalibAccumulate(
+                    inds: inds, M: M, Ktop: Ktop, nE: nE,
+                    counts: &frWinCounts[li], coact: &frWinCoact[li])
+            }
+        }
+        /// refresh: 窓 top-C ensure(pread)→ buddy table → slot table → bias mask → 窓リセット。
+        func frRefresh() {
+            guard boltRecalibR > 0 else { return }
+            var newTables: [[Int32]] = []
+            for (li, provider) in providers.enumerated() {
+                let top = frWinCounts[li].enumerated()
+                    .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                    .prefix(C)
+                    .map { $0.offset }
+                _ = provider.cache.ensure(Array(top))
+                provider.cache.buildBuddyTable(coact: frWinCoact[li], numExperts: nE)
+                newTables.append(provider.cache.buddyTableCPU)
+            }
+            fwd2.setBoltTables(newTables)
+            if boltBiasEps > 0 {
+                let masks: [[Int32]] = providers.map { p in
+                    (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
+                }
+                fwd2.setRouteBias(masks: masks, eps: boltBiasEps)
+            }
+            for li in 0 ..< nLayers {
+                for e in 0 ..< nE { frWinCounts[li][e] = 0; frWinCoact[li][e] = [Int](repeating: 0, count: nE) }
+            }
+            frRefreshes += 1
         }
         // group(li): early 0-12 / mid 13-26 / late 27-39
         struct DiagAcc { var cold = 0; var routed = 0; var stepsWithCold = 0; var margins: [Float] = [] }
@@ -761,8 +827,9 @@ public enum RawSpecRunner {
             diagSteps += 1
             var groupHadCold = [false, false, false]
             for li in 0 ..< nLayers {
+                // 一般 layout(slot 0, row 0): stride は obsMaxM(recalib 共存時 >1)。
                 let indsArr = Array(UnsafeBufferPointer(
-                    start: ib.contents().advanced(by: li * Ktop * 4).assumingMemoryBound(to: Int32.self),
+                    start: ib.contents().advanced(by: li * obsMaxM * Ktop * 4).assumingMemoryBound(to: Int32.self),
                     count: Ktop))
                 let glArr = Array(UnsafeBufferPointer(
                     start: gb.contents().advanced(by: li * nE * 2).assumingMemoryBound(to: Float16.self),
@@ -788,11 +855,15 @@ public enum RawSpecRunner {
         // Phase II-b: chain wiring for the D==0 greedy span.
         // chainedStepArgmax is bit-exact to K sequential stepArgmax calls (bolt = deterministic
         // buddy-greedy), so OUT_TOKENS is byte-identical with chain on or off.
-        let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+        // (boltChainK は observation buffer 設計のため diag/recalib block の前で定義済み)
 
         let t0 = DispatchTime.now()
 
         while out.count < N {
+            // notes/13 recalib: R 境界で re-freeze(全経路共通=loop 先頭で判定)。
+            if boltRecalibR > 0 && out.count >= frNextRefresh {
+                frRefresh(); frNextRefresh += boltRecalibR
+            }
             // experiment-3 horizon-decay: 生成位置で ε を線形減衰(H=0 で無効=常時 ε0)。
             if boltBiasEps > 0 && boltBiasDecayH > 0 {
                 fwd2.setRouteBiasEps(boltBiasEps * Swift.max(0, 1 - Float(out.count) / Float(boltBiasDecayH)))
@@ -806,6 +877,8 @@ public enum RawSpecRunner {
                 if let (emitted, nextU) = boltGreedyChainSpan(
                     backend: backend2, u: u, chainK: boltChainK,
                     budget: N - out.count) {
+                    // recalib 観測: chain の K step は slot 別に side-buffer 常駐(全 step coverage)。
+                    if boltRecalibR > 0 { for k in 0 ..< boltChainK { frAccumulate(slot: k, M: 1) } }
                     for t in emitted { out.append(t); hist.append(t) }
                     u = nextU; steps += 1; continue
                 }
@@ -813,6 +886,7 @@ public enum RawSpecRunner {
                 guard let evals = backend2.stepArgmax([Int32(u)])
                 else { return "[raw-spec bolt] ERROR: step(D=0) nil" }
                 if boltDiag { diagReadStep() }   // M==1 greedy step: side-buffers fresh
+                if boltRecalibR > 0 { frAccumulate(slot: 0, M: 1) }
                 out.append(u); hist.append(u)
                 u = evals[0]; steps += 1; continue
             }
@@ -820,6 +894,8 @@ public enum RawSpecRunner {
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
             guard let evals = backend2.stepArgmax(verifyTokens)
             else { return "[raw-spec bolt] ERROR: verify step nil" }
+            // recalib 観測: verify M=D+1 行(rebuild forward の重複観測は読まない)。
+            if boltRecalibR > 0 { frAccumulate(slot: 0, M: D + 1) }
 
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
@@ -854,6 +930,11 @@ public enum RawSpecRunner {
             "[RawSpec] bolt(L3 near-lossless) C=\(C): %.1f tok/s  accept/step=%.2f  品質(vs ref) %d/%d=%.0f%%",
             tokps, Double(accTok) / Double(Swift.max(steps, 1)), match, N, Double(match) / Double(N) * 100)
         print("[RawSpec] NOTE: bolt is L3 near-lossless (buddy remap, not strict). Quality vs ref is informational.")
+
+        // [BoltRecalib] (notes/13): free-run refresh 回数と pread io コスト。
+        if boltRecalibR > 0 {
+            print("[BoltRecalib] free-run refreshes=\(frRefreshes) preadMisses=\(LayerExpertCache.missTotal - frMissBase) R=\(boltRecalibR) eps=\(String(format: "%.2f", boltBiasEps))")
+        }
 
         // [BoltDiag] telemetry report (notes/11 案B Stage 0): greedy-step のみ集計(M==1)。
         if boltDiag {
@@ -890,7 +971,21 @@ public enum RawSpecRunner {
             if let (backendTF, fwdTF, _) = streamingBackend(
                 engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
                 existingProviders: providers) {
-                fwdTF.setBoltTables(tables)   // same frozen bolt tables
+                // ★TF 開始状態の正準化(notes/13): free-run recalib が cache slot を動かした後は
+                // phase-5 の `tables` が stale(slot が別 expert を保持)。calib の counts/coact から
+                // 「現在の cache 状態と整合する」table を再構築して calib-fresh 状態に戻す。
+                // (recalib off なら ensure は全 hit・buildBuddyTable は同一結果=従来と等価。)
+                var tfTables: [[Int32]] = []
+                for (li, provider) in providers.enumerated() {
+                    let top = counts[li].enumerated()
+                        .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                        .prefix(C)
+                        .map { $0.offset }
+                    _ = provider.cache.ensure(Array(top))
+                    provider.cache.buildBuddyTable(coact: coact[li], numExperts: nE)
+                    tfTables.append(provider.cache.buddyTableCPU)
+                }
+                fwdTF.setBoltTables(tfTables)
                 if boltBiasEps > 0 {
                     let biasMasks: [[Int32]] = providers.map { p in
                         (0 ..< nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
@@ -901,7 +996,7 @@ public enum RawSpecRunner {
                 // QWISP_BOLT_RECALIB_R=<R>: R token 毎に「直近窓の routing 観測(side-buffer)」から
                 // counts/coact を再集計し、top-C ensure(pread=io>0!)+ buddy table + bias mask を
                 // re-freeze する。窓はリセット(直近分布)。free-run 側は未配線(実験は TF が測定系)。
-                let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 0)
+                let recalibR = boltRecalibR   // notes/13: default 128(free-run と同一 knob)
                 var winCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
                 var winCoact  = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
                                           count: recalibR > 0 ? nLayers : 0)
@@ -995,6 +1090,13 @@ public enum RawSpecRunner {
 
         // QWISP_RAWSPEC_CHECK=1: rebuild backend #3 reusing providers+tables, run greedy.
         guard Tell.envFlag("QWISP_RAWSPEC_CHECK") else { return summary }
+
+        // notes/13: recalib 有効時は engine が適応的(観測依存の refresh)になり、spec と greedy で
+        // 観測窓が異なる=table 軌跡が異なるため「spec≡greedy(同一凍結 table)」の前提が設計上不成立。
+        // 決定性ゲート(同 env → byte-identical)が代替。self-check は R=0(凍結 bolt)専用。
+        if boltRecalibR > 0 {
+            return summary + "\n[RawSpec] bolt self-check SKIPPED (recalib R=\(boltRecalibR) active — adaptive tables; determinism gate applies instead)"
+        }
 
         print("[raw-spec bolt] self-check: bolt greedy M=1 (same frozen tables) ...")
         guard let (backend3, fwd3, _) = streamingBackend(

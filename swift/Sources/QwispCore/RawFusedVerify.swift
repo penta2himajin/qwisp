@@ -1729,16 +1729,18 @@ public enum RawFusedVerify {
                                    w: MoEBlockBufs, sc: MoEScratch,
                                    M: Int, E: Int, I: Int, Ktop: Int, H: Int,
                                    slotTable: MTLBuffer? = nil,
-                                   diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? = nil,
+                                   diag: (indsDst: MTLBuffer, indsOff: Int, indsCount: Int,
+                                          glDst: MTLBuffer, glOff: Int, glCount: Int)? = nil,
                                    bias: (mask: MTLBuffer, eps: Float)? = nil) {
         encodeMoERouteRows(enc, x: x, w: w, sc: sc, M: M, E: E, H: H, Ktop: Ktop, bias: bias)
-        // diag_copy_route (notes/11 Stage 0): route 直後・slot_remap 前に expert-id inds と raw gl を
-        // 層別 side-buffer へコピー(measurement-only、diag=nil で dispatch ゼロ=既存 byte-identical)。
+        // diag_copy_route (notes/11 Stage 0 / notes/13 一般化): route 直後・slot_remap 前に expert-id
+        // inds(M 行)と raw gl を層別 side-buffer へコピー(measurement-only、diag=nil で dispatch ゼロ)。
+        // offset/長さは呼び出し側(encodeLayerBolt)が slot/M layout で計算済み。
         if let d = diag, RawMetalForward._diagCopyRoutePipeline != nil {
             RawMetalForward.encodeDiagCopyRoute(enc, inds: sc.inds, gl: sc.gl,
-                                                indsDst: d.inds, indsDstByteOffset: d.li * Ktop * 4,
-                                                glDst: d.gl, glDstByteOffset: d.li * E * 2,
-                                                Ktop: Ktop, E: E)
+                                                indsDst: d.indsDst, indsDstByteOffset: d.indsOff,
+                                                glDst: d.glDst, glDstByteOffset: d.glOff,
+                                                Ktop: d.indsCount, E: d.glCount)
         }
         encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
         encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H, Ktop: Ktop)
@@ -2998,6 +3000,71 @@ public enum RawFusedVerify {
             return (cold, mar)
         }
 
+        // ── notes/13 bolt recalib+bias adoption (RED stubs — GREEN phase implements) ─────
+        // Two additive telemetry helpers. Both are stub-RED: they return nil/false so the
+        // locked G-A units fail on the current tree. GREEN replaces the bodies with the real
+        // (slot,li,M) diag-copy generalization and the free-run observation accumulator.
+
+        /// G-A.1 self-test for the generalized `diag_copy_route` layout (notes/13 §ground-truth).
+        /// Zero-fill an inds side-buffer of `chainKMax*nLayers*diagObsMaxM*Ktop` int32, dispatch
+        /// the PRODUCTION kernel to copy `inds[M*Ktop]` (row-major) into it at the byte offset
+        /// `((slot*nLayers+li)*diagObsMaxM)*Ktop*4` with copy length `kE.x = M*Ktop`, and return
+        /// the ENTIRE buffer as [Int32]. Defaults (slot=0, diagObsMaxM=1, M=1) must land at element
+        /// offset `li*Ktop` (== old byte offset `li*Ktop*4`) = test-61 layout compatibility.
+        /// The whole-buffer return lets the test pin the offset AND copy length exactly (only the
+        /// written region is nonzero). Reference (identity copy = kernel definition) lives in test.
+        public static func diagCopySlotMLayoutSelfTest(
+            inds: [Int32], slot: Int, li: Int, M: Int,
+            diagObsMaxM: Int, nLayers: Int, chainKMax: Int, Ktop: Int, E: Int
+        ) -> [Int32]? {
+            guard let (device, queue) = RawMetalForward.ensure(),
+                  RawMetalForward.compileDiagCopyRoute() else { return nil }
+            let bufLen = chainKMax * nLayers * diagObsMaxM * Ktop
+            let srcLen = M * Ktop
+            guard let srcI = inds.withUnsafeBytes({ p in
+                      device.makeBuffer(bytes: p.baseAddress!, length: srcLen * 4, options: .storageModeShared) }),
+                  let glDummy = device.makeBuffer(length: max(E, 1) * 2, options: .storageModeShared),
+                  let iBuf    = device.makeBuffer(length: bufLen * 4, options: .storageModeShared),
+                  let glDst   = device.makeBuffer(length: max(E, 1) * 2, options: .storageModeShared),
+                  let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder()
+            else { return nil }
+            memset(iBuf.contents(), 0, bufLen * 4)
+            let dstByteOffset = ((slot * nLayers + li) * diagObsMaxM) * Ktop * 4
+            // ponytail: reuse encodeDiagCopyRoute with kE.x = M*Ktop for M-row copy; E=0 skips gl.
+            RawMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: glDummy,
+                                                indsDst: iBuf, indsDstByteOffset: dstByteOffset,
+                                                glDst: glDst, glDstByteOffset: 0,
+                                                Ktop: srcLen, E: 0)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ptr = iBuf.contents().bindMemory(to: Int32.self, capacity: bufLen)
+            return Array(UnsafeBufferPointer(start: ptr, count: bufLen))
+        }
+
+        /// G-A.2 free-run recalib observation accumulator (notes/13 §free-run recalib 配線).
+        /// For one layer's observed block of `M` rows (`inds[M*Ktop]` row-major, each row = one
+        /// token's Ktop routed experts): per row, distinct experts increment `counts`, and each
+        /// unordered distinct pair increments `coact[a][b]` and `coact[b][a]`. Rows are independent
+        /// (a duplicate expert within a row counts once; the same expert across two rows counts
+        /// twice; no cross-row pairs). Additive (accumulates onto existing counts/coact — matches
+        /// the persisted per-window arrays). Returns false = not implemented (RED stub).
+        public static func recalibAccumulate(
+            inds: [Int32], M: Int, Ktop: Int, nE: Int,
+            counts: inout [Int], coact: inout [[Int]]
+        ) -> Bool {
+            for m in 0 ..< M {
+                let row = inds[m * Ktop ..< (m + 1) * Ktop]
+                let distinct = Array(Set(row.map { Int($0) }))
+                for e in distinct { counts[e] += 1 }
+                for ai in 0 ..< distinct.count {
+                    for bi in (ai + 1) ..< distinct.count {
+                        let a = distinct[ai], b = distinct[bi]
+                        coact[a][b] += 1; coact[b][a] += 1
+                    }
+                }
+            }
+            return true
+        }
+
         // ── streaming mode ─────────────────────────────────────────────────────────────
         public enum RawStreamMode { case resident, strict, bolt }
         public private(set) var streamMode: RawStreamMode = .resident
@@ -3103,16 +3170,28 @@ public enum RawFusedVerify {
             RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
-        /// bolt routing telemetry (notes/11 案B Stage 0): 非 nil かつ M==1 のとき encodeLayerBolt が
-        /// route 直後の inds/gl を層別 side-buffer(inds: li*Ktop / gl: li*E offset)へコピーする。
+        /// bolt routing telemetry (notes/11 Stage 0 → notes/13 採用で一般化): 非 nil のとき
+        /// encodeLayerBolt が route 直後の inds(M 行)/gl を層別 side-buffer へコピーする。
+        /// layout: inds byte offset = ((diagChainSlot*nLayers+li)*diagObsMaxM)*Ktop*4, 長さ M*Ktop。
+        /// defaults(diagObsMaxM=1, diagChainSlot=0)で旧 layout li*Ktop*4 に退化(Stage-0 diag 互換)。
         /// nil(既定)で dispatch 追加ゼロ=既存 bolt 経路 byte-identical。measurement-only。
         public var diagRouteBufs: (inds: MTLBuffer, gl: MTLBuffer)? = nil
+        /// 観測する最大 M(これ以下の M の forward を capture)。recalib 時 maxM、diag 単独時 1。
+        public var diagObsMaxM: Int = 1
+        /// chain 内の step 位置(chainedStepArgmax が per-step に set、非 chain は 0)。
+        public var diagChainSlot: Int = 0
 
         /// bolt 層: resident と同一だが MoE gather 前に全 inds を GPU remap する。
         func encodeLayerBolt(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, li: Int) {
             encodePreMoE(enc, L, M: M)
-            let diag: (inds: MTLBuffer, gl: MTLBuffer, li: Int)? =
-                (M == 1 && diagRouteBufs != nil) ? (diagRouteBufs!.inds, diagRouteBufs!.gl, li) : nil
+            var diag: (indsDst: MTLBuffer, indsOff: Int, indsCount: Int,
+                       glDst: MTLBuffer, glOff: Int, glCount: Int)? = nil
+            if let bufs = diagRouteBufs, M <= diagObsMaxM {
+                let indsOff = ((diagChainSlot * layers.count + li) * diagObsMaxM) * L.Ktop * 4
+                let glOn = (M == 1 && diagChainSlot == 0)   // gl は Stage-0 diag 用(slot0/M1 のみ)
+                diag = (bufs.inds, indsOff, M * L.Ktop,
+                        bufs.gl, glOn ? li * L.E * 2 : 0, glOn ? L.E : 0)
+            }
             // Stage 1 案B: bias 非 nil かつ eps>0 のとき全 M に適用(spec≡greedy 自己整合のため M==1 限定にしない)。
             let biasTuple: (mask: MTLBuffer, eps: Float)? = {
                 guard routeBiasEps > 0, let masks = routeBiasMasks, li < masks.count else { return nil }
@@ -3542,6 +3621,9 @@ public enum RawFusedVerify {
                 // variable bindings), so sequential encodes within this single CB are independent
                 // and memory-coherent on GPU (Metal guarantees program-order dispatch + barrier).
                 if streamMode == .bolt {
+                    // notes/13 recalib: chain 内 step 位置を slot として観測 buffer をずらす
+                    // (diagRouteBufs nil なら encodeLayerBolt 側で no-op=既存 byte-identical)。
+                    if diagRouteBufs != nil { diagChainSlot = k }
                     for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: 1, li: li) }
                 } else {
                     for L in layers { encodeLayer(enc, L, M: 1) }
@@ -3573,6 +3655,7 @@ public enum RawFusedVerify {
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
 
+            if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 

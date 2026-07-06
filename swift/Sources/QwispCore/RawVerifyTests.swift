@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 64
+        let total = 66
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3444,6 +3444,107 @@ public enum RawVerifyTests {
                 inds: [0, 1, 2, 3], gl: gl, resident: Set([0, 1, 2, 3]),
                 buddyExpert: buddyExpert, Ktop: Ktop)
             if !coldC.isEmpty || !marC.isEmpty { return (false, "C cold=\(coldC) mar=\(marC) want empty") }
+            return (true, "ok")
+        }
+
+        // Test 65 (G-A.1 — notes/13): diag_copy_route の (slot, li, M) 一般化 offset の bit-exact 検証。
+        // 新 self-test hook(既存 diagCopyRouteSelfTest は不変・別名 hook を追加)。side-buffer 全体を
+        // 返させ、① inds[M*Ktop] が期待 element offset ((slot*nLayers+li)*diagObsMaxM)*Ktop に identity
+        // copy されている ② それ以外は 0(offset/copy長ともに exact — over-copy も wrong-offset も検出)
+        // を確認。defaults(slot=0, diagObsMaxM=1, M=1) は element offset li*Ktop = 旧 byte offset
+        // li*Ktop*4 に退化 → test 61 互換。Reference = kernel の identity copy 定義(CPU 再実装 oracle 無)。
+        run("diag_copy_slot_m_layout") {
+            let Ktop = 4, E = 8, nLayers = 3, chainKMax = 8
+            let diagObsMaxM = 4
+            // up to M=4 rows worth of source inds (M*Ktop = 16), row-major.
+            let src16: [Int32] = [4, 1, 6, 2,  5, 0, 7, 3,  2, 6, 1, 4,  0, 3, 5, 7]
+            let bufLen = chainKMax * nLayers * diagObsMaxM * Ktop
+            for slot in [0, 3] {
+                for li in [0, 2] {
+                    for M in [1, 4] {
+                        let src = Array(src16.prefix(M * Ktop))
+                        guard let buf = RawFusedVerify.RawFusedForward.diagCopySlotMLayoutSelfTest(
+                            inds: src, slot: slot, li: li, M: M,
+                            diagObsMaxM: diagObsMaxM, nLayers: nLayers,
+                            chainKMax: chainKMax, Ktop: Ktop, E: E)
+                        else { return (false, "not implemented (slot=\(slot) li=\(li) M=\(M))") }
+                        if buf.count != bufLen {
+                            return (false, "slot=\(slot) li=\(li) M=\(M): buf.count \(buf.count) != \(bufLen)")
+                        }
+                        let want = (slot * nLayers + li) * diagObsMaxM * Ktop   // element offset
+                        // identity copy present at the expected offset
+                        for j in 0 ..< (M * Ktop) where buf[want + j] != src[j] {
+                            return (false, "slot=\(slot) li=\(li) M=\(M): buf[\(want + j)]=\(buf[want + j]) != \(src[j])")
+                        }
+                        // nothing written outside [want, want+M*Ktop) — pins offset & length exactly
+                        for j in 0 ..< bufLen where (j < want || j >= want + M * Ktop) && buf[j] != 0 {
+                            return (false, "slot=\(slot) li=\(li) M=\(M): leak buf[\(j)]=\(buf[j]) (want region [\(want),\(want + M * Ktop)))")
+                        }
+                    }
+                }
+            }
+            // defaults(slot=0, diagObsMaxM=1, M=1) → element offset li*Ktop == old byte offset li*Ktop*4
+            for li in [0, 2, 1] {
+                let src = Array(src16.prefix(Ktop))
+                guard let buf = RawFusedVerify.RawFusedForward.diagCopySlotMLayoutSelfTest(
+                    inds: src, slot: 0, li: li, M: 1,
+                    diagObsMaxM: 1, nLayers: nLayers, chainKMax: chainKMax, Ktop: Ktop, E: E)
+                else { return (false, "not implemented defaults li=\(li)") }
+                let want = li * Ktop   // == old layout li*Ktop*4 bytes
+                for j in 0 ..< Ktop where buf[want + j] != src[j] {
+                    return (false, "defaults li=\(li): buf[\(want + j)]=\(buf[want + j]) != \(src[j]) (old layout li*Ktop*4)")
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 66 (G-A.2 — notes/13): free-run recalib 観測累積の純関数を手計算で照合。
+        // 検証点: ①行独立性(M>1: 各行の distinct を独立集計、cross-row pair は作らない)
+        //         ②行内重複の dedup(同一 expert が 1 行に2回 → counts は1)
+        //         ③行跨ぎは加算(同一 expert が別行に → counts は2)
+        //         ④additive(2回目の呼び出しが既存 counts/coact に積み上がる)。
+        // Reference = 手計算(合成小ケース、CPU 再実装 oracle でなく数式定義)。
+        run("recalib_obs_accumulate") {
+            let Ktop = 4, nE = 8
+            var counts = [Int](repeating: 0, count: nE)
+            var coact = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE)
+
+            // Call 1: M=2 rows.
+            //   row0 [1,2,3,2] → distinct {1,2,3} (2 dedup within row)
+            //   row1 [3,4,5,3] → distinct {3,4,5} (3 dedup within row; 3 also in row0 → counts twice)
+            guard RawFusedVerify.RawFusedForward.recalibAccumulate(
+                inds: [1, 2, 3, 2,  3, 4, 5, 3], M: 2, Ktop: Ktop, nE: nE,
+                counts: &counts, coact: &coact)
+            else { return (false, "not implemented (call1)") }
+            let want1: [Int] = [0, 1, 1, 2, 1, 1, 0, 0]
+            if counts != want1 { return (false, "call1 counts=\(counts) want \(want1)") }
+            // coact pairs: row0 (1,2)(1,3)(2,3), row1 (3,4)(3,5)(4,5); symmetric.
+            func chk(_ a: Int, _ b: Int, _ v: Int, _ tag: String) -> (Bool, String)? {
+                if coact[a][b] != v || coact[b][a] != v {
+                    return (false, "\(tag) coact[\(a)][\(b)]=\(coact[a][b]) coact[\(b)][\(a)]=\(coact[b][a]) want \(v)")
+                }
+                return nil
+            }
+            for (a, b) in [(1, 2), (1, 3), (2, 3), (3, 4), (3, 5), (4, 5)] {
+                if let f = chk(a, b, 1, "call1") { return f }
+            }
+            // row independence: no cross-row pair (1 from row0, 4 from row1)
+            if let f = chk(1, 4, 0, "call1 cross-row") { return f }
+            if let f = chk(2, 5, 0, "call1 cross-row") { return f }
+
+            // Call 2: M=1 row [1,1,6,7] → distinct {1,6,7} (1 dedup within row) — must ADD.
+            guard RawFusedVerify.RawFusedForward.recalibAccumulate(
+                inds: [1, 1, 6, 7], M: 1, Ktop: Ktop, nE: nE,
+                counts: &counts, coact: &coact)
+            else { return (false, "not implemented (call2)") }
+            let want2: [Int] = [0, 2, 1, 2, 1, 1, 1, 1]   // counts[1] 1→2, counts[6],[7] 0→1
+            if counts != want2 { return (false, "call2 counts=\(counts) want \(want2)") }
+            for (a, b) in [(1, 6), (1, 7), (6, 7)] {
+                if let f = chk(a, b, 1, "call2") { return f }
+            }
+            // prior pairs preserved & not double-counted by the additive second call
+            if let f = chk(1, 2, 1, "call2 preserve") { return f }
+            if let f = chk(4, 5, 1, "call2 preserve") { return f }
             return (true, "ok")
         }
 
