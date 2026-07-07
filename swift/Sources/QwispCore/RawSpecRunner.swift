@@ -16,6 +16,18 @@ import MLXFast
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
 public enum RawSpecRunner {
 
+    /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
+    /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
+    /// 明示 env(QWISP_BOLT_RECALIB_R/QWISP_BOLT_REFRESH_B)が常にこの preset を上書きする。
+    static func boltWorkloadPreset(_ w: String) -> (r: Int, b: Int) {
+        switch w {
+        case "code":    return (128, 64)
+        case "agentic": return (256, 32)
+        case "shortnl": return (128, 16)
+        default:        return (128, 32)  // "", "longctx", unknown → current default
+        }
+    }
+
     /// spec ループが必要とする engine 操作の抽象(composed / fused の 2 実装)。
     /// forward: tokens → 最終 norm 済み hidden [M, H]。
     /// stepArgmax: tokens → 行毎 greedy argmax(cache も前進)。1-CB 実装が無ければ
@@ -742,12 +754,18 @@ public enum RawSpecRunner {
         // R token 毎に「直近窓の観測 routing」から counts/coact を再集計し top-C ensure(pread)+
         // buddy table + bias mask を re-freeze。観測は diag_copy_route の slot/M 一般化 layout
         // (chain 全 step = slot 別 / verify M 行 = kE.x=M*Ktop)で全 coverage。
-        let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
+        // notes/14 TODO-2: QWISP_BOLT_WORKLOAD が preset (R,B) を選択。明示 env が常に上書き。
+        let boltWL = Tell.envStr("QWISP_BOLT_WORKLOAD", "")
+        let preset = RawSpecRunner.boltWorkloadPreset(boltWL)
+        let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", preset.r)
         // notes/14 async refresh wiring (QWISP_BOLT_REFRESH_ASYNC, default 1)
         // B=32: chunk IO(~38ms@1.5GB/s)と decode の均衡 + 深さ2 pipeline で hide できる粒度。
         // S=0(既定)= plan 毎に自動導出: 窓の 3/4 で全 chunk を消化し切る間隔に均す(決定的)。
         let boltRefreshAsync = boltRecalibR > 0 && Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0
-        let boltRefreshB     = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
+        let boltRefreshB     = Tell.envInt("QWISP_BOLT_REFRESH_B", preset.b)
+        if !boltWL.isEmpty {
+            print("[raw-spec bolt] workload=\(boltWL) preset R=\(preset.r) B=\(preset.b)")
+        }
         let boltRefreshS     = Tell.envInt("QWISP_BOLT_REFRESH_S", 0)
         func refreshStride(_ nChunks: Int) -> Int {
             // 半窓 R/2 に均等割り(OAT 実測 2026-07-07): 全幅だと table 鮮度遅れで TF が旧 bolt を割る

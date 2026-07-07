@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 68
+        let total = 69
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3819,6 +3819,34 @@ public enum RawVerifyTests {
             return (true, "ok")
         }
 
+
+        // Test 69 (notes/14 TODO-2): QWISP_BOLT_WORKLOAD per-workload preset (R/B).
+        // Pure function RawSpecRunner.boltWorkloadPreset maps a workload name to the
+        // proven-optimal (recalib R, refresh B). Known names get tuned values; any
+        // other string ("", "longctx", unknown) falls back to the current default
+        // (R=128, B=32) so QWISP_BOLT_WORKLOAD unset is byte-identical to old bolt.
+        // Process-env-independent: calls the pure function directly.
+        run("bolt_workload_preset") {
+            let cases: [(String, Int, Int)] = [
+                ("code",    128, 64),
+                ("agentic", 256, 32),
+                ("shortnl", 128, 16),
+                ("longctx", 128, 32),   // unknown-but-real → default
+                ("zzz",     128, 32),   // arbitrary unknown → default
+            ]
+            for (w, wantR, wantB) in cases {
+                let got = RawSpecRunner.boltWorkloadPreset(w)
+                if got.r != wantR || got.b != wantB {
+                    return (false, "workload=\(w): got (R=\(got.r), B=\(got.b)) want (R=\(wantR), B=\(wantB))")
+                }
+            }
+            // Empty string must also yield the default (unset-env path).
+            let empty = RawSpecRunner.boltWorkloadPreset("")
+            if empty.r != 128 || empty.b != 32 {
+                return (false, "empty workload: got (R=\(empty.r), B=\(empty.b)) want (R=128, B=32)")
+            }
+            return (true, "ok")
+        }
 
         // ── Summary ───────────────────────────────────────────────────────
         return lines.joined(separator: "\n") + "\nRAWTESTS \(passed)/\(total)"
