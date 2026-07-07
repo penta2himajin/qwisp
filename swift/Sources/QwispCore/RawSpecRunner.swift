@@ -743,6 +743,38 @@ public enum RawSpecRunner {
         // buddy table + bias mask を re-freeze。観測は diag_copy_route の slot/M 一般化 layout
         // (chain 全 step = slot 別 / verify M 行 = kE.x=M*Ktop)で全 coverage。
         let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
+        // notes/14 async refresh wiring (QWISP_BOLT_REFRESH_ASYNC, default 1)
+        // B=32: chunk IO(~38ms@1.5GB/s)と decode の均衡 + 深さ2 pipeline で hide できる粒度。
+        // S=0(既定)= plan 毎に自動導出: 窓の 3/4 で全 chunk を消化し切る間隔に均す(決定的)。
+        let boltRefreshAsync = boltRecalibR > 0 && Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0
+        let boltRefreshB     = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
+        let boltRefreshS     = Tell.envInt("QWISP_BOLT_REFRESH_S", 0)
+        func refreshStride(_ nChunks: Int) -> Int {
+            // 半窓 R/2 に均等割り(OAT 実測 2026-07-07): 全幅だと table 鮮度遅れで TF が旧 bolt を割る
+            // (shortnl 71.3<72.5)、半窓で回復(73.2)しつつ slow-NAND 速度は −2% 程度。
+            // 詰めすぎ(S=2)は swap block=GPU idle で速度・fidelity とも悪化。
+            boltRefreshS > 0 ? boltRefreshS
+                             : Swift.max(1, (boltRecalibR / 2) / Swift.max(1, nChunks))
+        }
+
+        // Async refresh staging: ping-pong の 2 arena(N=B each)。bg thread は bounded-buffer
+        // (semFree/semReady)で全 chunk を先読み pipeline し、swap は通常 block しない(notes/14)。
+        var stagingArenas: [ExpertArena] = []
+        let bgRefreshQueue = DispatchQueue(label: "qwisp.bolt.async_refresh", qos: .userInitiated)
+        if boltRefreshAsync {
+            if let first = providers.first {
+                for _ in 0 ..< 2 {
+                    if let a = try? ExpertArena(device: first.cache.arena.device,
+                                                source: first.cache.arena.source,
+                                                N: boltRefreshB, refLayer: 0) { stagingArenas.append(a) }
+                }
+            }
+            if stagingArenas.count < 2 {
+                stagingArenas = []
+                print("[raw-spec bolt] WARNING: staging arena failed, async refresh disabled")
+            }
+        }
+        let stagingArena: ExpertArena? = stagingArenas.first   // nil 判定用(既存コードの guard 共用)
 
         // chain: diag 単独時は step 毎読出のため無効化。recalib は slot 観測で chain と共存。
         let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
@@ -818,6 +850,74 @@ public enum RawSpecRunner {
             }
             frRefreshes += 1
         }
+        // Async plan state (notes/14)
+        struct BoltCrossJob { let li: Int; let expert: Int; let victimSlot: Int }
+        var asyncBoundary  = 0
+        var asyncChunks    = [[BoltCrossJob]]()
+        var asyncNextSwap  = 0
+        var asyncStride    = 1   // plan 毎に refreshStride で再計算
+        var asyncSemFree   = DispatchSemaphore(value: 2)   // plan 毎に再生成(消化後は初期値に戻る)
+        var asyncSemReady  = DispatchSemaphore(value: 0)
+        var asyncCoactSnap = [[[Int]]]()   // coact snapshot at plan creation
+        /// Kick background pipeline: 全 chunk を bounded-buffer(2 staging)で先読み pread。
+        /// Background は stagingArenas のみに書く — providers には触れない。
+        func startBgPlan() {
+            guard boltRefreshAsync, stagingArenas.count == 2, !asyncChunks.isEmpty else { return }
+            let chunks = asyncChunks, stages = stagingArenas
+            let semFree = asyncSemFree, semReady = asyncSemReady
+            bgRefreshQueue.async {
+                for (j, chunk) in chunks.enumerated() {
+                    semFree.wait()                       // swap 済みで空いた staging を待つ
+                    let stage = stages[j % 2]
+                    var byLayer = [Int: [(e: Int, slot: Int)]]()
+                    for (k, cj) in chunk.enumerated() {
+                        byLayer[cj.li, default: []].append((e: cj.expert, slot: k))
+                    }
+                    for (layer, jobs) in byLayer { stage.loadMany(layer, jobs) }
+                    semReady.signal()
+                }
+            }
+        }
+        /// Atomic CPU-turn swap: apply asyncChunks[j].
+        /// Must be called only at loop head (GPU idle). Waits for IO if not done.
+        func swapBgChunk(_ j: Int) {
+            guard boltRefreshAsync, stagingArenas.count == 2, j < asyncChunks.count else { return }
+            asyncSemReady.wait()   // block until pread done (pipeline 先読み済みなら即)
+            let chunk = asyncChunks[j]
+            // memcpy staging slot k → main arena victimSlot (same sliceBytes — all layers share shape)
+            let stage = stagingArenas[j % 2]
+            for (k, cj) in chunk.enumerated() {
+                let arena = providers[cj.li].cache.arena
+                for key in stage.slots.keys {
+                    guard let srcS = stage.slots[key], let dstS = arena.slots[key] else { continue }
+                    memcpy(dstS.ptr + cj.victimSlot * dstS.sliceBytes,
+                           srcS.ptr + k             * srcS.sliceBytes,
+                           srcS.sliceBytes)
+                }
+                // Direct bookkeeping (no ensure() — doctrine: same-call invariant)
+                let cache = providers[cj.li].cache
+                let cur = cache.expertAt[cj.victimSlot]
+                if cur >= 0 && cur != cj.expert { cache.slotOf.removeValue(forKey: cur) }
+                cache.slotOf[cj.expert]        = cj.victimSlot
+                cache.expertAt[cj.victimSlot]  = cj.expert
+                cache.clock                   += 1
+                cache.tick[cj.victimSlot]      = cache.clock
+            }
+            LayerExpertCache.missTotal += chunk.count   // pread io 計上(staging 経路は ensure 迂回のため手動)
+            // Rebuild buddy + freeze — chunk が触った層のみ(層独立なので full rebuild と内容同一)。
+            // 全層 rebuild + 40 mask 再確保は swap 毎数 ms×多 swap で IO-bound 上限を食っていた。
+            for li in Set(chunk.map { $0.li }).sorted() {
+                let snap = li < asyncCoactSnap.count ? asyncCoactSnap[li]
+                           : [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE)
+                let cache = providers[li].cache
+                cache.buildBuddyTable(coact: snap, numExperts: nE)
+                fwd2.setBoltTable(li, cache.buddyTableCPU)
+                if boltBiasEps > 0 {
+                    fwd2.updateRouteBiasMask(li, (0..<nE).map { Int32(cache.buddyExpertCPU[$0] == $0 ? 1 : 0) })
+                }
+            }
+            asyncSemFree.signal()   // staging を bg pipeline に返却(次々 chunk の先読み解禁)
+        }
         // group(li): early 0-12 / mid 13-26 / late 27-39
         struct DiagAcc { var cold = 0; var routed = 0; var stepsWithCold = 0; var margins: [Float] = [] }
         var diagAcc = [DiagAcc(), DiagAcc(), DiagAcc()]
@@ -862,7 +962,53 @@ public enum RawSpecRunner {
         while out.count < N {
             // notes/13 recalib: R 境界で re-freeze(全経路共通=loop 先頭で判定)。
             if boltRecalibR > 0 && out.count >= frNextRefresh {
-                frRefresh(); frNextRefresh += boltRecalibR
+                if boltRefreshAsync && stagingArena != nil {
+                    // Flush any leftover chunks from previous plan (block-wait; bg pipeline 先読み済みなら軽い)
+                    while asyncNextSwap < asyncChunks.count {
+                        swapBgChunk(asyncNextSwap)
+                        asyncNextSwap += 1
+                    }
+                    // Build new plan: snapshot coact, compute per-layer diffs, flatten + chunk
+                    asyncCoactSnap = frWinCoact
+                    var allJobs = [BoltCrossJob]()
+                    for (li, provider) in providers.enumerated() {
+                        if let plan = BoltAsyncRefresh.makePlan(
+                            counts: frWinCounts[li], coact: frWinCoact[li],
+                            slotOf: provider.cache.slotOf, expertAt: provider.cache.expertAt,
+                            tick: provider.cache.tick, pinnedSlots: provider.cache.pinnedSlots,
+                            C: C, nE: nE, B: boltRefreshB) {
+                            for job in plan.jobs {
+                                allJobs.append(BoltCrossJob(li: li, expert: job.expert, victimSlot: job.victimSlot))
+                            }
+                        }
+                    }
+                    asyncBoundary = out.count
+                    asyncChunks = stride(from: 0, to: allJobs.count, by: boltRefreshB).map {
+                        Array(allJobs[$0..<Swift.min($0 + boltRefreshB, allJobs.count)])
+                    }
+                    asyncNextSwap = 0
+                    asyncStride = refreshStride(asyncChunks.count)
+                    // Reset observation window
+                    for li in 0..<nLayers {
+                        for e in 0..<nE { frWinCounts[li][e] = 0; frWinCoact[li][e] = [Int](repeating: 0, count: nE) }
+                    }
+                    frRefreshes += 1
+                    // bg pipeline 起動(semaphore は plan 毎に fresh — 前 plan は flush で初期値に戻り済み)
+                    asyncSemFree = DispatchSemaphore(value: 2)
+                    asyncSemReady = DispatchSemaphore(value: 0)
+                    startBgPlan()
+                } else {
+                    frRefresh()   // QWISP_BOLT_REFRESH_ASYNC=0: sync path, byte-identical
+                }
+                frNextRefresh += boltRecalibR
+            }
+            // Async: swap scheduled chunks at fixed token positions (notes/14 §機構-3)。
+            // chain/verify span で out.count が跳ぶため、この head で due の chunk は全部消化
+            // (while)。IO は bg pipeline が先読み済みなので通常 block しない。
+            while boltRefreshAsync, stagingArena != nil, asyncNextSwap < asyncChunks.count,
+                  out.count >= asyncBoundary + (asyncNextSwap + 1) * asyncStride {
+                swapBgChunk(asyncNextSwap)
+                asyncNextSwap += 1
             }
             // experiment-3 horizon-decay: 生成位置で ε を線形減衰(H=0 で無効=常時 ε0)。
             if boltBiasEps > 0 && boltBiasDecayH > 0 {
@@ -918,6 +1064,10 @@ public enum RawSpecRunner {
 
         let secs  = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
         let tokps = Double(N) / secs
+        // 未 swap chunk の drain(計時外)。semaphore 収支を初期値に戻す — 残したまま return すると
+        // bg 完了済みの場合 semFree<init で _dispatch_semaphore_dispose が trap(SIGTRAP)。
+        // 副作用(table 更新)は無害: decode 済み、TF は開始時に re-canonicalize、self-check は recalib 時 skip。
+        while asyncNextSwap < asyncChunks.count { swapBgChunk(asyncNextSwap); asyncNextSwap += 1 }
         let outN  = Array(out.prefix(N))
         let match = zip(outN, gRefIds.prefix(N)).filter { $0 == $1 }.count
 
@@ -1053,6 +1203,64 @@ public enum RawSpecRunner {
                     }
                     tfRefreshes += 1
                 }
+                // ── notes/14 §6: async schedule emulation ──────────────────────────
+                // free-run async と同じ plan/chunk 分割・同じ token 位置 swap を「同期で」再現し、
+                // schedule 分割の fidelity 影響を async 機構なしで測る。TF は同期(GPU idle at CPU
+                // turn)なので staging 不要 = victim slot へ直接 pread しても free-run swap と同結果。
+                let tfAsyncEmu = boltRefreshAsync && stagingArena != nil
+                var tfAsyncChunks: [[(li: Int, job: BoltAsyncRefresh.Job)]] = []
+                var tfAsyncNextSwap = 0, tfAsyncBoundary = 0, tfAsyncStride = 1
+                var tfAsyncCoactSnap: [[[Int]]] = []
+                func tfApplyChunk(_ j: Int) {
+                    guard j < tfAsyncChunks.count else { return }
+                    for (li, job) in tfAsyncChunks[j] {
+                        let cache = providers[li].cache
+                        cache.arena.loadMany(cache.layer, [(e: job.expert, slot: job.victimSlot)])
+                        let cur = cache.expertAt[job.victimSlot]
+                        if cur >= 0 && cur != job.expert { cache.slotOf.removeValue(forKey: cur) }
+                        cache.slotOf[job.expert]       = job.victimSlot
+                        cache.expertAt[job.victimSlot] = job.expert
+                        cache.clock                   += 1
+                        cache.tick[job.victimSlot]     = cache.clock
+                    }
+                    LayerExpertCache.missTotal += tfAsyncChunks[j].count   // pread io 計上(ensure 迂回のため手動)
+                    // free-run swap と同じ affected-layers-only 更新(内容は full rebuild と同一)。
+                    for li in Set(tfAsyncChunks[j].map { $0.li }).sorted() {
+                        let snap = li < tfAsyncCoactSnap.count ? tfAsyncCoactSnap[li]
+                                   : [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE)
+                        let cache = providers[li].cache
+                        cache.buildBuddyTable(coact: snap, numExperts: nE)
+                        fwdTF.setBoltTable(li, cache.buddyTableCPU)
+                        if boltBiasEps > 0 {
+                            fwdTF.updateRouteBiasMask(li, (0 ..< nE).map { Int32(cache.buddyExpertCPU[$0] == $0 ? 1 : 0) })
+                        }
+                    }
+                }
+                func tfAsyncPlan(boundary: Int) {
+                    // free-run 同様: 前 plan の残 chunk を境界で全消化してから次 plan。
+                    while tfAsyncNextSwap < tfAsyncChunks.count { tfApplyChunk(tfAsyncNextSwap); tfAsyncNextSwap += 1 }
+                    tfAsyncCoactSnap = winCoact
+                    var allJobs: [(li: Int, job: BoltAsyncRefresh.Job)] = []
+                    for (li, provider) in providers.enumerated() {
+                        if let plan = BoltAsyncRefresh.makePlan(
+                            counts: winCounts[li], coact: winCoact[li],
+                            slotOf: provider.cache.slotOf, expertAt: provider.cache.expertAt,
+                            tick: provider.cache.tick, pinnedSlots: provider.cache.pinnedSlots,
+                            C: C, nE: nE, B: boltRefreshB) {
+                            for job in plan.jobs { allJobs.append((li, job)) }
+                        }
+                    }
+                    tfAsyncBoundary = boundary
+                    tfAsyncChunks = stride(from: 0, to: allJobs.count, by: boltRefreshB).map {
+                        Array(allJobs[$0 ..< Swift.min($0 + boltRefreshB, allJobs.count)])
+                    }
+                    tfAsyncNextSwap = 0
+                    tfAsyncStride = refreshStride(tfAsyncChunks.count)
+                    for li in 0 ..< nLayers {
+                        for e in 0 ..< nE { winCounts[li][e] = 0; winCoact[li][e] = [Int](repeating: 0, count: nE) }
+                    }
+                    tfRefreshes += 1
+                }
                 if let lastNormedTF = prefill(promptIds: promptIds, backend: backendTF),
                    let lg0TF = engine.logits(lastNormedTF, M: 1) {
                     MLX.eval([lg0TF])
@@ -1072,9 +1280,17 @@ public enum RawSpecRunner {
                         guard let ev = backendTF.stepArgmax([Int32(gRefIds[i])]) else { break }
                         predTF = ev[0]
                         // experiment-1: routing 観測の累積 + R 境界で re-freeze
+                        // notes/14: async 時は emulation(plan + token 位置 chunk swap)、sync 時は従来 bulk refresh。
                         if recalibR > 0 {
                             tfRecalibRead()
-                            if (i + 1) % recalibR == 0 { tfRecalibRefresh() }
+                            if (i + 1) % recalibR == 0 {
+                                if tfAsyncEmu { tfAsyncPlan(boundary: i + 1) } else { tfRecalibRefresh() }
+                            }
+                            // free-run と同じ固定 token スケジュール(head 毎に due 分を全消化)。
+                            while tfAsyncEmu, tfAsyncNextSwap < tfAsyncChunks.count,
+                                  (i + 1) >= tfAsyncBoundary + (tfAsyncNextSwap + 1) * tfAsyncStride {
+                                tfApplyChunk(tfAsyncNextSwap); tfAsyncNextSwap += 1
+                            }
                         }
                     }
                     if predTF == gRefIds[nTF - 1] { tfMatch += 1 }; tfTotal += 1

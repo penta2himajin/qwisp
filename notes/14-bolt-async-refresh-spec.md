@@ -78,6 +78,27 @@ slow-NAND(1.5GB/s)で **shortnl −51%(107.9→52.7)/ code −56%(141.6→62.3)*
   2. TF@512(schedule emulation): 4 regime が sync recalib 値(88.3/74.0/93.0/92.6)± noise。
   3. fast-SSD 非退行。[BoltRecalib] preadMisses / block-wait 累積 ms を報告(B/S tuning 材料)。
 
+## VERDICT(2026-07-07 実装完了・実測)
+devloop(tests 67-68 locked)+driver 修正で採用。設計からの delta 4点:
+1. **bg pread は read-ahead pipeline**(ping-pong staging ×2 + bounded-buffer semaphore)。
+   「swap 後に次 chunk kick」の逐次案は chain span で loop head が少ない regime(code accept 7+)
+   だと boundary burst に縮退(+13% 止まり)。pipeline 化で +48% に到達。
+2. **B 既定 32 / S 既定 0=auto(半窓 R/2 均等割り)**。全幅は table 鮮度遅れで shortnl TF が
+   旧 bolt 割れ(71.3<72.5)、半窓で回復(73.2)。S 詰めすぎ(S=2)は swap block=GPU idle で両軸悪化。
+   B は regime split(shortnl 16 / code 64 が最適)→ TODO-2 R per-workload と同梱で knob 温存。
+3. **swap の table 更新は affected layers のみ**(per-layer setBoltTable/updateRouteBiasMask
+   in-place — 層独立なので full rebuild と内容同一)。全層 rebuild+40 mask 再確保は swap 毎数 ms
+   ×多 swap で IO-bound 上限を食っていた。
+4. **run 末尾に未 swap chunk drain(計時外)必須**: 残すと semaphore 収支 < 初期値で
+   `_dispatch_semaphore_dispose` trap(SIGTRAP、pipe 出力全喪失で無言 crash)。
+- GATE 実績: G-A 68/68 / G-B.1 opt-out=8237cf5 binary と byte-identical / G-B.2 決定性×2 ✓ /
+  G-D slow-NAND(1.5GB/s) sync→async: shortnl 58.0→81.8(+41%) code 62.4→92.5(+48%)
+  agentic 80.6 longctx 89.7。fast-SSD 非退行(±3%、agentic +7%)。
+  TF@512(emulation): shortnl 73.2 / code 93.0 / agentic 92.4 / longctx 87.9 —
+  全 regime 旧 bolt 以上(sync recalib 比 −0.8/±0/−0.2/−0.4 の鮮度税、採用条項クリア)。
+- 残 sliver: code は IO-bound 理論上限 ~120(B=64 で 111 実測)。B/S/R の per-workload 同時 tuning
+  は TODO-2。bench_batch 在プロセス連続 cell では bg thread park が累積し得る(単発 CLI は無害)。
+
 ## Doctrine
 - swap・table 書換えは **CPU turn 限定・原子的**。background thread は staging 以外に触れない。
 - 決定性 gate が正: swap は token-index 固定、IO 完了待ちは block(自由走行 swap 禁止)。

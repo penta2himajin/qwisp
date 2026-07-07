@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 66
+        let total = 68
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3547,6 +3547,278 @@ public enum RawVerifyTests {
             if let f = chk(4, 5, 1, "call2 preserve") { return f }
             return (true, "ok")
         }
+
+        // Test 67 (G-A.1 — notes/14): refresh plan is deterministic and correct.
+        // Checks: diff = newTop ∖ resident, victim ∉ (newTop slots ∪ pinnedSlots),
+        // chunk splitting covers all jobs with each chunk ≤ B, same input → same plan.
+        // Adversarial (Scenario B): newTop-resident expert occupies a slot that would
+        // be the LRU victim — plan must exclude it, unlike vanilla ensure().
+        run("refresh_plan_deterministic") {
+            // ── Scenario A ────────────────────────────────────────────────
+            // nE=8, C=4, B=2
+            // Resident: {0→slot0(tick=10), 1→slot1(tick=5), 2→slot2(tick=8), 3→slot3(tick=3)}
+            // Pinned: slot 0 (holds expert 0)
+            // Counts: expert 4=10, 5=8, 6=7, rest=0
+            // Expected newTop: {0,4,5,6}
+            //   (4th-best count=0: tie among {1,2,3,7} → lower id = expert 0 wins tie-break)
+            // diff = {4,5,6}  (experts 4,5,6 not resident)
+            // Victims LRU (exclude pinned slot0 + exclude newTop-resident slot0 for exp0):
+            //   slot3(tick=3)→expert4, slot1(tick=5)→expert5, slot2(tick=8)→expert6
+            let nE = 8, C = 4, B = 2
+            let counts = [0, 0, 0, 0, 10, 8, 7, 0]
+            var coact = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE)
+            coact[4][5] = 3; coact[5][4] = 3; coact[5][6] = 2; coact[6][5] = 2
+            let slotOf: [Int: Int] = [0: 0, 1: 1, 2: 2, 3: 3]
+            let expertAt: [Int] = [0, 1, 2, 3]
+            let tick: [Int] = [10, 5, 8, 3]
+            let pinned: Set<Int> = [0]
+
+            guard let plan = BoltAsyncRefresh.makePlan(
+                counts: counts, coact: coact,
+                slotOf: slotOf, expertAt: expertAt, tick: tick,
+                pinnedSlots: pinned, C: C, nE: nE, B: B)
+            else { return (false, "not implemented") }
+
+            // newTop must be exactly C experts
+            if plan.newTop.count != C {
+                return (false, "newTop.count \(plan.newTop.count) != C=\(C)")
+            }
+            let newTopSet = Set(plan.newTop)
+            if newTopSet != Set([0, 4, 5, 6]) {
+                return (false, "newTop \(plan.newTop.sorted()) != [0,4,5,6]")
+            }
+            // diff = newTop ∖ resident
+            let diffSet = Set(plan.diff)
+            let resident = Set(slotOf.keys)
+            if diffSet != Set([4, 5, 6]) {
+                return (false, "diff \(plan.diff.sorted()) != [4,5,6]")
+            }
+            if !diffSet.isDisjoint(with: resident) {
+                return (false, "diff ∩ resident ≠ ∅")
+            }
+            // victim slots ∉ pinnedSlots and ∉ slots of newTop-resident experts
+            let newTopResSlots = Set(plan.newTop.compactMap { slotOf[$0] })
+            for job in plan.jobs {
+                if pinned.contains(job.victimSlot) {
+                    return (false, "victim slot \(job.victimSlot) is pinned")
+                }
+                if newTopResSlots.contains(job.victimSlot) {
+                    return (false, "victim slot \(job.victimSlot) holds a newTop resident")
+                }
+            }
+            // jobs must cover exactly the diff set
+            if Set(plan.jobs.map { $0.expert }) != diffSet {
+                return (false, "jobs experts \(plan.jobs.map{$0.expert}.sorted()) != diff \(plan.diff.sorted())")
+            }
+            // chunk splitting: chunks.flatMap == jobs, each chunk ≤ B, none empty
+            let flatChunkJobs = plan.chunks.flatMap { $0 }
+            if flatChunkJobs != plan.jobs {
+                return (false, "chunks do not reproduce jobs exactly: \(flatChunkJobs.count) vs \(plan.jobs.count)")
+            }
+            for (ci, chunk) in plan.chunks.enumerated() {
+                if chunk.isEmpty  { return (false, "chunk \(ci) is empty") }
+                if chunk.count > B { return (false, "chunk \(ci) size \(chunk.count) > B=\(B)") }
+            }
+
+            // Determinism: same input → same plan
+            guard let plan2 = BoltAsyncRefresh.makePlan(
+                counts: counts, coact: coact,
+                slotOf: slotOf, expertAt: expertAt, tick: tick,
+                pinnedSlots: pinned, C: C, nE: nE, B: B)
+            else { return (false, "second call returned nil") }
+            if plan.newTop != plan2.newTop { return (false, "newTop non-deterministic") }
+            if plan.diff   != plan2.diff   { return (false, "diff non-deterministic") }
+            if plan.jobs   != plan2.jobs   { return (false, "jobs non-deterministic") }
+
+            // ── Scenario B (adversarial): newTop-resident in LRU-oldest slot ─────
+            // nE=6, C=3, B=2
+            // Resident: {0→slot0(tick=1), 1→slot1(tick=2), 2→slot2(tick=10)}, pinned={}
+            // Counts: [0,0,5,8,4,0] → newTop={3,2,4} (top-3)
+            // Expert 2 is resident in slot2(tick=10, highest tick = NOT LRU).
+            // diff = {3,4}
+            // Vanilla ensure would pick slot0(tick=1) and slot1(tick=2) as victims.
+            // Plan must ALSO exclude slot2 (holds newTop expert 2) from victims —
+            // here it is naturally excluded because tick=10 is not LRU, confirming
+            // the algorithm doesn't accidentally evict a newTop resident even when
+            // it's LRU (the adversarial check below uses a fresh scenario where
+            // the newTop resident has low tick to make the exclusion load-bearing).
+            let nE2 = 6, C2 = 3, B2 = 2
+            let counts2 = [0, 0, 5, 8, 4, 0]
+            let coact2 = [[Int]](repeating: [Int](repeating: 0, count: nE2), count: nE2)
+            let slotOf2: [Int: Int] = [0: 0, 1: 1, 2: 2]
+            let expertAt2: [Int]   = [0, 1, 2]
+            let tick2: [Int]       = [1, 2, 10]   // expert 2 (in newTop) is highest tick
+
+            guard let planB = BoltAsyncRefresh.makePlan(
+                counts: counts2, coact: coact2,
+                slotOf: slotOf2, expertAt: expertAt2, tick: tick2,
+                pinnedSlots: Set(), C: C2, nE: nE2, B: B2)
+            else { return (false, "scenario B: not implemented") }
+            if Set(planB.newTop) != Set([2, 3, 4]) {
+                return (false, "B newTop \(planB.newTop.sorted()) != [2,3,4]")
+            }
+            if Set(planB.diff) != Set([3, 4]) {
+                return (false, "B diff \(planB.diff.sorted()) != [3,4]")
+            }
+            // expert 2 in newTop → slot 2 must NOT be a victim
+            let newTopResSlots2 = Set(planB.newTop.compactMap { slotOf2[$0] })  // = {2}
+            for job in planB.jobs {
+                if newTopResSlots2.contains(job.victimSlot) {
+                    return (false, "B: victim slot \(job.victimSlot) holds newTop-resident exp2")
+                }
+            }
+            // Victims must be slot 0 and slot 1 (LRU of {slot0,slot1}, slot2 excluded)
+            if Set(planB.jobs.map { $0.victimSlot }) != Set([0, 1]) {
+                return (false, "B victim slots \(planB.jobs.map{$0.victimSlot}.sorted()) != [0,1]")
+            }
+            // Adversarial variant: same scenario but with expert 2 having LOW tick (tick2b).
+            // Now slot2 would be LRU if not excluded — the exclusion becomes load-bearing.
+            let tick2b: [Int] = [10, 8, 1]   // expert 2 in slot2 has tick=1 (oldest)
+            guard let planB2 = BoltAsyncRefresh.makePlan(
+                counts: counts2, coact: coact2,
+                slotOf: slotOf2, expertAt: expertAt2, tick: tick2b,
+                pinnedSlots: Set(), C: C2, nE: nE2, B: B2)
+            else { return (false, "scenario B adversarial: not implemented") }
+            // newTop = {2,3,4} still (counts unchanged)
+            if Set(planB2.newTop) != Set([2, 3, 4]) {
+                return (false, "B-adv newTop \(planB2.newTop.sorted()) != [2,3,4]")
+            }
+            // slot2 (holding newTop expert 2) MUST NOT be a victim even though tick=1 is LRU
+            for job in planB2.jobs {
+                if job.victimSlot == 2 {
+                    return (false, "B-adv: slot2 (newTop expert 2, tick=1) was chosen as victim — exclusion rule violated")
+                }
+            }
+            // Victims must come from {slot0(tick=10), slot1(tick=8)} only
+            if Set(planB2.jobs.map { $0.victimSlot }) != Set([0, 1]) {
+                return (false, "B-adv victim slots \(planB2.jobs.map{$0.victimSlot}.sorted()) != [0,1]")
+            }
+            return (true, "ok")
+        }
+
+
+        // Test 68 (G-A.2 — notes/14): chunk swap is atomic and slot-consistent.
+        // Per chunk: (a) slotOf is injective after each chunk (no double-mapping),
+        //            (b) expertAt[slotOf[e]] == e for all resident e.
+        // After all chunks + rebuildBuddyCPU: slotOf/expertAt/buddyTableCPU match the
+        // sync ensure path (same LRU algorithm, newTop-resident exclusion consistent).
+        // Adversarial: single-chunk (B ≥ diff) performs all swaps atomically.
+        run("chunk_swap_atomic") {
+            // ── Shared setup ─────────────────────────────────────────────
+            // nE=8, C=4; initial resident {0→s0(t=10),1→s1(t=5),2→s2(t=8),3→s3(t=3)}
+            // counts → newTop={0,4,5,6}, diff={4,5,6}
+            // experts in diff have simple coact pairs: (4,5) and (5,6)
+            let nE = 8, C = 4
+            var coact = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE)
+            coact[4][5] = 3; coact[5][4] = 3; coact[5][6] = 2; coact[6][5] = 2
+            coact[4][6] = 1; coact[6][4] = 1
+            let initSlotOf: [Int: Int] = [0: 0, 1: 1, 2: 2, 3: 3]
+            let initExpertAt: [Int]   = [0, 1, 2, 3]
+            let initTick: [Int]       = [10, 5, 8, 3]
+            let pinned: Set<Int> = []
+
+            // ── Scenario A: B=2 (multi-chunk) ────────────────────────────
+            let B = 2
+            let counts = [0, 0, 0, 0, 10, 8, 7, 0]
+            guard let plan = BoltAsyncRefresh.makePlan(
+                counts: counts, coact: coact,
+                slotOf: initSlotOf, expertAt: initExpertAt, tick: initTick,
+                pinnedSlots: pinned, C: C, nE: nE, B: B)
+            else { return (false, "makePlan not implemented") }
+
+            // Path A: apply chunks one at a time; check slot-consistency after each.
+            var stateA = BoltAsyncRefresh.CacheState(
+                slotOf: initSlotOf, expertAt: initExpertAt,
+                tick: initTick, clock: 100,
+                buddyTableCPU: [Int32](repeating: 0, count: nE),
+                buddyExpertCPU: [Int32](repeating: -1, count: nE))
+            for (ci, chunk) in plan.chunks.enumerated() {
+                guard stateA.applyChunkCPU(jobs: chunk)
+                else { return (false, "applyChunkCPU failed at chunk=\(ci)") }
+                // Slot-consistency invariant after each partial application:
+                // (1) slotOf is injective
+                let slots = Array(stateA.slotOf.values)
+                if Set(slots).count != slots.count {
+                    return (false, "double-mapping after chunk=\(ci): \(stateA.slotOf)")
+                }
+                // (2) forward-reverse maps agree
+                for (e, s) in stateA.slotOf {
+                    if stateA.expertAt[s] != e {
+                        return (false, "expertAt inconsistent after chunk=\(ci): expertAt[\(s)]=\(stateA.expertAt[s]) != e=\(e)")
+                    }
+                }
+            }
+            guard stateA.rebuildBuddyCPU(coact: coact, nE: nE)
+            else { return (false, "rebuildBuddyCPU not implemented") }
+
+            // Path B (sync reference): apply all diff experts at once via LRU ensure.
+            // expert 0 has tick=10 (highest), so vanilla LRU won't evict it even without
+            // the newTop-exclusion rule — both paths must agree on the final slot assignment.
+            var stateB = BoltAsyncRefresh.CacheState(
+                slotOf: initSlotOf, expertAt: initExpertAt,
+                tick: initTick, clock: 100,
+                buddyTableCPU: [Int32](repeating: 0, count: nE),
+                buddyExpertCPU: [Int32](repeating: -1, count: nE))
+            guard stateB.syncEnsure(experts: plan.diff, pinnedSlots: pinned)
+            else { return (false, "syncEnsure not implemented") }
+            guard stateB.rebuildBuddyCPU(coact: coact, nE: nE)
+            else { return (false, "rebuildBuddyCPU (B) not implemented") }
+
+            // Compare final states
+            if stateA.slotOf != stateB.slotOf {
+                let aS = stateA.slotOf.sorted { $0.key < $1.key }
+                let bS = stateB.slotOf.sorted { $0.key < $1.key }
+                return (false, "slotOf mismatch A=\(aS) B=\(bS)")
+            }
+            if stateA.expertAt != stateB.expertAt {
+                return (false, "expertAt mismatch A=\(stateA.expertAt) B=\(stateB.expertAt)")
+            }
+            if stateA.buddyTableCPU != stateB.buddyTableCPU {
+                return (false, "buddyTableCPU mismatch A=\(stateA.buddyTableCPU) B=\(stateB.buddyTableCPU)")
+            }
+            // final resident set = newTop
+            if Set(stateA.slotOf.keys) != Set(plan.newTop) {
+                return (false, "final resident \(stateA.slotOf.keys.sorted()) != newTop \(plan.newTop.sorted())")
+            }
+
+            // ── Scenario B (adversarial): B=8 ≥ diff (single chunk) ──────
+            // All swaps happen atomically in one chunk — no partial-state phase.
+            // Verify that a single-chunk plan is structurally valid and produces
+            // the same final state as the multi-chunk plan (same diff, coact, tick).
+            let Bsingle = 8
+            guard let planSingle = BoltAsyncRefresh.makePlan(
+                counts: counts, coact: coact,
+                slotOf: initSlotOf, expertAt: initExpertAt, tick: initTick,
+                pinnedSlots: pinned, C: C, nE: nE, B: Bsingle)
+            else { return (false, "scenario B: makePlan not implemented") }
+            if planSingle.chunks.count != 1 {
+                return (false, "B: expected 1 chunk for B=\(Bsingle) diff.count=\(planSingle.diff.count), got \(planSingle.chunks.count)")
+            }
+            var stateC = BoltAsyncRefresh.CacheState(
+                slotOf: initSlotOf, expertAt: initExpertAt,
+                tick: initTick, clock: 100,
+                buddyTableCPU: [Int32](repeating: 0, count: nE),
+                buddyExpertCPU: [Int32](repeating: -1, count: nE))
+            guard stateC.applyChunkCPU(jobs: planSingle.chunks[0])
+            else { return (false, "B: applyChunkCPU failed") }
+            guard stateC.rebuildBuddyCPU(coact: coact, nE: nE)
+            else { return (false, "B: rebuildBuddyCPU not implemented") }
+            // Final resident set must still equal newTop
+            if Set(stateC.slotOf.keys) != Set(planSingle.newTop) {
+                return (false, "B final resident \(stateC.slotOf.keys.sorted()) != newTop \(planSingle.newTop.sorted())")
+            }
+            // buddyTableCPU must match the multi-chunk path (same coact, same final slotOf)
+            if stateC.slotOf != stateA.slotOf {
+                let cS = stateC.slotOf.sorted { $0.key < $1.key }
+                let aS = stateA.slotOf.sorted { $0.key < $1.key }
+                return (false, "B slotOf mismatch C=\(cS) A=\(aS)")
+            }
+            if stateC.buddyTableCPU != stateA.buddyTableCPU {
+                return (false, "B buddyTableCPU mismatch C=\(stateC.buddyTableCPU) A=\(stateA.buddyTableCPU)")
+            }
+            return (true, "ok")
+        }
+
 
         // ── Summary ───────────────────────────────────────────────────────
         return lines.joined(separator: "\n") + "\nRAWTESTS \(passed)/\(total)"

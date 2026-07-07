@@ -3269,6 +3269,21 @@ public enum RawFusedVerify {
         /// bolt → strict に戻す(slot table は保持)。
         public func setStrictStreaming() { streamMode = .strict }
 
+        /// 単層の slot table を in-place 更新(async refresh chunk swap 用 — CPU turn 限定)。
+        public func setBoltTable(_ li: Int, _ tbl: [Int32]) {
+            guard li < slotTables.count else { return }
+            let p = slotTables[li].contents().bindMemory(to: Int32.self, capacity: tbl.count)
+            for (e, s) in tbl.enumerated() { p[e] = s }
+        }
+
+        /// 単層の residency mask を in-place 更新(MTLBuffer 再確保なし — CPU turn 限定)。
+        /// setRouteBias 未初期化(eps=0)なら no-op。
+        public func updateRouteBiasMask(_ li: Int, _ mask: [Int32]) {
+            guard let bufs = routeBiasMasks, li < bufs.count else { return }
+            let p = bufs[li].contents().bindMemory(to: Int32.self, capacity: mask.count)
+            for (e, v) in mask.enumerated() { p[e] = v }
+        }
+
         // ── Stage 1 案B: gate-score residency bias ───────────────────────────────────────
         // routeBiasMasks[li]: per-layer int32 resident mask(N=256 elements, resident=1/cold=0)。
         // eps=0(既定)で byte-identical(bias カーネルは呼ばれない=encodeRouteTop8Rows 従来経路)。
