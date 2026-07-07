@@ -85,6 +85,7 @@ if CommandLine.arguments.contains("stream") {
         ("qmm4-tiled-bench",      { _, _ in RawMetalForward.qmm4TiledBench() }),
         ("raw-moe-b",             { _, _ in RawMetalForward.runMoeBlockTestB() }),
         ("m1-floor",              { _, _ in RawMetalForward.runM1FloorProbe() }),
+        ("m2c-spec",              { try StreamingDecode.runSpeculative(modelDir: $0, refPath: $1) }),   // MTP D1 accept 計測(lever ①)
         ("step0-resident",        { try StreamingDecode.runResidencyProbe(modelDir: $0, refPath: $1) }),
         ("prefetch-whole",        { try StreamingDecode.runPrefetchWhole(modelDir: $0, refPath: $1) }),
         ("predict-h0",            { try StreamingDecode.runPredictH0(modelDir: $0, refPath: $1) }),

@@ -907,9 +907,10 @@ public enum StreamingDecode {
     public static func runSpeculative(modelDir: String, refPath: String) throws -> String {
         guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
         let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"], let spRef = r["spec_spec"] else {
+        guard let promptArr = r["spec_prompt"], let gRef = r["spec_greedy"] else {
             return "[M2c×stream] skip: spec_prompt 無し"
         }
+        let spRef = r["spec_spec"]   // optional: bench refs(spec_prompt/spec_greedy のみ)でも accept 計測可
         let C = Int(ProcessInfo.processInfo.environment["QWISP_CACHE_C"] ?? "64") ?? 64
         let store = try WeightStore(modelDir: modelDir)
         store.residentNonExperts()
@@ -922,7 +923,8 @@ public enum StreamingDecode {
         let rssLoad = rssGB()
 
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
-        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48, spRef.dim(0))
+        let N = Swift.min(Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "48") ?? 48,
+                          spRef?.dim(0) ?? gRef.dim(0))
         let gR = gRef.asArray(Int32.self).map { Int($0) }
         // 先に streaming greedy が Python greedy と一致するか（forward の正しさを切り分け）
         let sgCaches = model.makeCaches()
@@ -938,16 +940,25 @@ public enum StreamingDecode {
         }
         let sgMatch = zip(sg, gR).filter { $0 == $1 }.count
         let (sp, steps, acc, secs) = try specLoop(model, head, ids, N, diagGreedy: gR)
-        let spR = spRef.asArray(Int32.self).map { Int($0) }
-        let vsPython = zip(sp, spR).filter { $0 == $1 }.count
         let vsGreedy = zip(sp, gR).filter { $0 == $1 }.count
         let rssPeak = rssGB()
-        let ok = vsPython == N
+        // spec_spec(旧 Python ref)が有れば従来比較、無ければ canonical greedy(spec_greedy)一致で判定
+        let pyTag: String
+        let ok: Bool
+        if let spRef {
+            let spR = spRef.asArray(Int32.self).map { Int($0) }
+            let vsPython = zip(sp, spR).filter { $0 == $1 }.count
+            pyTag = "spec vs Python \(vsPython)/\(N) "
+            ok = vsPython == N
+        } else {
+            pyTag = ""
+            ok = vsGreedy == N
+        }
         return String(format: """
-            [M2c×stream] MTP 投機 on 8GB streaming(C=%d): streaming greedy=Python %d/%d  spec vs Python %d/%d vs greedy %d/%d %@
+            [M2c×stream] MTP 投機 on 8GB streaming(C=%d): streaming greedy=Python %d/%d  %@vs greedy %d/%d %@
                accept=%.3f  %.1f tok/s  RSS load=%.1fGB peak=%.1fGB
             """,
-            C, sgMatch, N, vsPython, N, vsGreedy, N, ok ? "OK ✅" : "❌",
+            C, sgMatch, N, pyTag, vsGreedy, N, ok ? "OK ✅" : "❌",
             Double(acc) / Double(steps), Double(N) / secs, rssLoad, rssPeak)
     }
 
@@ -978,9 +989,11 @@ public enum StreamingDecode {
         if seqAttn { AttentionLayer.seqMultiToken = true }
         var out: [Int] = []; var steps = 0, acc = 0
         let t0 = DispatchTime.now()
+        // QWISP_NOSYNC=1: pure no-sync(C>=nE 全 resident で無条件 exact、runSuffixSpec と同条件)。
+        let pureNS = ProcessInfo.processInfo.environment["QWISP_NOSYNC"] == "1"
         while out.count < maxTokens {
             // fast モード: refreshEvery 毎に sync(cache 更新)、それ以外は GPU-remap no-sync
-            StreamingMoEBlock.probeNoSync = refreshEvery > 0 && (steps % refreshEvery != 0)
+            StreamingMoEBlock.probeNoSync = pureNS || (refreshEvery > 0 && (steps % refreshEvery != 0))
             steps += 1
             let dl = head(lastH, uArr, cache: mtpKV)
             let dArr = MLX.argMax(dl[0..., 0...], axis: -1)
