@@ -170,6 +170,11 @@ public enum Tell {
             else { AttentionLayer.seqMultiToken = on && vseq }
         }
         let prof = Tell.envFlag("QWISP_SPECK_PROF")
+        // QWISP_ACCEPT_TRACE=1: accept-length histogram + fork analysis (k=2 draft prize).
+        // Flag off = zero behavior change (guards only). Dumped as [AcceptTrace] at loop end.
+        let acceptTrace = Tell.envFlag("QWISP_ACCEPT_TRACE")
+        var atHist: [Int: Int] = [:]
+        var atDraftless = 0, atSingleFB = 0, atMismatch = 0, atAltExist = 0, atAltHit = 0, atCertStop = 0
         var tDraft: UInt64 = 0, tVerify: UInt64 = 0
         func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
         // adaptive escalation: escalateActive 時、input を no-sync で forward→cold routed があれば cache を
@@ -344,11 +349,13 @@ public enum Tell {
             steps += 1
             let u = uArr.item(Int.self)
             var ts = now()
-            let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: Swift.min(maxK, safeMaxK), minMatch: minMatch)
+            let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: Swift.min(maxK, safeMaxK), minMatch: minMatch,
+                                     traceAlts: acceptTrace)
             let D = drafts.count
             draftTot += D
             if prof { tDraft += now() - ts; ts = now() }
             if D == 0 {                                          // 一致なし → 通常 greedy 1 step（pending は fold）
+                if acceptTrace { atDraftless += 1 }
                 try advanceSingle(u)
                 if prof { tVerify += now() - ts }
                 continue
@@ -401,6 +408,7 @@ public enum Tell {
                 break                                            // union≤C=fit → accept へ
             }
             if singleFallback {                                  // 安全 prefix が 1 未満 → single-token（pending は fold）
+                if acceptTrace { atSingleFB += 1 }
                 try advanceSingle(u)
                 if prof { tVerify += now() - ts }
                 continue
@@ -425,6 +433,21 @@ public enum Tell {
             // commit する境界 token は常に row p 由来（draft 低 margin 停止・mismatch reject・bonus row
             //   の全ケース共通）→ margins[p] ≤ τ なら未認定 = sequential replay で確定。
             let certStop = margins[p] <= certTau
+            if acceptTrace {
+                atHist[p, default: 0] += 1
+                if p < D2 {
+                    if curDrafts[p] != evals[p] {                 // true draft mismatch (fork)
+                        atMismatch += 1
+                        let alt = p < Tell.lastDraftAlts.count ? Tell.lastDraftAlts[p] : -1
+                        if alt >= 0 {
+                            atAltExist += 1
+                            if alt == evals[p] { atAltHit += 1 }  // 2nd choice would have caught it
+                        }
+                    } else {
+                        atCertStop += 1                           // stopped by low margin only
+                    }
+                }
+            }
             out.append(u); hist.append(u)
             for i in 0 ..< p { out.append(curDrafts[i]); hist.append(curDrafts[i]) }
             accTok += p
@@ -481,6 +504,11 @@ public enum Tell {
                 "[SuffixSpec-PROF/step] draft(lookup)=%.2f verify=%.1f (ms)  draft長平均=%.1f  steps=%d\n",
                 Double(tDraft)/s/1e6, Double(tVerify)/s/1e6, Double(draftTot)/s, steps).data(using: .utf8)!)
         }
+        if acceptTrace {
+            let histStr = atHist.keys.sorted().map { "\($0):\(atHist[$0]!)" }.joined(separator: ",")
+            print("[AcceptTrace] steps=\(steps) draftless=\(atDraftless) singleFB=\(atSingleFB) acceptHist=\(histStr) "
+                  + "mismatch=\(atMismatch) alt2exist=\(atAltExist) alt2hit=\(atAltHit) certStopOnly=\(atCertStop)")
+        }
         let ovTag = overflowCount > 0 ? "  [union-overflow guard: \(overflowCount) step re-verify/fallback]" : ""
         let certTag = String(format: "  cert-fallback=%d(%d fwd) commit(cert=%d/replay=%d)",
                              certFallbacks, certReplayFwd, certCommitted, replayCommitted)
@@ -526,9 +554,16 @@ public enum Tell {
     nonisolated(unsafe) static var reuseForks = 0   // votes with >1 distinct candidate
     nonisolated(unsafe) static var reuseFlips = 0   // votes where rerank picked ≠ count-majority
 
+    // QWISP_ACCEPT_TRACE diag: per-position runner-up token of the last draft (-1 = no 2nd
+    // candidate at that vote). Filled only when suffixDraft(traceAlts: true); measures the
+    // k=2-parallel-draft prize ("would the 2nd choice have caught the mismatch?").
+    nonisolated(unsafe) static var lastDraftAlts: [Int] = []
+
     static func suffixDraft(_ seq: [Int], maxMatch: Int, draftK: Int, minMatch: Int,
-                            reuseCtx: (ctx: ReuseContext, residentPerLayer: [Set<Int>], alpha: Double)? = nil) -> [Int] {
+                            reuseCtx: (ctx: ReuseContext, residentPerLayer: [Set<Int>], alpha: Double)? = nil,
+                            traceAlts: Bool = false) -> [Int] {
         let n = seq.count
+        if traceAlts { lastDraftAlts = [] }
         if n < minMatch + 1 { return [] }
         var m = Swift.min(maxMatch, n - 1)
         while m >= minMatch {
@@ -559,6 +594,7 @@ public enum Tell {
                     var best = -1
                     var bestWeight = -1.0   // counts >= 1, so any valid token beats this
                     var countBest = -1, countBestCnt = 0   // diag: what pure count-majority would pick
+                    var second = -1, secondWeight = -1.0   // traceAlts diag: runner-up token
                     for k in 0 ..< alive.count {
                         let t = next[k]
                         guard t >= 0, let c = counts[t] else { continue }
@@ -568,7 +604,12 @@ public enum Tell {
                         } else {
                             w = Double(c)
                         }
-                        if w > bestWeight { best = t; bestWeight = w }
+                        if w > bestWeight {
+                            if best >= 0 && best != t { second = best; secondWeight = bestWeight }
+                            best = t; bestWeight = w
+                        } else if t != best && w > secondWeight {
+                            second = t; secondWeight = w
+                        }
                         if c > countBestCnt { countBest = t; countBestCnt = c }
                     }
                     // diag counters (reuseCtx runs only): fork = >1 distinct candidate, flip = rerank changed pick
@@ -578,6 +619,7 @@ public enum Tell {
                         if best != countBest { reuseFlips += 1 }
                     }
                     if best < 0 { break }                      // 全 alive が末尾到達
+                    if traceAlts { lastDraftAlts.append(second) }
                     draft.append(best)
                     var kept: [Int] = []
                     for k in 0 ..< alive.count where next[k] == best { kept.append(alive[k]) }
