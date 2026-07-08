@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 75
+        let total = 76
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4437,6 +4437,88 @@ public enum RawVerifyTests {
             if headA.len != nPairs || headB.len != nPairs {
                 return (false, "len changed after draftArgmax: A=\(headA.len) B=\(headB.len)")
             }
+
+            return (true, "ok")
+        }
+
+        // Test 76 (T-seam, ①③ Step 4): RawSpecRunner.mtpDraftSpan — the D==0 draft seam.
+        // (a) head nil (QWISP_MTP_DRAFT unset) → nil: the greedy path is untouched =
+        //     flag-off byte-identity by construction.
+        // (b) rowOfU < 0 (invalid hidden row, e.g. after a chained span) → nil.
+        // (c) active head → non-nil token in [0,V), and head KV len UNCHANGED through
+        //     the seam (draft is READ-ONLY; feedPairs is the sole writer).
+        // (d) determinism: two identical spans return the same token (read-only ⇒
+        //     same state ⇒ same argmax — a wrong-but-stable draft is lossless because
+        //     verify rejects it; a nondeterministic seam would break rowOfU reasoning).
+        run("mtp_draft_span_seam") {
+            guard let (device, _) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+            // Synthetic head, same real-shape geometry as tests 74/75 (H=2048, gs=64).
+            let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
+            let nH = 16, nKV = 2, hD = 256, rD = 64
+            let gs = 64
+            func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([e, n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            let (embedWq, embedSc, embedBi) = q4(V, H)
+            let (swGWq, swGSc, swGBi) = q4e(E, I, H)
+            let (swUWq, swUSc, swUBi) = q4e(E, I, H)
+            let (swDWq, swDSc, swDBi) = q4e(E, H, I)
+            let (lmWq, lmSc, lmBi) = q4(V, H)
+            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+                H: H, V: V, E: E, I: I, Ktop: Ktop,
+                numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
+                ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
+                expertGroupSize: gs,
+                fc: f16([H, 2 * H]),
+                qW: f16([nH * 2 * hD, H]), kW: f16([nKV * hD, H]),
+                vW: f16([nKV * hD, H]), oW: f16([H, nH * hD]),
+                routerGate: f16([E, H]),
+                shGate: f16([I, H]), shUp: f16([I, H]), shDown: f16([H, I]),
+                sharedGate: f16([1, H]),
+                preEmb: f16([H]), preHid: f16([H]), inputLN: f16([H]), postLN: f16([H]),
+                qNorm: f16([hD]), kNorm: f16([hD]), finalNorm: f16([H]),
+                embedWq: embedWq, embedSc: embedSc, embedBi: embedBi,
+                swGWq: swGWq, swGSc: swGSc, swGBi: swGBi,
+                swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
+                swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
+                lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
+            guard let head = RawFusedVerify.RawMTPHead(spec: spec) else {
+                return (false, "head init nil")
+            }
+            // Fake normed buffer: 4 rows, hidden of u at row 2.
+            let hRows = (MLXRandom.normal([4, H]) * 0.05).asType(.float16); hRows.eval()
+            guard let hBuf = RawMetalForward.mtlBuf(hRows, device) else {
+                return (false, "hBuf nil")
+            }
+            let u = 7
+
+            // (a) flag-off: head nil → nil
+            if RawSpecRunner.mtpDraftSpan(head: nil, hPrevBuf: hBuf, rowOfU: 2, u: u) != nil {
+                return (false, "(a) head nil must yield nil")
+            }
+            // (b) invalid row → nil
+            if RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: -1, u: u) != nil {
+                return (false, "(b) rowOfU=-1 must yield nil")
+            }
+            // (c) active: draft token in range, len unchanged
+            guard let d1 = RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            else { return (false, "(c) active span returned nil") }
+            if d1 < 0 || d1 >= V { return (false, "(c) draft out of range: \(d1)") }
+            if head.len != 0 { return (false, "(c) len changed through seam: \(head.len)") }
+            // (d) determinism (read-only ⇒ identical repeat)
+            guard let d2 = RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            else { return (false, "(d) repeat span returned nil") }
+            if d1 != d2 { return (false, "(d) nondeterministic: \(d1) vs \(d2)") }
 
             return (true, "ok")
         }

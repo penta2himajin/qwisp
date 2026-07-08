@@ -12,15 +12,12 @@ import Metal
 /// This is the only gate that exercises the real expert layout (4bit gs=32 vs the
 /// synthetic tests' gs=64) and the real vocab-sized lm_head.
 public enum RawMTPValidate {
-    public static func run(modelDir: String) throws -> String {
+    /// Build the production WeightsSpec from mtp.safetensors + shared embed/lm_head
+    /// (store must have residentNonExperts or residentAll done). Shared by the
+    /// validate gate below and the run() draft-head wiring (①③ Step 4).
+    public static func loadSpec(modelDir: String, store: WeightStore, maxSeqLen: Int = 256) throws
+        -> RawFusedVerify.RawMTPHead.WeightsSpec {
         let H = 2048
-        guard let (device, _) = RawMetalForward.ensure() else { return "[mtp-raw] no device" }
-
-        // MLX reference = production MTPHead (loads + recovers norms itself)
-        let store = try WeightStore(modelDir: modelDir)
-        store.residentNonExperts()
-        let mlxHead = try MTPHead(modelDir: modelDir, store: store)
-
         // Raw head from the same arrays (mirror MTPHead.init recovery exactly)
         let url = URL(fileURLWithPath: modelDir).appendingPathComponent("mtp.safetensors")
         let w = try loadArrays(url: url)
@@ -37,10 +34,10 @@ public enum RawMTPValidate {
         let lmB = store.req("language_model.lm_head.biases")
         let V = lmW.dim(0)
 
-        let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+        return RawFusedVerify.RawMTPHead.WeightsSpec(
             H: H, V: V, E: 256, I: 512, Ktop: 8,
             numHeads: 16, numKV: 2, headDim: 256, ropeDim: 64,
-            ropeBase: 1e7, eps: 1e-6, maxSeqLen: 256,
+            ropeBase: 1e7, eps: 1e-6, maxSeqLen: maxSeqLen,
             expertGroupSize: 32,
             fc: g("fc.weight"),
             qW: g("layers.0.self_attn.q_proj.weight"),
@@ -67,6 +64,19 @@ public enum RawMTPValidate {
             swDWq: stackE("down_proj", "weight"), swDSc: stackE("down_proj", "scales"),
             swDBi: stackE("down_proj", "biases"),
             lmWq: lmW, lmSc: lmS, lmBi: lmB)
+    }
+
+    public static func run(modelDir: String) throws -> String {
+        let H = 2048
+        guard let (device, _) = RawMetalForward.ensure() else { return "[mtp-raw] no device" }
+
+        // MLX reference = production MTPHead (loads + recovers norms itself)
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentNonExperts()
+        let mlxHead = try MTPHead(modelDir: modelDir, store: store)
+
+        let spec = try loadSpec(modelDir: modelDir, store: store)
+        let V = spec.V
         guard let raw = RawFusedVerify.RawMTPHead(spec: spec) else { return "[mtp-raw] init nil" }
 
         // Probes: both sides walk the same growing KV history.

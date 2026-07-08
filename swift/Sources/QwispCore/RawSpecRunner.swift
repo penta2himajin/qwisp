@@ -120,6 +120,13 @@ public enum RawSpecRunner {
     /// fused backend(1-CB step: embed→40層→final norm→lm_head→argmax、readback は token id のみ。
     /// rollback は KV len 巻き戻し+ping-pong swap)。
     static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
+        return fusedBackendWithFwd(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)?.0
+    }
+
+    /// fusedBackend + 内部 RawFusedForward の handle も返す変種(MTP-D1 draft が
+    /// normedBuffer を GPU-bind するために必要。streamingBackend と同形)。
+    static func fusedBackendWithFwd(engine: RawEngine, maxM: Int, maxSeqLen: Int)
+        -> (SpecBackend, RawFusedVerify.RawFusedForward)? {
         guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
         let forward: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
@@ -144,7 +151,7 @@ public enum RawSpecRunner {
         if fwd.head != nil {
             backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
         }
-        return backend
+        return (backend, fwd)
     }
 
     /// streaming fused backend(strict segmented per-layer CB)。
@@ -221,6 +228,25 @@ public enum RawSpecRunner {
         let emitted = [u] + Array(chainResult[0 ..< tailEnd])
         let nextU = chainResult.last!
         return (emitted: emitted, nextU: nextU)
+    }
+
+    // ── MTP-D1 draft seam (①③ Step 4, notes/17) ─────────────────────────
+    //
+    // Fills the suffix-draftless (D==0) span with a 1-token draft from the raw
+    // MTPHead, mirroring Tell.swift's D==0 MTP block. The draft is verified by
+    // the normal batched-verify path, so any wrong draft is rejected → lossless
+    // by construction. Contract:
+    //   • head nil (QWISP_MTP_DRAFT unset / non-resident tier) → nil, caller keeps
+    //     the pre-existing greedy path → flag-off byte-identity by construction.
+    //   • rowOfU < 0 (no valid hidden row, e.g. after a chained span) → nil.
+    //   • Otherwise: head.draftArgmax on normed row `rowOfU` (the post-final-norm
+    //     hidden that produced u — Step 2 normedBuffer accessor, VOLATILE: valid
+    //     only until the next forward). READ-ONLY on head KV (len unchanged,
+    //     locked test 75); feedPairs (Step 5) is the sole writer.
+    static func mtpDraftSpan(head: RawFusedVerify.RawMTPHead?, hPrevBuf: MTLBuffer?,
+                             rowOfU: Int, u: Int) -> Int? {
+        guard let head, let hPrevBuf, rowOfU >= 0 else { return nil }
+        return head.draftArgmax(hPrevBuf: hPrevBuf, hPrevRow: rowOfU, tok: Int32(u))
     }
 
     // ── Prefill helper ────────────────────────────────────────────────────
@@ -447,6 +473,8 @@ public enum RawSpecRunner {
             }
         }
         // Build main backend; for streaming, capture fwd/providers for optional rerank.
+        // For resident fused, capture fwd for the MTP-D1 draft head (normedBuffer bind).
+        var _residentFwd: RawFusedVerify.RawFusedForward? = nil
         let backend: SpecBackend
         if isStreaming {
             guard let (b, fwd, providers) = streamingBackend(engine: engine, modelDir: modelDir,
@@ -455,10 +483,31 @@ public enum RawSpecRunner {
             _reuseStreamFwd = fwd
             _reuseStreamProviders = providers
             backend = b
+        } else if useFused {
+            guard let (b, fwd) = fusedBackendWithFwd(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)
+            else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
+            _residentFwd = fwd
+            backend = b
         } else {
             guard let b = mkBackend()
             else { return "[raw-spec] ERROR: backend init nil (fused=\(useFused), streaming=\(isStreaming))" }
             backend = b
+        }
+
+        // ── MTP-D1 raw draft head (①③ Step 4, notes/17) ───────────────────
+        // Opt-in QWISP_MTP_DRAFT=1, resident fused tier only (C>=nE — mirrors
+        // Tell.swift:105). Flag off / other tiers → mtpHead=nil → the loop below is
+        // byte-identical to pre-change (seam contract, mtpDraftSpan).
+        var mtpHead: RawFusedVerify.RawMTPHead? = nil
+        if Tell.envFlag("QWISP_MTP_DRAFT"), let _ = _residentFwd {
+            if let spec = try? RawMTPValidate.loadSpec(modelDir: modelDir, store: store,
+                                                       maxSeqLen: maxSeqLen),
+               let h = RawFusedVerify.RawMTPHead(spec: spec) {
+                mtpHead = h
+                print("[raw-spec] MTP-D1 raw draft head active (maxSeqLen=\(maxSeqLen))")
+            } else {
+                print("[raw-spec] WARN: QWISP_MTP_DRAFT set but raw head init failed → drafts off")
+            }
         }
 
         // reuse-rerank setup (flag-off = zero-cost nil path, notes/10 §1c-1e)
@@ -498,6 +547,13 @@ public enum RawSpecRunner {
         var pending: [Int] = []  // A3: tokens committed but not yet realized in cache
         // pendingCap = 24 (already declared above for maxM computation)
 
+        // MTP-D1: row (in the most recent forward's normed buffer) of the hidden that
+        // produced the current u. Invariant: last row of the most recent forward
+        // (A3-reject exception: verify rows survive rollback, row = pk+p).
+        // -1 = invalid (draft seam disabled until the next tracked forward).
+        // Prefill chunk=64 → last chunk's final row is (pLen-1) % 64.
+        var rowOfU = (promptIds.count - 1) % 64
+
         // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
         // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
         // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
@@ -510,9 +566,18 @@ public enum RawSpecRunner {
                 let resPerLayer = _reuseStreamProviders?.map { Set($0.cache.slotOf.keys) } ?? []
                 return (ctx: _reuseCtx, residentPerLayer: resPerLayer, alpha: _reuseAlpha)
             }() : nil
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4,
+            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4,
                                           reuseCtx: _reuseArg)
-            let D      = drafts.count
+            var D      = drafts.count
+
+            // ★ MTP-D1 (Step 4): suffix-draftless かつ pending 空 → raw head の 1-token draft。
+            //   下の verify path が必ず照合する(reject 経路は greedy と同一 token 列)ので lossless。
+            //   flag off = mtpHead nil = mtpDraftSpan nil = このブロック不変(byte-identity)。
+            if D == 0, mtpHead != nil, pending.isEmpty,
+               let d = mtpDraftSpan(head: mtpHead, hPrevBuf: _residentFwd?.normedBuffer,
+                                    rowOfU: rowOfU, u: u) {
+                drafts = [d]; D = 1
+            }
 
             // Snapshot before the batched verify (backend-specific representation).
             var snap = backend.snapshot()
@@ -531,6 +596,9 @@ public enum RawSpecRunner {
                             out.append(chainResult[i]); hist.append(chainResult[i])
                         }
                         u = chainResult[chainResult.count - 1]
+                        // ponytail: normed-row state after a chained CB is unverified → disable
+                        // the draft seam until the next tracked forward re-establishes it.
+                        rowOfU = -1
                         steps += 1; continue
                     }
                     // chain returned nil (e.g. strict mode) → fall through to per-step
@@ -542,6 +610,7 @@ public enum RawSpecRunner {
                     guard let evals = backend.stepArgmax(stepTokens)
                     else { return "[raw-spec] ERROR: A3 step(D=0) nil" }
                     out.append(u); hist.append(u)
+                    rowOfU = pending.count    // u = evals[pk] ← row pk (last row)
                     u = evals[pending.count]  // argmax at position pk (where u is)
                     pending = []
                 } else {
@@ -551,6 +620,7 @@ public enum RawSpecRunner {
                     else { return "[raw-spec] ERROR: step(D=0) nil" }
                     out.append(u); hist.append(u)
                     u = evals[0]
+                    rowOfU = 0
                 }
                 steps += 1
                 continue
@@ -580,6 +650,7 @@ public enum RawSpecRunner {
                     steps  += 1
                     pending = []
                     u = evals[pk + D]
+                    rowOfU = pk + D           // last row of the verify forward
                 } else {
                     // ── A3 partial reject: rollback to B, re-add to pending ────
                     backend.rollback(snap)
@@ -591,6 +662,7 @@ public enum RawSpecRunner {
                     pending.append(u)
                     for d in drafts.prefix(p) { pending.append(d) }
                     u = evals[pk + p]
+                    rowOfU = pk + p           // rollback leaves normed intact → verify row pk+p
 
                     // Cap flush: only if pending exceeds 24 (safety to bound M)
                     if pending.count >= pendingCap {
@@ -598,6 +670,8 @@ public enum RawSpecRunner {
                         if _useRerank { _reuseVerifyToks = [] }
                         guard let _ = backend.forward(pendingTokens)
                         else { return "[raw-spec] ERROR: A3 pending flush nil" }
+                        // flush realizes pending; its last row's hidden is u's predecessor
+                        rowOfU = pendingTokens.count - 1
                         pending = []
                     }
                 }
@@ -618,6 +692,7 @@ public enum RawSpecRunner {
                     accTok += D
                     steps  += 1
                     u = evals[D]
+                    rowOfU = D                // last row of the verify forward
                 } else {
                     // ── partial reject ────────────────────────────────────
                     backend.rollback(snap)
@@ -630,6 +705,7 @@ public enum RawSpecRunner {
                     guard let _ = backend.forward(rebuildTokens)
                     else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
                     u = evals[p]
+                    rowOfU = p                // last row of the rebuild forward
                 }
             }
         }
