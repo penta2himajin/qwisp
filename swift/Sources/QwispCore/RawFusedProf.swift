@@ -25,8 +25,8 @@ public enum RawFusedProf {
         func nowMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
         var out = "[raw-fused-prof] resident raw fused engine (prompt=\(prompt.count), warm=\(warmPrompt.count))"
 
-        // M=1 decode 定常: wall と GPU-exec を分離
-        for M in [1, 8, 17] {
+        // M=1 decode 定常: wall と GPU-exec を分離(M=2 は D1 go/no-go gate の実測点)
+        for M in [1, 2, 8, 17] {
             let toks = (0 ..< M).map { _ -> Int32 in let v = cur; return v }   // 同一 token M 個(profile 用, cache は伸びる)
             for _ in 0 ..< 5 { _ = fwd.stepArgmax(toks) }                        // warm
             let reps = M == 1 ? 60 : 20
