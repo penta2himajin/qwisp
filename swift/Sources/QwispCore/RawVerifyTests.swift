@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 73
+        let total = 75
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4127,6 +4127,319 @@ public enum RawVerifyTests {
             return (true, "ok")
         }
 
+        // Test 74 (T-head): RawMTPHead end-to-end draft vs production MLX class composition.
+        // Real-shape synthetic: H=2048, V=256, E=16, Ktop=8, I=512, nH=16, nKV=2, hD=256, rD=64.
+        // WeightsSpec injection (seed-trick impossible: weights arrive as MLXArray, not regenerated
+        // inside the impl).  Reference = AttentionLayer(.plain) + MoEBlock(expertGroupSize:64) +
+        // ModelHead.embed + Proj.quantized composed exactly as MTPHead.callWithHidden:73-90.
+        // Assert (a) len=0 single draft matches MLX argmax.
+        // Assert (b) after feedPairs 2 pairs, raw draft == MLX reference with KVCache history.
+        // Assert (c) re-draft after (b) returns same token and len is unchanged (READ-ONLY proof).
+        // RED: init?(spec:) returns nil → "STUB not implemented" FAIL on all three asserts.
+        run("mtp_head_vs_mlx_ref") {
+            guard let (device, _) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+
+            // ── Geometry ─────────────────────────────────────────────────
+            let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
+            let nH = 16, nKV = 2, hD = 256, rD = 64
+            let gs = 64   // expertGroupSize for synthetic (spec §T-74)
+            let eps: Float = 1e-6
+            let ropeBase: Float = 1e7
+
+            // ── Weight helpers ────────────────────────────────────────────
+            func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([e, n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            // Plain F16 proj weights  [out, in] row-major
+            let fcW  = f16([H, 2 * H])          // fc [H, 2H]
+            let qW   = f16([nH * 2 * hD, H])    // q+gate qd2 format
+            let kW   = f16([nKV * hD, H])
+            let vW   = f16([nKV * hD, H])
+            let oW   = f16([H, nH * hD])
+            let gateW = f16([E, H])              // router gate
+            let shGW  = f16([I, H]); let shUW = f16([I, H]); let shDW = f16([H, I])
+            let sharedGW = f16([1, H])           // shared_expert_gate [1,H]
+            // Norms F16 (already RECOVERED — no +1 shift needed in tests)
+            let preEmb = f16([H]); let preHid = f16([H])
+            let inputLN = f16([H]); let postLN = f16([H])
+            let qNorm = f16([hD]); let kNorm = f16([hD]); let finalNorm = f16([H])
+            // 4-bit quantized triples
+            let (embedWq, embedSc, embedBi) = q4(V, H)            // embed [V,H]
+            let (swGWq, swGSc, swGBi) = q4e(E, I, H)
+            let (swUWq, swUSc, swUBi) = q4e(E, I, H)
+            let (swDWq, swDSc, swDBi) = q4e(E, H, I)
+            let (lmWq, lmSc, lmBi) = q4(V, H)                     // lm_head [V,H]
+
+            MLX.eval([fcW, qW, kW, vW, oW, gateW, shGW, shUW, shDW, sharedGW,
+                      preEmb, preHid, inputLN, postLN, qNorm, kNorm, finalNorm,
+                      embedWq, embedSc, embedBi, swGWq, swGSc, swGBi,
+                      swUWq, swUSc, swUBi, swDWq, swDSc, swDBi, lmWq, lmSc, lmBi])
+
+            // ── WeightsSpec ───────────────────────────────────────────────
+            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+                H: H, V: V, E: E, I: I, Ktop: Ktop,
+                numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
+                ropeBase: ropeBase, eps: eps, maxSeqLen: 128,
+                expertGroupSize: gs,
+                fc: fcW,
+                qW: qW, kW: kW, vW: vW, oW: oW,
+                routerGate: gateW,
+                shGate: shGW, shUp: shUW, shDown: shDW, sharedGate: sharedGW,
+                preEmb: preEmb, preHid: preHid, inputLN: inputLN, postLN: postLN,
+                qNorm: qNorm, kNorm: kNorm, finalNorm: finalNorm,
+                embedWq: embedWq, embedSc: embedSc, embedBi: embedBi,
+                swGWq: swGWq, swGSc: swGSc, swGBi: swGBi,
+                swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
+                swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
+                lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
+
+            // RED: stub returns nil
+            guard let head = RawFusedVerify.RawMTPHead(spec: spec) else {
+                return (false, "init? nil (STUB not implemented)")
+            }
+
+            // ── MLX reference: production class composition (MTPHead:73-90) ──
+            // Mirrors callWithHidden exactly: embed → preNorm → fc → attn(KVCache) → MoE → finalNorm → lm_head.
+            let attnMLX = AttentionLayer(
+                numHeads: nH, numKVHeads: nKV, headDim: hD, ropeDim: rD,
+                ropeBase: ropeBase, eps: eps,
+                qProj: .plain(qW),
+                kProj: .plain(kW),
+                vProj: .plain(vW),
+                oProj: .plain(oW),
+                qNorm: qNorm,
+                kNorm: kNorm)
+            let moeMLX = MoEBlock(
+                topK: Ktop, numExperts: E, normTopk: true, expertBits: 4,
+                expertGroupSize: gs,
+                gate: .plain(gateW),
+                swGateW: swGWq, swGateS: swGSc, swGateB: swGBi,
+                swUpW: swUWq, swUpS: swUSc, swUpB: swUBi,
+                swDownW: swDWq, swDownS: swDSc, swDownB: swDBi,
+                shGate: .plain(shGW), shUp: .plain(shUW), shDown: .plain(shDW),
+                sharedGate: .plain(sharedGW))
+            // lm_head proj
+            let lmHead = Proj.quantized(lmWq, lmSc, lmBi, 4)
+
+            // Forward function: hPrev [1,1,H] f16, tok Int32 → argmax Int
+            // KVCache is caller-supplied (nil for no history).
+            func mlxDraft(_ hPrev: MLXArray, tok: Int32, cache: KVCache?) -> Int {
+                let tokArr = MLXArray([tok], [1, 1])
+                let emb = ModelHead.embed(ids: tokArr, weight: embedWq, scales: embedSc,
+                                          biases: embedBi, bits: 4)          // [1,1,H]
+                let e = MLXFast.rmsNorm(emb, weight: preEmb, eps: eps)
+                let hh = MLXFast.rmsNorm(hPrev, weight: preHid, eps: eps)
+                let cat = MLX.concatenated([e, hh], axis: -1)                // [1,1,2H]
+                var x = MLX.matmul(cat, fcW.transposed())                    // [1,1,H]
+                let r = attnMLX(MLXFast.rmsNorm(x, weight: inputLN, eps: eps), cache: cache)
+                x = x + r
+                let B = x.dim(0), L = x.dim(1), Hd = x.dim(2)
+                let post = MLXFast.rmsNorm(x, weight: postLN, eps: eps)
+                x = x + moeMLX(post.reshaped([B * L, Hd])).reshaped([B, L, Hd])
+                let normed = MLXFast.rmsNorm(x, weight: finalNorm, eps: eps)
+                let logits = lmHead.apply(normed)                             // [1,1,V]
+                logits.eval()
+                return MLX.argMax(logits[0, 0], axis: -1).item(Int.self)
+            }
+
+            // ── (a) len=0 draft: raw argmax == MLX argmax ────────────────
+            let tok0: Int32 = 42
+            let hPrev0 = MLXRandom.normal([1, 1, H]).asType(.float16); hPrev0.eval()
+            guard let hBuf0 = RawMetalForward.mtlBuf(hPrev0.reshaped([1, H]).asType(.float16), device)
+            else { return (false, "hBuf0 nil") }
+
+            guard let rawDraft0 = head.draftArgmax(hPrevBuf: hBuf0, hPrevRow: 0, tok: tok0)
+            else { return (false, "draftArgmax nil len=0 (STUB not implemented)") }
+
+            let refDraft0 = mlxDraft(hPrev0, tok: tok0, cache: nil)
+            if rawDraft0 != refDraft0 {
+                return (false, "(a) len=0 draft mismatch: raw=\(rawDraft0) ref=\(refDraft0)")
+            }
+            if head.len != 0 {
+                return (false, "(a) len must be 0 after draftArgmax (READ-ONLY violated): len=\(head.len)")
+            }
+
+            // ── (b) feedPairs 2 pairs → draft with KV history ────────────
+            // Build hBuf for 2 feed rows [2, H] f16.
+            let hFeed = MLXRandom.normal([2, H]).asType(.float16); hFeed.eval()
+            let toks2: [Int32] = [7, 19]
+            guard let hBufFeed = RawMetalForward.mtlBuf(hFeed, device)
+            else { return (false, "hBufFeed nil") }
+
+            // Feed 2 pairs into raw head.
+            let feedOK = head.feedPairs(hBuf: hBufFeed, rowRange: 0..<2, toks: toks2)
+            if !feedOK { return (false, "(b) feedPairs returned false (STUB not implemented)") }
+            if head.len != 2 { return (false, "(b) len must be 2 after feedPairs: got \(head.len)") }
+
+            // MLX reference: build KVCache by feeding same 2 pairs sequentially.
+            // Each pair: embed(tok) + hPrev row → attn with KVCache writes → KV grows.
+            // This mirrors feedPairs semantics: lm_head skipped, KV committed.
+            let refCache = KVCache()
+            for i in 0..<2 {
+                let hRow = hFeed[i ..< i+1].reshaped([1, 1, H])
+                _ = mlxDraft(hRow, tok: toks2[i], cache: refCache)
+            }
+
+            // Now raw draft at len=2 must match MLX draft with same KV history.
+            let tok1: Int32 = 99
+            let hPrev1 = MLXRandom.normal([1, 1, H]).asType(.float16); hPrev1.eval()
+            guard let hBuf1 = RawMetalForward.mtlBuf(hPrev1.reshaped([1, H]).asType(.float16), device)
+            else { return (false, "hBuf1 nil") }
+
+            guard let rawDraft1 = head.draftArgmax(hPrevBuf: hBuf1, hPrevRow: 0, tok: tok1)
+            else { return (false, "(b) draftArgmax nil after feedPairs (STUB not implemented)") }
+
+            let refDraft1 = mlxDraft(hPrev1, tok: tok1, cache: refCache)
+            if rawDraft1 != refDraft1 {
+                return (false, "(b) post-feed draft mismatch: raw=\(rawDraft1) ref=\(refDraft1)")
+            }
+            let lenAfterDraft1 = head.len
+            if lenAfterDraft1 != 2 {
+                return (false, "(b) len changed after draftArgmax: want 2 got \(lenAfterDraft1)")
+            }
+
+            // ── (c) re-draft: same token, len unchanged ───────────────────
+            guard let rawDraft1b = head.draftArgmax(hPrevBuf: hBuf1, hPrevRow: 0, tok: tok1)
+            else { return (false, "(c) re-draft nil (STUB not implemented)") }
+            if rawDraft1b != rawDraft1 {
+                return (false, "(c) re-draft mismatch: first=\(rawDraft1) second=\(rawDraft1b)")
+            }
+            if head.len != 2 {
+                return (false, "(c) len changed after re-draft: want 2 got \(head.len)")
+            }
+
+            return (true, "ok")
+        }
+
+        // Test 75 (T-kv): batch feedPairs vs sequential feedPairs produce identical drafts.
+        // Same synthetic geometry as T-head. No MLX reference needed (raw vs raw).
+        // head A: feedPairs(hBuf, rowRange: 0..<3, toks: 3) — batch ingest.
+        // head B: feedPairs 3 × (rowRange: i..<i+1, toks: [toks[i]]) — sequential ingest.
+        // Assert: draftArgmax(same hPrev, tok) agrees for A and B, and both report len==3.
+        // Exercises rope position writing: each pair maps to a distinct position, so any
+        // position-index bug (e.g., all rows landing at position 0) would produce different
+        // attention and diverge. RED: init? nil → "STUB not implemented" FAIL.
+        run("mtp_kv_batch_vs_sequential") {
+            guard let (device, _) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+
+            let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
+            let nH = 16, nKV = 2, hD = 256, rD = 64
+            let gs = 64
+            let eps: Float = 1e-6
+            let ropeBase: Float = 1e7
+
+            // Shared weight construction (same idiom as T-head).
+            func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([e, n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            let fcW  = f16([H, 2 * H])
+            let qW   = f16([nH * 2 * hD, H])
+            let kW   = f16([nKV * hD, H])
+            let vW   = f16([nKV * hD, H])
+            let oW   = f16([H, nH * hD])
+            let gateW = f16([E, H])
+            let shGW  = f16([I, H]); let shUW = f16([I, H]); let shDW = f16([H, I])
+            let sharedGW = f16([1, H])
+            let preEmb = f16([H]); let preHid = f16([H])
+            let inputLN = f16([H]); let postLN = f16([H])
+            let qNorm = f16([hD]); let kNorm = f16([hD]); let finalNorm = f16([H])
+            let (embedWq, embedSc, embedBi) = q4(V, H)
+            let (swGWq, swGSc, swGBi) = q4e(E, I, H)
+            let (swUWq, swUSc, swUBi) = q4e(E, I, H)
+            let (swDWq, swDSc, swDBi) = q4e(E, H, I)
+            let (lmWq, lmSc, lmBi) = q4(V, H)
+
+            MLX.eval([fcW, qW, kW, vW, oW, gateW, shGW, shUW, shDW, sharedGW,
+                      preEmb, preHid, inputLN, postLN, qNorm, kNorm, finalNorm,
+                      embedWq, embedSc, embedBi, swGWq, swGSc, swGBi,
+                      swUWq, swUSc, swUBi, swDWq, swDSc, swDBi, lmWq, lmSc, lmBi])
+
+            func makeSpec() -> RawFusedVerify.RawMTPHead.WeightsSpec {
+                RawFusedVerify.RawMTPHead.WeightsSpec(
+                    H: H, V: V, E: E, I: I, Ktop: Ktop,
+                    numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
+                    ropeBase: ropeBase, eps: eps, maxSeqLen: 128,
+                    expertGroupSize: gs,
+                    fc: fcW,
+                    qW: qW, kW: kW, vW: vW, oW: oW,
+                    routerGate: gateW,
+                    shGate: shGW, shUp: shUW, shDown: shDW, sharedGate: sharedGW,
+                    preEmb: preEmb, preHid: preHid, inputLN: inputLN, postLN: postLN,
+                    qNorm: qNorm, kNorm: kNorm, finalNorm: finalNorm,
+                    embedWq: embedWq, embedSc: embedSc, embedBi: embedBi,
+                    swGWq: swGWq, swGSc: swGSc, swGBi: swGBi,
+                    swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
+                    swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
+                    lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
+            }
+
+            // Two independent heads with identical weights.
+            guard let headA = RawFusedVerify.RawMTPHead(spec: makeSpec()),
+                  let headB = RawFusedVerify.RawMTPHead(spec: makeSpec()) else {
+                return (false, "init? nil (STUB not implemented)")
+            }
+
+            // Feed data: 3 rows.
+            let nPairs = 3
+            let hFeed = MLXRandom.normal([nPairs, H]).asType(.float16); hFeed.eval()
+            let toks: [Int32] = [3, 11, 27]
+            guard let hBufFeed = RawMetalForward.mtlBuf(hFeed, device)
+            else { return (false, "hBufFeed nil") }
+
+            // head A: batch ingest all 3 at once.
+            let okA = headA.feedPairs(hBuf: hBufFeed, rowRange: 0..<nPairs, toks: toks)
+            if !okA { return (false, "headA feedPairs batch failed (STUB not implemented)") }
+            if headA.len != nPairs { return (false, "headA len=\(headA.len) want \(nPairs)") }
+
+            // head B: sequential ingest 1 row at a time.
+            for i in 0..<nPairs {
+                let ok = headB.feedPairs(hBuf: hBufFeed, rowRange: i..<(i+1), toks: [toks[i]])
+                if !ok { return (false, "headB feedPairs seq i=\(i) failed (STUB not implemented)") }
+            }
+            if headB.len != nPairs { return (false, "headB len=\(headB.len) want \(nPairs)") }
+
+            // Draft from both heads must agree.
+            let tokQ: Int32 = 55
+            let hQ = MLXRandom.normal([1, H]).asType(.float16); hQ.eval()
+            guard let hBufQ = RawMetalForward.mtlBuf(hQ, device)
+            else { return (false, "hBufQ nil") }
+
+            guard let draftA = headA.draftArgmax(hPrevBuf: hBufQ, hPrevRow: 0, tok: tokQ)
+            else { return (false, "headA draftArgmax nil (STUB not implemented)") }
+            guard let draftB = headB.draftArgmax(hPrevBuf: hBufQ, hPrevRow: 0, tok: tokQ)
+            else { return (false, "headB draftArgmax nil (STUB not implemented)") }
+
+            if draftA != draftB {
+                return (false, "batch vs sequential draft mismatch: A=\(draftA) B=\(draftB)")
+            }
+
+            // len must still be nPairs (draftArgmax is READ-ONLY).
+            if headA.len != nPairs || headB.len != nPairs {
+                return (false, "len changed after draftArgmax: A=\(headA.len) B=\(headB.len)")
+            }
+
+            return (true, "ok")
+        }
 
         // ── Summary ───────────────────────────────────────────────────────
         return lines.joined(separator: "\n") + "\nRAWTESTS \(passed)/\(total)"

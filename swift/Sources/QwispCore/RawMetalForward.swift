@@ -4080,6 +4080,96 @@ public enum RawMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
     }
 
+    nonisolated(unsafe) static var _gqmmRowsPipelineGS32: MTLComputePipelineState?
+    /// gqmm4_rows の gs=32 変種(mtp experts は gs=32、safetensors 形状で確証)。
+    /// production gs=64 kernel/pipeline は不可触(main-engine experts bit-proven)なので additive に別 compile。
+    /// delta は 3 点のみ: scale stride /64→/32、block 前進 /64→/32、scale_step_per_thread 4→2
+    /// (thread 毎 16 値は group=32 に整列内包: floor(simd_lid*16/32)=simd_lid/2)。他は byte-identical。
+    static func compileGqmmRowsGS32() -> Bool {
+        if _gqmmRowsPipelineGS32 != nil { return true }
+        guard let (device, _) = ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        #define SIMD_SIZE 32
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) {
+                sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                xt[i] = x[i]; xt[i+1] = x[i+1]/16.0f; xt[i+2] = x[i+2]/256.0f; xt[i+3] = x[i+3]/4096.0f;
+            }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                          xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                          xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                          xt[4*i+3] * (float)(ws[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void gqmm4_rows_gs32(device const uint32_t* w      [[buffer(0)]],   // [E, N, K/8]
+                          device const half*     scales [[buffer(1)]],   // [E, N, K/32]
+                          device const half*     biases [[buffer(2)]],
+                          device const half*     x      [[buffer(3)]],   // [M, K]
+                          device const int*      inds   [[buffer(4)]],   // [M*Ktop]
+                          device half*           y      [[buffer(5)]],   // [M*Ktop, N]
+                          constant int& in_vec_size  [[buffer(6)]],
+                          constant int& out_vec_size [[buffer(7)]],
+                          constant int& ktop         [[buffer(8)]],
+                          device const int* stopFlag [[buffer(9)]],
+                          constant uint& lhsPer      [[buffer(10)]],
+                          uint3 tid      [[threadgroup_position_in_grid]],
+                          uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                          uint  simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;
+            constexpr int packs_per_thread = 2, num_simdgroups = 2, results_per_simdgroup = 4;
+            constexpr int pack_factor = 8, bytes_per_pack = 4, values_per_thread = 16;
+            constexpr int block_size = 512, scale_step_per_thread = 2;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[16];
+            thread U result[4] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 32;
+            uint mk = tid.z;
+            uint e = (uint)inds[mk];
+            ws     += (size_t)e * out_vec_size * in_vec_size_w;
+            scales += (size_t)e * out_vec_size * in_vec_size_g;
+            biases += (size_t)e * out_vec_size * in_vec_size_g;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+            y += (size_t)mk * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld16(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U b = bl[0];
+                    result[row] += qd4(wl, x_thread, s, b, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 32; biases += block_size / 32; x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
+        """
+        do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+             _gqmmRowsPipelineGS32 = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm4_rows_gs32")!)
+             return true
+        } catch { print("[raw-gqmm-rows-gs32] compile: \(error)"); return false }
+    }
+
     // ── gqmm3 / gqmm3Rows — 3-bit affine gather-qmv ─────────────────────────────────
     //
     // Port of gqmm4_rows with 3 deltas: ld16_b3 (load_vector<3>), qd3 (qdot<3> w/ *256 straddle),

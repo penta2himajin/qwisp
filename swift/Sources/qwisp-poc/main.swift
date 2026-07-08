@@ -125,6 +125,7 @@ if CommandLine.arguments.contains("stream") {
         ("raw-perf",              { _, _ in RawVerifyTests.runPerfProbe() }),             // D1: per-row 再読コスト probe
         ("raw-smoke",             { try RawSmokeRunner.run(modelDir: $0, refPath: $1) }), // U2a: real-weight A-vs-B bit-exact
         ("raw-spec",              { try RawSpecRunner.run(modelDir: $0, refPath: $1) }),   // U2b: SuffixSpec on raw engine
+        ("mtp-raw-validate",      { md, _ in try RawMTPValidate.run(modelDir: md) }),      // ①③ step3: raw MTPHead vs MLX 実重み gate
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {

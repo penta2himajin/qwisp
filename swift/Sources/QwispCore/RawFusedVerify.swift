@@ -36,8 +36,11 @@ public enum RawFusedVerify {
                                     w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                                     x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
                                     M: Int, Ktop: Int, K: Int, N: Int, lhsPer: Bool,
-                                    xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
-        enc.setComputePipelineState(RawMetalForward._gqmmRowsPipeline!)
+                                    xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0,
+                                    gs: Int = 64) {
+        // gs=32 は mtp experts 専用の additive pipeline(production gs=64 は不変)。
+        enc.setComputePipelineState(gs == 32 ? RawMetalForward._gqmmRowsPipelineGS32!
+                                             : RawMetalForward._gqmmRowsPipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2)
         enc.setBuffer(x, offset: xByteOffset, index: 3)
@@ -104,6 +107,10 @@ public enum RawFusedVerify {
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _routeRowsBiasPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _fmmRowsPipeline: MTLComputePipelineState?  // fmm_rows: out[M,N]=x[M,K]@W[N,K]^T (F16, M-invariant per-thread dot)
+    nonisolated(unsafe) static var _mtpCopyRowPipeline: MTLComputePipelineState?   // mtp_copy_row_f16: extract row[rowOff..rowOff+H) → dst[0..H)
+    nonisolated(unsafe) static var _mtpConcatPipeline: MTLComputePipelineState?    // mtp_concat_f16: concat(a[H], b[H]) → out[2H]
+    /// mtp_argmax_rows: argmax with bi=0 initial (matches MLX argMax NaN behavior: first element wins ties/NaN).
+    nonisolated(unsafe) static var _mtpArgmaxPipeline: MTLComputePipelineState?
     /// M-row route_top8: 各 threadgroup が 1 token の top-8 を独立に選ぶ(route_top8 と同一の
     /// per-token reduction — precise::exp softmax + 決定的 K 回 argmax)。grid.x=M でトークン offset
     /// するだけ → M 不変。MLX argPartition の sync 島を Metal に置換(routing の中間は argPartition と
@@ -4007,22 +4014,80 @@ public enum RawFusedVerify {
         return _fmmRowsPipeline != nil
     }
 
-    /// RawMTPHead: raw Metal MTP draft head (§Step 3). Holds KV cache + weight refs.
-    ///
-    /// Step 3 test-mode: `draftArgmax` reproduces the T-74 MLX reference exactly by
-    /// re-seeding `MLXRandom.seed(99)` and regenerating the same synthetic weights,
-    /// then running the same forward pass with MLX ops. hPrev is read from hPrevBuf.
-    /// Production weight wiring is deferred to Step 4+.
-    /// MTP-D1 raw port §Step 3 (notes/17): raw Metal MTP head.
-    /// Weights are INJECTED (MLXArrays → MTLBuffers at init; production loads mtp.safetensors —
-    /// the loader applies the +1 norm-shift recovery, WeightsSpec carries RECOVERED norms).
-    /// KV discipline (notes/15 §head-sync): draftArgmax reads KV history but NEVER commits
-    /// (len unchanged); feedPairs is the ONLY KV writer (committed pairs only, no rollback).
+    /// Compiles the MTP aux kernels (copy_row, concat, argmax) needed by RawMTPHead.
+    static func ensureMTPAuxPipelines() -> Bool {
+        if _mtpCopyRowPipeline != nil && _mtpConcatPipeline != nil && _mtpArgmaxPipeline != nil { return true }
+        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // Copies H float16 values from src[rowOff..rowOff+H) into dst[0..H).
+        kernel void mtp_copy_row_f16(
+            device const half* src [[buffer(0)]],
+            device half*       dst [[buffer(1)]],
+            constant uint&     rowOff [[buffer(2)]],
+            constant uint&     H     [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid < H) dst[tid] = src[rowOff + tid];
+        }
+        // Concatenates a[0..H) and b[0..H) into out[0..2H).
+        kernel void mtp_concat_f16(
+            device const half* a   [[buffer(0)]],
+            device const half* b   [[buffer(1)]],
+            device half*       out [[buffer(2)]],
+            constant uint&     H   [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid < H) out[tid] = a[tid];
+            else         out[tid] = b[tid - H];
+        }
+        // mtp_argmax_rows: argmax matching MLX argMax NaN semantics.
+        // bi initialised to 0 (not 0x7fffffff) so NaN-only arrays return index 0,
+        // matching MLX Metal argmax which also defaults to the first element on NaN.
+        kernel void mtp_argmax_rows(device const half* logits [[buffer(0)]],
+                                    device int* outIdx [[buffer(1)]],
+                                    constant uint& V [[buffer(2)]],
+                                    uint m [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint tgs [[threads_per_threadgroup]]) {
+            threadgroup float red[256]; threadgroup int redi[256];
+            device const half* row = logits + (size_t)m * V;
+            // ponytail: bi=0 matches MLX argMax NaN behavior (first index on all-NaN)
+            float best = -INFINITY; int bi = 0;
+            for (uint v = tid; v < V; v += tgs) {
+                float lv = (float)row[v];
+                if (lv > best) { best = lv; bi = (int)v; }
+            }
+            red[tid] = best; redi[tid] = bi;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    if (red[tid+s] > red[tid] || (red[tid+s] == red[tid] && redi[tid+s] < redi[tid])) {
+                        red[tid] = red[tid+s]; redi[tid] = redi[tid+s];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) outIdx[m] = redi[0];
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            _mtpCopyRowPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_copy_row_f16")!)
+            _mtpConcatPipeline  = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_concat_f16")!)
+            _mtpArgmaxPipeline  = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_argmax_rows")!)
+        } catch { print("[raw-mtp-aux] compile: \(error)"); return false }
+        return _mtpCopyRowPipeline != nil && _mtpConcatPipeline != nil && _mtpArgmaxPipeline != nil
+    }
+
+    /// RawMTPHead: raw Metal MTP draft head (§Step 3, notes/17).
+    /// Weights are INJECTED via WeightsSpec (MLXArrays → MTLBuffers in init).
+    /// KV discipline: draftArgmax reads KV[0..<len]+self at pos len but does NOT commit (len unchanged).
+    /// feedPairs is the ONLY KV writer.
+    /// No MLX ops in draftArgmax/feedPairs — all compute is Metal kernels via existing encoders.
     public final class RawMTPHead {
-        /// Geometry + weights, MLXArray in / kernel-layout (mirrors LayerSpec idiom).
-        /// q4 triples use the SAME packed layout the existing qmm4/gqmm4/embed kernels consume
-        /// (synthetic tests: gs=64 like the rest of the suite; production mtp experts are
-        /// gs=32 → groupSize must be threaded, real-model validate runner gates it).
+        /// Geometry + injected weights (all MLXArrays; init converts to MTLBuffers).
         public struct WeightsSpec {
             // geometry
             var H: Int, V: Int, E: Int, I: Int, Ktop: Int
@@ -4037,7 +4102,7 @@ public enum RawFusedVerify {
             // norms F16 (RECOVERED values — no +1 shift left to apply)
             var preEmb: MLXArray, preHid: MLXArray, inputLN: MLXArray, postLN: MLXArray
             var qNorm: MLXArray, kNorm: MLXArray, finalNorm: MLXArray
-            // 4bit quantized triples (weight U32-packed, scales/biases f16, gs=64)
+            // 4bit quantized triples (weight U32-packed, scales/biases f16)
             var embedWq: MLXArray, embedSc: MLXArray, embedBi: MLXArray     // [V, H]
             var swGWq: MLXArray, swGSc: MLXArray, swGBi: MLXArray           // [E, I, H]
             var swUWq: MLXArray, swUSc: MLXArray, swUBi: MLXArray           // [E, I, H]
@@ -4045,30 +4110,417 @@ public enum RawFusedVerify {
             var lmWq: MLXArray, lmSc: MLXArray, lmBi: MLXArray              // [V, H]
         }
 
-        /// Committed pair count == KV length (positions 0..<len occupied).
-        public var len: Int { 0 }   // STUB — implementation pending (notes/17)
+        // ── Stored properties ───────────────────────────────────────────────
+        private let device: MTLDevice
+        private let queue: MTLCommandQueue
+        // Geometry
+        private let H: Int, V: Int, E: Int, I: Int, Ktop: Int
+        private let numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int
+        private let ropeBase: Float, eps: Float, maxSeqLen: Int
+        private let expertGS: Int              // 64 synthetic / 32 production (mtp experts)
+        // Weight buffers — F16 plain
+        private let fcBuf: MTLBuffer           // [H, 2H]
+        private let qBuf: MTLBuffer, kBuf: MTLBuffer, vBuf: MTLBuffer, oBuf: MTLBuffer
+        private let routerGateBuf: MTLBuffer   // [E, H]
+        private let shGateBuf: MTLBuffer, shUpBuf: MTLBuffer, shDownBuf: MTLBuffer
+        private let sharedGateBuf: MTLBuffer   // [1, H]
+        // Norm buffers — F16, already RECOVERED
+        private let preEmbBuf: MTLBuffer, preHidBuf: MTLBuffer
+        private let inputLNBuf: MTLBuffer, postLNBuf: MTLBuffer
+        private let qNormBuf: MTLBuffer, kNormBuf: MTLBuffer, finalNormBuf: MTLBuffer
+        // 4bit triple buffers
+        private let embedWBuf: MTLBuffer, embedSBuf: MTLBuffer, embedBBuf: MTLBuffer
+        private let swGWBuf: MTLBuffer, swGSBuf: MTLBuffer, swGBBuf: MTLBuffer
+        private let swUWBuf: MTLBuffer, swUSBuf: MTLBuffer, swUBBuf: MTLBuffer
+        private let swDWBuf: MTLBuffer, swDSBuf: MTLBuffer, swDBBuf: MTLBuffer
+        private let lmWBuf: MTLBuffer, lmSBuf: MTLBuffer, lmBBuf: MTLBuffer
+        // KV cache — [numKV, maxSeqLen, headDim] f16
+        private let kCache: MTLBuffer, vCache: MTLBuffer
+        private var _len: Int = 0
+        // Scratch buffers for M=1 draft/feed operations (shared, sequential access)
+        // named _s_ prefix for scratch
+        private let _sTok: MTLBuffer           // [1] int32 — current token id
+        private let _sEmb: MTLBuffer           // [H] f16 — embed output
+        private let _sEmbN: MTLBuffer          // [H] f16 — rmsNorm(emb, preEmb)
+        private let _sHN: MTLBuffer            // [H] f16 — rmsNorm(hPrevRow, preHid)
+        private let _sCat: MTLBuffer           // [2H] f16 — concat(eN, hN)
+        private let _sX: MTLBuffer             // [H] f16 — fc(cat), residual stream
+        private let _sAN: MTLBuffer            // [H] f16 — rmsNorm(x, inputLN) — attn input
+        private let _sQOut: MTLBuffer          // [numHeads * 2 * headDim] f16 — q+gate (qd2)
+        private let _sKOut: MTLBuffer          // [numKV * headDim] f16 — k proj
+        private let _sVOut: MTLBuffer          // [numKV * headDim] f16 — v proj
+        private let _sQX: MTLBuffer            // [numHeads * headDim] f16 — extract_q output
+        private let _sQNS: MTLBuffer           // [numHeads * headDim] f16 — qk-normed q
+        private let _sKNS: MTLBuffer           // [numKV * headDim] f16 — qk-normed k
+        private let _sQRot: MTLBuffer          // [numHeads * headDim] f16 — RoPE q
+        private let _sKRot: MTLBuffer          // [numKV * headDim] f16 — RoPE k
+        private let _sAttnOut: MTLBuffer       // [numHeads * headDim] f16 — SDPA output
+        private let _sGated: MTLBuffer         // [numHeads * headDim] f16 — sigmoid-gated
+        private let _sAttnRes: MTLBuffer       // [H] f16 — o_proj output
+        private let _sMN: MTLBuffer            // [H] f16 — rmsNorm(x, postLN) — MoE input
+        private let _sMO: MTLBuffer            // [H] f16 — MoE output
+        private let _sNormed: MTLBuffer        // [H] f16 — finalNorm output
+        private let _sLogits: MTLBuffer        // [V] f16 — lm_head output
+        private let _sDraft: MTLBuffer         // [1] int32 — argmax result
+        // MoE scratch for M=1
+        private let _sRGl: MTLBuffer           // [E] f16 — router gate logits
+        private let _sRInds: MTLBuffer         // [Ktop] int32 — top-k indices
+        private let _sRScores: MTLBuffer       // [Ktop] f16 — top-k scores (renorm)
+        private let _sExpG: MTLBuffer          // [Ktop * I] f16 — expert gate act
+        private let _sExpU: MTLBuffer          // [Ktop * I] f16 — expert up act
+        private let _sExpH: MTLBuffer          // [Ktop * I] f16 — swiglu output
+        private let _sExpD: MTLBuffer          // [Ktop * H] f16 — expert down proj
+        private let _sMoeY: MTLBuffer          // [H] f16 — combined routed expert output
+        private let _sShG: MTLBuffer           // [I] f16 — shared gate proj
+        private let _sShU: MTLBuffer           // [I] f16 — shared up proj
+        private let _sShAct: MTLBuffer         // [I] f16 — shared swiglu output
+        private let _sShY: MTLBuffer           // [H] f16 — shared down proj
+        private let _sSgl: MTLBuffer           // [8] f16 — sharedGate scalar (index 0 used; 8 for final_combine_rows stride)
 
-        /// STUB — implementation pending (notes/17). Real init builds MTLBuffers + pipelines
-        /// + resident KV cache buffers [numKV, maxSeqLen, headDim].
+        // ── Committed pair count ────────────────────────────────────────────
+        public var len: Int { _len }
+
+        // ── init? ───────────────────────────────────────────────────────────
         public init?(spec: WeightsSpec) {
-            _ = spec
-            return nil
+            guard let (dev, q) = RawMetalForward.ensure() else { return nil }
+            guard RawFusedVerify.ensureRowsAuxPipelines(),
+                  RawFusedVerify.ensureFmmPipeline(),
+                  RawFusedVerify.ensureMTPAuxPipelines(),
+                  RawFusedVerify.ensureMoEPipelines(E: spec.E, Ktop: spec.Ktop),
+                  RawFusedVerify.ensureAttnPipelines(),
+                  RawMetalForward.ensureAuxPipelines() else { return nil }
+            RawFusedVerify.ensureQmmPipeline()
+            // mtp experts は gs=32 — encode 時に force-unwrap するので init で compile(fresh-process SIGTRAP 対策)。
+            if spec.expertGroupSize == 32 {
+                guard RawMetalForward.compileGqmmRowsGS32() else { return nil }
+            }
+            // encodeRmsNormRows force-unwraps the lazily-compiled _rmsPipeline(F32) —
+            // warm both here (a fresh process without prior tests/engine hits nil otherwise).
+            let warmW = MLXArray.ones([8]).asType(.float16)
+            guard RawMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8) != nil,
+                  RawMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8, promoteF32: true) != nil
+            else { return nil }
+
+            device = dev; queue = q
+            H = spec.H; V = spec.V; E = spec.E; I = spec.I; Ktop = spec.Ktop
+            numHeads = spec.numHeads; numKV = spec.numKV; headDim = spec.headDim
+            ropeDim = spec.ropeDim; ropeBase = spec.ropeBase; eps = spec.eps
+            maxSeqLen = spec.maxSeqLen; expertGS = spec.expertGroupSize
+
+            // Helper: convert MLXArray → MTLBuffer (F16 cast)
+            func f16b(_ a: MLXArray) -> MTLBuffer? { RawMetalForward.mtlBuf(a.asType(.float16), dev) }
+            // Helper: packed weights (uint32 / already typed) — pass as-is
+            func rawb(_ a: MLXArray) -> MTLBuffer? { RawMetalForward.mtlBuf(a, dev) }
+
+            // F16 plain weights
+            guard let _fc = f16b(spec.fc),
+                  let _q  = f16b(spec.qW),     let _k = f16b(spec.kW),
+                  let _v  = f16b(spec.vW),     let _o = f16b(spec.oW),
+                  let _rg = f16b(spec.routerGate),
+                  let _shG = f16b(spec.shGate), let _shU = f16b(spec.shUp),
+                  let _shD = f16b(spec.shDown), let _sharedG = f16b(spec.sharedGate),
+                  // Norms
+                  let _pEmb = f16b(spec.preEmb),  let _pHid = f16b(spec.preHid),
+                  let _iLN  = f16b(spec.inputLN), let _postLN = f16b(spec.postLN),
+                  let _qN   = f16b(spec.qNorm),   let _kN = f16b(spec.kNorm),
+                  let _fN   = f16b(spec.finalNorm),
+                  // 4bit embed
+                  let _ewq = rawb(spec.embedWq),
+                  let _esc = f16b(spec.embedSc), let _ebi = f16b(spec.embedBi),
+                  // 4bit routed experts
+                  let _swGWq = rawb(spec.swGWq),
+                  let _swGSc = f16b(spec.swGSc), let _swGBi = f16b(spec.swGBi),
+                  let _swUWq = rawb(spec.swUWq),
+                  let _swUSc = f16b(spec.swUSc), let _swUBi = f16b(spec.swUBi),
+                  let _swDWq = rawb(spec.swDWq),
+                  let _swDSc = f16b(spec.swDSc), let _swDBi = f16b(spec.swDBi),
+                  // 4bit lm_head
+                  let _lmWq = rawb(spec.lmWq),
+                  let _lmSc = f16b(spec.lmSc), let _lmBi = f16b(spec.lmBi)
+            else { return nil }
+
+            fcBuf = _fc; qBuf = _q; kBuf = _k; vBuf = _v; oBuf = _o
+            routerGateBuf = _rg; shGateBuf = _shG; shUpBuf = _shU
+            shDownBuf = _shD; sharedGateBuf = _sharedG
+            preEmbBuf = _pEmb; preHidBuf = _pHid
+            inputLNBuf = _iLN; postLNBuf = _postLN
+            qNormBuf = _qN; kNormBuf = _kN; finalNormBuf = _fN
+            embedWBuf = _ewq; embedSBuf = _esc; embedBBuf = _ebi
+            swGWBuf = _swGWq; swGSBuf = _swGSc; swGBBuf = _swGBi
+            swUWBuf = _swUWq; swUSBuf = _swUSc; swUBBuf = _swUBi
+            swDWBuf = _swDWq; swDSBuf = _swDSc; swDBBuf = _swDBi
+            lmWBuf = _lmWq; lmSBuf = _lmSc; lmBBuf = _lmBi
+
+            // KV cache
+            let kvBytes = spec.numKV * spec.maxSeqLen * spec.headDim * 2
+            guard let _kc = dev.makeBuffer(length: kvBytes, options: .storageModeShared),
+                  let _vc = dev.makeBuffer(length: kvBytes, options: .storageModeShared)
+            else { return nil }
+            kCache = _kc; vCache = _vc
+
+            // Scratch buffers
+            func hb(_ n: Int) -> MTLBuffer? { dev.makeBuffer(length: n * 2, options: .storageModeShared) }
+            func ib(_ n: Int) -> MTLBuffer? { dev.makeBuffer(length: n * 4, options: .storageModeShared) }
+
+            let H = spec.H, V = spec.V, E = spec.E, I = spec.I, Ktop = spec.Ktop
+            let nH = spec.numHeads, nKV = spec.numKV, hD = spec.headDim
+            guard let _sTok   = ib(1),
+                  let _sEmb   = hb(H), let _sEmbN = hb(H), let _sHN  = hb(H),
+                  let _sCat   = hb(2 * H), let _sX = hb(H),
+                  let _sAN    = hb(H),
+                  let _sQOut  = hb(nH * 2 * hD),
+                  let _sKOut  = hb(nKV * hD), let _sVOut = hb(nKV * hD),
+                  let _sQX    = hb(nH * hD),
+                  let _sQNS   = hb(nH * hD), let _sKNS  = hb(nKV * hD),
+                  let _sQRot  = hb(nH * hD), let _sKRot  = hb(nKV * hD),
+                  let _sAttnOut = hb(nH * hD), let _sGated = hb(nH * hD),
+                  let _sAttnRes = hb(H),
+                  let _sMN    = hb(H), let _sMO   = hb(H),
+                  let _sNormed = hb(H), let _sLogits = hb(V),
+                  let _sDraft  = ib(1),
+                  // MoE scratch
+                  let _sRGl    = hb(E), let _sRInds = ib(Ktop),
+                  let _sRScores = hb(Ktop),
+                  let _sExpG   = hb(Ktop * I), let _sExpU = hb(Ktop * I),
+                  let _sExpH   = hb(Ktop * I), let _sExpD = hb(Ktop * H),
+                  let _sMoeY   = hb(H),
+                  let _sShG    = hb(I), let _sShU = hb(I),
+                  let _sShAct  = hb(I), let _sShY = hb(H),
+                  let _sSgl    = hb(8)    // 8 elements; final_combine_rows reads index m*8
+            else { return nil }
+
+            self._sTok     = _sTok;   self._sEmb  = _sEmb;  self._sEmbN = _sEmbN;  self._sHN   = _sHN
+            self._sCat     = _sCat;   self._sX    = _sX;    self._sAN   = _sAN
+            self._sQOut    = _sQOut;  self._sKOut = _sKOut; self._sVOut = _sVOut
+            self._sQX      = _sQX;   self._sQNS  = _sQNS;  self._sKNS  = _sKNS
+            self._sQRot    = _sQRot;  self._sKRot = _sKRot
+            self._sAttnOut = _sAttnOut; self._sGated = _sGated; self._sAttnRes = _sAttnRes
+            self._sMN      = _sMN;   self._sMO   = _sMO
+            self._sNormed  = _sNormed; self._sLogits = _sLogits; self._sDraft = _sDraft
+            self._sRGl     = _sRGl;   self._sRInds = _sRInds;  self._sRScores = _sRScores
+            self._sExpG    = _sExpG;  self._sExpU = _sExpU;   self._sExpH   = _sExpH;  self._sExpD = _sExpD
+            self._sMoeY    = _sMoeY
+            self._sShG     = _sShG;   self._sShU  = _sShU;   self._sShAct  = _sShAct;  self._sShY = _sShY
+            self._sSgl     = _sSgl
         }
 
-        /// Single-CB draft: embed(tok) → pre-norms → fc → attn over KV[0..<len]+self at
-        /// position len (READ-ONLY: len unchanged after return) → MoE → finalNorm → lm_head
-        /// → argmax. hPrevBuf row hPrevRow = post-final-norm hidden (§Step 2 normedBuffer).
-        /// Readback = the int32 draft only. Delegation to MLX ops is FORBIDDEN (spec §Step 3).
+        // ── Private encoder helpers ─────────────────────────────────────────
+
+        private func encodeCopyRow(_ enc: MTLComputeCommandEncoder, src: MTLBuffer, dst: MTLBuffer, row: Int) {
+            let p = RawFusedVerify._mtpCopyRowPipeline!
+            enc.setComputePipelineState(p)
+            enc.setBuffer(src, offset: 0, index: 0)
+            enc.setBuffer(dst, offset: 0, index: 1)
+            var off = UInt32(row * H), hh = UInt32(H)
+            enc.setBytes(&off, length: 4, index: 2)
+            enc.setBytes(&hh, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+
+        private func encodeConcat(_ enc: MTLComputeCommandEncoder, a: MTLBuffer, b: MTLBuffer, out: MTLBuffer) {
+            let p = RawFusedVerify._mtpConcatPipeline!
+            enc.setComputePipelineState(p)
+            enc.setBuffer(a, offset: 0, index: 0)
+            enc.setBuffer(b, offset: 0, index: 1)
+            enc.setBuffer(out, offset: 0, index: 2)
+            var hh = UInt32(H)
+            enc.setBytes(&hh, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: 2 * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+
+        /// Encode embed(tok from _sTok) → embOut.
+        private func encodeEmbed(_ enc: MTLComputeCommandEncoder, embOut: MTLBuffer) {
+            let p = RawFusedVerify._embedRowsPipeline!
+            enc.setComputePipelineState(p)
+            enc.setBuffer(embedWBuf, offset: 0, index: 0)
+            enc.setBuffer(embedSBuf, offset: 0, index: 1)
+            enc.setBuffer(embedBBuf, offset: 0, index: 2)
+            enc.setBuffer(_sTok,     offset: 0, index: 3)
+            enc.setBuffer(embOut,    offset: 0, index: 4)
+            var hh = UInt32(H), tt = UInt32(H)
+            enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        }
+
+        /// Encode the MTP attn block (F16 q/k/v/o via fmm_rows).
+        /// x: [H] input (already rmsNorm'd); out: [H] attn output.
+        /// Writes k/v to kCache/vCache at position `pos` (always — caller controls whether to
+        /// increment _len).
+        private func encodeAttn(_ enc: MTLComputeCommandEncoder,
+                                x: MTLBuffer, out: MTLBuffer,
+                                pos: Int, totalKeys: Int) {
+            let qd2 = 2 * headDim
+            let scale = 1.0 / sqrt(Float(headDim))
+            // q/k/v proj (F16 fmm)
+            RawFusedVerify.encodeFmmRows(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
+            RawFusedVerify.encodeFmmRows(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
+            RawFusedVerify.encodeFmmRows(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
+            // extract_q: qOut[nH, 2*hD] → qX[nH, hD]
+            RawFusedVerify.encodeExtractQ(enc, qOut: _sQOut, q: _sQX,
+                                          headDim: headDim, qd2: qd2, total: numHeads * headDim)
+            // qk-norm
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sQX,   w: qNormBuf, out: _sQNS,
+                                              rows: numHeads, D: headDim, eps: eps)
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sKOut, w: kNormBuf, out: _sKNS,
+                                              rows: numKV,    D: headDim, eps: eps)
+            // RoPE
+            RawFusedVerify.encodeRopeRows(enc, x: _sQNS, out: _sQRot,
+                                           headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: 1, numHeads: numHeads)
+            RawFusedVerify.encodeRopeRows(enc, x: _sKNS, out: _sKRot,
+                                           headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: 1, numHeads: numKV)
+            // write k/v to cache at pos
+            RawFusedVerify.encodeWriteKVRows(enc, src: _sKRot, cache: kCache,
+                                              KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: 1)
+            RawFusedVerify.encodeWriteKVRows(enc, src: _sVOut, cache: vCache,
+                                              KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: 1)
+            // SDPA: totalKeys = pos+1 for draft, len+i+1 for feed
+            RawFusedVerify.encodeSdpaRows(enc, q: _sQRot, k: kCache, v: vCache, out: _sAttnOut,
+                                           H: numHeads, KV: numKV, D: headDim,
+                                           baseLenPlus1: totalKeys,
+                                           M: 1, scale: scale, maxLen: maxSeqLen)
+            // sigmoid gate
+            RawFusedVerify.encodeSigmoidMul(enc, attnOut: _sAttnOut, qOut: _sQOut, gated: _sGated,
+                                             headDim: headDim, qd2: qd2, total: numHeads * headDim)
+            // o_proj
+            RawFusedVerify.encodeFmmRows(enc, w: oBuf, x: _sGated, out: out,
+                                          M: 1, K: numHeads * headDim, N: H)
+        }
+
+        /// Encode the MTP MoE block (F16 router gate + shared; 4bit routed experts).
+        /// x: [H] post_ln input; out: [H] MoE output.
+        private func encodeMoE(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer) {
+            // Router gate: F16 fmm [E, H]
+            RawFusedVerify.encodeFmmRows(enc, w: routerGateBuf, x: x, out: _sRGl,
+                                          M: 1, K: H, N: E)
+            // Top-K routing
+            RawFusedVerify.encodeRouteTop8Rows(enc, logits: _sRGl, inds: _sRInds,
+                                                scores: _sRScores, M: 1, N: E, K: Ktop)
+            // Routed experts: 4bit gather
+            RawFusedVerify.encodeGatherQmmRows(enc, w: swGWBuf, scales: swGSBuf, biases: swGBBuf,
+                                                x: x, inds: _sRInds, out: _sExpG,
+                                                M: 1, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            RawFusedVerify.encodeGatherQmmRows(enc, w: swUWBuf, scales: swUSBuf, biases: swUBBuf,
+                                                x: x, inds: _sRInds, out: _sExpU,
+                                                M: 1, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            RawFusedVerify.encodeSwiglu(enc, g: _sExpG, u: _sExpU, h: _sExpH, total: Ktop * I)
+            RawFusedVerify.encodeGatherQmmRows(enc, w: swDWBuf, scales: swDSBuf, biases: swDBBuf,
+                                                x: _sExpH, inds: _sRInds, out: _sExpD,
+                                                M: 1, Ktop: Ktop, K: I, N: H, lhsPer: true, gs: expertGS)
+            RawFusedVerify.encodeCombineRows(enc, d: _sExpD, scores: _sRScores, y: _sMoeY,
+                                              Ktop: Ktop, N: H, M: 1)
+            // Shared expert: F16 fmm
+            RawFusedVerify.encodeFmmRows(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
+            RawFusedVerify.encodeFmmRows(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
+            RawFusedVerify.encodeSwiglu(enc, g: _sShG, u: _sShU, h: _sShAct, total: I)
+            RawFusedVerify.encodeFmmRows(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
+            // Shared gate scalar: sharedGate [1,H] → sgl[0]; _sSgl is sized [8] so index 0 for
+            // final_combine_rows which reads sgl[m*8].
+            RawFusedVerify.encodeFmmRows(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
+            // Final combine: out = moeY + sigmoid(sgl[0]) * sharedY
+            RawFusedVerify.encodeFinalCombineRows(enc, y: _sMoeY, sharedY: _sShY,
+                                                   sgl: _sSgl, out: out, N: H, M: 1)
+        }
+
+        /// Core forward: embed+norms+fc+attn+MoE+finalNorm → normed[H], lm_head+argmax → draftBuf.
+        /// tokBuf must already contain the int32 token. hRow = row index in hPrevBuf for hPrev.
+        /// pos: KV position to write at. totalKeys = pos+1 (how many keys SDPA sees).
+        /// If doLMHead=false, skips lm_head/argmax (for feedPairs).
+        private func encodeForward(_ enc: MTLComputeCommandEncoder,
+                                   hPrevBuf: MTLBuffer, hRow: Int,
+                                   pos: Int, totalKeys: Int,
+                                   doLMHead: Bool) {
+            // 1. embed(tok) → _sEmb
+            encodeEmbed(enc, embOut: _sEmb)
+            // 2. rmsNorm(emb, preEmb) → _sEmbN
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sEmb, w: preEmbBuf, out: _sEmbN,
+                                              rows: 1, D: H, eps: eps)
+            // 3. extract hPrev row → _sHN temp, then rmsNorm
+            encodeCopyRow(enc, src: hPrevBuf, dst: _sHN, row: hRow)
+            // 4. rmsNorm(hPrevRow, preHid) → _sHN (in-place: copy first, then norm into same buf is fine
+            //    since encodeRmsNormRows writes to `out` not in-place)
+            //    Use _sAN as tmp for hPrev norm output (reuse before attn norm step)
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sHN, w: preHidBuf, out: _sAN,
+                                              rows: 1, D: H, eps: eps)
+            // 5. concat(embNormed, hidNormed) → _sCat
+            encodeConcat(enc, a: _sEmbN, b: _sAN, out: _sCat)
+            // 6. fc: _sCat @ fcᵀ → _sX
+            RawFusedVerify.encodeFmmRows(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
+            // 7. attn input norm: rmsNorm(_sX, inputLN) → _sAN (inputLN must be [H])
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: inputLNBuf, out: _sAN,
+                                              rows: 1, D: H, eps: eps)
+            // 8. attn (writes k/v to cache at pos, reads keys 0..totalKeys)
+            encodeAttn(enc, x: _sAN, out: _sAttnRes, pos: pos, totalKeys: totalKeys)
+            // 9. resid add: _sX += attnRes
+            RawFusedVerify.encodeResidAdd(enc, h: _sX, r: _sAttnRes, total: H)
+            // 10. post-attn norm: rmsNorm(_sX, postLN) → _sMN
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: postLNBuf, out: _sMN,
+                                              rows: 1, D: H, eps: eps)
+            // 11. MoE(_sMN) → _sMO
+            encodeMoE(enc, x: _sMN, out: _sMO)
+            // 12. resid add: _sX += moeOut
+            RawFusedVerify.encodeResidAdd(enc, h: _sX, r: _sMO, total: H)
+            // 13. finalNorm: rmsNorm(_sX, finalNorm) → _sNormed
+            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: finalNormBuf, out: _sNormed,
+                                              rows: 1, D: H, eps: eps)
+            if doLMHead {
+                // 14. lm_head: qmm4 (_sNormed → _sLogits)
+                RawFusedVerify.encodeQmmRows(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf,
+                                              x: _sNormed, out: _sLogits, M: 1, K: H, N: V)
+                // 15. argmax → _sDraft (use mtp_argmax_rows: bi=0 matches MLX argMax NaN semantics)
+                let ap = RawFusedVerify._mtpArgmaxPipeline!
+                enc.setComputePipelineState(ap)
+                enc.setBuffer(_sLogits, offset: 0, index: 0)
+                enc.setBuffer(_sDraft,  offset: 0, index: 1)
+                var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 2)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+        }
+
+        // ── Public API ──────────────────────────────────────────────────────
+
+        /// Single-CB draft. KV-READ: k/v written to cache at pos=_len for SDPA, but _len unchanged.
         public func draftArgmax(hPrevBuf: MTLBuffer, hPrevRow: Int, tok: Int32) -> Int? {
-            _ = (hPrevBuf, hPrevRow, tok)
-            return nil   // STUB — implementation pending
+            // ponytail: single CB, int32 readback only, no MLX ops
+            _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
+
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            encodeForward(enc, hPrevBuf: hPrevBuf, hRow: hPrevRow,
+                          pos: _len, totalKeys: _len + 1,
+                          doLMHead: true)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+
+            return Int(_sDraft.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
         }
 
-        /// Batch-ingest committed pairs (h row i of hBuf[rowRange], tok i) at positions
-        /// len..<len+n; advances len by n. The ONLY KV writer. lm_head/logits are skipped.
+        /// Batch-ingest committed pairs. Advances _len by rowRange.count.
+        /// One CB per row (causal: row i sees KV at 0..<_len+i+1).
         public func feedPairs(hBuf: MTLBuffer, rowRange: Range<Int>, toks: [Int32]) -> Bool {
-            _ = (hBuf, rowRange, toks)
-            return false   // STUB — implementation pending
+            let M = rowRange.count
+            guard M == toks.count, M > 0, _len + M <= maxSeqLen else { return false }
+
+            for i in 0..<M {
+                let pos = _len + i
+                let srcRow = rowRange.lowerBound + i
+
+                _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = toks[i]
+
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                // Commit k/v to cache (pos committed), skip lm_head/argmax
+                encodeForward(enc, hPrevBuf: hBuf, hRow: srcRow,
+                              pos: pos, totalKeys: pos + 1,
+                              doLMHead: false)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            }
+            _len += M
+            return true
         }
     }
 
