@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 76
+        let total = 77
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4520,6 +4520,86 @@ public enum RawVerifyTests {
             else { return (false, "(d) repeat span returned nil") }
             if d1 != d2 { return (false, "(d) nondeterministic: \(d1) vs \(d2)") }
 
+            return (true, "ok")
+        }
+
+        // Test 77 (T-lifetime, ①③ Step 5 real-bug regression): RawMTPHead must retain the
+        // backing MLXArrays of its noCopy weight buffers. THE BUG: init converted weights via
+        // temporary MLXArrays (asType) and bound their Metal buffers noCopy; once the caller's
+        // WeightsSpec went out of scope, the MLX allocator recycled the weight memory and the
+        // head's weights turned to garbage mid-run (found in run(): accept 0.00, NaN logits —
+        // masked in validate/tests because their spec stayed alive in a local). Protocol:
+        // draft with spec alive → drop the spec scope → churn the MLX allocator hard →
+        // same (h, tok) draft must be identical.
+        run("mtp_head_weight_lifetime") {
+            guard let (device, _) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+            let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
+            let nH = 16, nKV = 2, hD = 256, rD = 64
+            let gs = 64
+            let hQ = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); hQ.eval()
+            guard let hBuf = RawMetalForward.mtlBuf(hQ, device) else { return (false, "hBuf nil") }
+            let tok: Int32 = 42
+
+            var head: RawFusedVerify.RawMTPHead? = nil
+            var d0 = -1
+            do {  // spec lives ONLY in this scope
+                func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
+                func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                    let wf = (MLXRandom.normal([n, k]) * 0.05).asType(.float16)
+                    let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                    return (q, s, bOpt!)
+                }
+                func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                    let wf = (MLXRandom.normal([e, n, k]) * 0.05).asType(.float16)
+                    let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                    return (q, s, bOpt!)
+                }
+                let (embedWq, embedSc, embedBi) = q4(V, H)
+                let (swGWq, swGSc, swGBi) = q4e(E, I, H)
+                let (swUWq, swUSc, swUBi) = q4e(E, I, H)
+                let (swDWq, swDSc, swDBi) = q4e(E, H, I)
+                let (lmWq, lmSc, lmBi) = q4(V, H)
+                let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+                    H: H, V: V, E: E, I: I, Ktop: Ktop,
+                    numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
+                    ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
+                    expertGroupSize: gs,
+                    fc: f16([H, 2 * H]),
+                    qW: f16([nH * 2 * hD, H]), kW: f16([nKV * hD, H]),
+                    vW: f16([nKV * hD, H]), oW: f16([H, nH * hD]),
+                    routerGate: f16([E, H]),
+                    shGate: f16([I, H]), shUp: f16([I, H]), shDown: f16([H, I]),
+                    sharedGate: f16([1, H]),
+                    preEmb: f16([H]), preHid: f16([H]), inputLN: f16([H]), postLN: f16([H]),
+                    qNorm: f16([hD]), kNorm: f16([hD]), finalNorm: f16([H]),
+                    embedWq: embedWq, embedSc: embedSc, embedBi: embedBi,
+                    swGWq: swGWq, swGSc: swGSc, swGBi: swGBi,
+                    swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
+                    swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
+                    lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
+                guard let h = RawFusedVerify.RawMTPHead(spec: spec) else {
+                    return (false, "head init nil")
+                }
+                head = h
+                guard let d = h.draftArgmax(hPrevBuf: hBuf, hPrevRow: 0, tok: tok) else {
+                    return (false, "draft (spec alive) nil")
+                }
+                d0 = d
+            }
+            // spec + weight temporaries released → churn the MLX allocator so any
+            // non-retained noCopy backing gets recycled and overwritten.
+            for _ in 0 ..< 12 {
+                let junk = MLXRandom.normal([2048, 2048]).asType(.float16)
+                junk.eval()
+            }
+            guard let d1 = head!.draftArgmax(hPrevBuf: hBuf, hPrevRow: 0, tok: tok) else {
+                return (false, "draft (after churn) nil")
+            }
+            if d0 != d1 {
+                return (false, "weights corrupted after spec release: before=\(d0) after=\(d1) (noCopy lifetime)")
+            }
             return (true, "ok")
         }
 

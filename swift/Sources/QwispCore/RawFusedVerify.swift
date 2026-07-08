@@ -4136,6 +4136,8 @@ public enum RawFusedVerify {
         private let lmWBuf: MTLBuffer, lmSBuf: MTLBuffer, lmBBuf: MTLBuffer
         // KV cache — [numKV, maxSeqLen, headDim] f16
         private let kCache: MTLBuffer, vCache: MTLBuffer
+        // noCopy 寿命規約: weight MTLBuffer 群の backing MLXArray を head と同寿命で保持
+        private let _retainedWeights: [MLXArray]
         private var _len: Int = 0
         // Scratch buffers for M=1 draft/feed operations (shared, sequential access)
         // named _s_ prefix for scratch
@@ -4207,10 +4209,21 @@ public enum RawFusedVerify {
             ropeDim = spec.ropeDim; ropeBase = spec.ropeBase; eps = spec.eps
             maxSeqLen = spec.maxSeqLen; expertGS = spec.expertGroupSize
 
-            // Helper: convert MLXArray → MTLBuffer (F16 cast)
-            func f16b(_ a: MLXArray) -> MTLBuffer? { RawMetalForward.mtlBuf(a.asType(.float16), dev) }
+            // Helper: convert MLXArray → MTLBuffer (F16 cast).
+            // ★ noCopy 寿命規約 (notes/03): mtlBuf(noCopy) は MLXArray の buffer を借用するだけ。
+            //   変換後の array を head と同寿命で retain しないと、caller の spec がスコープを
+            //   抜けた後 MLX allocator が weight メモリを再利用し重みが実行中にゴミ化する
+            //   (validate/tests は spec がローカルに生存していたため発現しなかった実バグ)。
+            var retained: [MLXArray] = []
+            func f16b(_ a: MLXArray) -> MTLBuffer? {
+                let c = a.asType(.float16); c.eval(); retained.append(c)
+                return RawMetalForward.mtlBuf(c, dev)
+            }
             // Helper: packed weights (uint32 / already typed) — pass as-is
-            func rawb(_ a: MLXArray) -> MTLBuffer? { RawMetalForward.mtlBuf(a, dev) }
+            func rawb(_ a: MLXArray) -> MTLBuffer? {
+                a.eval(); retained.append(a)
+                return RawMetalForward.mtlBuf(a, dev)
+            }
 
             // F16 plain weights
             guard let _fc = f16b(spec.fc),
@@ -4238,6 +4251,7 @@ public enum RawFusedVerify {
                   let _lmWq = rawb(spec.lmWq),
                   let _lmSc = f16b(spec.lmSc), let _lmBi = f16b(spec.lmBi)
             else { return nil }
+            _retainedWeights = retained
 
             fcBuf = _fc; qBuf = _q; kBuf = _k; vBuf = _v; oBuf = _o
             routerGateBuf = _rg; shGateBuf = _shG; shUpBuf = _shU

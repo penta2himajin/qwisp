@@ -253,7 +253,12 @@ public enum RawSpecRunner {
 
     /// Chunked prefill: runs all prompt tokens through the backend, chunk=64.
     /// Returns normed hidden of the very last position [1, H], or nil on error.
-    static func prefill(promptIds: [Int32], backend: SpecBackend) -> MLXArray? {
+    /// mtpHead/mtpFwd (①③ Step 5): ingest prompt pairs (h_i, id_{i+1}) per chunk —
+    /// pLen-1 pairs total; the final position's pair (h_last, u) is fed by the spec
+    /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
+    static func prefill(promptIds: [Int32], backend: SpecBackend,
+                        mtpHead: RawFusedVerify.RawMTPHead? = nil,
+                        mtpFwd: RawFusedVerify.RawFusedForward? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         let chunkSize = 64
@@ -263,6 +268,15 @@ public enum RawSpecRunner {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
             guard let normed = backend.forward(chunk) else { return nil }
+            if let head = mtpHead, let fwd = mtpFwd {
+                // Non-final chunk: k pairs (last row pairs with the next chunk's head
+                // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
+                let nPairs = (end < pLen) ? chunk.count : chunk.count - 1
+                if nPairs > 0 {
+                    let toks = Array(promptIds[(pos + 1) ..< (pos + 1 + nPairs)])
+                    _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: 0 ..< nPairs, toks: toks)
+                }
+            }
             // Keep last row [H] — will be overwritten each chunk until the final one.
             lastNormed = normed[chunk.count - 1]    // [H]
             pos = end
@@ -499,7 +513,7 @@ public enum RawSpecRunner {
         // Tell.swift:105). Flag off / other tiers → mtpHead=nil → the loop below is
         // byte-identical to pre-change (seam contract, mtpDraftSpan).
         var mtpHead: RawFusedVerify.RawMTPHead? = nil
-        if Tell.envFlag("QWISP_MTP_DRAFT"), let _ = _residentFwd {
+        if Tell.envFlag("QWISP_MTP_DRAFT"), let _ = _residentFwd, !useA3 {
             if let spec = try? RawMTPValidate.loadSpec(modelDir: modelDir, store: store,
                                                        maxSeqLen: maxSeqLen),
                let h = RawFusedVerify.RawMTPHead(spec: spec) {
@@ -508,6 +522,10 @@ public enum RawSpecRunner {
             } else {
                 print("[raw-spec] WARN: QWISP_MTP_DRAFT set but raw head init failed → drafts off")
             }
+        } else if Tell.envFlag("QWISP_MTP_DRAFT") && useA3 {
+            // ponytail: A3 pending-prefix + head pair-feed の整合(pending 実現タイミングの
+            // pair 順序)は未配線 — A3 は opt-in 実験経路なので mtp とは相互排他にする。
+            print("[raw-spec] NOTE: QWISP_MTP_DRAFT ignored (QWISP_RAW_A3 set — mutually exclusive)")
         }
 
         // reuse-rerank setup (flag-off = zero-cost nil path, notes/10 §1c-1e)
@@ -529,7 +547,9 @@ public enum RawSpecRunner {
         // stream-vs-resident check は別途 resident backend を構築する。
 
         // ── PREFILL ───────────────────────────────────────────────────────
-        guard let lastNormed = prefill(promptIds: promptIds, backend: backend)
+        // (mtpHead non-nil → prompt pairs ingested into head KV per chunk, Step 5)
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend,
+                                       mtpHead: mtpHead, mtpFwd: _residentFwd)
         else { return "[raw-spec] ERROR: prefill returned nil" }
 
         // First token: argmax of logits at the last prompt position.
@@ -579,6 +599,15 @@ public enum RawSpecRunner {
                 drafts = [d]; D = 1
             }
 
+            // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
+            //   forward が normed を上書きする前に feed(draft が同 pair を読んだ後 = validate
+            //   と同一規約: draftArgmax read-only → feedPairs same pair)。rowOfU<0 は skip
+            //   (KV desync するが draft は verify に photograph されるので lossless のまま)。
+            if let head = mtpHead, let fwd = _residentFwd, rowOfU >= 0 {
+                _ = head.feedPairs(hBuf: fwd.normedBuffer,
+                                   rowRange: rowOfU ..< (rowOfU + 1), toks: [Int32(u)])
+            }
+
             // Snapshot before the batched verify (backend-specific representation).
             var snap = backend.snapshot()
 
@@ -587,7 +616,9 @@ public enum RawSpecRunner {
                 // Phase II-a chain path: only the non-A3 / empty-pending greedy span.
                 // chainedStepArgmax is bit-exact to K sequential stepArgmax([t]) calls, so OUT_TOKENS
                 // stays byte-identical to per-step while collapsing K CPU round-trips to 1.
-                if chainK > 0, let chainFn = backend.chainedStepArgmax,
+                // mtpHead active → chain disabled: chained steps would skip the per-commit
+                // pair feed (head KV position desync). Flag off (nil) → condition unchanged.
+                if mtpHead == nil, chainK > 0, let chainFn = backend.chainedStepArgmax,
                    (!useA3 || pending.isEmpty) {
                     if let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
                         out.append(u); hist.append(u)
@@ -685,6 +716,7 @@ public enum RawSpecRunner {
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
 
+
                 if p == D {
                     // ── full accept ───────────────────────────────────────
                     out.append(u); hist.append(u)
@@ -706,6 +738,17 @@ public enum RawSpecRunner {
                     else { return "[raw-spec] ERROR: rebuild forwardRows nil" }
                     u = evals[p]
                     rowOfU = p                // last row of the rebuild forward
+                }
+
+                // ★ MTP-D1 (Step 5): accepted-draft pairs (h_i, tok_{i+1}) を feed。
+                //   Tell.mtpFeedPlan(test 70, engine-agnostic)準拠: pk=0 → feedRows 0..<p、
+                //   lastHRow=p(rowOfU の branch 値と一致)。accept 時は verify rows、reject 時は
+                //   rebuild rows(同 token 列を同 state から再計算 = 同値)— どちらも現 normed。
+                if let head = mtpHead, let fwd = _residentFwd,
+                   let plan = Tell.mtpFeedPlan(pk: 0, p: p, path: p == D ? .fullAccept : .reject),
+                   !plan.feedRows.isEmpty {
+                    _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: plan.feedRows,
+                                       toks: drafts.prefix(p).map { Int32($0) })
                 }
             }
         }
