@@ -126,3 +126,65 @@ KV は**内容が draft 出力に影響する assert**(カウンタ偽装死)。
   :3587-3601(Step 2 の hiddenRows/normedBuffer)、:1699-1703(shared expert encode 例=qmm 版)。
 - RawMetalForward.swift:256(qmm4 kernel idiom)、:1064(write_kv)、:1479(sdpa)、:1628(rope)。
 - RawVerifyTests.swift:22(bitEqual)、:1131/1285(synthetic fused 構築例)。
+
+---
+
+# 判定書(2026-07-09, Steps 3-6 完了) — ①③ raw MTP-D1 port
+
+HEAD d630b49。Step 3(13de33d) → 4(292d540) → 5(46cd51c) → 6a(d630b49)。
+
+## 結果: 正しさ = 全 gate GREEN / 速度 = resident では chain に敗北 → default OFF(opt-in QWISP_MTP_DRAFT)
+
+### 正しさ(全部通った)
+- mtp-raw-validate 24/24(gs32 gqmm4_rows 変種で 15/24→24/24。真因 = scale stride /64 hardcode)。
+- RAWTESTS 78/78(locked 74-78: MLX-ref/KV-batch/seam契約/noCopy寿命/commitLastDraft≡feedPairs)。
+- flag-off byte-identity ×4 regime(OUT_TOKENS diff)。flag-on も OUT_TOKENS 完全一致(lossless by verify)。
+- self-check spec-vs-greedy **512/512 LOSSLESS ×4 regime** — MLX hybrid を殺した 512-horizon
+  drift(notes/15 §G-E longctx 60%)は raw では**発生しない**。port の構造保証仮説は実証された。
+- accept/step 実測: code .74 / agentic 1.25 / shortnl .49 — Speculative.swift 時代の
+  measured accepts(.506-.829)と整合。head は機能している。
+
+### ★実バグ(このキャンペーン最大の収穫)
+**noCopy 寿命バグ**: RawMTPHead.init が weight MTLBuffer を一時 MLXArray(asType)から
+noCopy bind → caller の WeightsSpec がスコープを抜けると MLX allocator が重みメモリを
+再利用し、**実行中に重みがゴミ化**(accept 0.00 / NaN logits / 実行毎に変わる junk)。
+validate/tests 74-76 は spec がローカルに生存していたため 24/24 のまま隠蔽 = 「gate green
+でも配線で死ぬ」の新形。診断は fresh-raw vs fresh-MLX 同入力比較 → stage stats(MoE 内で
+expG が健全時の 30-70x)→ per-expert gather 全数照合(256/256 OK = kernel 無罪)→ 消去法で
+weight 実体。fix = init が変換済み MLXArray を head と同寿命で retain(46cd51c)。
+regression = locked test 77(draft → spec スコープ破棄 → allocator churn → draft 同値)。
+
+### 速度(GEN=128, resident, code/agentic/longctx/shortnl)
+| regime  | flag-off(chain) | flag-off(chain切) | flag-on D1(fold 済) | D1/off |
+|---------|-----------------|-------------------|---------------------|--------|
+| code    | 93.7            | 80.5              | 65.7                | 0.70x  |
+| agentic | 76.0            | —                 | 61.7                | 0.81x  |
+| longctx | 97.1            | —                 | 84.0                | 0.87x  |
+| shortnl | 94.6            | 81.0              | 53.0                | 0.56x  |
+
+(MLX E7 53.5 比では D1 も 1.0-1.6x だが、raw の土俵では常に負け)
+
+### なぜ負けたか(算術、cost 単位 = engine M=1 forward)
+draftless step の per-token cost = (c_head + 1.38 + (1-a)·1.0) / (1+a)。
+- **1.38** = M=2/M=1 wall(91bbb04 の gate 値。gate は正しかった)
+- **(1-a)·1.0** = reject 時 rollback+rebuild forward([u]) — **gate 算術から抜けていた項**
+- **c_head** = draft CB + accepted-pair feed CB ≈ 0.3-0.4(実測 shortnl から逆算)
+→ head cost ゼロでも a > 0.69 が break-even。shortnl a=.49 で 1.27x 損、code a=.74 で
+ようやく 0.94(6% 得)だが c_head で反転。さらに **chain(QWISP_CHAIN_K, +16-17%)が同じ
+draftless-span slack を accept リスクゼロで機械的に回収する substitute** であり、mtp 有効時は
+pair-feed 順序のため chain を切る必要がある(=D1 は chain の +16% を先に支払う)。
+**doctrine 追記: seedless-vs-batching(c1b395f)と同型 — 同一 slack への予測的 lever は
+機械的 lever に負ける。**
+
+### 閉じなかった扉(将来 lever、今は追わない)
+1. **strict streaming(C<256)**: chain が構造的に存在しない(per-step CPU turn 必須)ため
+   per-step floor が本物の競争相手。ただし break-even a>0.69 + c_head 削減は同様に必要で、
+   M=2 の expert union 増(≤16/layer)は C=64 でも fit。測るならここが唯一の残り prize。
+2. **reject rebuild の除去**: verify kernel に per-row GDN state checkpoint を足せば
+   (1-a) 項が消え code で ~1.1x/per-step 圏。ただし bit-proven recurrent core への外科手術
+   +それでも chain と同着程度 → 単独では割に合わない。(1)が GO の時のみ検討。
+
+### 処置
+- default 不変(QWISP_MTP_DRAFT=1 opt-in、resident fused 限定、A3 と相互排他)。matrix 再走不要。
+- 資産: RawMTPHead(全 Metal 単一CB head)+ gs32 kernel + loadSpec + locked tests 74-78 は
+  streaming 検討(扉1)にそのまま流用可能。
