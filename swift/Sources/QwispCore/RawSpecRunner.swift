@@ -412,12 +412,20 @@ public enum RawSpecRunner {
 
     // ── Main runner ───────────────────────────────────────────────────────
 
-    public static func run(modelDir: String, refPath: String) throws -> String {
+    /// forceBolt: the default QWISP_BOLT=1 entry routes here with bolt requested (shipping bolt =
+    /// raw, not MLX boltCore). Bolt is streaming-only by construction (buddy calib→freeze→1-CB); at
+    /// resident tier it degenerates to strict (io=0 already), so a resident forceBolt falls back to
+    /// strict raw with a notice. Same effect as env QWISP_RAW_BOLT=1 but without mutating the env.
+    public static func run(modelDir: String, refPath: String, forceBolt: Bool = false) throws -> String {
         // ── streaming tier detection ──────────────────────────────────────
         let env = ProcessInfo.processInfo.environment
         let rawC = resolveRawC(envC: env["QWISP_RAW_C"], defaultC: DeviceCalibration.defaultC())
         let isStreaming = rawC > 0 && rawC < 256
-        let isBolt = isStreaming && Tell.envFlag("QWISP_RAW_BOLT")
+        let boltReq = forceBolt || Tell.envFlag("QWISP_RAW_BOLT")
+        let isBolt = isStreaming && boltReq
+        if boltReq && !isStreaming {
+            print("[raw-spec] bolt requested but C=\(rawC) is resident tier (bolt is streaming-only; io=0 at resident) → strict raw")
+        }
         let useFused = resolveUseFused(env: env["QWISP_RAW_FUSED"])
         let useA3 = Tell.envFlag("QWISP_RAW_A3")
         if isStreaming && !useFused {
