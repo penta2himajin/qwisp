@@ -3581,6 +3581,23 @@ public enum RawFusedVerify {
             return (nil, nil)
         }
 
+        /// MTP-D1 raw port §Step 2: post-final-norm hidden rows [M,H] f16 that the
+        /// most recent forwardRows(finalNormW:) / stepArgmax step left in `normed`.
+        /// Copy-read (contents() bind → MLXArray). M > maxM → nil.
+        /// VOLATILE: the next forwardRows/stepArgmax overwrites `normed`; read before stepping.
+        public func hiddenRows(M: Int) -> MLXArray? {
+            guard M <= maxM else { return nil }
+            let ptr = normed.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+        }
+
+        /// MTP-D1 raw port §Step 2: read-only handle to the `normed` shared buffer so a
+        /// raw MTPHead (§Step 3) can GPU-bind the post-final-norm hidden directly.
+        /// VOLATILE: overwritten by the next forwardRows/stepArgmax.
+        public var normedBuffer: MTLBuffer {
+            return normed
+        }
+
         /// Phase II-a G1 gate: K-step chained greedy decode in a single GPU command buffer.
         /// Encodes K greedy steps using indirect embed (step k+1 reads GPU-side tokensOut from
         /// step k, no CPU round-trip). firstToken is the seed input for step 0.

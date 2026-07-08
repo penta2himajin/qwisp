@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 71
+        let total = 72
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3959,6 +3959,97 @@ public enum RawVerifyTests {
                 if !approx(g.meanMissMass, c.mass) {
                     return (false, "\(c.name): meanMissMass=\(g.meanMissMass) want \(c.mass)")
                 }
+            }
+            return (true, "ok")
+        }
+
+        // Test 72 (MTP-D1 raw §Step 2): post-final-norm hidden rows accessor.
+        //   hiddenRows(M:) must return the exact [M,H] f16 that forwardRows(finalNormW:)
+        //   returned (both read the same `normed` buffer). normedBuffer exposes it for
+        //   GPU-direct bind (§Step 3). (ii) stepArgmax parity skipped — head build is heavy
+        //   in synthetic and its input path (embed) differs from forwardRows(x); forwardRows
+        //   side is the verifiable goal per task spec.
+        run("fused_hidden_rows") {
+            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            let H = 2048, E = 16, I = 512
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func mkMoE() -> RawVerifyForward.MoEBlockW {
+                let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+                let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+                let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+                return RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                    swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                    swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                    shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                    sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            }
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
+            let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
+            let gdnW = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
+                normWeight: MLXRandom.normal([Dv]).asType(.float16),
+                aLog: MLXRandom.normal([Hv]).asType(.float32), dtBias: MLXRandom.normal([Hv]).asType(.float32))
+            let nH = 16, nKV = 2, hD = 256
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let attnW = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let layers = [
+                RawVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
+                RawVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
+            ]
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([cs0, rs0, kC0, vC0])
+            func freshCaches() -> [RawVerifyForward.LayerCaches] {
+                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 RawVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            }
+            let maxM = 8
+            guard let fused = RawFusedVerify.RawFusedForward(layers: layers, caches: freshCaches(),
+                                                             maxM: maxM, H: H, maxSeqLen: 64)
+            else { return (false, "fused init nil") }
+            // final RMSNorm weight → MTLBuffer (same helper attachHead uses for fnW).
+            let fnA = MLXRandom.normal([H]).asType(.float16); fnA.eval()
+            guard let fn = RawMetalForward.mtlBuf(fnA, device) else { return (false, "fn buf nil") }
+
+            let M = 3
+            let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+            guard let ref = fused.forwardRows(x, M: M, finalNormW: fn)
+            else { return (false, "forwardRows nil") }
+            ref.eval()
+            // (i) hiddenRows(M:) ≡ forwardRows(finalNormW:) return (both read `normed`).
+            guard let got = fused.hiddenRows(M: M) else { return (false, "hiddenRows nil M=\(M)") }
+            got.eval()
+            let (ok, d) = bitEqual(got, ref)
+            if !ok { return (false, "hiddenRows mismatch M=\(M): \(d)") }
+            // maxM+1 → nil (out-of-range guard).
+            if fused.hiddenRows(M: maxM + 1) != nil { return (false, "hiddenRows M>maxM not nil") }
+            // normedBuffer exposes the real [maxM,H] f16 buffer for §Step 3 GPU bind.
+            if fused.normedBuffer.length < maxM * H * 2 {
+                return (false, "normedBuffer.length=\(fused.normedBuffer.length) want >= \(maxM * H * 2)")
             }
             return (true, "ok")
         }
