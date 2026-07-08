@@ -136,15 +136,16 @@ if CommandLine.arguments.contains("stream") {
         exit(0)
     }
 
-    // 既定: 標準手法 SuffixSpec（batched f32-full verify, strict-L1, Pareto 最適）。
-    // QWISP_BOLT=1 で opt-in L3 bolt-mode（slow-NAND 向け near-lossless）。unset なら strict のまま。
+    // 既定: strict = raw engine SuffixSpec（RawSpecRunner: resident=fused 1-CB / C<256=streaming、
+    // C は QWISP_RAW_C 未指定なら RAM tier 自動）。旧 MLX strict は QWISP_RUN=suffix-spec で利用可。
+    // QWISP_BOLT=1 で opt-in L3 bolt-mode（MLX boltCore; raw bolt は QWISP_RUN=raw-spec + QWISP_RAW_BOLT=1）。
     // 旧 2 系統(SpecK/Fast)は QWISP_RUN=spec-verify / buddy-no-sync で利用可。
     let boltDefault = env["QWISP_BOLT"] == "1"
     do {
         print(try (boltDefault
             ? Tell.runBolt(modelDir: md, refPath: mtpRef)
-            : Tell.runSuffixSpec(modelDir: md, refPath: mtpRef)))
-    } catch { print("[\(boltDefault ? "Bolt" : "SuffixSpec")] error: \(error)") }
+            : RawSpecRunner.run(modelDir: md, refPath: mtpRef)))
+    } catch { print("[\(boltDefault ? "Bolt" : "RawSpec")] error: \(error)") }
     exit(0)
 }
 
