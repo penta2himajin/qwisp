@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 70
+        let total = 71
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3887,6 +3887,77 @@ public enum RawVerifyTests {
                 }
                 if got.lastHRow != c.wantLastH {
                     return (false, "pk=\(c.pk) p=\(c.p) path=\(c.path): lastHRow=\(got.lastHRow) want \(c.wantLastH)")
+                }
+            }
+            return (true, "ok")
+        }
+
+        // Test 71 (notes/11 レバー② measure-first): missWeightStats — pure function.
+        // bolt の cold-selection(miss)の gate-weight 分布 + top-8 内 rank 集計。
+        // Calls RawSpecRunner.missWeightStats directly (no process-env / GPU dependency).
+        // Hand-computed cases: 分位点 index=floor(q*(n-1)), top1Share=fraction 0..1,
+        // meanMissMass = Σ(miss weight) / topInds.count(全観測数), missCount=総 miss 数。
+        // RED until the stub returns real values (stub returns -1 sentinel).
+        run("missWeightStats") {
+            func approx(_ a: Float, _ b: Float) -> Bool { abs(a - b) < 1e-5 }
+
+            struct Case {
+                let name: String
+                let inds: [[Int]]
+                let w: [[Float]]
+                let res: [Set<Int>]
+                let p10: Float, p50: Float, p90: Float
+                let top1: Float, mass: Float, misses: Int
+            }
+            let cases: [Case] = [
+                // (A) no miss — every routed expert resident → all zeros.
+                Case(name: "no-miss",
+                     inds: [[0, 1, 2, 3]],
+                     w:    [[0.4, 0.3, 0.2, 0.1]],
+                     res:  [Set([0, 1, 2, 3])],
+                     p10: 0, p50: 0, p90: 0, top1: 0, mass: 0, misses: 0),
+                // (B) all miss — resident empty. weights sorted asc [0.1,0.2,0.3,0.4], n=4.
+                //   p10 idx=floor(0.1*3)=0→0.1  p50 idx=floor(0.5*3)=1→0.2  p90 idx=floor(0.9*3)=2→0.3
+                //   rank-1 (max=0.4 @ idx0) is a miss → top1Share=1/4=0.25
+                //   mass = (0.4+0.3+0.2+0.1)/1obs = 1.0 ; misses=4
+                Case(name: "all-miss",
+                     inds: [[0, 1, 2, 3]],
+                     w:    [[0.4, 0.3, 0.2, 0.1]],
+                     res:  [Set<Int>()],
+                     p10: 0.1, p50: 0.2, p90: 0.3, top1: 0.25, mass: 1.0, misses: 4),
+                // (C) tail-only miss — rank1,2 resident; low-gate tail misses. n=4 miss weights
+                //   sorted asc [0.05,0.07,0.08,0.10].  p10 idx0→0.05  p50 idx1→0.07  p90 idx2→0.08
+                //   rank-1 (max=0.5 @ idx0) resident → NOT a miss → top1Share=0
+                //   mass = (0.1+0.08+0.07+0.05)/1obs = 0.30 ; misses=4
+                Case(name: "tail-only",
+                     inds: [[0, 1, 2, 3, 4, 5]],
+                     w:    [[0.5, 0.2, 0.1, 0.08, 0.07, 0.05]],
+                     res:  [Set([0, 1])],
+                     p10: 0.05, p50: 0.07, p90: 0.08, top1: 0.0, mass: 0.30, misses: 4),
+                // (D) top1 miss mixed across 2 observations — divides mass by obs count(2).
+                //   obs0: miss idx0 w=0.6 = rank-1 (top1).  obs1: miss idx3 w=0.05 = tail.
+                //   miss weights sorted asc [0.05,0.6], n=2. p10/p50/p90 idx=floor(q*1):
+                //     0.1→0 0.5→0 0.9→0  → all 0.05
+                //   top1Share = 1/2 = 0.5 ; mass = (0.6+0.05)/2obs = 0.325 ; misses=2
+                Case(name: "top1-mixed",
+                     inds: [[10, 11, 12, 13], [20, 21, 22, 23]],
+                     w:    [[0.6, 0.2, 0.15, 0.05], [0.4, 0.35, 0.2, 0.05]],
+                     res:  [Set([11, 12, 13]), Set([20, 21, 22])],
+                     p10: 0.05, p50: 0.05, p90: 0.05, top1: 0.5, mass: 0.325, misses: 2),
+            ]
+            for c in cases {
+                let g = RawSpecRunner.missWeightStats(topInds: c.inds, topWeights: c.w, resident: c.res)
+                if g.missCount != c.misses {
+                    return (false, "\(c.name): missCount=\(g.missCount) want \(c.misses)")
+                }
+                if !approx(g.p10, c.p10) || !approx(g.p50, c.p50) || !approx(g.p90, c.p90) {
+                    return (false, "\(c.name): p10/50/90=\(g.p10)/\(g.p50)/\(g.p90) want \(c.p10)/\(c.p50)/\(c.p90)")
+                }
+                if !approx(g.top1Share, c.top1) {
+                    return (false, "\(c.name): top1Share=\(g.top1Share) want \(c.top1)")
+                }
+                if !approx(g.meanMissMass, c.mass) {
+                    return (false, "\(c.name): meanMissMass=\(g.meanMissMass) want \(c.mass)")
                 }
             }
             return (true, "ok")

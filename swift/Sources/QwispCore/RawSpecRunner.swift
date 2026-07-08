@@ -28,6 +28,53 @@ public enum RawSpecRunner {
         }
     }
 
+    /// notes/11 レバー②(measure-first): bolt の cold-selection(miss)を「どの gate weight /
+    /// top-8 内 rank で起きるか」で特徴づける純関数。novice が効くのは低 gate の tail miss か、
+    /// top miss 支配なら別処方かの go/no-go 数を出す。
+    ///
+    /// - Parameters は step×層ごとに層別に並べた観測列(caller が並べて渡す):
+    ///   `topInds[t]` = 観測 t の top-8 expert index、`topWeights[t]` = 対応する正規化 gate weight
+    ///   (norm_topk: top-8 内で和 1、降順とは限らない)、`resident[t]` = その層の常駐集合。
+    /// - miss = `topInds[t][k]` が `resident[t]` に無い選択。その weight を収集。
+    /// - p10/p50/p90 = miss weight の分位点(昇順 sort、index = floor(q*(n-1)))。
+    /// - top1Share = miss のうち「その観測 t の top-8 内で weight 最大位(rank-1)」だった割合(0..1)。
+    /// - meanMissMass = 観測 t あたりの miss weight 合計の平均(全観測数 = topInds.count で割る)。
+    /// - missCount = 総 miss 数。miss ゼロなら数値は全て 0。
+    ///
+    /// GREEN: quantile/share/mass computation for bolt cold-selection analysis.
+    static func missWeightStats(topInds: [[Int]], topWeights: [[Float]], resident: [Set<Int>])
+        -> (p10: Float, p50: Float, p90: Float, top1Share: Float, meanMissMass: Float, missCount: Int) {
+        let obsCount = topInds.count
+        guard obsCount > 0 else { return (0, 0, 0, 0, 0, 0) }
+        var missWeights: [Float] = []
+        var top1Misses = 0
+        var totalMissMass: Float = 0
+        for t in 0 ..< obsCount {
+            let inds = topInds[t]
+            let weights = topWeights[t]
+            let res = t < resident.count ? resident[t] : Set<Int>()
+            let maxW = weights.max() ?? 0
+            for k in 0 ..< inds.count {
+                guard !res.contains(inds[k]) else { continue }
+                let w = k < weights.count ? weights[k] : 0
+                missWeights.append(w)
+                totalMissMass += w
+                if w == maxW { top1Misses += 1 }
+            }
+        }
+        let missCount = missWeights.count
+        guard missCount > 0 else { return (0, 0, 0, 0, 0, 0) }
+        missWeights.sort()
+        let n = missWeights.count
+        let p10 = missWeights[Int(Float(0.1) * Float(n - 1))]
+        let p50 = missWeights[Int(Float(0.5) * Float(n - 1))]
+        let p90 = missWeights[Int(Float(0.9) * Float(n - 1))]
+        return (p10: p10, p50: p50, p90: p90,
+                top1Share: Float(top1Misses) / Float(missCount),
+                meanMissMass: totalMissMass / Float(obsCount),
+                missCount: missCount)
+    }
+
     /// spec ループが必要とする engine 操作の抽象(composed / fused の 2 実装)。
     /// forward: tokens → 最終 norm 済み hidden [M, H]。
     /// stepArgmax: tokens → 行毎 greedy argmax(cache も前進)。1-CB 実装が無ければ
@@ -940,6 +987,10 @@ public enum RawSpecRunner {
         struct DiagAcc { var cold = 0; var routed = 0; var stepsWithCold = 0; var margins: [Float] = [] }
         var diagAcc = [DiagAcc(), DiagAcc(), DiagAcc()]
         var diagSteps = 0
+        // missWeightStats accumulators (per-layer observations, boltDiag only)
+        var diagMissInds: [[Int]] = []
+        var diagMissWeights: [[Float]] = []
+        var diagMissResidents: [Set<Int>] = []
         func diagReadStep() {
             guard let ib = diagIBuf, let gb = diagGBuf else { return }
             diagSteps += 1
@@ -960,6 +1011,22 @@ public enum RawSpecRunner {
                 diagAcc[g].routed += Ktop
                 diagAcc[g].margins.append(contentsOf: mar)
                 if !cold.isEmpty { groupHadCold[g] = true }
+                // accumulate norm_topk weights for missWeightStats
+                if boltDiag {
+                    // ponytail: reproduce route_top8_rows exactly — stable softmax over E=256
+                    // logits, then renorm the selected Ktop probs to sum 1 (=combine's norm_topk).
+                    let logitsF = glArr.map { Float($0) }
+                    let maxL = logitsF.max() ?? 0
+                    let exps = logitsF.map { Foundation.exp($0 - maxL) }
+                    let Z = exps.reduce(0, +)
+                    let gates = Z > 0 ? exps.map { $0 / Z } : exps.map { _ in 1.0 / Float(nE) }
+                    let topGates = indsArr.map { gates[Int($0)] }
+                    let ss = topGates.reduce(0, +)
+                    let normW = ss > 0 ? topGates.map { $0 / ss } : topGates.map { _ in 1.0 / Float(Ktop) }
+                    diagMissInds.append(indsArr.map { Int($0) })
+                    diagMissWeights.append(normW)
+                    diagMissResidents.append(diagResidents[li])
+                }
             }
             for g in 0 ..< 3 where groupHadCold[g] { diagAcc[g].stepsWithCold += 1 }
         }
@@ -1127,6 +1194,9 @@ public enum RawSpecRunner {
                              pct(0.10), pct(0.50), pct(0.90), infN,
                              flips[0], flips[1], flips[2], flips[3]))
             }
+            let mw = RawSpecRunner.missWeightStats(topInds: diagMissInds, topWeights: diagMissWeights, resident: diagMissResidents)
+            print(String(format: "[BoltDiag] missWeight p10/50/90=%.3f/%.3f/%.3f top1Share=%.1f%% missMass/token=%.3f misses=%d",
+                         mw.p10, mw.p50, mw.p90, mw.top1Share * 100, mw.meanMissMass, mw.missCount))
         }
 
         // ── SELF-CHECK (bolt): spec vs bolt greedy (same frozen tables = self-consistent) ──
