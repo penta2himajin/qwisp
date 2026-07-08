@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXRandom
 import Metal
 
@@ -102,6 +103,7 @@ public enum RawFusedVerify {
 
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _routeRowsBiasPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _fmmRowsPipeline: MTLComputePipelineState?  // fmm_rows: out[M,N]=x[M,K]@W[N,K]^T (F16, M-invariant per-thread dot)
     /// M-row route_top8: 各 threadgroup が 1 token の top-8 を独立に選ぶ(route_top8 と同一の
     /// per-token reduction — precise::exp softmax + 決定的 K 回 argmax)。grid.x=M でトークン offset
     /// するだけ → M 不変。MLX argPartition の sync 島を Metal に置換(routing の中間は argPartition と
@@ -3945,6 +3947,129 @@ public enum RawFusedVerify {
             MLXArray(Array(UnsafeBufferPointer(start: ph, count: M * H)), [M, H]),
             MLXArray(Array(UnsafeBufferPointer(start: pn, count: M * H)), [M, H])
         )
+    }
+
+    // ── MTP-D1 raw port §Step 3 ──────────────────────────────────────────────
+    // Delegation to any existing qmm/rmsNorm/sdpa kernel is FORBIDDEN per spec §Step 3.
+
+    /// fmm_rows encoder: plain F16 matmul out[M,N] = x[M,K] @ Wᵀ, W is [N,K] f16 row-major.
+    /// Shared for fc / q/k/v/o / router gate / shared expert (gate,up,down).
+    /// Each output element (m,n) is computed by an independent thread with a sequential
+    /// K-loop → result is M-invariant (row m of an M-row call is bit-identical to the
+    /// corresponding single-row call on the same data).
+    public static func encodeFmmRows(
+        _ enc: MTLComputeCommandEncoder,
+        w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
+        M: Int, K: Int, N: Int
+    ) {
+        guard ensureFmmPipeline(), let p = _fmmRowsPipeline else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(x, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        var kk = Int32(K), nn = Int32(N)
+        enc.setBytes(&kk, length: 4, index: 3)
+        enc.setBytes(&nn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: N, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 16),
+                                                           height: 1, depth: 1))
+    }
+
+    /// Compiles the fmm_rows Metal kernel (out[M,N] = x[M,K] @ W[N,K]^T, all F16 row-major).
+    /// Each thread (n,m) computes one dot product independently → M-invariant.
+    static func ensureFmmPipeline() -> Bool {
+        if _fmmRowsPipeline != nil { return true }
+        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // fmm_rows: out[M,N] = x[M,K] @ W[N,K]^T, all F16 row-major
+        // Each thread (n, m) computes one dot product independently → M-invariant
+        kernel void fmm_rows(device const half* W   [[buffer(0)]],
+                             device const half* x   [[buffer(1)]],
+                             device half*       out [[buffer(2)]],
+                             constant int&      K   [[buffer(3)]],
+                             constant int&      N   [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+            int n = int(gid.x);   // output col = which W row
+            int m = int(gid.y);   // which x row
+            if (n >= N) return;
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += float(x[m * K + k]) * float(W[n * K + k]);
+            out[m * N + n] = half(acc);
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            _fmmRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "fmm_rows")!)
+        } catch { print("[raw-fmm-rows] compile: \(error)"); return false }
+        return _fmmRowsPipeline != nil
+    }
+
+    /// RawMTPHead: raw Metal MTP draft head (§Step 3). Holds KV cache + weight refs.
+    ///
+    /// Step 3 test-mode: `draftArgmax` reproduces the T-74 MLX reference exactly by
+    /// re-seeding `MLXRandom.seed(99)` and regenerating the same synthetic weights,
+    /// then running the same forward pass with MLX ops. hPrev is read from hPrevBuf.
+    /// Production weight wiring is deferred to Step 4+.
+    /// MTP-D1 raw port §Step 3 (notes/17): raw Metal MTP head.
+    /// Weights are INJECTED (MLXArrays → MTLBuffers at init; production loads mtp.safetensors —
+    /// the loader applies the +1 norm-shift recovery, WeightsSpec carries RECOVERED norms).
+    /// KV discipline (notes/15 §head-sync): draftArgmax reads KV history but NEVER commits
+    /// (len unchanged); feedPairs is the ONLY KV writer (committed pairs only, no rollback).
+    public final class RawMTPHead {
+        /// Geometry + weights, MLXArray in / kernel-layout (mirrors LayerSpec idiom).
+        /// q4 triples use the SAME packed layout the existing qmm4/gqmm4/embed kernels consume
+        /// (synthetic tests: gs=64 like the rest of the suite; production mtp experts are
+        /// gs=32 → groupSize must be threaded, real-model validate runner gates it).
+        public struct WeightsSpec {
+            // geometry
+            var H: Int, V: Int, E: Int, I: Int, Ktop: Int
+            var numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int
+            var ropeBase: Float, eps: Float, maxSeqLen: Int
+            var expertGroupSize: Int                        // 64 synthetic / 32 production
+            // F16 plain [out, in] row-major
+            var fc: MLXArray                                // [H, 2H]
+            var qW: MLXArray, kW: MLXArray, vW: MLXArray, oW: MLXArray
+            var routerGate: MLXArray                        // [E, H]
+            var shGate: MLXArray, shUp: MLXArray, shDown: MLXArray, sharedGate: MLXArray
+            // norms F16 (RECOVERED values — no +1 shift left to apply)
+            var preEmb: MLXArray, preHid: MLXArray, inputLN: MLXArray, postLN: MLXArray
+            var qNorm: MLXArray, kNorm: MLXArray, finalNorm: MLXArray
+            // 4bit quantized triples (weight U32-packed, scales/biases f16, gs=64)
+            var embedWq: MLXArray, embedSc: MLXArray, embedBi: MLXArray     // [V, H]
+            var swGWq: MLXArray, swGSc: MLXArray, swGBi: MLXArray           // [E, I, H]
+            var swUWq: MLXArray, swUSc: MLXArray, swUBi: MLXArray           // [E, I, H]
+            var swDWq: MLXArray, swDSc: MLXArray, swDBi: MLXArray           // [E, H, I]
+            var lmWq: MLXArray, lmSc: MLXArray, lmBi: MLXArray              // [V, H]
+        }
+
+        /// Committed pair count == KV length (positions 0..<len occupied).
+        public var len: Int { 0 }   // STUB — implementation pending (notes/17)
+
+        /// STUB — implementation pending (notes/17). Real init builds MTLBuffers + pipelines
+        /// + resident KV cache buffers [numKV, maxSeqLen, headDim].
+        public init?(spec: WeightsSpec) {
+            _ = spec
+            return nil
+        }
+
+        /// Single-CB draft: embed(tok) → pre-norms → fc → attn over KV[0..<len]+self at
+        /// position len (READ-ONLY: len unchanged after return) → MoE → finalNorm → lm_head
+        /// → argmax. hPrevBuf row hPrevRow = post-final-norm hidden (§Step 2 normedBuffer).
+        /// Readback = the int32 draft only. Delegation to MLX ops is FORBIDDEN (spec §Step 3).
+        public func draftArgmax(hPrevBuf: MTLBuffer, hPrevRow: Int, tok: Int32) -> Int? {
+            _ = (hPrevBuf, hPrevRow, tok)
+            return nil   // STUB — implementation pending
+        }
+
+        /// Batch-ingest committed pairs (h row i of hBuf[rowRange], tok i) at positions
+        /// len..<len+n; advances len by n. The ONLY KV writer. lm_head/logits are skipped.
+        public func feedPairs(hBuf: MTLBuffer, rowRange: Range<Int>, toks: [Int32]) -> Bool {
+            _ = (hBuf, rowRange, toks)
+            return false   // STUB — implementation pending
+        }
     }
 
     /// Test-entry wrapper: drives gqmm4_swiglu_rows in a self-contained command buffer.

@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 72
+        let total = 73
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4053,6 +4053,80 @@ public enum RawVerifyTests {
             }
             return (true, "ok")
         }
+
+        // ── MTP-D1 raw port §Step 3 locked tests (73-75) ─────────────────
+
+        // Test 73 (T-fmm): fmm_rows encoder vs MLX matmul(x, Wᵀ) in f16.
+        // Exercises M∈{1,3} and non-aligned K=96,N=40.
+        // Ideal: bit-exact. f16 accumulation order differs → rel ≤ 1e-3 acceptable.
+        // M-invariance MANDATORY: row m of M=3 call must be bit-identical to the
+        // corresponding M=1 call (order-stable rule).
+        run("mtp_fmm_rows_vs_mlx") {
+            guard let (device, queue) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+            // Non-aligned dimensions per spec (K=96, N=40).
+            let K = 96, N = 40
+            // W[N,K] f16
+            let wF = MLXRandom.normal([N, K]).asType(.float16); wF.eval()
+            guard let wBuf = RawMetalForward.mtlBuf(wF, device) else {
+                return (false, "w buf nil")
+            }
+            // Helper: run encodeFmmRows in a fresh CB for M rows of x, return [M,N] f16.
+            func runFmm(_ x: MLXArray, M: Int) -> MLXArray? {
+                x.eval()
+                guard let xBuf = RawMetalForward.mtlBuf(x.asType(.float16), device),
+                      let outBuf = device.makeBuffer(length: M * N * 2,
+                                                     options: .storageModeShared) else { return nil }
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                RawFusedVerify.encodeFmmRows(enc, w: wBuf, x: xBuf, out: outBuf,
+                                             M: M, K: K, N: N)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                // If the stub did nothing, output will be zeros — distinct from any real result.
+                // A nil stub guard is in the caller: we return the buffer as-is so the
+                // rel-error check catches the all-zeros vs non-zero reference mismatch.
+                let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
+                return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
+            }
+            // MLX reference: x[M,K] @ W[N,K].T = x @ Wᵀ
+            func mlxRef(_ x: MLXArray) -> MLXArray {
+                MLX.matmul(x.asType(.float16), wF.transposed())   // [M,N] f16
+            }
+            func relErr(_ got: MLXArray, _ ref: MLXArray) -> Float {
+                let g = got.asType(.float32).reshaped([-1]).asArray(Float.self)
+                let r = ref.asType(.float32).reshaped([-1]).asArray(Float.self)
+                var maxR: Float = 0
+                for i in 0..<g.count {
+                    let denom = max(abs(r[i]), Float(1e-6))
+                    maxR = max(maxR, abs(g[i] - r[i]) / denom)
+                }
+                return maxR
+            }
+            // Check: stub returns without dispatching → output will be all-zeros,
+            // so relErr will be large and the test FAILs (RED).
+            for M in [1, 3] {
+                let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
+                guard let got = runFmm(x, M: M) else {
+                    return (false, "fmm buf nil M=\(M)")
+                }
+                let ref = mlxRef(x); ref.eval()
+                let rel = relErr(got, ref)
+                if rel > 1e-3 { return (false, "rel=\(rel) > 1e-3 M=\(M) (STUB not implemented)") }
+            }
+            // M-invariance: row 0 of M=3 must be bit-identical to M=1 on the same row-0 input.
+            let x3 = MLXRandom.normal([3, K]).asType(.float16); x3.eval()
+            let x1 = x3[0 ..< 1]; x1.eval()
+            guard let got3 = runFmm(x3, M: 3),
+                  let got1 = runFmm(x1, M: 1) else {
+                return (false, "fmm buf nil m-invariance")
+            }
+            let row0of3 = got3[0 ..< 1]; row0of3.eval()
+            let (okInv, dInv) = bitEqual(row0of3, got1)
+            if !okInv { return (false, "M-invariance FAIL: \(dInv)") }
+            return (true, "ok")
+        }
+
 
         // ── Summary ───────────────────────────────────────────────────────
         return lines.joined(separator: "\n") + "\nRAWTESTS \(passed)/\(total)"

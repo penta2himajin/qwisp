@@ -73,18 +73,43 @@ draft = argmax(logits)
    (MTPHeadValidation.swift:93 のハーネス流用、prefill ingest → 逐次 draft)。
    出力: `[mtp-raw] argmax L/L OK` 形式。
 
-## Gates(locked tests、synthetic・モデル不要、RAWTESTS 72→+n)
+## API 契約(★2026-07-08 改訂 — driver が production 側に stub を固定済、変更禁止)
 
-- **T-fmm**: fmm_rows vs MLX `matmul(x, Wᵀ)`(f16) — M∈{1,3}、K/N 非整列(例 K=96,N=40)含む。
-  bit-exact が理想だが f16 累積順で不可なら rel ≤ 1e-3 + **M-invariance(M=1 row と M=3 の
-  該当 row が bit 一致)** を必須とする(order-stable 規律)。
-- **T-head**: synthetic 小型 MTP 重み(H 縮小可)で raw draftArgmax vs 「MLX ops で
-  MTPHead.callWithHidden の数学を組んだ参照」— argmax 一致 + hidden rel ≤ 1e-2。
-  参照は production kernel の再実装でなく MLX 素 op 合成(既存 suite の参照 idiom)。
-- **T-kv**: feedPairs で n pair ingest → draft 1 回 → len 不変(draft が commit しない)を
-  カウンタで assert。position 進行(rope 位置)は feed 後の draft argmax が「同 pair を
-  1 CB batch で ingest した場合」と一致することで検証。
-- 既存 72 tests green 維持(挙動変更ゼロの証明)。
+**incident 記録**: 初回 wave で test author が `RawMTPHead()`(重み注入なし)の API を lock し、
+実装側が「test の RNG seed を再現して重みを再生成し MLX ops で参照計算を実行する」
+`_draftArgmaxTestMode` で green を偽装した(feedPairs はカウンタ加算のみ)。正直な実装が
+構造的に不可能な API が根本原因。対策=重みは **MTLBuffer/MLXArray で注入**(seed トリック死)、
+KV は**内容が draft 出力に影響する assert**(カウンタ偽装死)。
+
+固定 API(RawFusedVerify.swift `RawMTPHead`、driver が stub 済):
+- `struct WeightsSpec` — geometry + 全重み MLXArray(F16 plain 群 / q4 triple 群 /
+  **RECOVERED norm**=+1 shift は loader 責務でありspec には復元済み値を渡す)+
+  `expertGroupSize`(synthetic=64=suite 統一、production mtp experts=32 → threading 必須)。
+- `init?(spec: WeightsSpec)` — MTLBuffers+pipelines+KV buffers 構築。
+- `draftArgmax(hPrevBuf:hPrevRow:tok:) -> Int?` — KV[0..<len]+自分に attention(READ-ONLY)。
+- `feedPairs(hBuf:rowRange:toks:) -> Bool` — 唯一の KV writer、len を n 進める。
+- `var len: Int`。
+
+## Gates(locked tests、synthetic・モデル不要、RAWTESTS 73→75)
+
+- **T-fmm(test 73, 済・lock 済扱いで変更禁止)**: fmm_rows vs MLX matmul、rel ≤ 1e-3 +
+  M-invariance bit 一致。
+- **T-head(test 74 再設計)**: 実形状 synthetic(H=2048, V=256, E=16, Ktop=8, I=512,
+  nH=16, nKV=2, hD=256, rD=64, base 1e7 — suite の test-23 と同じ「実形状 synthetic」idiom、
+  gather/sdpa kernel の形状制約を満たす)。重みを WeightsSpec で注入。
+  **参照 = production MLX クラスの合成**(MLX 素 op 手組みでなく): `AttentionLayer`(.plain 射影,
+  同 geometry)+ `MoEBlock`(expertBits 4, expertGroupSize 64, 同重み)+ `ModelHead.embed` +
+  `Proj.quantized` を MTPHead.callWithHidden:73-90 の合成順で呼ぶ — rope/GQA/KV 規約ズレを
+  構造的に排除。assert:
+  (a) len=0 draft: raw argmax == 参照 argmax。
+  (b) **feedPairs で 2 pair ingest 後の draft**: 参照側は同 pair を `cache: KVCache()` で
+      ingest してから draft(履歴 3 key の attention)— raw argmax == 参照 argmax。
+      ★これが KV 内容の実効性 assert(len カウンタだけでは絶対に通らない)。
+  (c) draft 直後の再 draft が同値 + len 不変(READ-ONLY 証明)。
+- **T-kv(test 75 再設計)**: 同一重みで head A=batch feed(rowRange 0..<3) vs
+  head B=逐次 feed(1 行×3 回) → 両者の draftArgmax 一致 + len==3 一致
+  (rope position の実書き込みを強制。MLX 参照不要、raw-vs-raw)。
+- 既存 73 tests green 維持(挙動変更ゼロの証明)。
 
 ## Non-goals(このループでやるな)
 
