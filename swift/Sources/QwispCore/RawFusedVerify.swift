@@ -4344,14 +4344,15 @@ public enum RawFusedVerify {
                                 threadsPerThreadgroup: MTLSize(width: min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
         }
 
-        /// Encode embed(tok from _sTok) → embOut.
-        private func encodeEmbed(_ enc: MTLComputeCommandEncoder, embOut: MTLBuffer) {
+        /// Encode embed(tok from tokBuf[tokOffset]) → embOut.
+        private func encodeEmbed(_ enc: MTLComputeCommandEncoder, embOut: MTLBuffer,
+                                 tokBuf: MTLBuffer, tokOffset: Int) {
             let p = RawFusedVerify._embedRowsPipeline!
             enc.setComputePipelineState(p)
             enc.setBuffer(embedWBuf, offset: 0, index: 0)
             enc.setBuffer(embedSBuf, offset: 0, index: 1)
             enc.setBuffer(embedBBuf, offset: 0, index: 2)
-            enc.setBuffer(_sTok,     offset: 0, index: 3)
+            enc.setBuffer(tokBuf,    offset: tokOffset, index: 3)
             enc.setBuffer(embOut,    offset: 0, index: 4)
             var hh = UInt32(H), tt = UInt32(H)
             enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
@@ -4447,9 +4448,10 @@ public enum RawFusedVerify {
         private func encodeForward(_ enc: MTLComputeCommandEncoder,
                                    hPrevBuf: MTLBuffer, hRow: Int,
                                    pos: Int, totalKeys: Int,
-                                   doLMHead: Bool) {
+                                   doLMHead: Bool,
+                                   tokBuf: MTLBuffer? = nil, tokOffset: Int = 0) {
             // 1. embed(tok) → _sEmb
-            encodeEmbed(enc, embOut: _sEmb)
+            encodeEmbed(enc, embOut: _sEmb, tokBuf: tokBuf ?? _sTok, tokOffset: tokOffset)
             // 2. rmsNorm(emb, preEmb) → _sEmbN
             RawFusedVerify.encodeRmsNormRows(enc, x: _sEmb, w: preEmbBuf, out: _sEmbN,
                                               rows: 1, D: H, eps: eps)
@@ -4514,26 +4516,40 @@ public enum RawFusedVerify {
         }
 
         /// Batch-ingest committed pairs. Advances _len by rowRange.count.
-        /// One CB per row (causal: row i sees KV at 0..<_len+i+1).
+        /// Single CB for all rows: dispatches are hazard-tracked in encode order, so row i's
+        /// k/v write completes before row i+1's SDPA reads it (same discipline as the
+        /// 37-dispatch draft chain). Per-row toks live in a small per-call buffer bound at
+        /// offset i*4 (a shared _sTok scratch would be overwritten CPU-side before commit).
         public func feedPairs(hBuf: MTLBuffer, rowRange: Range<Int>, toks: [Int32]) -> Bool {
             let M = rowRange.count
             guard M == toks.count, M > 0, _len + M <= maxSeqLen else { return false }
+            guard let tokBuf = toks.withUnsafeBytes({ raw in
+                device.makeBuffer(bytes: raw.baseAddress!, length: M * 4, options: .storageModeShared)
+            }) else { return false }
 
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
             for i in 0..<M {
                 let pos = _len + i
-                let srcRow = rowRange.lowerBound + i
-
-                _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = toks[i]
-
-                let cb = queue.makeCommandBuffer()!
-                let enc = cb.makeComputeCommandEncoder()!
                 // Commit k/v to cache (pos committed), skip lm_head/argmax
-                encodeForward(enc, hPrevBuf: hBuf, hRow: srcRow,
+                encodeForward(enc, hPrevBuf: hBuf, hRow: rowRange.lowerBound + i,
                               pos: pos, totalKeys: pos + 1,
-                              doLMHead: false)
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                              doLMHead: false,
+                              tokBuf: tokBuf, tokOffset: i * 4)
             }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             _len += M
+            return true
+        }
+
+        /// ①③ Step 6 fold: draftArgmax has ALREADY written this pair's k/v at pos=_len
+        /// (same encodeForward feedPairs would run — bit-identical, deterministic kernels).
+        /// When the caller commits the drafted-for pair in the same iteration with NO
+        /// intervening head op, advancing len commits it without a second forward.
+        /// Caller contract: the last head op was draftArgmax for exactly this pair.
+        public func commitLastDraft() -> Bool {
+            guard _len + 1 <= maxSeqLen else { return false }
+            _len += 1
             return true
         }
     }

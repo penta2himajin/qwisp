@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 77
+        let total = 78
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4599,6 +4599,83 @@ public enum RawVerifyTests {
             }
             if d0 != d1 {
                 return (false, "weights corrupted after spec release: before=\(d0) after=\(d1) (noCopy lifetime)")
+            }
+            return (true, "ok")
+        }
+
+        // Test 78 (T-fold, ①③ Step 6): commitLastDraft ≡ feedPairs for the drafted pair.
+        // draftArgmax already writes the pair's k/v at pos=len (same encodeForward feedPairs
+        // runs, deterministic kernels) — so draft+commitLastDraft must leave the head in a
+        // state indistinguishable from an explicit feedPairs of the same pair.
+        // Protocol: two heads, identical weights. A: draftArgmax(h0,t0) → commitLastDraft.
+        // B: feedPairs(h0,[t0]). Then both draft (h1,t1): tokens must match, len must match.
+        run("mtp_commit_last_draft_fold") {
+            guard let (device, _) = RawMetalForward.ensure() else {
+                return (false, "no device")
+            }
+            let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
+            let nH = 16, nKV = 2, hD = 256, rD = 64
+            let gs = 64
+            func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = (MLXRandom.normal([e, n, k]) * 0.05).asType(.float16)
+                let (q, s, bOpt) = MLX.quantized(wf, groupSize: gs, bits: 4, mode: .affine)
+                return (q, s, bOpt!)
+            }
+            let (embedWq, embedSc, embedBi) = q4(V, H)
+            let (swGWq, swGSc, swGBi) = q4e(E, I, H)
+            let (swUWq, swUSc, swUBi) = q4e(E, I, H)
+            let (swDWq, swDSc, swDBi) = q4e(E, H, I)
+            let (lmWq, lmSc, lmBi) = q4(V, H)
+            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+                H: H, V: V, E: E, I: I, Ktop: Ktop,
+                numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
+                ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
+                expertGroupSize: gs,
+                fc: f16([H, 2 * H]),
+                qW: f16([nH * 2 * hD, H]), kW: f16([nKV * hD, H]),
+                vW: f16([nKV * hD, H]), oW: f16([H, nH * hD]),
+                routerGate: f16([E, H]),
+                shGate: f16([I, H]), shUp: f16([I, H]), shDown: f16([H, I]),
+                sharedGate: f16([1, H]),
+                preEmb: f16([H]), preHid: f16([H]), inputLN: f16([H]), postLN: f16([H]),
+                qNorm: f16([hD]), kNorm: f16([hD]), finalNorm: f16([H]),
+                embedWq: embedWq, embedSc: embedSc, embedBi: embedBi,
+                swGWq: swGWq, swGSc: swGSc, swGBi: swGBi,
+                swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
+                swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
+                lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
+            guard let headA = RawFusedVerify.RawMTPHead(spec: spec),
+                  let headB = RawFusedVerify.RawMTPHead(spec: spec) else {
+                return (false, "head init nil")
+            }
+            let h0 = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); h0.eval()
+            let h1 = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); h1.eval()
+            guard let b0 = RawMetalForward.mtlBuf(h0, device),
+                  let b1 = RawMetalForward.mtlBuf(h1, device) else { return (false, "hBuf nil") }
+            let t0: Int32 = 9, t1: Int32 = 77
+
+            // A: draft then fold-commit
+            guard let _ = headA.draftArgmax(hPrevBuf: b0, hPrevRow: 0, tok: t0)
+            else { return (false, "A draft nil") }
+            guard headA.commitLastDraft() else { return (false, "A commitLastDraft failed") }
+            // B: explicit feed
+            guard headB.feedPairs(hBuf: b0, rowRange: 0 ..< 1, toks: [t0])
+            else { return (false, "B feedPairs failed") }
+
+            if headA.len != 1 || headB.len != 1 {
+                return (false, "len mismatch: A=\(headA.len) B=\(headB.len) want 1")
+            }
+            guard let dA = headA.draftArgmax(hPrevBuf: b1, hPrevRow: 0, tok: t1),
+                  let dB = headB.draftArgmax(hPrevBuf: b1, hPrevRow: 0, tok: t1)
+            else { return (false, "post-commit draft nil") }
+            if dA != dB {
+                return (false, "fold != feed: A=\(dA) B=\(dB)")
             }
             return (true, "ok")
         }

@@ -593,19 +593,27 @@ public enum RawSpecRunner {
             // ★ MTP-D1 (Step 4): suffix-draftless かつ pending 空 → raw head の 1-token draft。
             //   下の verify path が必ず照合する(reject 経路は greedy と同一 token 列)ので lossless。
             //   flag off = mtpHead nil = mtpDraftSpan nil = このブロック不変(byte-identity)。
+            var mtpDrafted = false
             if D == 0, mtpHead != nil, pending.isEmpty,
                let d = mtpDraftSpan(head: mtpHead, hPrevBuf: _residentFwd?.normedBuffer,
                                     rowOfU: rowOfU, u: u) {
                 drafts = [d]; D = 1
+                mtpDrafted = true
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
             //   forward が normed を上書きする前に feed(draft が同 pair を読んだ後 = validate
             //   と同一規約: draftArgmax read-only → feedPairs same pair)。rowOfU<0 は skip
             //   (KV desync するが draft は verify に photograph されるので lossless のまま)。
+            //   Step 6 fold: draft が走った step は同 pair の k/v が既に pos=len に書かれて
+            //   いる → commitLastDraft(len advance のみ、feed CB 不要)。
             if let head = mtpHead, let fwd = _residentFwd, rowOfU >= 0 {
-                _ = head.feedPairs(hBuf: fwd.normedBuffer,
-                                   rowRange: rowOfU ..< (rowOfU + 1), toks: [Int32(u)])
+                if mtpDrafted {
+                    _ = head.commitLastDraft()
+                } else {
+                    _ = head.feedPairs(hBuf: fwd.normedBuffer,
+                                       rowRange: rowOfU ..< (rowOfU + 1), toks: [Int32(u)])
+                }
             }
 
             // Snapshot before the batched verify (backend-specific representation).
