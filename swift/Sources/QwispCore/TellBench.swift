@@ -90,7 +90,7 @@ extension Tell {
                 let res: (summary: String, tokps: Double)
                 switch m {
                 case "suffix-spec":
-                    res = try Tell.suffixSpecCore(model: model, ids: ids, gR: gR, C: C)
+                    res = try Tell.suffixSpecCore(model: model, ids: ids, gR: gR, C: C, modelDir: modelDir)
                 case "bolt":
                     res = try Tell.boltCore(model: model, ids: ids, gR: gR, C: C)
                 default:

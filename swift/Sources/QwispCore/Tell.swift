@@ -40,14 +40,15 @@ public enum Tell {
         let model = try StreamingQwispModel(store: store, arena: arena, device: device, source: source, cacheC: C)
         let ids = promptArr.asType(.int32).reshaped([1, promptArr.dim(0)])
         let gR = gRef.asArray(Int32.self).map { Int($0) }
-        return try suffixSpecCore(model: model, ids: ids, gR: gR, C: C).summary
+        return try suffixSpecCore(model: model, ids: ids, gR: gR, C: C, modelDir: modelDir).summary
     }
 
     /// ★ T1: SuffixSpec 本体 core。prebuilt model を受け取り、runSuffixSpec と TellBench(batch bench)
     /// の両方から呼ぶ。in-process 連続実行を想定し、依存する global static は process-fresh 既定を
     /// 仮定せず entry で全て明示 set し、exit(defer)で reset する。timed decode 直前に
     /// ExpertSource.throttleActive を立てる（T2: QWISP_THROTTLE_DEFER=1 時のみ意味を持つ）。
-    static func suffixSpecCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int)
+    static func suffixSpecCore(model: StreamingQwispModel, ids: MLXArray, gR: [Int], C: Int,
+                                modelDir: String? = nil)
         throws -> (summary: String, tokps: Double) {
         let calibN = Tell.envInt("QWISP_CALIB", 48)
         // ★ batched f32-full verify が既定(investigate C + batched 再評価で確定):
@@ -99,6 +100,16 @@ public enum Tell {
         let isLin = model.isLinearFlags
         let N = Swift.min(Tell.envInt("QWISP_GEN", 48), gR.count)
         let nE = 256, nMoE = model.expertCaches.count
+        // ★ MTP-D1 hybrid draft (notes/15): opt-in via QWISP_MTP_DRAFT, resident tier のみ (C>=nE)。
+        //   flag unset → mtpActive=false → 全経路 1 バイト不変(zero behavior change)。
+        let mtpActive = Tell.envFlag("QWISP_MTP_DRAFT") && C >= nE && modelDir != nil
+        var mtpHead: MTPHead? = nil
+        var mtpKV: KVCache? = nil
+        var lastH: MLXArray? = nil
+        if mtpActive, let dir = modelDir {
+            mtpHead = try MTPHead(modelDir: dir, store: model.store)
+            mtpKV = KVCache()
+        }
 
         // phase 1: calib（hot-pin 用頻度）
         var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nMoE)
@@ -155,7 +166,20 @@ public enum Tell {
         var hist = ids.asArray(Int32.self).map { Int($0) }     // 履歴（prompt + commit token）
         let mc = model.makeCaches()
         StreamingMoEBlock.probeNoSync = pureNoSync
-        var (_, lg) = try model.prefillChunked(ids, caches: mc)
+        var (prefillH, lg) = try model.prefillChunked(ids, caches: mc)
+        if mtpActive, let head = mtpHead, let kv = mtpKV {
+            let P = ids.dim(1)
+            if P > 1 {
+                // prompt pairs: (h[t], id[t+1]) for t=0..<(P-1) — committed prefix を mtpKV に ingest
+                let hPrev = prefillH[0..., 0 ..< (P - 1)]   // [1, P-1, H]
+                let tokCond = ids[0..., 1...]                  // [1, P-1]
+                MLX.eval([hPrev, tokCond])
+                _ = head(hPrev, tokCond, cache: kv)
+                MLX.eval([kv.keys, kv.values].compactMap { $0 })
+            }
+            lastH = prefillH[0..., (prefillH.dim(1) - 1) ..< prefillH.dim(1)]  // [1, 1, H]
+            MLX.eval([lastH!])
+        }
         var uArr = MLX.argMax(lg[0, lg.dim(1) - 1], axis: -1).reshaped([1, 1])
         MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
         // ★2026-07-02: VERIFY_SEQ を default ON に（strict-lossless 修正）。batched f32 verify は
@@ -190,15 +214,40 @@ public enum Tell {
         let escWindow = Tell.envInt("QWISP_ESC_WINDOW", 16)
         let escGrace = Tell.envInt("QWISP_ESC_GRACE", 24)
         let escMaxRate = 0.45
+        // ★ MTP-D1 head-sync (notes/15 §head-sync): committed (h_t, id_{t+1}) pair を mtpHead に feed し
+        //   lastH を更新。mtpKV は committed 済み pair のみ ingest(rollback 無し)。pk/p は caller の
+        //   loop-iteration 値を明示的に受ける(closure capture の scope 問題を回避)。flag off → guard で素通り。
+        var lastVerifyHidden: MLXArray? = nil
+        func mtpFeedAfterCommit(path: FeedPath, h2: MLXArray, committed: [Int], newU: Int, pk: Int, p: Int) {
+            guard mtpActive, let head = mtpHead, let kv = mtpKV else { return }
+            guard let plan = Tell.mtpFeedPlan(pk: pk, p: p, path: path) else { return }
+            if !plan.feedRows.isEmpty {
+                let r = plan.feedRows
+                let hFeed = h2[0..., r.lowerBound ..< r.upperBound]  // [1, n, H]
+                let allToks = committed + [newU]
+                let nextToks = Array(allToks.dropFirst().prefix(r.count)).map { Int32($0) }
+                guard nextToks.count == r.count else { return }
+                let tokFeed = MLXArray(nextToks, [1, r.count])
+                MLX.eval([hFeed, tokFeed])
+                _ = head(hFeed, tokFeed, cache: kv)
+                MLX.eval([kv.keys, kv.values].compactMap { $0 })
+            }
+            if plan.lastHRow >= 0, plan.lastHRow < h2.dim(1) {
+                lastH = h2[0..., plan.lastHRow ..< (plan.lastHRow + 1)]
+                MLX.eval([lastH!])
+            }
+        }
         func decodeForward(_ input: MLXArray, rows: Int, escalate: Bool) throws -> MLXArray {
             if !escalateActive || !escalate {
-                let (_, l) = try model.forwardHidden(input, caches: mc)
+                let (hidden, l) = try model.forwardHidden(input, caches: mc)
+                if mtpActive { lastVerifyHidden = hidden }
                 return l
             }
             let snaps = mc.map { $0.snapshot() }
             StreamingMoEBlock.hotMissAccum = nil
             StreamingMoEBlock.probeNoSync = true; StreamingMoEBlock.countHotMiss = true
-            let (_, l) = try model.forwardHidden(input, caches: mc)
+            let (hidden, l) = try model.forwardHidden(input, caches: mc)
+            if mtpActive { lastVerifyHidden = hidden }
             let missArr = StreamingMoEBlock.hotMissAccum ?? MLXArray(Int32(0))
             MLX.eval([l, missArr] + mc.flatMap { $0.stateArrays })
             StreamingMoEBlock.countHotMiss = false; StreamingMoEBlock.probeNoSync = false
@@ -207,7 +256,8 @@ public enum Tell {
             let escalated = missArr.item(Int32.self) != 0
             if escalated {                                           // cold routed あり → sync 再計算(exact, cold ensure)
                 for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: rows) }
-                let (_, l2) = try model.forwardHidden(input, caches: mc)
+                let (hidden2, l2) = try model.forwardHidden(input, caches: mc)
+                if mtpActive { lastVerifyHidden = hidden2 }
                 result = l2
             }
             escRecent.append(escalated); if escRecent.count > escWindow { escRecent.removeFirst() }
@@ -285,6 +335,7 @@ public enum Tell {
                 out.append(u); hist.append(u)
                 uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                if mtpActive { lastH = lastVerifyHidden }
                 return
             }
             let pk = pending.count
@@ -309,6 +360,7 @@ public enum Tell {
                     out.append(u); hist.append(u)
                     uArr = MLX.argMax(glg[0, 0], axis: -1).reshaped([1, 1])
                     MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                    if mtpActive { lastH = lastVerifyHidden }
                     return
                 }
             }
@@ -322,10 +374,16 @@ public enum Tell {
             out.append(u); hist.append(u)
             if fmg.asArray(Float.self)[0] > certTau {             // certified → fold 成立（pending 実体化済み）
                 certCommitted += 1
+                let committedSeq = pending + [u]
                 uArr = MLXArray([evArr.asArray(Int32.self)[0]], [1, 1])
                 pending = []
                 setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                // MTP: pending hiddens を feed(0..<pk)、lastH=u row(pk)。H2=fold forward の [1,pk+1,H]。
+                if mtpActive, let h2 = lastVerifyHidden {
+                    mtpFeedAfterCommit(path: .single, h2: h2, committed: committedSeq,
+                                       newU: Int(evArr.asArray(Int32.self)[0]), pk: pk, p: 0)
+                }
             } else {
                 // 未認定 → pre-pending snapshot から pending+[u] を M=1 逐次 replay（無条件 exact）
                 certFallbacks += 1
@@ -333,7 +391,9 @@ public enum Tell {
                 setVerifyMode(false)
                 var rlg = flg
                 for t in pending + [u] {
-                    (_, rlg) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    let (rh, l3) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    if mtpActive { lastVerifyHidden = rh }
+                    rlg = l3
                     MLX.eval([rlg] + mc.flatMap { $0.stateArrays })
                     certReplayFwd += 1
                 }
@@ -341,6 +401,7 @@ public enum Tell {
                 MLX.eval([uArr])
                 replayCommitted += 1
                 pending = []
+                if mtpActive { lastH = lastVerifyHidden }
             }
         }
         ExpertSource.throttleActive = true   // T2: deferred throttle はここ（timed decode 開始）から有効
@@ -349,11 +410,18 @@ public enum Tell {
             steps += 1
             let u = uArr.item(Int.self)
             var ts = now()
-            let drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: Swift.min(maxK, safeMaxK), minMatch: minMatch,
+            var drafts = suffixDraft(hist + [u], maxMatch: maxMatch, draftK: Swift.min(maxK, safeMaxK), minMatch: minMatch,
                                      traceAlts: acceptTrace)
-            let D = drafts.count
+            var D = drafts.count
             draftTot += D
             if prof { tDraft += now() - ts; ts = now() }
+            // ★ MTP-D1: draftless かつ pending 空の時 1-token draft を生成（suffix は空だが head が埋める）。
+            //   cache=nil で draft only(KV 更新無し)。verify が必ず照合するので lossless。
+            if D == 0 && pending.isEmpty, let head = mtpHead, let lh = lastH {
+                let dl = head(lh, uArr)                      // logits [1,1,V]
+                let d = MLX.argMax(dl[0, 0], axis: -1).item(Int.self)
+                drafts = [d]; D = 1
+            }
             if D == 0 {                                          // 一致なし → 通常 greedy 1 step（pending は fold）
                 if acceptTrace { atDraftless += 1 }
                 try advanceSingle(u)
@@ -461,7 +529,9 @@ public enum Tell {
                 setVerifyMode(false)                              // replay は verify mode 外（greedy branch と同様）
                 var rlg = vlg                                     // placeholder（replay ≥1 token で必ず上書き）
                 for t in pending + [u] + Array(curDrafts.prefix(p)) {
-                    (_, rlg) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    let (rh, l3) = try model.forwardHidden(MLXArray([Int32(t)], [1, 1]), caches: mc)
+                    if mtpActive { lastVerifyHidden = rh }
+                    rlg = l3
                     MLX.eval([rlg] + mc.flatMap { $0.stateArrays })
                     certReplayFwd += 1
                 }
@@ -469,23 +539,44 @@ public enum Tell {
                 MLX.eval([uArr])
                 replayCommitted += 1
                 pending = []
+                // MTP: replay path は feedRows 空(mtpFeedPlan .replay)→ mtpKV には feed しない。
+                //   lastH を最終 replay hidden(=h(末尾 committed token))で更新。KV は stale になるが
+                //   draft 品質低下のみ・verify が正すので lossless 不変。
+                if mtpActive { lastH = lastVerifyHidden }
             } else if p == D2 {
                 certCommitted += 1                                // bonus token evals[D2] も certified
+                let committedSeq = pending + [u] + curDrafts
                 uArr = MLXArray([Int32(evals[D2])], [1, 1])
                 pending = []                                      // fused forward が pending ごと実体化済み
                 setVerifyMode(false)
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                // MTP: fullAccept — committed prefix(pending+[u]+drafts) の pair を feed、lastH=H2 row pk+p。
+                if mtpActive, let h2 = lastVerifyHidden {
+                    mtpFeedAfterCommit(path: .fullAccept, h2: h2, committed: committedSeq,
+                                       newU: evals[D2], pk: pk, p: p)
+                }
             } else {
                 certCommitted += 1                                // reject 境界 token evals[p] は certified
+                let committedSeq = pending + [u] + Array(curDrafts.prefix(p))
                 for (i, c) in mc.enumerated() { c.restore(snaps[i], isLinear: isLin[i], trim: pk + 1 + D2) }
                 // ★A3 fused reject: 旧 rebuild forward（logits 不使用の cache 再構築）を SKIP し、
                 //   [u]+accepted を pending に積んで次 verify に融合（連続 reject では連結で成長）。
                 pending += [u] + Array(curDrafts.prefix(p))
                 a3Fused += 1
+                // MTP: snapshot verify H2 BEFORE flushPending() — flush calls decodeForward which
+                //   overwrites lastVerifyHidden with flush hiddens (wrong for the reject feed).
+                //   H2 rows are independent of cache state, so the snapshot remains valid post-flush.
+                let rejectH2 = mtpActive ? lastVerifyHidden : nil
                 if pending.count > pendingCap { try flushPending() }   // 非有界成長の cap（verify mode はまだ true）
                 setVerifyMode(false)
                 uArr = MLXArray([Int32(evals[p])], [1, 1])
                 MLX.eval([uArr] + mc.flatMap { $0.stateArrays })
+                // MTP: reject — 同一規約(fullAccept と同一)で committed prefix の pair を feed。
+                //   H2 は cache restore 後も committed-prefix 行は exact(配列は cache と独立)→ feed 可。
+                if mtpActive, let h2 = rejectH2 {
+                    mtpFeedAfterCommit(path: .reject, h2: h2, committed: committedSeq,
+                                       newU: evals[p], pk: pk, p: p)
+                }
             }
             if prof { tVerify += now() - ts }
         }
@@ -631,7 +722,31 @@ public enum Tell {
         }
         return []
     }
+
+    // Row-map pure function for MTP-D1 hybrid draft head-sync (notes/15 G-A).
+    // rows = [pending pk][u][drafts] in H2 from verify.
+    //   fullAccept/reject: feedRows = 0..<(pk+p), lastHRow = pk+p (flush committed prefix).
+    //   replay:  feedRows = 0..<0,    lastHRow = -1   (caller feeds sequentially; pk/p ignored).
+    //   single:  feedRows = 0..<pk,   lastHRow = pk   (feed pending hiddens; lastH = u hidden).
+    public static func mtpFeedPlan(pk: Int, p: Int, path: FeedPath)
+        -> (feedRows: Range<Int>, lastHRow: Int)? {
+        switch path {
+        case .fullAccept, .reject:
+            return (feedRows: 0..<(pk + p), lastHRow: pk + p)
+        case .replay:
+            return (feedRows: 0..<0, lastHRow: -1)
+        case .single:
+            return (feedRows: 0..<pk, lastHRow: pk)
+        }
+    }
 }
+
+/// FeedPath discriminates the four head-sync wiring paths in MTP-D1 hybrid draft (notes/15).
+/// - fullAccept: verify accepted p drafts (p may be 0 for a clean reject-all step)
+/// - reject:     verify rejected all drafts (same contract as fullAccept; kept distinct for caller clarity)
+/// - replay:     certStop replay — head is fed sequentially by the caller; feedRows always empty
+/// - single:     advanceSingle — pending non-empty, no suffix draft; feeds pending hiddens only
+public enum FeedPath { case fullAccept, reject, replay, single }
 
 // ── ReuseContext: expert-reuse draft rerank context (notes/10 §2) ─────────────
 // Accumulates per-token per-layer expert usage from streaming verify rows and

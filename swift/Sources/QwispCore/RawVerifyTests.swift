@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 69
+        let total = 70
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3844,6 +3844,50 @@ public enum RawVerifyTests {
             let empty = RawSpecRunner.boltWorkloadPreset("")
             if empty.r != 128 || empty.b != 32 {
                 return (false, "empty workload: got (R=\(empty.r), B=\(empty.b)) want (R=128, B=32)")
+            }
+            return (true, "ok")
+        }
+
+        // Test 70 (notes/15 G-A): mtp_feed_plan — pure-function row-map contract.
+        // Calls Tell.mtpFeedPlan(pk:p:path:) directly (no process-env dependency).
+        // Verifies the row-map convention from notes/15 §head-sync:
+        //   rows = [pending pk][u][drafts] in H2 from verify.
+        //   fullAccept/reject: feedRows = 0..<(pk+p), lastHRow = pk+p.
+        //   replay:  feedRows = 0..<0, lastHRow = -1   (replay feeds sequentially; pk/p ignored)
+        //   single:  feedRows = 0..<pk, lastHRow = pk  (feed pending hiddens; lastH = u hidden)
+        // All cases are RED until the stub returns a non-nil value.
+        run("mtp_feed_plan") {
+            struct Case {
+                let pk: Int, p: Int, path: FeedPath
+                let wantFeed: Range<Int>, wantLastH: Int
+            }
+            let cases: [Case] = [
+                // fullAccept × 4
+                Case(pk: 0, p: 0, path: .fullAccept, wantFeed: 0..<0,  wantLastH: 0),
+                Case(pk: 0, p: 3, path: .fullAccept, wantFeed: 0..<3,  wantLastH: 3),
+                Case(pk: 2, p: 0, path: .fullAccept, wantFeed: 0..<2,  wantLastH: 2),
+                Case(pk: 2, p: 3, path: .fullAccept, wantFeed: 0..<5,  wantLastH: 5),
+                // reject × 4 — identical contract to fullAccept (both flush committed prefix)
+                Case(pk: 0, p: 0, path: .reject,     wantFeed: 0..<0,  wantLastH: 0),
+                Case(pk: 0, p: 3, path: .reject,     wantFeed: 0..<3,  wantLastH: 3),
+                Case(pk: 2, p: 0, path: .reject,     wantFeed: 0..<2,  wantLastH: 2),
+                Case(pk: 2, p: 3, path: .reject,     wantFeed: 0..<5,  wantLastH: 5),
+                // replay — adversarial: pk/p ignored, always empty+(-1)
+                Case(pk: 0, p: 0, path: .replay,     wantFeed: 0..<0,  wantLastH: -1),
+                Case(pk: 2, p: 3, path: .replay,     wantFeed: 0..<0,  wantLastH: -1),
+                // single — pending hiddens only; lastH = u row
+                Case(pk: 0, p: 0, path: .single,     wantFeed: 0..<0,  wantLastH: 0),
+                Case(pk: 2, p: 0, path: .single,     wantFeed: 0..<2,  wantLastH: 2),
+            ]
+            for c in cases {
+                guard let got = Tell.mtpFeedPlan(pk: c.pk, p: c.p, path: c.path)
+                else { return (false, "not implemented (pk=\(c.pk) p=\(c.p) path=\(c.path))") }
+                if got.feedRows != c.wantFeed {
+                    return (false, "pk=\(c.pk) p=\(c.p) path=\(c.path): feedRows=\(got.feedRows) want \(c.wantFeed)")
+                }
+                if got.lastHRow != c.wantLastH {
+                    return (false, "pk=\(c.pk) p=\(c.p) path=\(c.path): lastHRow=\(got.lastHRow) want \(c.wantLastH)")
+                }
             }
             return (true, "ok")
         }
