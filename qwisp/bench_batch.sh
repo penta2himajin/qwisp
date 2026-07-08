@@ -4,10 +4,12 @@
 # the in-process batch runner (QWISP_RUN=bench-batch, swift TellBench.swift) loops methods ×
 # regimes with a single model load (vs 8-12 loads for bench.sh), resetting all engine state per
 # cell (cold-start equivalent; OS page-cache warmth is identical to the multi-process bench).
-# bolt cells are measured with per-regime single-shot raw-spec CLI (QWISP_RUN=raw-spec,
-# RawSpecRunner.swift) — the shipping engine, not the MLX boltCore path.
+# suffix-spec (strict) AND bolt cells are measured with per-regime single-shot raw-spec CLI
+# (QWISP_RUN=raw-spec, RawSpecRunner.swift) — the shipping engine (strict default since a58bde7),
+# not the MLX suffixSpecCore/boltCore paths. Other methods still go through the in-process batch.
 # Post-processing of the runner's stdout per cell:
-#   speed        non-bolt: BENCH|method=..|regime=..|tokps=..
+#   speed        in-process: BENCH|method=..|regime=..|tokps=..
+#                suffix-spec: [RawSpec] raw engine(<resident|streaming C=N>): <X> tok/s ...
 #                bolt: [RawSpec] bolt(L3 near-lossless) C=<C>: <X> tok/s ...
 #   fidelity     suffix-spec: T0 token compare (bench_tokcmp.py on OUT_TOKENS vs canonical ref);
 #                bolt: [RawSpec] bolt TF fidelity vs strict-canonical: <a>/<b>=<Z>% (chaos-free)
@@ -36,17 +38,17 @@ REGIMES="code agentic longctx shortnl"
 echo "== Qwisp bench: C=$C GEN=$GEN throttle=${THR}GB/s ($([ "$THR" = 0 ] && echo fast-SSD || echo slow-NAND)) =="
 printf '  %-12s %-8s %10s %12s  %s\n' method regime "tok/s" "fidelity" "correctness"
 
-# --- split methods into non-bolt (in-process batch) and bolt (per-regime raw-spec CLI) ---
-NON_BOLT=""; HAS_BOLT=0
+# --- split methods: suffix-spec/bolt → per-regime raw-spec CLI, everything else → in-process ---
+BATCH=""
 for _m in $METHODS; do
-  if [ "$_m" = bolt ]; then HAS_BOLT=1; else NON_BOLT="${NON_BOLT:+$NON_BOLT }$_m"; fi
+  case "$_m" in suffix-spec|bolt) ;; *) BATCH="${BATCH:+$BATCH }$_m" ;; esac
 done
 
-# --- single batch invocation for non-bolt methods (1 model load; skip if none) ---
+# --- single batch invocation for in-process methods (1 model load; skip if none) ---
 RAW="$(mktemp)"
-if [ -n "$NON_BOLT" ]; then
+if [ -n "$BATCH" ]; then
   QWISP_RUN=bench-batch QWISP_MODEL="$MODEL" QWISP_BENCH_REFS_DIR="$REFS" \
-    QWISP_BENCH_METHODS="$NON_BOLT" QWISP_BENCH_REGIMES="$REGIMES" \
+    QWISP_BENCH_METHODS="$BATCH" QWISP_BENCH_REGIMES="$REGIMES" \
     QWISP_CACHE_C="$C" QWISP_GEN="$GEN" QWISP_SSD_THROTTLE_GBS="$THR" \
     QWISP_DUMP_TOKENS=1 "$BIN" stream > "$RAW" 2>/dev/null
 fi
@@ -75,6 +77,24 @@ for m in $METHODS; do
       fid="$(printf '%s\n' "$raw_out" \
         | grep '\[RawSpec\] bolt TF fidelity' | head -1 \
         | grep -oE '[0-9.]+%' | tail -1)"
+      corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
+      [ -z "$corr" ] && corr="(checker error)"
+      rm -f "$dump"
+    elif [ "$m" = suffix-spec ]; then
+      # --- per-regime single-shot raw-spec CLI (strict; raw is the shipping strict engine) ---
+      # ponytail: env -u strips QWISP_THROTTLE_DEFER; raw measurement is invalid with DEFER set.
+      raw_out="$(env -u QWISP_THROTTLE_DEFER \
+        QWISP_RUN=raw-spec QWISP_MODEL="$MODEL" QWISP_RAW_C="$C" \
+        QWISP_MTP_REF="$ref" QWISP_GEN="$GEN" QWISP_SSD_THROTTLE_GBS="$THR" \
+        QWISP_DUMP_TOKENS=1 "$BIN" stream 2>/dev/null)"
+      dump="$(mktemp)"
+      printf '%s\n' "$raw_out" | grep -E 'PROMPT_TOKENS|OUT_TOKENS|BOLT_TOKENS' > "$dump"
+      # speed: "[RawSpec] raw engine(<resident|streaming C=N>): <X> tok/s ..."  (RawSpecRunner.swift:789)
+      tokps="$(printf '%s\n' "$raw_out" \
+        | grep '\[RawSpec\] raw engine(' | head -1 \
+        | sed 's/.*): *\([0-9.]*\) tok\/s.*/\1/')"
+      # T0 strict fidelity: free-run tokens vs canonical ref (same axis as the old in-process cell)
+      fid="$("$PY" "$REPO/qwisp/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
       corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
       [ -z "$corr" ] && corr="(checker error)"
       rm -f "$dump"

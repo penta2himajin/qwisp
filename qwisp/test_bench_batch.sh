@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# RED test for task ②A: bench_batch.sh bolt cell → raw bolt runner (single-shot CLI).
+# Lock test: bench_batch.sh suffix-spec AND bolt cells → raw runner (single-shot CLI).
+# (Updated 2026-07-09 by owner instruction: strict default = raw engine (a58bde7), so the
+#  canonical strict bench cell must measure raw too — the old goal "suffix-spec stays
+#  in-process MLX" is superseded.)
 #
 # Fixture test — no real GPU/model. A stub BIN (this script writes it to mktemp) impersonates
-# qwisp-poc: it branches on QWISP_RUN. The stub proves that bench_batch.sh routes bolt through
-# a per-regime `QWISP_RUN=raw-spec` CLI invocation (not the in-process bench-batch runner) and
-# parses the raw human output lines (RawSpecRunner.swift:1098 speed / :1316 TF fidelity).
+# qwisp-poc: it branches on QWISP_RUN (and QWISP_RAW_BOLT within raw-spec). The stub proves
+# that bench_batch.sh routes BOTH suffix-spec and bolt through per-regime `QWISP_RUN=raw-spec`
+# CLI invocations (not the in-process bench-batch runner) and parses the raw human output
+# lines (RawSpecRunner.swift:789 strict speed / :1098 bolt speed / :1316 TF fidelity).
 #
-# Goal encoded here (fails on current tree, where bolt still goes through in-process batch):
-#   1. suffix-spec rows still come from the single bench-batch invocation  (tokps 50.0)
+# Goal encoded here:
+#   1. suffix-spec rows (4 regimes) come from raw-spec CLI, NO QWISP_RAW_BOLT  (73.0 tok/s)
+#   1b. the in-process bench-batch runner is NOT used for suffix-spec  (stub tokps 50.0 absent)
 #   2. bolt rows (4 regimes) come from raw-spec CLI  (92.5 tok/s, 92.9% TF fidelity)
-#   3. QWISP_THROTTLE_DEFER is NOT propagated into the raw-spec call  (DEFER-leak marker absent)
-#   4. QWISP_BOLT_WORKLOAD matches the regime of QWISP_MTP_REF          (workload marker absent)
+#   3. QWISP_THROTTLE_DEFER is NOT propagated into ANY raw-spec call  (DEFER-leak marker absent)
+#   4. QWISP_BOLT_WORKLOAD matches the regime of QWISP_MTP_REF on bolt calls (marker absent)
 #
 # Exit 0 = PASS (prints BENCHBATCHTEST PASS), else FAIL (BENCHBATCHTEST FAIL).
 set -u
@@ -27,7 +32,8 @@ cat > "$BIN" <<'STUB'
 #!/usr/bin/env bash
 case "${QWISP_RUN:-}" in
   bench-batch)
-    # in-process batch: emit ONLY suffix-spec cells (bolt must NOT come from here anymore).
+    # in-process batch: must NOT be invoked for suffix-spec/bolt anymore. If it is, it emits
+    # the 50.0 marker row the test asserts absent.
     for r in code agentic longctx shortnl; do
       echo "BENCHCELL|method=suffix-spec|regime=$r"
       echo "BENCH|method=suffix-spec|regime=$r|tokps=50.0"
@@ -36,20 +42,26 @@ case "${QWISP_RUN:-}" in
     done
     ;;
   raw-spec)
-    # trap the two known raw-CLI hazards:
+    # hazard trap (both strict and bolt raw calls):
     #  (a) QWISP_THROTTLE_DEFER must be stripped before the raw call (else invalid measurement)
     if [ -n "${QWISP_THROTTLE_DEFER:-}" ]; then
       echo "DEFER_LEAKED workload=${QWISP_BOLT_WORKLOAD:-?}" >> "${QWISP_TEST_DEFER_MARKER:?}"
     fi
-    #  (b) QWISP_BOLT_WORKLOAD must equal the regime named by QWISP_MTP_REF
-    ref_regime="$(basename "${QWISP_MTP_REF:-}" .safetensors)"
-    if [ "${QWISP_BOLT_WORKLOAD:-}" != "$ref_regime" ]; then
-      echo "MISMATCH bolt=${QWISP_BOLT_WORKLOAD:-?} ref=$ref_regime" >> "${QWISP_TEST_WORKLOAD_MARKER:?}"
+    if [ "${QWISP_RAW_BOLT:-}" = 1 ]; then
+      #  (b) bolt only: QWISP_BOLT_WORKLOAD must equal the regime named by QWISP_MTP_REF
+      ref_regime="$(basename "${QWISP_MTP_REF:-}" .safetensors)"
+      if [ "${QWISP_BOLT_WORKLOAD:-}" != "$ref_regime" ]; then
+        echo "MISMATCH bolt=${QWISP_BOLT_WORKLOAD:-?} ref=$ref_regime" >> "${QWISP_TEST_WORKLOAD_MARKER:?}"
+      fi
+      # canonical raw bolt human output (RawSpecRunner.swift:1098 / :1316)
+      echo "[RawSpec] bolt(L3 near-lossless) C=${QWISP_RAW_C:-?}: 92.5 tok/s  accept/step=7.00  品質(vs ref) 120/128=94%"
+      echo "[RawSpec] NOTE: bolt is L3 near-lossless (buddy remap, not strict). Quality vs ref is informational."
+      echo "[RawSpec] bolt TF fidelity vs strict-canonical: 118/127=92.9% (chaos-free)"
+    else
+      # canonical raw strict human output (RawSpecRunner.swift:789)
+      echo "[RawSpec] raw engine(streaming C=${QWISP_RAW_C:-?}): 73.0 tok/s  accept/step=3.00  品質(vs ref spec_greedy) 128/128=100%"
+      echo "[RawSpec] self-check spec-vs-greedy: 128/128 LOSSLESS"
     fi
-    # canonical raw bolt human output (RawSpecRunner.swift:1098 / :1316)
-    echo "[RawSpec] bolt(L3 near-lossless) C=${QWISP_RAW_C:-?}: 92.5 tok/s  accept/step=7.00  品質(vs ref) 120/128=94%"
-    echo "[RawSpec] NOTE: bolt is L3 near-lossless (buddy remap, not strict). Quality vs ref is informational."
-    echo "[RawSpec] bolt TF fidelity vs strict-canonical: 118/127=92.9% (chaos-free)"
     echo "PROMPT_TOKENS:1,2,3"
     echo "OUT_TOKENS:4,5,6"
     ;;
@@ -91,9 +103,19 @@ check() { # <desc> <0-if-ok>
   if [ "$2" -eq 0 ]; then echo "  ok   : $1"; else echo "  FAIL : $1"; fails=$((fails + 1)); fi
 }
 
-# 1) suffix-spec rows still present from the batch invocation (unchanged behavior)
-printf '%s\n' "$OUT" | grep -qE 'suffix-spec[[:space:]]+code[[:space:]]+50\.0'
-check "suffix-spec code row (tokps 50.0) present" $?
+# 1) suffix-spec rows (4 regimes) come from the raw-spec CLI (strict raw output, 73.0 tok/s)
+strict_rows=0
+for r in code agentic longctx shortnl; do
+  if printf '%s\n' "$OUT" | grep -qE "suffix-spec[[:space:]]+$r[[:space:]]+73\.0"; then
+    strict_rows=$((strict_rows + 1))
+  fi
+done
+[ "$strict_rows" -eq 4 ]
+check "suffix-spec raw rows for 4 regimes (73.0 tok/s) — got $strict_rows/4" $?
+
+# 1b) the in-process bench-batch runner was NOT used for suffix-spec (stub marker 50.0 absent)
+! printf '%s\n' "$OUT" | grep -qE 'suffix-spec[[:space:]]+[a-z]+[[:space:]]+50\.0'
+check "in-process bench-batch NOT used for suffix-spec (50.0 absent)" $?
 
 # 2) bolt rows for all 4 regimes, from raw-spec CLI: 92.5 tok/s AND 92.9% TF fidelity on the row
 bolt_rows=0
