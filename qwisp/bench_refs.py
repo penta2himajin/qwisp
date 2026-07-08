@@ -7,18 +7,19 @@ Each ref stores {spec_prompt, spec_greedy}. This is what the Swift runners (suff
 consume via QWISP_MTP_REF.
 
 spec_greedy provenance: the Python-4bit greedy written by the generate step is a BOOTSTRAP value
-only — Python runs f16 SDPA/conv while the Swift engine (and mlx-fidelity's teacher forcing) is
-f32-full, so near-tie argmax flips make strict fidelity read <100% against it (observed: longctx
-120/128, shortnl 126/128, all benign rank<=2 near-ties). The CANONICAL reference is the Swift
-strict greedy with the PINNED canonical op configuration (2026-07-02 doctrine):
-  f32-full + fuseGDN OFF + prefill chunk=8 (C-independent constant) + M=1 sequential decode
-  + sync routing.
-Batched kernels are NOT order-stable across shapes (M, chunk, fused-vs-split), so any change to
-these computation shapes changes near-tie argmaxes => regenerate refs whenever they change.
-After generating, replace spec_greedy via --ingest-swift with a QWISP_SWIFT_REF dump:
-  QWISP_RUN=suffix-spec QWISP_DUMP_TOKENS=1 ... qwisp-poc stream | grep OUT_TOKENS  > /tmp/code.toks
-  (or QWISP_RUN=bolt QWISP_SWIFT_REF=1 QWISP_DUMP_TOKENS=1 ... | grep STRICT_TOKENS)
+only. The CANONICAL reference is the RAW ENGINE greedy (2026-07-09, when raw became the shipping
+strict default a58bde7; supersedes the 2026-07-02 MLX f32-full canonical): raw kernels are
+order-stable and C-independent, and raw-spec's structural self-check guarantees spec==greedy.
+The old MLX canonical differs from raw only at f16-ULP near-tie argmax flips (diagnosed
+2026-07-09: longctx k=2 / shortnl k=10, logit gap 0.06-0.09 ~= 1-2 f16 ULP, benign) — but one
+flip cascades in free-run, so refs MUST come from the engine under measurement.
+Doctrine unchanged: kernels are NOT order-stable across computation shapes, so regenerate refs
+whenever the shipping engine or its shapes change.
+After generating, replace spec_greedy via --ingest-swift with a raw-spec dump:
+  QWISP_RUN=raw-spec QWISP_RAW_C=0 QWISP_GEN=128 QWISP_DUMP_TOKENS=1 QWISP_MODEL=... \
+    QWISP_MTP_REF=<repo>/refs/code.safetensors qwisp-poc stream > /tmp/code.toks
   PYTHONPATH=<repo> "$PY" -m qwisp.bench_refs --ingest-swift code /tmp/code.toks
+  (legacy MLX canonical: QWISP_RUN=suffix-spec OUT_TOKENS / QWISP_RUN=bolt STRICT_TOKENS dumps)
 
 Run (MTPLX runtime venv has mlx_lm):
   PY="$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python3"
