@@ -28,7 +28,21 @@ case "serve":
     let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID)
     try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
-    print("qwisp chat — not yet implemented (step 6)")
+    let promptText = args.dropFirst().joined(separator: " ")
+    let prompt = promptText.isEmpty ? (readLine(strippingNewline: true) ?? "") : promptText
+    if prompt.isEmpty {
+        print("usage: qwisp chat <prompt>   (or pipe text via stdin)")
+    } else {
+        let tok = try await QwispTokenizer(modelDir: model)
+        let backend: any LLMBackend
+        if ProcessInfo.processInfo.environment["QWISP_FAKE"] == "1" {
+            backend = FakeBackend(script: tok.encode("(fake backend) hello from qwisp chat."))
+        } else {
+            backend = try SeedlessBackend(modelDir: model)
+        }
+        let maxTokens = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "512") ?? 512
+        await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens)
+    }
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":

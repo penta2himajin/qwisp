@@ -46,6 +46,18 @@ struct ChatCompletionChunk: Codable {
     let choices: [ChunkChoice]
 }
 
+// ── CLI (`qwisp chat`) — thin in-process wrapper over the same core ──────────
+func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend, maxTokens: Int) async {
+    let promptIds: [Int]
+    do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]]) }
+    catch { fputs("chat: render error: \(error)\n", stderr); return }
+    _ = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
+                            decode: { tokenizer.decode($0) }, backend: backend) { delta in
+        fputs(delta, stdout); fflush(stdout)   // real-time token output
+    }
+    fputs("\n", stdout)
+}
+
 // ── Core ─────────────────────────────────────────────────────────────────────
 struct CompletionResult {
     var text: String

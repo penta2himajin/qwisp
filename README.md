@@ -4,8 +4,30 @@ Apple Silicon (MLX) 上で **Qwen3.6 系 MoE モデル**を「制約デバイス
 
 antirez の [DwarfStar4 (DS4)](https://antirez.com/news/165) に着想を得つつ、方向性は逆 ―― DS4 が「巨大モデルを高メモリ機にギリ載せる」のに対し、本プロジェクトは **MoE のスパース性を活かして、より非力な Apple Silicon に reach を広げる**ことを目指す。中核アイデアは Apple の **AFM 3 Core Advanced** 戦略（大きなスパースモデルをフラッシュに常駐させ、必要なスライスだけ DRAM にロード）の自前 OSS 版。
 
-> **現状：調査・設計フェーズ。実装コードはまだ無い。**
-> まず routing trace の実測でストリーミングの go/no-go を判断する（`docs/02-roadmap.md`）。
+実行時（ランタイム）は **Tell**、そのデコードエンジン（生 Metal 実装、旧 MLX）は **Seedless**。
+
+## Quickstart（server / CLI）
+
+```bash
+# ビルド（Metal Toolchain 必須）
+cd swift && xcodebuild build -scheme qwisp -configuration Release \
+  -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation
+BIN=swift/.xcode-build-rel/Build/Products/Release/qwisp
+export QWISP_MODEL=$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16
+
+# OpenAI 互換サーバ（QWISP_PORT 既定 8080）
+"$BIN" serve
+#   GET  /v1/models
+#   POST /v1/chat/completions   （stream:true で SSE、既定は非ストリーミング JSON）
+
+# CLI（in-process、stdout にストリーミング）
+"$BIN" chat "日本語で自己紹介して"
+```
+
+**サンプリングについて（重要）**: エンジンは *lossless greedy*。OpenAI リクエストの
+`temperature` / `top_p` / `n` は**受理するが無視**する（決定的・greedy 出力）。指定されると
+レスポンスに `x-qwisp-warning: sampling params ignored (greedy/lossless engine)` ヘッダが付き、
+`serve` 起動時にもその旨を表示する。tools / logprobs / n>1 は未対応。
 
 ## ターゲット
 
