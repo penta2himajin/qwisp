@@ -23,7 +23,8 @@ swift/            # the product — Swift package
   Sources/QwispCore/    # Tell runtime + Seedless engine (raw-Metal forward, arena/streaming, spec-verify) + locked tests
   Sources/qwisp/        # OpenAI server + `qwisp chat` CLI + tokenizer (swift-transformers)
   Sources/qwisp-poc/    # bench/gate binary (RAWTESTS + bench harness)
-scripts/            # gate scripts + Python reference/bench oracle (bit-compare only; NEVER in the serving path)
+scripts/          # shell gate + benchmark scripts
+oracle/           # Python reference/bench oracle (bit-compare only; NEVER in the serving path)
 notes/            # engine design rationale (referenced by number from source comments)
 docs/             # process docs (handoff-protocol, i18n-policy)
 refs/             # canonical measurement refs (raw-greedy) — GITIGNORED, regenerate locally
@@ -39,7 +40,7 @@ cannot cheaply reach.
   on QwispCore files — LSP-only noise; `xcodebuild` is the truth.
 - Model: a Qwen3.6-35B-A3B MTPLX checkpoint; point `QWISP_MODEL` at its directory.
 - Python reference oracle needs an MLX-capable python (numpy/safetensors/mlx_lm), not Homebrew
-  python3 — see `scripts/README.md`.
+  python3 — see `oracle/README.md`.
 
 ## Build & Test
 
