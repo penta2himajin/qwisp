@@ -49,7 +49,7 @@ public enum RawVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 78
+        let total = 79
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4677,6 +4677,21 @@ public enum RawVerifyTests {
             if dA != dB {
                 return (false, "fold != feed: A=\(dA) B=\(dB)")
             }
+            return (true, "ok")
+        }
+
+        // Test 79: seedless_config — facade tier sizing (productization step 2).
+        // Pure/GPU-free seam; mirrors RawSpecRunner.run()'s tier arithmetic:
+        //   maxK        = streaming ? max(4, C*3/8) : 96
+        //   maxM        = max(pendingCap(24) + maxK + 1, 64)
+        //   maxSeqLen   = promptLen + maxTokens + maxK + 64
+        run("seedless_config") {
+            let s = SeedlessBackend.config(tier: .streaming(c: 64), promptLen: 10, maxTokens: 48)
+            let sWant = SeedlessBackend.Config(isStreaming: true, c: 64, maxK: 24, maxM: 64, maxSeqLen: 146)
+            if s != sWant { return (false, "streaming c=64 got \(s) want \(sWant)") }
+            let r = SeedlessBackend.config(tier: .resident, promptLen: 10, maxTokens: 48)
+            let rWant = SeedlessBackend.Config(isStreaming: false, c: 256, maxK: 96, maxM: 121, maxSeqLen: 218)
+            if r != rWant { return (false, "resident got \(r) want \(rWant)") }
             return (true, "ok")
         }
 
