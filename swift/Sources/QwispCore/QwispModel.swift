@@ -1198,6 +1198,80 @@ public final class QwispModel {
         return out
     }
 
+    /// ★ ghost-smart (Plato/SGD dependency-aware waves, arXiv 2402.12280): base の全並列 blind に対し、
+    /// 独立 B-1 節を wave1 で並列 expand し、統合節(conclusion=最終 prompt)を wave2 で **wave1 の生成文を
+    /// grown-context として前置**して decode(依存を解決=coherent conclusion)。同一 run で base(全並列) と
+    /// smart(2-wave) の実測 tok/s を比較し、依存 wave の真の速度コストを測る。resident engine の prefill が
+    /// Python PoC(mlx_lm re-encode)より安いかの検証。注: wave2 は grown-context を fresh prefill(KV 再利用は
+    /// しない — 真の KV 共有は cross-slot attention=Hogwild 別項)。入力 env は runGhost と同じ。最終 prompt=依存節。
+    public static func runGhostSmart(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store); let L = model.numLayers
+        let M = Tell.envInt("QWISP_GHOST_GEN", 120)
+        guard let path = ProcessInfo.processInfo.environment["QWISP_GHOST_PROMPTS"] else {
+            return "[ghost-smart] ERROR: set QWISP_GHOST_PROMPTS"
+        }
+        let prompts: [[Int32]] = (try String(contentsOfFile: path, encoding: .utf8))
+            .split(separator: "\n").map { String($0) }.filter { !$0.isEmpty }
+            .map { $0.split(separator: ",").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) } }
+        let B = prompts.count
+        guard B >= 2, prompts.allSatisfy({ !$0.isEmpty }) else { return "[ghost-smart] ERROR: need >=2 non-empty prompts" }
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+        func promptArr(_ ids: [Int32]) -> MLXArray { MLXArray(ids, [1, ids.count]) }
+
+        // 並列 expand: prompt 添字集合 sel を独立-B で M step decode。(出力トークン, 経過ms) を返す。
+        func batchedExpand(_ sel: [Int]) -> ([[Int32]], Double) {
+            let n = sel.count
+            var pf: [[LayerCache]] = []; var cur = [Int32](repeating: 0, count: n); var pos = [Int](repeating: 0, count: n)
+            for (j, b) in sel.enumerated() {
+                let c = model.makeCaches(); let lg = model(promptArr(prompts[b]), caches: c); lg.eval()
+                MLX.eval(c.flatMap { $0.stateArrays })
+                pf.append(c); cur[j] = Int32(MLX.argMax(lg[0, prompts[b].count-1], axis: -1).item(Int.self)); pos[j] = prompts[b].count
+            }
+            var gdn: [LayerCache] = (0..<L).map { _ in LayerCache() }
+            var akv: [[KVCache]] = (0..<L).map { _ in (0..<n).map { _ in KVCache() } }
+            for i in 0..<L {
+                if model.isLinear(i) {
+                    gdn[i].gdn.recState = MLX.concatenated(pf.map { $0[i].gdn.recState! }, axis: 0)
+                    let cv = pf.map { $0[i].gdn.convState }
+                    if cv.allSatisfy({ $0 != nil }) { gdn[i].gdn.convState = MLX.concatenated(cv.map { $0! }, axis: 0) }
+                } else { for j in 0..<n { akv[i][j] = pf[j][i].kv } }
+            }
+            var out = [[Int32]](repeating: [], count: n); for j in 0..<n { out[j].append(cur[j]) }
+            let t0 = now()
+            for _ in 0..<M {
+                let lg = model.forwardContinuous(MLXArray(cur, [n,1]), positions: pos, gdnCaches: gdn, attnKV: akv)
+                let nx = MLX.argMax(lg[0..., 0], axis: -1); nx.eval(); MLX.eval(gdn.flatMap { $0.stateArrays })
+                let na = nx.asArray(Int32.self); for j in 0..<n { cur[j] = na[j]; pos[j] += 1; out[j].append(na[j]) }
+            }
+            return (out, now() - t0)
+        }
+        // 単一 prefill(ids)+M decode。経過ms。
+        func prefillDecode(_ ids: [Int32]) -> Double {
+            let c = model.makeCaches(); let lg0 = model(promptArr(ids), caches: c)
+            var s = MLX.argMax(lg0[0, ids.count-1], axis: -1).reshaped([1,1]); MLX.eval([s] + c.flatMap { $0.stateArrays })
+            let t0 = now()
+            for _ in 0..<M { let lg = model(s, caches: c); s = MLX.argMax(lg[0,0], axis: -1).reshaped([1,1]); MLX.eval([s] + c.flatMap { $0.stateArrays }) }
+            return now() - t0
+        }
+
+        let (_, baseMs) = batchedExpand(Array(0..<B))                 // (a) 全 B 並列 blind
+        let (w1, w1Ms) = batchedExpand(Array(0..<B-1))                // (b1) wave1: 独立 B-1 並列
+        let ctx = w1.flatMap { $0 } + prompts[B-1]                    // grown-context ++ 依存節 prompt
+        let tW2 = now(); let w2Ms0 = prefillDecode(ctx); let w2Ms = now() - tW2; _ = w2Ms0
+        let smartMs = w1Ms + w2Ms
+        let baseRate = Double(B*M) / (baseMs/1000)
+        let smartRate = Double(B*M) / (smartMs/1000)
+        return String(format: """
+            [ghost-smart] B=%d × M=%d, resident · Plato dependency-aware 2-wave
+              base  (all %d parallel, blind)          : %.2f s, %.1f tok/s
+              smart (%d parallel + 1 dep-conclusion)   : %.2f s, %.1f tok/s  (%.0f%% of base)
+                wave1 %.2fs / wave2(ctx %d-tok fresh prefill + %d decode) %.2fs
+              → 依存 wave の wall コスト = base 比 +%.0f%%(この分で conclusion が本文を見て coherent 化)
+            """, B, M, B, baseMs/1000, baseRate, B-1, smartMs/1000, smartRate, smartRate/baseRate*100,
+            w1Ms/1000, ctx.count, M, w2Ms/1000, (smartMs-baseMs)/baseMs*100)
+    }
+
     /// ★ issue#6 #2: scheduler 最適化。診断（continuous-run）で判明した overhead のうち末尾 idle slot を
     /// **動的 batch 縮小**で回収する。queue が枯れた後、完了 slot を物理 batch から compact（gather）して
     /// active 行のみ forward する。同一 workload で (a)static (b)continuous full-B (c)continuous+shrink を

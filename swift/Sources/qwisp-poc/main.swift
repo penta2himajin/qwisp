@@ -84,6 +84,7 @@ if CommandLine.arguments.contains("stream") {
         ("continuous-run",        { md, _ in try QwispModel.runContinuousRun(modelDir: md) }),
         ("continuous-run2",       { md, _ in try QwispModel.runContinuousRun2(modelDir: md) }),
         ("ghost",                 { md, _ in try QwispModel.runGhost(modelDir: md) }),   // ghost-mode PoC: resident 独立-B batched expand
+        ("ghost-smart",           { md, _ in try QwispModel.runGhostSmart(modelDir: md) }),   // Plato dependency-aware 2-wave
 
         ("qmm4-tiled-bench",      { _, _ in RawMetalForward.qmm4TiledBench() }),
         ("raw-moe-b",             { _, _ in RawMetalForward.runMoeBlockTestB() }),
