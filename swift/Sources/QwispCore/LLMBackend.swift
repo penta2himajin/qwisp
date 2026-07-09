@@ -20,7 +20,13 @@ public enum SeedlessTier {
 
 public struct GenerateOptions {
     public var maxTokens: Int
-    public init(maxTokens: Int = 128) { self.maxTokens = maxTokens }
+    /// Token ids that halt decoding (EOS / chat turn-end). Empty = run to maxTokens.
+    /// A stop token is NOT emitted; the runtime stops before yielding it.
+    public var stopTokens: [Int]
+    public init(maxTokens: Int = 128, stopTokens: [Int] = []) {
+        self.maxTokens = maxTokens
+        self.stopTokens = stopTokens
+    }
 }
 
 /// Coarse backend protocol: load + generate + tier. Both a future MLXBackend and

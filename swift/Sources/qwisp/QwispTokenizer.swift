@@ -17,6 +17,14 @@ struct QwispTokenizer {
         self.chatTemplate = try? String(contentsOf: tpl, encoding: .utf8)
     }
 
+    /// Token ids that end generation: EOS + Qwen chat turn-end (<|im_end|>).
+    var stopTokenIds: [Int] {
+        var ids: [Int] = []
+        if let e = tokenizer.eosTokenId { ids.append(e) }
+        if let im = tokenizer.convertTokenToId("<|im_end|>") { ids.append(im) }
+        return Array(Set(ids))
+    }
+
     /// Encode raw text → token ids.
     func encode(_ text: String) -> [Int] {
         tokenizer.encode(text: text)

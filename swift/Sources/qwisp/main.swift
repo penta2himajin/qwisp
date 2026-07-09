@@ -20,6 +20,8 @@ case "chat":
     print("qwisp chat — not yet implemented (step 6)")
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
+case "comptest":
+    print(await runCompletionSelftest(modelDir: model))
 default:
     print("usage: qwisp [serve|chat|selftest]")
 }
