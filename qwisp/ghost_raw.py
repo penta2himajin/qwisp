@@ -56,13 +56,30 @@ def main():
                     help="Plato dependency-aware 2-wave: last section is an integrative conclusion")
     ap.add_argument("--ctxpad", type=int, default=0,
                     help="pad each slot's prompt to ~N tokens (Hogwild proxy: mimics shared-attention KV length)")
+    ap.add_argument("--brother", action="store_true",
+                    help="isolated-header + brother scope annotations in each prompt (realistic length; speed probe)")
+    ap.add_argument("--skel-gen", type=int, default=0,
+                    help="time an annotated-skeleton generation of N tokens (resident single-stream) as the Amdahl tax")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
     heads = TEMPLATE[:args.sections]
     if args.smart:  # make the LAST section the integrative one that depends on the rest
         heads = TEMPLATE[:args.sections - 1] + ["Reflections and Farewell"]
-    prompts = [chunk_ids(tok, h) for h in heads]
+    if args.brother:  # each prompt carries scope annotations for all sibling sections (generic scopes = realistic length)
+        def bro(i):
+            others = "\n".join(f"- {heads[j]}: covers {heads[j].lower()}; leave this to that section"
+                               for j in range(len(heads)) if j != i)
+            u = (f"You are writing section {i+1} of a travel blog post about a recent trip to Hawaii.\n\n"
+                 f"YOUR section: {heads[i]}\nYour scope: cover {heads[i].lower()} only.\n\n"
+                 f"Your co-authors are simultaneously writing these OTHER sections. Stay strictly in your "
+                 f"lane; do NOT cover their topics or reuse their imagery:\n{others}\n\n"
+                 f"Write ONLY your section — 2 short paragraphs, no title.")
+            s = tok.apply_chat_template([{"role": "user", "content": u}], add_generation_prompt=True, tokenize=False)
+            return tok.encode(s, add_special_tokens=False)
+        prompts = [bro(i) for i in range(len(heads))]
+    else:
+        prompts = [chunk_ids(tok, h) for h in heads]
     if args.ctxpad:  # front-pad with filler so each slot attends to ~ctxpad keys (speed-only probe)
         filler = tok.encode("In Hawaii the ocean meets the mountains under a bright sky. ",
                             add_special_tokens=False)
@@ -76,7 +93,7 @@ def main():
 
     env = dict(os.environ, QWISP_RUN="ghost-smart" if args.smart else "ghost", QWISP_MODEL=args.model,
                QWISP_GHOST_PROMPTS=pf, QWISP_GHOST_GEN=str(args.sec_tokens),
-               QWISP_GHOST_DUMP="1")
+               QWISP_GHOST_SKEL_GEN=str(args.skel_gen), QWISP_GHOST_DUMP="1")
     r = subprocess.run([args.bin, "stream"], env=env, capture_output=True, text=True)
     os.unlink(pf)
     out = r.stdout + r.stderr

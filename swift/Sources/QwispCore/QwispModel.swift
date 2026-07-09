@@ -1160,6 +1160,18 @@ public final class QwispModel {
         for _ in 0..<M { let lg = model(s, caches: cs); s = MLX.argMax(lg[0,0], axis: -1).reshaped([1,1]); MLX.eval([s] + cs.flatMap { $0.stateArrays }) }
         let ssRate = Double(M) / ((now() - tS0)/1000)
 
+        // ── skeleton phase(任意): 注釈スケルトン生成コストを resident 単流で実測(SKEL_GEN トークン) ──
+        // full-pipeline effective tok/s = (skeleton + expand)/(skelMs + expandMs)。速度は長さ依存ゆえ内容不問。
+        let skelGen = Tell.envInt("QWISP_GHOST_SKEL_GEN", 0)
+        var skelMs = 0.0
+        if skelGen > 0 {
+            let c = model.makeCaches(); let lg = model(promptArr(prompts[0]), caches: c)
+            var y = MLX.argMax(lg[0, prompts[0].count-1], axis: -1).reshaped([1,1]); MLX.eval([y] + c.flatMap { $0.stateArrays })
+            let t0 = now()
+            for _ in 0..<skelGen { let l = model(y, caches: c); y = MLX.argMax(l[0,0], axis: -1).reshaped([1,1]); MLX.eval([y] + c.flatMap { $0.stateArrays }) }
+            skelMs = now() - t0
+        }
+
         // ── ghost expand: B slot を独立 KV で prefill → forwardContinuous を M step batched ──
         var pf: [[LayerCache]] = []; var cur = [Int32](repeating: 0, count: B); var positions = [Int](repeating: 0, count: B)
         for b in 0..<B {
@@ -1186,14 +1198,24 @@ public final class QwispModel {
             let na = nx.asArray(Int32.self)
             for b in 0..<B { cur[b] = na[b]; positions[b] += 1; outToks[b].append(na[b]) }
         }
-        let expRate = Double(B * M) / ((now() - tE0)/1000)
+        let expandMs = now() - tE0
+        let expRate = Double(B * M) / (expandMs/1000)
 
         var out = String(format: """
             [ghost] resident continuous-batching(forwardContinuous, 独立-B) · B=%d × M=%d tok
               single-stream(B=1, 同 engine): %.1f tok/s
               ghost expand(B=%d batched)   : %.1f tok/s  → %.2fx
-              (skeleton=template 0-cost 前提 → effective ≈ expand。非lossless SoT)
             """, B, M, ssRate, B, expRate, expRate/ssRate)
+        if skelGen > 0 {
+            let fullTok = skelGen + B * M
+            let fullRate = Double(fullTok) / ((skelMs + expandMs)/1000)
+            out += String(format: """
+                \n  full pipeline(skeleton %d tok %.2fs + expand %d tok %.2fs):
+                    %.1f tok/s (skeleton 税込 effective)  vs single-pass 相当 %.1f tok/s(単流)
+                """, skelGen, skelMs/1000, B*M, expandMs/1000, fullRate, ssRate)
+        } else {
+            out += "\n  (skeleton=template 0-cost 前提 → effective ≈ expand。非lossless SoT)"
+        }
         if dump { for b in 0..<B { out += "\nGHOST_TOKENS:\(b):" + outToks[b].map(String.init).joined(separator: ",") } }
         return out
     }
