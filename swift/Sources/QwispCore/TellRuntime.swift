@@ -289,7 +289,8 @@ extension Tell {
     /// SuffixSpec ループ本体(main run / self-check / stream-vs-resident check の 3 箇所で共用)。
     /// Returns out[0..<N] token ids.
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
-                             N: Int, maxK: Int, useA3: Bool = false) -> [Int]? {
+                             N: Int, maxK: Int, useA3: Bool = false,
+                             onToken: ((Int) -> Void)? = nil) -> [Int]? {
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
@@ -299,8 +300,12 @@ extension Tell {
         var out: [Int] = []
         var pending: [Int] = []  // A3: pending prefix tokens
         let pendingCap = 24
+        // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
+        var streamed = 0
+        func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
 
         while out.count < N {
+            flush()
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
 
@@ -380,6 +385,7 @@ extension Tell {
                 }
             }
         }
+        flush()
         return Array(out.prefix(N))
     }
 

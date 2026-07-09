@@ -42,7 +42,7 @@ public protocol LLMBackend {
 // (net −1 type), but only once a forcing function appears — step-5 server wiring
 // making the indirection bite, or per-instance state the static runtime can't thread.
 // Until then the split works and is gate-tested; don't restructure for tidiness.
-public final class SeedlessBackend: LLMBackend {
+public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
 
     /// Pure, GPU-free sizing seam. Mirrors Tell.run()'s tier arithmetic so
     /// the facade sizes the backend identically to the shipped strict path.
@@ -91,20 +91,25 @@ public final class SeedlessBackend: LLMBackend {
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
         let cfg = SeedlessBackend.config(tier: tier, promptLen: prompt.count, maxTokens: options.maxTokens)
         let promptIds = prompt.map { Int32($0) }
-        let backend: Tell.SpecBackend? = cfg.isStreaming
-            ? Tell.streamingBackend(engine: engine, modelDir: modelDir,
-                                             maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen, C: cfg.c).map { $0.0 }
-            : Tell.fusedBackend(engine: engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
-        // ponytail: batch-decode then replay as a stream. True incremental SSE streaming
-        // (yield per accepted token) is a follow-up for when the server needs token latency
-        // — runSpecLoop currently returns the full [Int], and the GPU is exclusive anyway.
-        let out: [Int] = backend.flatMap {
-            Tell.runSpecLoop(promptIds: promptIds, backend: $0, engine: engine,
-                                      N: options.maxTokens, maxK: cfg.maxK)
-        } ?? []
-        return AsyncStream { cont in
-            for t in out { cont.yield(t) }
-            cont.finish()
+        return AsyncStream { continuation in
+            // The decode loop is synchronous + GPU-bound. Run it off the caller's task and
+            // yield each accepted token as it lands (true incremental streaming). The spec
+            // backend is built INSIDE the thread so no non-Sendable state is captured;
+            // generation is serialized upstream (server AsyncLock) so touching engine is safe.
+            // ponytail: the spec backend is rebuilt per request — fine for a single-user
+            // server; make it a persistent per-instance backend if throughput matters.
+            Thread.detachNewThread {
+                let specBackend: Tell.SpecBackend? = cfg.isStreaming
+                    ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
+                                            maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen, C: cfg.c).map { $0.0 }
+                    : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
+                guard let sb = specBackend else { continuation.finish(); return }
+                _ = Tell.runSpecLoop(promptIds: promptIds, backend: sb, engine: self.engine,
+                                     N: options.maxTokens, maxK: cfg.maxK) { tok in
+                    continuation.yield(tok)
+                }
+                continuation.finish()
+            }
         }
     }
 }

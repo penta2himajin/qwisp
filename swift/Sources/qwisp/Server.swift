@@ -131,6 +131,7 @@ func makeRouter(engine: QwispEngine, modelID: String) -> Router<BasicRequestCont
             headers[.cacheControl] = "no-cache"
             let body = ResponseBody { writer in
                 try await engine.streamSSE(req, writer: &writer)
+                try await writer.finish(nil)   // terminate the chunked body (not auto-called)
             }
             return Response(status: .ok, headers: headers, body: body)
         } else {
