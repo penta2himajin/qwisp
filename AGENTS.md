@@ -23,7 +23,7 @@ swift/            # the product — Swift package
   Sources/QwispCore/    # Tell runtime + Seedless engine (raw-Metal forward, arena/streaming, spec-verify) + locked tests
   Sources/qwisp/        # OpenAI server + `qwisp chat` CLI + tokenizer (swift-transformers)
   Sources/qwisp-poc/    # bench/gate binary (RAWTESTS + bench harness)
-qwisp/            # gate scripts + Python reference/bench oracle (bit-compare only; NEVER in the serving path)
+scripts/            # gate scripts + Python reference/bench oracle (bit-compare only; NEVER in the serving path)
 notes/            # engine design rationale (referenced by number from source comments)
 docs/             # process docs (handoff-protocol, i18n-policy)
 refs/             # canonical measurement refs (raw-greedy) — GITIGNORED, regenerate locally
@@ -39,7 +39,7 @@ cannot cheaply reach.
   on QwispCore files — LSP-only noise; `xcodebuild` is the truth.
 - Model: a Qwen3.6-35B-A3B MTPLX checkpoint; point `QWISP_MODEL` at its directory.
 - Python reference oracle needs an MLX-capable python (numpy/safetensors/mlx_lm), not Homebrew
-  python3 — see `qwisp/README.md`.
+  python3 — see `scripts/README.md`.
 
 ## Build & Test
 
@@ -51,10 +51,10 @@ cd swift && xcodebuild build -scheme qwisp -configuration Release \
   -skipPackagePluginValidation
 
 # correctness gates (must stay green through every commit)
-qwisp/test_raw.sh          # → RAWTESTS 79/79     (engine, GPU, no model)
-qwisp/test_bench_batch.sh  # → BENCHBATCHTEST PASS (fixture, no GPU)
-qwisp/test_tokenizer.sh    # → TOKTEST 3/3        (needs model tokenizer files)
-qwisp/test_completion.sh   # → COMPTEST 4/4       (needs model tokenizer files)
+scripts/test_raw.sh          # → RAWTESTS 79/79     (engine, GPU, no model)
+scripts/test_bench_batch.sh  # → BENCHBATCHTEST PASS (fixture, no GPU)
+scripts/test_tokenizer.sh    # → TOKTEST 3/3        (needs model tokenizer files)
+scripts/test_completion.sh   # → COMPTEST 4/4       (needs model tokenizer files)
 ```
 
 `refs/*.safetensors` are gitignored. A fresh checkout / `git clean` loses them and makes the

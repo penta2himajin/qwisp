@@ -12,8 +12,8 @@
 #   4. speed sanity  — strict fast >= slow (WARN only; bolt is io=0 ~throttle-flat)
 #   5. correctness   — list any FAIL rows verbatim
 #
-# Usage: qwisp/bench_matrix.sh [GEN]          run everything + gate  (default GEN=128)
-#        qwisp/bench_matrix.sh --check [DIR]  gate existing logs only (default DIR from env)
+# Usage: scripts/bench_matrix.sh [GEN]          run everything + gate  (default GEN=128)
+#        scripts/bench_matrix.sh --check [DIR]  gate existing logs only (default DIR from env)
 # Env:   QWISP_MATRIX_DIR — log dir (default /tmp). Logs: $DIR/qwisp-fm-<tag>.log
 # Exit:  0 iff gate PASS. Final line: MATRIXGATE PASS|FAIL.
 set -u
@@ -44,9 +44,9 @@ else
     echo "== $tag (C=$c thr=$thr) -> $log =="
     # DEFER only for slow configs' strict batch (bench_batch strips it for raw bolt calls).
     if [ "$thr" != 0 ]; then
-      QWISP_THROTTLE_DEFER=1 "$REPO/qwisp/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
+      QWISP_THROTTLE_DEFER=1 "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
     else
-      "$REPO/qwisp/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
+      "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
     fi
     echo "EXIT=$?" >> "$log"
     tail -n +2 "$log" | grep -E '^  (suffix-spec|bolt) +(code|agentic|longctx|shortnl) ' || true

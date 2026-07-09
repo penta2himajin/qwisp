@@ -1,4 +1,4 @@
-# `qwisp/` — gates + reference oracle
+# `scripts/` — gates + reference oracle
 
 Test harness and the Python **reference oracle** for validating the engine. None of this is on
 the serving path — the product is `swift/`.
@@ -26,7 +26,7 @@ against MLX. Refs land in the gitignored `refs/`.
 python3 will not do — plus the model. Regenerate refs with, e.g.:
 
 ```bash
-PYTHONPATH=<repo> <mlx-python> -m qwisp.bench_refs --ingest-swift <regime> /tmp/<regime>.toks
+PYTHONPATH=<repo> <mlx-python> -m scripts.bench_refs --ingest-swift <regime> /tmp/<regime>.toks
 ```
 
 Refs are the canonical strict-fidelity baseline; regenerate them only from Swift raw-greedy output,

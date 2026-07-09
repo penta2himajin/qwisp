@@ -21,7 +21,7 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SCRIPT="$REPO/qwisp/bench_batch.sh"
+SCRIPT="$REPO/scripts/bench_batch.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

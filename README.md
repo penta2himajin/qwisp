@@ -80,15 +80,15 @@ by number (e.g. `notes/10`).
 
 ```bash
 # Correctness / regression gates:
-qwisp/test_raw.sh          # RAWTESTS 79/79  — engine unit tests (GPU, no model needed)
-qwisp/test_bench_batch.sh  # BENCHBATCHTEST  — bench-harness fixture (no GPU)
-qwisp/test_tokenizer.sh    # TOKTEST 3/3     — tokenizer round-trip + chat template (needs model)
-qwisp/test_completion.sh   # COMPTEST 4/4    — completion core, fake backend (needs model tokenizer)
+scripts/test_raw.sh          # RAWTESTS 79/79  — engine unit tests (GPU, no model needed)
+scripts/test_bench_batch.sh  # BENCHBATCHTEST  — bench-harness fixture (no GPU)
+scripts/test_tokenizer.sh    # TOKTEST 3/3     — tokenizer round-trip + chat template (needs model)
+scripts/test_completion.sh   # COMPTEST 4/4    — completion core, fake backend (needs model tokenizer)
 ```
 
-`qwisp/` also holds the Python **reference oracle** (bit-exact comparison + benchmark
+`scripts/` also holds the Python **reference oracle** (bit-exact comparison + benchmark
 prompts/refs). It is used only to validate the engine, never on the serving path, and needs an
-MLX-capable Python environment plus the model — see `qwisp/README.md`.
+MLX-capable Python environment plus the model — see `scripts/README.md`.
 
 The dev conventions (TDD, commit style, the lossless doctrine, the frozen shipped path) are in
 [`AGENTS.md`](AGENTS.md).
@@ -100,7 +100,7 @@ swift/            # the product — Swift package
   Sources/QwispCore/   Tell runtime + Seedless engine (+ locked engine tests)
   Sources/qwisp/       OpenAI server + `qwisp chat` CLI + tokenizer
   Sources/qwisp-poc/   bench/gate binary (RAWTESTS / bench harness)
-qwisp/            # gate scripts + Python reference oracle
+scripts/            # gate scripts + Python reference oracle
 notes/            # engine design rationale (referenced from source comments)
 docs/             # process docs (handoff protocol, i18n policy)
 ```
