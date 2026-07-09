@@ -83,6 +83,8 @@ if CommandLine.arguments.contains("stream") {
         ("continuous-batch",      { md, _ in try QwispModel.runContinuousBatch(modelDir: md) }),
         ("continuous-run",        { md, _ in try QwispModel.runContinuousRun(modelDir: md) }),
         ("continuous-run2",       { md, _ in try QwispModel.runContinuousRun2(modelDir: md) }),
+        ("ghost",                 { md, _ in try QwispModel.runGhost(modelDir: md) }),   // ghost-mode PoC: resident 独立-B batched expand
+
         ("qmm4-tiled-bench",      { _, _ in RawMetalForward.qmm4TiledBench() }),
         ("raw-moe-b",             { _, _ in RawMetalForward.runMoeBlockTestB() }),
         ("m1-floor",              { _, _ in RawMetalForward.runM1FloorProbe() }),

@@ -1129,6 +1129,75 @@ public final class QwispModel {
             Double(totTok)/((contMs-prefillMs)/1000), N, B)
     }
 
+    /// ★ ghost-mode PoC (resident, OPTION — not default): Skeleton-of-Thought の並列 expand を
+    /// issue#6 continuous batching(forwardContinuous, 独立-B slot)で resident 実走し、
+    /// single-stream(B=1) 対 B-slot batched の実測 tok/s 比を出す。非lossless(SoT)。
+    /// expand は forwardContinuous(MLX-op 独立-B; raw kernel には独立-B が無いため、これが唯一の並列経路)。
+    /// 入力: env QWISP_GHOST_PROMPTS = 1行=1 chunk prompt(comma-sep int token ids)のファイル(Python が tokenize)。
+    ///       QWISP_GHOST_GEN = section あたり生成トークン数(default 120)。
+    ///       QWISP_GHOST_DUMP=1 → 各 slot 出力を "GHOST_TOKENS:b:<ints>" で dump(Python が detokenize)。
+    public static func runGhost(modelDir: String) throws -> String {
+        let store = try WeightStore(modelDir: modelDir); store.residentAll()
+        let model = QwispModel(store: store); let L = model.numLayers
+        let M = Tell.envInt("QWISP_GHOST_GEN", 120)
+        guard let path = ProcessInfo.processInfo.environment["QWISP_GHOST_PROMPTS"] else {
+            return "[ghost] ERROR: set QWISP_GHOST_PROMPTS=<file, 1 comma-int prompt per line>"
+        }
+        let prompts: [[Int32]] = (try String(contentsOfFile: path, encoding: .utf8))
+            .split(separator: "\n").map { String($0) }.filter { !$0.isEmpty }
+            .map { $0.split(separator: ",").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) } }
+        let B = prompts.count
+        guard B >= 1, prompts.allSatisfy({ !$0.isEmpty }) else { return "[ghost] ERROR: no/empty prompts in \(path)" }
+        func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds)/1e6 }
+        func promptArr(_ ids: [Int32]) -> MLXArray { MLXArray(ids, [1, ids.count]) }
+        let dump = Tell.envInt("QWISP_GHOST_DUMP", 0) == 1
+
+        // ── single-stream baseline: prompt[0] を M トークン decode(同 engine, B=1) ──
+        let cs = model.makeCaches(); let p0 = promptArr(prompts[0])
+        let lg0 = model(p0, caches: cs)
+        var s = MLX.argMax(lg0[0, prompts[0].count-1], axis: -1).reshaped([1,1]); MLX.eval([s] + cs.flatMap { $0.stateArrays })
+        let tS0 = now()
+        for _ in 0..<M { let lg = model(s, caches: cs); s = MLX.argMax(lg[0,0], axis: -1).reshaped([1,1]); MLX.eval([s] + cs.flatMap { $0.stateArrays }) }
+        let ssRate = Double(M) / ((now() - tS0)/1000)
+
+        // ── ghost expand: B slot を独立 KV で prefill → forwardContinuous を M step batched ──
+        var pf: [[LayerCache]] = []; var cur = [Int32](repeating: 0, count: B); var positions = [Int](repeating: 0, count: B)
+        for b in 0..<B {
+            let c = model.makeCaches(); let lg = model(promptArr(prompts[b]), caches: c); lg.eval()
+            MLX.eval(c.flatMap { $0.stateArrays })
+            pf.append(c); cur[b] = Int32(MLX.argMax(lg[0, prompts[b].count-1], axis: -1).item(Int.self)); positions[b] = prompts[b].count
+        }
+        var gdnCaches: [LayerCache] = (0..<L).map { _ in LayerCache() }
+        var attnKV: [[KVCache]] = (0..<L).map { _ in (0..<B).map { _ in KVCache() } }
+        for i in 0..<L {
+            if model.isLinear(i) {
+                gdnCaches[i].gdn.recState = MLX.concatenated(pf.map { $0[i].gdn.recState! }, axis: 0)
+                let convs = pf.map { $0[i].gdn.convState }
+                if convs.allSatisfy({ $0 != nil }) { gdnCaches[i].gdn.convState = MLX.concatenated(convs.map { $0! }, axis: 0) }
+            } else { for b in 0..<B { attnKV[i][b] = pf[b][i].kv } }
+        }
+        var outToks = [[Int32]](repeating: [], count: B)
+        for b in 0..<B { outToks[b].append(cur[b]) }
+        let tE0 = now()
+        for _ in 0..<M {
+            let lg = model.forwardContinuous(MLXArray(cur, [B,1]), positions: positions, gdnCaches: gdnCaches, attnKV: attnKV)
+            let nx = MLX.argMax(lg[0..., 0], axis: -1); nx.eval()
+            MLX.eval(gdnCaches.flatMap { $0.stateArrays })
+            let na = nx.asArray(Int32.self)
+            for b in 0..<B { cur[b] = na[b]; positions[b] += 1; outToks[b].append(na[b]) }
+        }
+        let expRate = Double(B * M) / ((now() - tE0)/1000)
+
+        var out = String(format: """
+            [ghost] resident continuous-batching(forwardContinuous, 独立-B) · B=%d × M=%d tok
+              single-stream(B=1, 同 engine): %.1f tok/s
+              ghost expand(B=%d batched)   : %.1f tok/s  → %.2fx
+              (skeleton=template 0-cost 前提 → effective ≈ expand。非lossless SoT)
+            """, B, M, ssRate, B, expRate, expRate/ssRate)
+        if dump { for b in 0..<B { out += "\nGHOST_TOKENS:\(b):" + outToks[b].map(String.init).joined(separator: ",") } }
+        return out
+    }
+
     /// ★ issue#6 #2: scheduler 最適化。診断（continuous-run）で判明した overhead のうち末尾 idle slot を
     /// **動的 batch 縮小**で回収する。queue が枯れた後、完了 slot を物理 batch から compact（gather）して
     /// active 行のみ forward する。同一 workload で (a)static (b)continuous full-B (c)continuous+shrink を
