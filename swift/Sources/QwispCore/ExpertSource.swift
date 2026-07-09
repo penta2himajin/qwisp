@@ -198,35 +198,3 @@ public final class ExpertSource {
     }
 }
 
-public enum ExpertSourceValidation {
-    public static func run(modelDir: String) throws -> String {
-        let store = try WeightStore(modelDir: modelDir)
-        store.residentNonExperts()
-        let src = try ExpertSource(modelDir: modelDir)
-        // layer 0,3,39 × proj × part × expert {0,7,255} を resident と bit 比較
-        var worst: Float = 0
-        var checks = 0
-        for layer in [0, 3, 39] {
-            for proj in ExpertSource.projs {
-                for part in ExpertSource.parts {
-                    let full = store.req("\(ExpertSource.prefix).\(layer).mlp.switch_mlp.\(proj).\(part)")
-                    for e in [0, 7, 255] {
-                        let s = try src.slice(layer, proj, part, e)
-                        let ref = full[e ..< (e + 1)]
-                        // uint32 は ==、float は abs 差
-                        let d: Float
-                        if s.dtype == .uint32 {
-                            d = MLX.sum(MLX.notEqual(s, ref)).item(Int.self) > 0 ? 1 : 0
-                        } else {
-                            d = MLX.max(MLX.abs(s.asType(.float32) - ref.asType(.float32))).item(Float.self)
-                        }
-                        worst = max(worst, d); checks += 1
-                    }
-                }
-            }
-        }
-        let ok = worst == 0
-        return String(format: "[S1] ExpertSource pread スライス: %d 件検証 worst|Δ|=%.3e  %@",
-                      checks, worst, ok ? "OK ✅ resident と bit一致" : "MISMATCH ❌")
-    }
-}

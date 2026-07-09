@@ -44,33 +44,3 @@ public final class PersistentMoELayer {
         return d.squeezed(axis: -2)                        // [T,K,H]
     }
 }
-
-public enum MoELayerValidation {
-    public static func run(refPath: String) throws -> String {
-        guard let device = MTLCreateSystemDefaultDevice() else { return "ERROR: no Metal device" }
-        let ref = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let x = ref["x"], let inds32 = ref["inds"], let expected = ref["expected_moe"] else {
-            return "ERROR: ref に expected_moe 等が無い"
-        }
-        guard let layer = PersistentMoELayer(device: device, loaded: ref) else {
-            return "ERROR: PersistentMoELayer 構築失敗（重み欠落？）"
-        }
-        let inds = inds32.asType(.uint32)
-        let y = layer(x, inds)
-        y.eval()
-        let diff = MLX.max(MLX.abs(y - expected)).item(Float.self)
-        let rel = diff / (MLX.max(MLX.abs(expected)).item(Float.self) + 1e-9)
-        let ok = rel < 1e-3
-
-        // 1層 forward の概算速度（持続 arena 経由）
-        let reps = 200
-        for _ in 0..<20 { layer(x, inds).eval() }
-        let t0 = DispatchTime.now()
-        for _ in 0..<reps { layer(x, inds).eval() }
-        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6 / Double(reps)
-
-        return String(
-            format: "[M2a] 持続 arena switch_mlp forward: out=%@ max|Δ|=%.3e rel=%.3e  %@  (%.4f ms/層)",
-            "\(y.shape)", diff, rel, ok ? "OK ✅ bit一致" : "MISMATCH ❌", ms)
-    }
-}

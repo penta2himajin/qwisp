@@ -426,24 +426,3 @@ extension AttentionLayer {
     }
 }
 
-public enum AttentionLayerValidation {
-    public static func run(refPath: String) throws -> String {
-        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let x = r["x"], let qp = r["q_proj"], let kp = r["k_proj"], let vp = r["v_proj"],
-              let op = r["o_proj"], let qn = r["q_norm"], let kn = r["k_norm"],
-              let expOut = r["out"] else {
-            return "ERROR: attn ref 不足"
-        }
-        let attn = AttentionLayer(
-            numHeads: 16, numKVHeads: 2, headDim: 256, ropeDim: 64, ropeBase: 1e7, eps: 1e-6,
-            qProj: .plain(qp), kProj: .plain(kp), vProj: .plain(vp), oProj: .plain(op),
-            qNorm: qn, kNorm: kn)
-        let out = attn(x)
-        out.eval()
-        let d = MLX.max(MLX.abs(out - expOut)).item(Float.self)
-            / (MLX.max(MLX.abs(expOut)).item(Float.self) + 1e-9)
-        let ok = d < 1e-3
-        return String(format: "[M2b-2] full-attention 層: out_rel=%.2e  %@",
-                      d, ok ? "OK ✅ bit一致" : "MISMATCH ❌")
-    }
-}

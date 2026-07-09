@@ -46,14 +46,14 @@ public struct MoEBlock {
     /// x: [T, H] → [T, H]
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let inds: MLXArray, scores: MLXArray
-        if RawMetalForward.metalRoute {
+        if SeedlessMetalForward.metalRoute {
             // ★ task#8 検証: routing(選択+normalize)を Metal(route_top8)で。gate logits は MLX(qmm8 と bit-exact)。
             //   argPartition→route_top8 だけを差し替え＝選択法の near-tie 差を実 decode で検証。T 行をループ。
             let logits = gate.apply(x)                                    // [T, E] f16（softmax 前）
             let T = x.dim(0)
             var iRows: [MLXArray] = [], sRows: [MLXArray] = []
             for t in 0 ..< T {
-                guard let (ri, rs) = RawMetalForward.routeTop8(logits[t].reshaped([numExperts]), N: numExperts, K: topK) else {
+                guard let (ri, rs) = SeedlessMetalForward.routeTop8(logits[t].reshaped([numExperts]), N: numExperts, K: topK) else {
                     return callAsFunctionMLX(x)   // 失敗時は MLX 経路にフォールバック
                 }
                 iRows.append(ri.reshaped([1, topK])); sRows.append(rs.reshaped([1, topK]))
@@ -97,17 +97,16 @@ public struct MoEBlock {
     }
 }
 
-public enum MoEBlockValidation {
-    public static func run(refPath: String) throws -> String {
-        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
+extension MoEBlock {
+    /// Build a MoEBlock from a quantized weight dict (8-bit gates, 4-bit experts).
+    static func from(_ r: [String: MLXArray]) -> MoEBlock {
         func q8(_ n: String) -> Proj {
             .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 8)
         }
         func q4(_ n: String) -> Proj {
             .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 4)
         }
-        guard let x = r["x"], let expY = r["y"] else { return "ERROR: real-moe ref 不足" }
-        let blk = MoEBlock(
+        return MoEBlock(
             topK: 8, numExperts: 256, normTopk: true, expertBits: 4,
             gate: q8("gate"),
             swGateW: r["switch_mlp.gate_proj.weight"]!, swGateS: r["switch_mlp.gate_proj.scales"]!,
@@ -118,12 +117,5 @@ public enum MoEBlockValidation {
             swDownB: r["switch_mlp.down_proj.biases"]!,
             shGate: q4("shared_expert.gate_proj"), shUp: q4("shared_expert.up_proj"),
             shDown: q4("shared_expert.down_proj"), sharedGate: q8("shared_expert_gate"))
-        let y = blk(x)
-        y.eval()
-        let d = MLX.max(MLX.abs(y - expY)).item(Float.self)
-            / (MLX.max(MLX.abs(expY)).item(Float.self) + 1e-9)
-        let ok = d < 2e-3
-        return String(format: "[M2b-3] 実 MoE block(gate8/switch4/shared4): y_rel=%.2e  %@",
-                      d, ok ? "OK ✅ 実重み一致" : "MISMATCH ❌")
     }
 }

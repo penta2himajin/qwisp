@@ -195,22 +195,3 @@ extension GatedDelta {
     }
 }
 
-public enum GatedDeltaValidation {
-    public static func run(refPath: String) throws -> String {
-        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let q = r["q"], let k = r["k"], let v = r["v"], let a = r["a"], let b = r["b"],
-              let aLog = r["A_log"], let dtBias = r["dt_bias"],
-              let expOut = r["out"], let expState = r["state"] else {
-            return "ERROR: gdn ref 不足"
-        }
-        let (out, state) = GatedDelta.update(q, k, v, a, b, aLog, dtBias)
-        out.eval(); state.eval()
-        let dOut = MLX.max(MLX.abs(out - expOut)).item(Float.self)
-            / (MLX.max(MLX.abs(expOut)).item(Float.self) + 1e-9)
-        let dState = MLX.max(MLX.abs(state - expState)).item(Float.self)
-            / (MLX.max(MLX.abs(expState)).item(Float.self) + 1e-9)
-        let ok = dOut < 1e-3 && dState < 1e-3
-        return String(format: "[M2b-1] GatedDelta recurrent核: out_rel=%.2e state_rel=%.2e  %@",
-                      dOut, dState, ok ? "OK ✅ bit一致" : "MISMATCH ❌")
-    }
-}
