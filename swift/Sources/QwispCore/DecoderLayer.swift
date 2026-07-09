@@ -48,25 +48,3 @@ public struct DecoderLayer {
     }
 }
 
-public enum DecoderLayerValidation {
-    static func mlpFrom(_ r: [String: MLXArray]) -> MoEBlock {
-        func q8(_ n: String) -> Proj {
-            .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 8)
-        }
-        func q4(_ n: String) -> Proj {
-            .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 4)
-        }
-        return MoEBlock(
-            topK: 8, numExperts: 256, normTopk: true, expertBits: 4,
-            gate: q8("gate"),
-            swGateW: r["switch_mlp.gate_proj.weight"]!, swGateS: r["switch_mlp.gate_proj.scales"]!,
-            swGateB: r["switch_mlp.gate_proj.biases"]!,
-            swUpW: r["switch_mlp.up_proj.weight"]!, swUpS: r["switch_mlp.up_proj.scales"]!,
-            swUpB: r["switch_mlp.up_proj.biases"]!,
-            swDownW: r["switch_mlp.down_proj.weight"]!, swDownS: r["switch_mlp.down_proj.scales"]!,
-            swDownB: r["switch_mlp.down_proj.biases"]!,
-            shGate: q4("shared_expert.gate_proj"), shUp: q4("shared_expert.up_proj"),
-            shDown: q4("shared_expert.down_proj"), sharedGate: q8("shared_expert_gate"))
-    }
-}
-

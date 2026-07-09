@@ -14,7 +14,7 @@ import MLXFast
 /// QWISP_RAWSPEC_CHECK=1   — also run pure sequential raw greedy and report spec-vs-greedy k/N
 /// QWISP_RAWSTREAM_CHECK=1 — (strict streaming only) compare stream output vs resident; needs ~20GB+
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
-public enum RawSpecRunner {
+public enum SeedlessSpecRunner {
 
     /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
     /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
@@ -89,7 +89,7 @@ public enum RawSpecRunner {
     }
 
     /// forward+lm_head+MLX argMax による stepArgmax 合成(composed 用 fallback)。
-    static func makeStepArgmax(engine: RawEngine, forward: @escaping ([Int32]) -> MLXArray?) -> ([Int32]) -> [Int]? {
+    static func makeStepArgmax(engine: SeedlessEngine, forward: @escaping ([Int32]) -> MLXArray?) -> ([Int32]) -> [Int]? {
         return { tokens in
             guard let n = forward(tokens), let l = engine.logits(n, M: tokens.count) else { return nil }
             MLX.eval([l])
@@ -98,7 +98,7 @@ public enum RawSpecRunner {
     }
 
     /// composed backend(per-op CB、MLX cache 参照 snapshot)。
-    static func composedBackend(engine: RawEngine) -> SpecBackend {
+    static func composedBackend(engine: SeedlessEngine) -> SpecBackend {
         let caches = engine.freshCaches()
         let fwd: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
@@ -109,7 +109,7 @@ public enum RawSpecRunner {
             stepArgmax: makeStepArgmax(engine: engine, forward: fwd),
             snapshot: { caches.map { $0.copyState() } },
             rollback: { snap in
-                guard let snaps = snap as? [RawVerifyForward.LayerCaches] else { return }
+                guard let snaps = snap as? [SeedlessVerifyForward.LayerCaches] else { return }
                 for (i, s) in snaps.enumerated() {
                     caches[i].kCache = s.kCache; caches[i].vCache = s.vCache
                     caches[i].convState = s.convState; caches[i].recState = s.recState
@@ -119,14 +119,14 @@ public enum RawSpecRunner {
 
     /// fused backend(1-CB step: embed→40層→final norm→lm_head→argmax、readback は token id のみ。
     /// rollback は KV len 巻き戻し+ping-pong swap)。
-    static func fusedBackend(engine: RawEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
+    static func fusedBackend(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
         return fusedBackendWithFwd(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)?.0
     }
 
-    /// fusedBackend + 内部 RawFusedForward の handle も返す変種(MTP-D1 draft が
+    /// fusedBackend + 内部 SeedlessFusedForward の handle も返す変種(MTP-D1 draft が
     /// normedBuffer を GPU-bind するために必要。streamingBackend と同形)。
-    static func fusedBackendWithFwd(engine: RawEngine, maxM: Int, maxSeqLen: Int)
-        -> (SpecBackend, RawFusedVerify.RawFusedForward)? {
+    static func fusedBackendWithFwd(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int)
+        -> (SpecBackend, SeedlessFusedVerify.SeedlessFusedForward)? {
         guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
         let forward: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
@@ -143,7 +143,7 @@ public enum RawSpecRunner {
             stepArgmax: step,
             snapshot: { fwd.snapshot() },
             rollback: { snap in
-                guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
+                guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
@@ -156,9 +156,9 @@ public enum RawSpecRunner {
 
     /// streaming fused backend(strict segmented per-layer CB)。
     /// existingProviders を渡すと arena を再利用し fresh forward のみ構築する(bolt phase 2 用)。
-    static func streamingBackend(engine: RawEngine, modelDir: String, maxM: Int, maxSeqLen: Int, C: Int,
+    static func streamingBackend(engine: SeedlessEngine, modelDir: String, maxM: Int, maxSeqLen: Int, C: Int,
                                   existingProviders: [ArenaExpertProvider]? = nil)
-        -> (SpecBackend, RawFusedVerify.RawFusedForward, [ArenaExpertProvider])? {
+        -> (SpecBackend, SeedlessFusedVerify.SeedlessFusedForward, [ArenaExpertProvider])? {
         guard let (fwd, fnBuf, providers) = engine.makeFusedStreaming(
             modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
             existingProviders: existingProviders) else { return nil }
@@ -177,7 +177,7 @@ public enum RawSpecRunner {
             stepArgmax: step,
             snapshot: { fwd.snapshot() },
             rollback: { snap in
-                guard let s = snap as? RawFusedVerify.RawFusedForward.Snapshot else { return }
+                guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
@@ -207,7 +207,7 @@ public enum RawSpecRunner {
     //   • Returns nil when chainK <= 0 or the backend exposes no chain fn (caller then
     //     falls back to per-step) OR on backend error.
     //
-    // Note: strict streaming intentionally exposes NO chain fn (RawFusedForward.
+    // Note: strict streaming intentionally exposes NO chain fn (SeedlessFusedForward.
     // chainedStepArgmax guards `streamMode == .resident || .bolt`), because strict needs
     // a CPU turn between steps to ensure/pread the next expert union — so this seam
     // returns nil there and the strict path stays per-step by construction.
@@ -243,7 +243,7 @@ public enum RawSpecRunner {
     //     hidden that produced u — Step 2 normedBuffer accessor, VOLATILE: valid
     //     only until the next forward). READ-ONLY on head KV (len unchanged,
     //     locked test 75); feedPairs (Step 5) is the sole writer.
-    static func mtpDraftSpan(head: RawFusedVerify.RawMTPHead?, hPrevBuf: MTLBuffer?,
+    static func mtpDraftSpan(head: SeedlessFusedVerify.SeedlessMTPHead?, hPrevBuf: MTLBuffer?,
                              rowOfU: Int, u: Int) -> Int? {
         guard let head, let hPrevBuf, rowOfU >= 0 else { return nil }
         return head.draftArgmax(hPrevBuf: hPrevBuf, hPrevRow: rowOfU, tok: Int32(u))
@@ -257,8 +257,8 @@ public enum RawSpecRunner {
     /// pLen-1 pairs total; the final position's pair (h_last, u) is fed by the spec
     /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
     static func prefill(promptIds: [Int32], backend: SpecBackend,
-                        mtpHead: RawFusedVerify.RawMTPHead? = nil,
-                        mtpFwd: RawFusedVerify.RawFusedForward? = nil) -> MLXArray? {
+                        mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         let chunkSize = 64
@@ -281,14 +281,14 @@ public enum RawSpecRunner {
             lastNormed = normed[chunk.count - 1]    // [H]
             pos = end
         }
-        return lastNormed.map { $0.reshaped([1, RawEngine.H]) }   // [1, H]
+        return lastNormed.map { $0.reshaped([1, SeedlessEngine.H]) }   // [1, H]
     }
 
     // ── Spec loop helper ──────────────────────────────────────────────────
 
     /// SuffixSpec ループ本体(main run / self-check / stream-vs-resident check の 3 箇所で共用)。
     /// Returns out[0..<N] token ids.
-    static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: RawEngine,
+    static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false) -> [Int]? {
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
@@ -388,7 +388,7 @@ public enum RawSpecRunner {
     // recon #16 fix: two default-path wiring changes, both lossless (output
     // byte-identical; only default selection differs). Factored as pure helpers
     // so the resolved defaults are unit-testable via the production seam without
-    // a real model (RawVerifyTests 52/53). run() MUST call these.
+    // a real model (SeedlessVerifyTests 52/53). run() MUST call these.
     //
     // STUB (RED): implementer wires the real logic here. Stubs return failing
     // sentinels and MUST NOT delegate to existing env-parsing code.
@@ -442,8 +442,8 @@ public enum RawSpecRunner {
             print("[raw-spec] residentAll complete")
         }
 
-        print("[raw-spec] building RawEngine ...")
-        let engine = RawEngine.build(store: store)
+        print("[raw-spec] building SeedlessEngine ...")
+        let engine = SeedlessEngine.build(store: store)
         print("[raw-spec] engine ready (moeI=\(engine.moeI))")
 
         // ── load ref ─────────────────────────────────────────────────────
@@ -481,7 +481,7 @@ public enum RawSpecRunner {
         LayerExpertCache.chunkTotal  = 0
 
         // reuse-rerank: capture streaming fwd/providers for expert-aware draft (notes/10)
-        var _reuseStreamFwd: RawFusedVerify.RawFusedForward? = nil
+        var _reuseStreamFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
         var _reuseStreamProviders: [ArenaExpertProvider]? = nil
 
         let mkBackend: () -> SpecBackend? = {
@@ -496,7 +496,7 @@ public enum RawSpecRunner {
         }
         // Build main backend; for streaming, capture fwd/providers for optional rerank.
         // For resident fused, capture fwd for the MTP-D1 draft head (normedBuffer bind).
-        var _residentFwd: RawFusedVerify.RawFusedForward? = nil
+        var _residentFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
         let backend: SpecBackend
         if isStreaming {
             guard let (b, fwd, providers) = streamingBackend(engine: engine, modelDir: modelDir,
@@ -520,11 +520,11 @@ public enum RawSpecRunner {
         // Opt-in QWISP_MTP_DRAFT=1, resident fused tier only (C>=nE — mirrors
         // Tell.swift:105). Flag off / other tiers → mtpHead=nil → the loop below is
         // byte-identical to pre-change (seam contract, mtpDraftSpan).
-        var mtpHead: RawFusedVerify.RawMTPHead? = nil
+        var mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil
         if Tell.envFlag("QWISP_MTP_DRAFT"), let _ = _residentFwd, !useA3 {
-            if let spec = try? RawMTPValidate.loadSpec(modelDir: modelDir, store: store,
+            if let spec = try? SeedlessMTPValidate.loadSpec(modelDir: modelDir, store: store,
                                                        maxSeqLen: maxSeqLen),
-               let h = RawFusedVerify.RawMTPHead(spec: spec) {
+               let h = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) {
                 mtpHead = h
                 print("[raw-spec] MTP-D1 raw draft head active (maxSeqLen=\(maxSeqLen))")
             } else {
@@ -585,7 +585,7 @@ public enum RawSpecRunner {
         // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
         // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
         // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
-        let chainK = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
 
         let t0 = DispatchTime.now()
 
@@ -824,11 +824,11 @@ public enum RawSpecRunner {
 
     /// Bolt run: calib → freeze tables → 1-CB bolt decode。
     /// Deviations from TellBolt: no B3 in-decode fetch, no A3 pending-prefix(raw spec loop 不変)。
-    private static func runBoltMode(engine: RawEngine, modelDir: String, promptIds: [Int32],
+    private static func runBoltMode(engine: SeedlessEngine, modelDir: String, promptIds: [Int32],
                                      gRefIds: [Int], N: Int, maxK: Int, C: Int,
                                      maxM: Int, maxSeqLen: Int, refPath: String) throws -> String {
         let calibN = Tell.envInt("QWISP_CALIB", 48)
-        let nLayers = RawEngine.numLayers
+        let nLayers = SeedlessEngine.numLayers
         let nE = 256
 
         // ── phase 1: build strict streaming backend #1 for calib ─────────
@@ -938,7 +938,7 @@ public enum RawSpecRunner {
         // (chain 全 step = slot 別 / verify M 行 = kE.x=M*Ktop)で全 coverage。
         // notes/14 TODO-2: QWISP_BOLT_WORKLOAD が preset (R,B) を選択。明示 env が常に上書き。
         let boltWL = Tell.envStr("QWISP_BOLT_WORKLOAD", "")
-        let preset = RawSpecRunner.boltWorkloadPreset(boltWL)
+        let preset = SeedlessSpecRunner.boltWorkloadPreset(boltWL)
         let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", preset.r)
         // notes/14 async refresh wiring (QWISP_BOLT_REFRESH_ASYNC, default 1)
         // B=32: chunk IO(~38ms@1.5GB/s)と decode の均衡 + 深さ2 pipeline で hide できる粒度。
@@ -977,7 +977,7 @@ public enum RawSpecRunner {
         let stagingArena: ExpertArena? = stagingArenas.first   // nil 判定用(既存コードの guard 共用)
 
         // chain: diag 単独時は step 毎読出のため無効化。recalib は slot 観測で chain と共存。
-        let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+        let boltChainK = boltDiag ? 0 : Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
 
         // 観測 buffer(diag/recalib 共用, 一般 layout)。obsMaxM/obsSlots は recalib 有効時のみ拡張。
         let obsMaxM = boltRecalibR > 0 ? maxM : 1
@@ -985,8 +985,8 @@ public enum RawSpecRunner {
         var diagResidents: [Set<Int>] = [], diagBuddyExp: [[Int32]] = []
         var diagIBuf: MTLBuffer? = nil, diagGBuf: MTLBuffer? = nil
         if boltDiag || boltRecalibR > 0 {
-            guard RawMetalForward.compileDiagCopyRoute(),
-                  let (device, _) = RawMetalForward.ensure(),
+            guard SeedlessMetalForward.compileDiagCopyRoute(),
+                  let (device, _) = SeedlessMetalForward.ensure(),
                   let ib = device.makeBuffer(length: obsSlots * nLayers * obsMaxM * Ktop * 4,
                                              options: .storageModeShared),
                   let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared)
@@ -1020,7 +1020,7 @@ public enum RawSpecRunner {
                 let inds = Array(UnsafeBufferPointer(
                     start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
                     count: M * Ktop))
-                _ = RawFusedVerify.RawFusedForward.recalibAccumulate(
+                _ = SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &frWinCounts[li], coact: &frWinCoact[li])
             }
@@ -1138,7 +1138,7 @@ public enum RawSpecRunner {
                 let glArr = Array(UnsafeBufferPointer(
                     start: gb.contents().advanced(by: li * nE * 2).assumingMemoryBound(to: Float16.self),
                     count: nE))
-                let (cold, mar) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+                let (cold, mar) = SeedlessFusedVerify.SeedlessFusedForward.computeRouteDiag(
                     inds: indsArr, gl: glArr, resident: diagResidents[li],
                     buddyExpert: diagBuddyExp[li], Ktop: Ktop)
                 let g = li <= 12 ? 0 : (li <= 26 ? 1 : 2)
@@ -1329,7 +1329,7 @@ public enum RawSpecRunner {
                              pct(0.10), pct(0.50), pct(0.90), infN,
                              flips[0], flips[1], flips[2], flips[3]))
             }
-            let mw = RawSpecRunner.missWeightStats(topInds: diagMissInds, topWeights: diagMissWeights, resident: diagMissResidents)
+            let mw = SeedlessSpecRunner.missWeightStats(topInds: diagMissInds, topWeights: diagMissWeights, resident: diagMissResidents)
             print(String(format: "[BoltDiag] missWeight p10/50/90=%.3f/%.3f/%.3f top1Share=%.1f%% missMass/token=%.3f misses=%d",
                          mw.p10, mw.p50, mw.p90, mw.top1Share * 100, mw.meanMissMass, mw.missCount))
         }
@@ -1377,8 +1377,8 @@ public enum RawSpecRunner {
                 var tfRefreshes = 0
                 let missBase = LayerExpertCache.missTotal
                 if recalibR > 0 {
-                    if RawMetalForward.compileDiagCopyRoute(),
-                       let (device, _) = RawMetalForward.ensure(),
+                    if SeedlessMetalForward.compileDiagCopyRoute(),
+                       let (device, _) = SeedlessMetalForward.ensure(),
                        let ib = device.makeBuffer(length: nLayers * Ktop * 4, options: .storageModeShared),
                        let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared) {
                         tfIBuf = ib
@@ -1565,7 +1565,7 @@ public enum RawSpecRunner {
 
     // ── Self-check helper ──────────────────────────────────────────────────
 
-    private static func runSelfCheck(engine: RawEngine, promptIds: [Int32], N: Int, maxK: Int,
+    private static func runSelfCheck(engine: SeedlessEngine, promptIds: [Int32], N: Int, maxK: Int,
                                       mkBackend: () -> SpecBackend?, outN: [Int]) -> String {
         print("[raw-spec] self-check: running raw greedy (M=1) for \(N) tokens ...")
         guard let backend2 = mkBackend()
@@ -1594,7 +1594,7 @@ public enum RawSpecRunner {
 
     // ── Stream-vs-resident check ───────────────────────────────────────────
 
-    private static func runStreamVsResidentCheck(engine: RawEngine, store: WeightStore,
+    private static func runStreamVsResidentCheck(engine: SeedlessEngine, store: WeightStore,
                                                   modelDir: String, promptIds: [Int32],
                                                   streamOut: [Int], N: Int,
                                                   maxM: Int, maxSeqLen: Int, maxK: Int) -> String {

@@ -7,12 +7,12 @@ import Metal
 /// D1 TDD RED phase — M-row (batched, order-stable) kernel scaffolding.
 ///
 /// All 7 kernel-level tests FAIL initially because the D1 stub APIs in
-/// RawMetalForward return nil.  Two baseline tests PASS to confirm the
+/// SeedlessMetalForward return nil.  Two baseline tests PASS to confirm the
 /// harness itself is correct (existing M=1 kernels are deterministic).
 ///
 /// Run:  QWISP_RUN=raw-tests ./qwisp-poc stream
 ///   or: qwisp/test_raw.sh
-public enum RawVerifyTests {
+public enum SeedlessVerifyTests {
 
     // ── Bit-exact comparison helper ───────────────────────────────────────
 
@@ -66,8 +66,8 @@ public enum RawVerifyTests {
         // differ from the f32-multiply path by 1 f16 ULP on ~1/2048 elements when `s`
         // is not exactly representable in f16 (e.g. invScale = 1/sqrt(headKDim)).
         func scaleMulKernel(_ input: MLXArray, s: Float, total: Int) -> MLXArray? {
-            guard let (device, queue) = RawMetalForward.ensure(),
-                  RawMetalForward.ensureAuxPipelines() else { return nil }
+            guard let (device, queue) = SeedlessMetalForward.ensure(),
+                  SeedlessMetalForward.ensureAuxPipelines() else { return nil }
             let f16 = input.reshaped([-1]).asType(.float16); f16.eval()
             let arr = f16.asArray(Float16.self)
             guard let buf = arr.withUnsafeBytes({ ptr in
@@ -75,7 +75,7 @@ public enum RawVerifyTests {
             }) else { return nil }
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
-            RawFusedVerify.encodeScaleMul(enc, x: buf, s: s, total: total)
+            SeedlessFusedVerify.encodeScaleMul(enc, x: buf, s: s, total: total)
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             let ptr = buf.contents().bindMemory(to: Float16.self, capacity: total)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: total)), input.shape)
@@ -92,8 +92,8 @@ public enum RawVerifyTests {
             let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
             guard let bi = biOpt else { return (false, "biases nil") }
             MLX.eval([x, wq, sc, bi])
-            guard let a = RawMetalForward.qmm(x, wq, scales: sc, biases: bi, M: 1, K: K, N: N),
-                  let b = RawMetalForward.qmm(x, wq, scales: sc, biases: bi, M: 1, K: K, N: N)
+            guard let a = SeedlessMetalForward.qmm(x, wq, scales: sc, biases: bi, M: 1, K: K, N: N),
+                  let b = SeedlessMetalForward.qmm(x, wq, scales: sc, biases: bi, M: 1, K: K, N: N)
             else { return (false, "qmm returned nil") }
             MLX.eval([a, b])
             return bitEqual(a, b)
@@ -108,9 +108,9 @@ public enum RawVerifyTests {
             let indsArr: [Int32] = [3, 17, 40, 62]
             let inds = MLXArray(indsArr, [Ktop])
             MLX.eval([x, wq, sc, bi, inds])
-            guard let a = RawMetalForward.gatherQmm(x, wq, scales: sc, biases: bi,
+            guard let a = SeedlessMetalForward.gatherQmm(x, wq, scales: sc, biases: bi,
                                                      inds: inds, Ktop: Ktop, K: K, N: N),
-                  let b = RawMetalForward.gatherQmm(x, wq, scales: sc, biases: bi,
+                  let b = SeedlessMetalForward.gatherQmm(x, wq, scales: sc, biases: bi,
                                                      inds: inds, Ktop: Ktop, K: K, N: N)
             else { return (false, "gatherQmm returned nil") }
             MLX.eval([a, b])
@@ -135,14 +135,14 @@ public enum RawVerifyTests {
                     var refParts: [MLXArray] = []
                     for m in 0..<M {
                         let xm = x[m ..< m+1]   // [1, K]
-                        guard let r = RawMetalForward.qmm(xm, wq, scales: sc, biases: bi,
+                        guard let r = SeedlessMetalForward.qmm(xm, wq, scales: sc, biases: bi,
                                                            M: 1, K: K, N: N)
                         else { return (false, "ref qmm nil N=\(N) M=\(M) m=\(m)") }
                         r.eval(); refParts.append(r)
                     }
                     let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M, N]
                     // Stub
-                    guard let got = RawMetalForward.qmmRows(x, wq, scales: sc, biases: bi,
+                    guard let got = SeedlessMetalForward.qmmRows(x, wq, scales: sc, biases: bi,
                                                              M: M, K: K, N: N)
                     else { return (false, "not implemented (N=\(N) M=\(M))") }
                     got.eval()
@@ -179,14 +179,14 @@ public enum RawVerifyTests {
                     let xm = x[m ..< m+1]   // [1, K]
                     let rowInds = MLXArray(Array(indsFlat[m*Ktop ..< (m+1)*Ktop]), [Ktop])
                     MLX.eval([xm, rowInds])
-                    guard let r = RawMetalForward.gatherQmm(xm, wq, scales: sc, biases: bi,
+                    guard let r = SeedlessMetalForward.gatherQmm(xm, wq, scales: sc, biases: bi,
                                                              inds: rowInds, Ktop: Ktop, K: K, N: N)
                     else { return (false, "ref gatherQmm nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)   // [Ktop, N]
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
                 // Stub: inds[M*Ktop] row-major, x[M,K]
-                guard let got = RawMetalForward.gatherQmmRows(x, wq, scales: sc, biases: bi,
+                guard let got = SeedlessMetalForward.gatherQmmRows(x, wq, scales: sc, biases: bi,
                                                                inds: inds,
                                                                M: M, Ktop: Ktop, K: K, N: N)
                 else { return (false, "not implemented (M=\(M))") }
@@ -219,14 +219,14 @@ public enum RawVerifyTests {
                     let km = (S == totalSeq) ? kFull : kFull[0..., 0..<S]  // [KV, S, D]
                     let vm = (S == totalSeq) ? vFull : vFull[0..., 0..<S]
                     MLX.eval([qm, km, vm])
-                    guard let r = RawMetalForward.sdpaDecode(qm, km, vm,
+                    guard let r = SeedlessMetalForward.sdpaDecode(qm, km, vm,
                                                               H: H, KV: KV, D: D, S: S, scale: scale)
                     else { return (false, "ref sdpaDecode nil M=\(M) m=\(m) S=\(S)") }
                     r.eval(); refParts.append(r)   // [H, D]
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*H, D]
                 // Stub: q[M*H,D], kFull[KV,totalSeq,D], vFull[KV,totalSeq,D]
-                guard let got = RawMetalForward.sdpaRows(q, kFull, vFull,
+                guard let got = SeedlessMetalForward.sdpaRows(q, kFull, vFull,
                                                           H: H, KV: KV, D: D,
                                                           baseLen: L0, M: M, scale: scale)
                 else { return (false, "not implemented (M=\(M))") }
@@ -251,7 +251,7 @@ public enum RawVerifyTests {
                 for m in 0..<M {
                     let window = buf[m ..< m+K]   // [K, C]
                     window.eval()
-                    guard let r = RawMetalForward.conv1dSilu(window, w, K: K, C: C)
+                    guard let r = SeedlessMetalForward.conv1dSilu(window, w, K: K, C: C)
                     else { return (false, "ref conv1dSilu nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r.reshaped([1, C]))   // normalise [1,1,C]→[1,C]
                 }
@@ -260,7 +260,7 @@ public enum RawVerifyTests {
                 let windowsArr = (0..<M).map { buf[$0 ..< $0+K].reshaped([1, K, C]) }
                 let windows = MLX.concatenated(windowsArr, axis: 0); windows.eval()   // [M, K, C]
                 // Stub
-                guard let got = RawMetalForward.conv1dSiluRows(windows, w, M: M, K: K, C: C)
+                guard let got = SeedlessMetalForward.conv1dSiluRows(windows, w, M: M, K: K, C: C)
                 else { return (false, "not implemented (M=\(M))") }
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
@@ -310,7 +310,7 @@ public enum RawVerifyTests {
                     let gm    = gM[0..., m ..< m+1]       // [B,1,Hv] f32
                     let betam = betaM[0..., m ..< m+1]    // [B,1,Hv] f16
                     MLX.eval([qm, km, vm, gm, betam])
-                    guard let (ym, ns) = RawMetalForward.recurrent(
+                    guard let (ym, ns) = SeedlessMetalForward.recurrent(
                         qm, km, vm, g: gm, beta: betam, state: state,
                         B: B, T: 1, Hk: Hk, Dk: Dk, Hv: Hv, Dv: Dv)
                     else { refOK = false; refErr = "ref recurrent nil M=\(M) m=\(m)"; break }
@@ -322,7 +322,7 @@ public enum RawVerifyTests {
                 let refY     = MLX.concatenated(refOutputs, axis: 1); refY.eval()   // [B,M,Hv,Dv]
                 let refState = state; refState.eval()
                 // Stub: takes all M positions at once, initial state → (y[B,M,Hv,Dv], finalState)
-                guard let (gotY, gotState) = RawMetalForward.gatedDeltaStepRows(
+                guard let (gotY, gotState) = SeedlessMetalForward.gatedDeltaStepRows(
                     qM, kM, vM, g: gM, beta: betaM, state: initState,
                     M: M, B: B, Hk: Hk, Dk: Dk, Hv: Hv, Dv: Dv)
                 else { return (false, "not implemented (M=\(M))") }
@@ -348,14 +348,14 @@ public enum RawVerifyTests {
                 for m in 0..<M {
                     let xm = x[m*numHeads ..< (m+1)*numHeads]   // [numHeads, HD]
                     xm.eval()
-                    guard let r = RawMetalForward.rope(xm, headDim: HD, ropeDim: rd,
+                    guard let r = SeedlessMetalForward.rope(xm, headDim: HD, ropeDim: rd,
                                                         base: base, offset: startOffset + m)
                     else { return (false, "ref rope nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)   // [numHeads, HD]
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*numHeads, HD]
                 // Stub: x[M*numHeads, HD], groups of numHeads share position startOffset+m
-                guard let got = RawMetalForward.ropeRows(x, headDim: HD, ropeDim: rd,
+                guard let got = SeedlessMetalForward.ropeRows(x, headDim: HD, ropeDim: rd,
                                                           base: base,
                                                           startOffset: startOffset,
                                                           M: M, numHeads: numHeads)
@@ -380,13 +380,13 @@ public enum RawVerifyTests {
                 for m in 0..<M {
                     let xm = x[m ..< m+1]   // [1, D]
                     xm.eval()
-                    guard let r = RawMetalForward.rmsNorm(xm, wt, eps: 1e-6, D: D)
+                    guard let r = SeedlessMetalForward.rmsNorm(xm, wt, eps: 1e-6, D: D)
                     else { return (false, "ref rmsNorm nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)   // [1, D]
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M, D]
                 // Stub: x[M, D] → y[M, D]
-                guard let got = RawMetalForward.rmsNormRows(x, wt, M: M, eps: 1e-6, D: D)
+                guard let got = SeedlessMetalForward.rmsNormRows(x, wt, M: M, eps: 1e-6, D: D)
                 else { return (false, "not implemented (M=\(M))") }
                 got.eval()
                 let (ok, d) = bitEqual(got.reshaped(ref.shape), ref)
@@ -418,7 +418,7 @@ public enum RawVerifyTests {
             var row0Ref: MLXArray? = nil
             for M in Ms {
                 let xM = xAll[0..<M]   // [M, K]
-                guard let out = RawMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+                guard let out = SeedlessMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
                 else { return (false, "qmmTiled returned nil M=\(M)") }
                 out.eval()
                 let row0 = out[0..<1]   // [1, N]
@@ -434,13 +434,13 @@ public enum RawVerifyTests {
             // Step 2: for each M, full output must equal concat of M individual M=1 calls.
             for M in Ms {
                 let xM = xAll[0..<M]
-                guard let outM = RawMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+                guard let outM = SeedlessMetalForward.qmmTiled(xM, wq, scales: sc, biases: bi, M: M, K: K, N: N)
                 else { return (false, "qmmTiled(M=\(M)) nil in concat-check") }
                 outM.eval()
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
                     let x1 = xAll[m..<m+1]   // [1, K]
-                    guard let r = RawMetalForward.qmmTiled(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)
+                    guard let r = SeedlessMetalForward.qmmTiled(x1, wq, scales: sc, biases: bi, M: 1, K: K, N: N)
                     else { return (false, "qmmTiled(M=1) nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)
                 }
@@ -461,8 +461,8 @@ public enum RawVerifyTests {
             guard let bi = biOpt else { return (false, "biases nil") }
             let x = MLXRandom.normal([M, K]).asType(.float16)
             MLX.eval([wq, sc, bi, x])
-            guard let a = RawMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N),
-                  let b = RawMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N)
+            guard let a = SeedlessMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N),
+                  let b = SeedlessMetalForward.qmmTiled(x, wq, scales: sc, biases: bi, M: M, K: K, N: N)
             else { return (false, "qmmTiled returned nil") }
             MLX.eval([a, b])
             return bitEqual(a, b)
@@ -483,7 +483,7 @@ public enum RawVerifyTests {
             let (oW, oS, oB) = quant(H, numHeads * headDim)
             let qN = MLXRandom.normal([headDim]).asType(.float16)
             let kN = MLXRandom.normal([headDim]).asType(.float16)
-            let w = RawVerifyForward.AttnLayerW(qWq: qW, qSc: qS, qBi: qB, kWq: kW, kSc: kS, kBi: kB,
+            let w = SeedlessVerifyForward.AttnLayerW(qWq: qW, qSc: qS, qBi: qB, kWq: kW, kSc: kS, kBi: kB,
                                                 vWq: vW, vSc: vS, vBi: vB, oWq: oW, oSc: oS, oBi: oB,
                                                 qNorm: qN, kNorm: kN)
             let kC0 = MLXRandom.normal([numKV, baseLen, headDim]).asType(.float16)
@@ -492,13 +492,13 @@ public enum RawVerifyTests {
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 var k1 = kC0, v1 = vC0
-                guard let got = RawVerifyForward.attnLayerRows(x, w, kCache: &k1, vCache: &v1, M: M)
+                guard let got = SeedlessVerifyForward.attnLayerRows(x, w, kCache: &k1, vCache: &v1, M: M)
                 else { return (false, "rows nil M=\(M)") }
                 got.eval()
                 var k2 = kC0, v2 = vC0
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let r = RawVerifyForward.attnLayerRows(x[m ..< m+1], w, kCache: &k2, vCache: &v2, M: 1)
+                    guard let r = SeedlessVerifyForward.attnLayerRows(x[m ..< m+1], w, kCache: &k2, vCache: &v2, M: 1)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)
                 }
@@ -532,7 +532,7 @@ public enum RawVerifyTests {
             let normW = MLXRandom.normal([Dv]).asType(.float16)
             let aLog = MLXRandom.normal([Hv]).asType(.float32)
             let dtB = MLXRandom.normal([Hv]).asType(.float32)
-            let w = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            let w = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                                                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB,
                                                aWq: aW, aSc: aS, aBi: aB, outWq: oW, outSc: oS, outBi: oB,
                                                conv1dW: convW, normWeight: normW, aLog: aLog, dtBias: dtB)
@@ -542,13 +542,13 @@ public enum RawVerifyTests {
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 var c1 = cs0, r1 = rs0
-                guard let got = RawVerifyForward.gdnLayerRows(x, w, convState: &c1, recState: &r1, M: M)
+                guard let got = SeedlessVerifyForward.gdnLayerRows(x, w, convState: &c1, recState: &r1, M: M)
                 else { return (false, "rows nil M=\(M)") }
                 got.eval()
                 var c2 = cs0, r2 = rs0
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let r = RawVerifyForward.gdnLayerRows(x[m ..< m+1], w, convState: &c2, recState: &r2, M: 1)
+                    guard let r = SeedlessVerifyForward.gdnLayerRows(x[m ..< m+1], w, convState: &c2, recState: &r2, M: 1)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)
                 }
@@ -585,19 +585,19 @@ public enum RawVerifyTests {
             let (shG0, shG1, shG2) = quant(I, H)
             let (shU0, shU1, shU2) = quant(I, H)
             let (shD0, shD1, shD2) = quant(H, I)
-            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                 swGWq: swG0, swGSc: swG1, swGBi: swG2, swUWq: swU0, swUSc: swU1, swUBi: swU2,
                 swDWq: swD0, swDSc: swD1, swDBi: swD2, shGWq: shG0, shGSc: shG1, shGBi: shG2,
                 shUWq: shU0, shUSc: shU1, shUBi: shU2, shDWq: shD0, shDSc: shD1, shDBi: shD2,
                 sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
-                guard let got = RawVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                guard let got = SeedlessVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
                 else { return (false, "rows nil M=\(M)") }
                 got.eval()
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let r = RawVerifyForward.moeBlockRows(x[m ..< m+1], w, M: 1, E: E, I: I, Ktop: Ktop)
+                    guard let r = SeedlessVerifyForward.moeBlockRows(x[m ..< m+1], w, M: 1, E: E, I: I, Ktop: Ktop)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)
                 }
@@ -624,11 +624,11 @@ public enum RawVerifyTests {
                 let wf = MLXRandom.normal([e, n, k]).asType(.float16)
                 let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
             }
-            func mkMoE() -> RawVerifyForward.MoEBlockW {
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
                 let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
                 let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
                 let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-                return RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                     swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                     swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                     shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
@@ -639,7 +639,7 @@ public enum RawVerifyTests {
             let convDim = Hk * Dk * 2 + Hv * Dv
             let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
             let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
-            let gdnW = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                 zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
                 outWq: oW, outSc: oS, outBi: oB,
                 conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
@@ -649,14 +649,14 @@ public enum RawVerifyTests {
             let nH = 16, nKV = 2, hD = 256
             let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
             let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
-            let attnW = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
                 vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
                 qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
             let layers = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
             ]
@@ -665,19 +665,19 @@ public enum RawVerifyTests {
             let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             MLX.eval([cs0, rs0, kC0, vC0])
-            func freshCaches() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
-                 RawVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
             }
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 let c1 = freshCaches()
-                guard let got = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: c1, M: M)
+                guard let got = SeedlessVerifyForward.verifyForwardRows(x, layers: layers, caches: c1, M: M)
                 else { return (false, "rows nil M=\(M)") }
                 let c2 = freshCaches()
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let r = RawVerifyForward.verifyForwardRows(x[m ..< m+1], layers: layers, caches: c2, M: 1)
+                    guard let r = SeedlessVerifyForward.verifyForwardRows(x[m ..< m+1], layers: layers, caches: c2, M: 1)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     refParts.append(r)
                 }
@@ -708,12 +708,12 @@ public enum RawVerifyTests {
             for M in [1, 2, 9, 17, 25] {
                 let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
                 // reference: per-op qmmRows 2回(個別CB + readback)
-                guard let mid = RawMetalForward.qmmRows(x, w1.0, scales: w1.1, biases: w1.2, M: M, K: K, N: N1),
-                      let ref = RawMetalForward.qmmRows(mid, w2.0, scales: w2.1, biases: w2.2, M: M, K: N1, N: N2)
+                guard let mid = SeedlessMetalForward.qmmRows(x, w1.0, scales: w1.1, biases: w1.2, M: M, K: K, N: N1),
+                      let ref = SeedlessMetalForward.qmmRows(mid, w2.0, scales: w2.1, biases: w2.2, M: M, K: N1, N: N2)
                 else { return (false, "ref nil M=\(M)") }
                 ref.eval()
                 // fused: 単一CB + 常駐 midBuf
-                guard let got = RawFusedVerify.fusedTwoQmm(x, w1: w1, N1: N1, w2: w2, N2: N2, M: M, K: K)
+                guard let got = SeedlessFusedVerify.fusedTwoQmm(x, w1: w1, N1: N1, w2: w2, N2: N2, M: M, K: K)
                 else { return (false, "fused nil M=\(M)") }
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
@@ -728,12 +728,12 @@ public enum RawVerifyTests {
             let N = 256, K = 8
             for M in [1, 2, 9, 17, 25] {
                 let logits = MLXRandom.normal([M, N]).asType(.float16); logits.eval()
-                guard let (gi, gs) = RawFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
+                guard let (gi, gs) = SeedlessFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
                 else { return (false, "rows nil M=\(M)") }
                 gi.eval(); gs.eval()
                 var iParts: [MLXArray] = [], sParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let (ri, rs) = RawFusedVerify.routeTop8Rows(logits[m ..< m+1], M: 1, N: N, K: K)
+                    guard let (ri, rs) = SeedlessFusedVerify.routeTop8Rows(logits[m ..< m+1], M: 1, N: N, K: K)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     ri.eval(); rs.eval(); iParts.append(ri); sParts.append(rs)
                 }
@@ -759,7 +759,7 @@ public enum RawVerifyTests {
                 // well-separated logits so a uniform +eps never collides two selected values
                 let logits = (MLXRandom.normal([M, N]).asType(.float16) * MLXArray(Float16(4)))
                     .asType(.float16); logits.eval()
-                guard let (refI, refS) = RawFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
+                guard let (refI, refS) = SeedlessFusedVerify.routeTop8Rows(logits, M: M, N: N, K: K)
                 else { return (false, "ref routeTop8Rows nil M=\(M)") }
                 refI.eval(); refS.eval()
 
@@ -769,7 +769,7 @@ public enum RawVerifyTests {
                     (0..<N).map { Int32($0 % 3 == 0 ? 1 : 0) },
                 ]
                 for mask in masks {
-                    guard let (gi, gs) = RawFusedVerify.routeTop8RowsBias(
+                    guard let (gi, gs) = SeedlessFusedVerify.routeTop8RowsBias(
                         logits, residentMask: mask, eps: 0, M: M, N: N, K: K)
                     else { return (false, "not implemented (eps0 M=\(M))") }
                     gi.eval(); gs.eval()
@@ -781,7 +781,7 @@ public enum RawVerifyTests {
 
                 // Part B: all-resident + eps>0 → uniform shift → selection & scores unchanged.
                 let allRes = [Int32](repeating: 1, count: N)
-                guard let (bi, bs) = RawFusedVerify.routeTop8RowsBias(
+                guard let (bi, bs) = SeedlessFusedVerify.routeTop8RowsBias(
                     logits, residentMask: allRes, eps: 0.5, M: M, N: N, K: K)
                 else { return (false, "not implemented (allres M=\(M))") }
                 bi.eval(); bs.eval()
@@ -812,7 +812,7 @@ public enum RawVerifyTests {
             let logits = MLXArray(lg, [1, N]).asType(.float16); logits.eval()
             var mask = [Int32](repeating: 0, count: N); mask[R] = 1   // only R resident
 
-            guard let (uI, uS) = RawFusedVerify.routeTop8Rows(logits, M: 1, N: N, K: K)
+            guard let (uI, uS) = SeedlessFusedVerify.routeTop8Rows(logits, M: 1, N: N, K: K)
             else { return (false, "ref routeTop8Rows nil") }
             uI.eval(); uS.eval()
             let ui = uI.asType(.int32).asArray(Int32.self)
@@ -821,7 +821,7 @@ public enum RawVerifyTests {
             if Int(ui[0]) != C { return (false, "ref top-1 expected C=\(C), got \(ui[0])") }
 
             // flip: eps=0.5 > margin(≈0.199) → R promoted to rank 0, set unchanged.
-            guard let (fI, fS) = RawFusedVerify.routeTop8RowsBias(
+            guard let (fI, fS) = SeedlessFusedVerify.routeTop8RowsBias(
                 logits, residentMask: mask, eps: 0.5, M: 1, N: N, K: K)
             else { return (false, "not implemented (flip)") }
             fI.eval(); fS.eval()
@@ -838,7 +838,7 @@ public enum RawVerifyTests {
             }
 
             // no-flip: eps=0.1 < margin(≈0.199) → selection identical to unbiased (inds+scores bit-exact).
-            guard let (nI, nS) = RawFusedVerify.routeTop8RowsBias(
+            guard let (nI, nS) = SeedlessFusedVerify.routeTop8RowsBias(
                 logits, residentMask: mask, eps: 0.1, M: 1, N: N, K: K)
             else { return (false, "not implemented (noflip)") }
             nI.eval(); nS.eval()
@@ -868,19 +868,19 @@ public enum RawVerifyTests {
             let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
             let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
             let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                 swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                 swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                 shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
                 sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
-                guard let got = RawVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                guard let got = SeedlessVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
                 else { return (false, "rows nil M=\(M)") }
                 got.eval()
                 var refParts: [MLXArray] = []
                 for m in 0..<M {
-                    guard let r = RawVerifyForward.moeBlockRows(x[m ..< m+1], w, M: 1, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                    guard let r = SeedlessVerifyForward.moeBlockRows(x[m ..< m+1], w, M: 1, E: E, I: I, Ktop: Ktop, metalRoute: true)
                     else { return (false, "ref nil M=\(M) m=\(m)") }
                     r.eval(); refParts.append(r)
                 }
@@ -906,13 +906,13 @@ public enum RawVerifyTests {
                 let inds = MLXArray((0..<M*Ktop).map { pool[$0 % pool.count] }, [M * Ktop])
                 MLX.eval([x, inds])
                 // reference: gatherQmmRows 2回(mid = gate lhsPer=false, out = down lhsPer=true)
-                guard let mid = RawMetalForward.gatherQmmRows(x, w1.0, scales: w1.1, biases: w1.2,
+                guard let mid = SeedlessMetalForward.gatherQmmRows(x, w1.0, scales: w1.1, biases: w1.2,
                                                              inds: inds, M: M, Ktop: Ktop, K: K, N: I),
-                      let ref = RawMetalForward.gatherQmmRows(mid, w2.0, scales: w2.1, biases: w2.2,
+                      let ref = SeedlessMetalForward.gatherQmmRows(mid, w2.0, scales: w2.1, biases: w2.2,
                                                              inds: inds, M: M, Ktop: Ktop, K: I, N: K2, lhsPerExpert: true)
                 else { return (false, "ref nil M=\(M)") }
                 ref.eval()
-                guard let got = RawFusedVerify.fusedGatherChain(x, inds: inds, w1: w1, I: I, w2: w2, K2: K2,
+                guard let got = SeedlessFusedVerify.fusedGatherChain(x, inds: inds, w1: w1, I: I, w2: w2, K2: K2,
                                                                 M: M, Ktop: Ktop, K: K)
                 else { return (false, "fused nil M=\(M)") }
                 got.eval()
@@ -940,41 +940,41 @@ public enum RawVerifyTests {
             let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
             let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
             let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                 swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                 swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                 shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
                 sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
-                guard let ref = RawVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
+                guard let ref = SeedlessVerifyForward.moeBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop, metalRoute: true)
                 else { return (false, "composed nil M=\(M)") }
                 ref.eval()
-                guard let got = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                guard let got = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
                 else { return (false, "fused nil M=\(M)") }
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok {
                     // 段階バイセクト: composed per-op 中間 vs fused dump で最初の乖離段を特定
-                    guard let dump = RawFusedVerify.fusedMoEBlockRowsDump(x, w, M: M, E: E, I: I, Ktop: Ktop),
-                          let cgl = RawMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E),
-                          let (ci, cs) = RawFusedVerify.routeTop8Rows(cgl, M: M, N: E, K: Ktop)
+                    guard let dump = SeedlessFusedVerify.fusedMoEBlockRowsDump(x, w, M: M, E: E, I: I, Ktop: Ktop),
+                          let cgl = SeedlessMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E),
+                          let (ci, cs) = SeedlessFusedVerify.routeTop8Rows(cgl, M: M, N: E, K: Ktop)
                     else { return (false, "M=\(M): \(d) (dump nil)") }
                     let cif = ci.reshaped([M * Ktop]).asType(.int32); cif.eval()
-                    guard let cg = RawMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
+                    guard let cg = SeedlessMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
                                                                  inds: cif, M: M, Ktop: Ktop, K: H, N: I),
-                          let cu = RawMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
+                          let cu = SeedlessMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
                                                                  inds: cif, M: M, Ktop: Ktop, K: H, N: I),
-                          let ch = RawMetalForward.swigluRaw(cg, cu),
-                          let cd = RawMetalForward.gatherQmmRows(ch, w.swDWq, scales: w.swDSc, biases: w.swDBi,
+                          let ch = SeedlessMetalForward.swigluRaw(cg, cu),
+                          let cd = SeedlessMetalForward.gatherQmmRows(ch, w.swDWq, scales: w.swDSc, biases: w.swDBi,
                                                                  inds: cif, M: M, Ktop: Ktop, K: I, N: H, lhsPerExpert: true),
-                          let csg = RawMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
-                          let csu = RawMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I),
-                          let cshAct = RawMetalForward.swigluRaw(csg, csu),
-                          let csharedY = RawMetalForward.qmmRows(cshAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
-                          let csgl = RawMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi, M: M, K: H, N: 8)
+                          let csg = SeedlessMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
+                          let csu = SeedlessMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I),
+                          let cshAct = SeedlessMetalForward.swigluRaw(csg, csu),
+                          let csharedY = SeedlessMetalForward.qmmRows(cshAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
+                          let csgl = SeedlessMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi, M: M, K: H, N: 8)
                     else { return (false, "M=\(M): \(d) (composed stage nil)") }
-                    guard let cy = RawFusedVerify.combineRowsRaw(cd, cs, M: M, Ktop: Ktop, N: H)
+                    guard let cy = SeedlessFusedVerify.combineRowsRaw(cd, cs, M: M, Ktop: Ktop, N: H)
                     else { return (false, "M=\(M): \(d) (combine nil)") }
                     cy.eval()
                     let stages: [(String, MLXArray)] = [
@@ -1001,7 +1001,7 @@ public enum RawVerifyTests {
             }
             let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
             let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
-            let w = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+            let w = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
                 vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
                 qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
             let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
@@ -1010,10 +1010,10 @@ public enum RawVerifyTests {
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 var kc = kC0, vc = vC0
-                guard let ref = RawVerifyForward.attnLayerRows(x, w, kCache: &kc, vCache: &vc, M: M)
+                guard let ref = SeedlessVerifyForward.attnLayerRows(x, w, kCache: &kc, vCache: &vc, M: M)
                 else { return (false, "composed nil M=\(M)") }
                 ref.eval()
-                guard let (got, gk, gv) = RawFusedVerify.fusedAttnLayerRows(x, w, kInit: kC0, vInit: vC0,
+                guard let (got, gk, gv) = SeedlessFusedVerify.fusedAttnLayerRows(x, w, kInit: kC0, vInit: vC0,
                                                                             maxLen: 64, M: M)
                 else { return (false, "fused nil M=\(M)") }
                 got.eval(); gk.eval(); gv.eval()
@@ -1037,7 +1037,7 @@ public enum RawVerifyTests {
             }
             let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
             let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
-            let w = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            let w = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                 zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
                 outWq: oW, outSc: oS, outBi: oB,
                 conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
@@ -1049,10 +1049,10 @@ public enum RawVerifyTests {
             for M in [1, 2, 9, 17] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 var cs = cs0, rs = rs0
-                guard let ref = RawVerifyForward.gdnLayerRows(x, w, convState: &cs, recState: &rs, M: M)
+                guard let ref = SeedlessVerifyForward.gdnLayerRows(x, w, convState: &cs, recState: &rs, M: M)
                 else { return (false, "composed nil M=\(M)") }
                 ref.eval()
-                guard let (got, gcs, grs) = RawFusedVerify.fusedGdnLayerRows(x, w, convInit: cs0, recInit: rs0, M: M)
+                guard let (got, gcs, grs) = SeedlessFusedVerify.fusedGdnLayerRows(x, w, convInit: cs0, recInit: rs0, M: M)
                 else { return (false, "fused nil M=\(M)") }
                 got.eval(); gcs.eval(); grs.eval()
                 let (ok1, d1) = bitEqual(got, ref)
@@ -1081,11 +1081,11 @@ public enum RawVerifyTests {
                 let wf = MLXRandom.normal([e, n, k]).asType(.float16)
                 let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
             }
-            func mkMoE() -> RawVerifyForward.MoEBlockW {
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
                 let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
                 let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
                 let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-                return RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                     swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                     swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                     shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
@@ -1095,7 +1095,7 @@ public enum RawVerifyTests {
             let convDim = Hk * Dk * 2 + Hv * Dv
             let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
             let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
-            let gdnW = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                 zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
                 outWq: oW, outSc: oS, outBi: oB,
                 conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
@@ -1104,14 +1104,14 @@ public enum RawVerifyTests {
             let nH = 16, nKV = 2, hD = 256
             let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
             let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
-            let attnW = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
                 vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
                 qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
             let layers = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
             ]
@@ -1120,20 +1120,20 @@ public enum RawVerifyTests {
             let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             MLX.eval([cs0, rs0, kC0, vC0])
-            func freshCaches() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
-                 RawVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
             }
             // ステップ列: M 掃引 + 最後に 2-step チェーン(9→3)
             let stepPlans: [[Int]] = [[1], [2], [9], [17], [9, 3]]
             for plan in stepPlans {
                 let comp = freshCaches()
-                guard let fused = RawFusedVerify.RawFusedForward(layers: layers, caches: freshCaches(),
+                guard let fused = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
                                                                  maxM: 17, H: H, maxSeqLen: 64)
                 else { return (false, "fused init nil plan=\(plan)") }
                 for (si, M) in plan.enumerated() {
                     let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
-                    guard let ref = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: comp, M: M, metalRoute: true)
+                    guard let ref = SeedlessVerifyForward.verifyForwardRows(x, layers: layers, caches: comp, M: M, metalRoute: true)
                     else { return (false, "composed nil plan=\(plan) step=\(si)") }
                     ref.eval()
                     guard let got = fused.forwardRows(x, M: M)
@@ -1171,7 +1171,7 @@ public enum RawVerifyTests {
                 let refE = ModelHead.embed(ids: ids, weight: wq, scales: sc, biases: bi, bits: 4)
                     .reshaped([M, H]).asType(.float16)
                 refE.eval()
-                guard let gotE = RawFusedVerify.embedRowsRaw(toks, w: wq, scales: sc, biases: bi, H: H)
+                guard let gotE = SeedlessFusedVerify.embedRowsRaw(toks, w: wq, scales: sc, biases: bi, H: H)
                 else { return (false, "embed nil M=\(M)") }
                 gotE.eval()
                 let (okE, dE) = bitEqual(gotE, refE)
@@ -1181,7 +1181,7 @@ public enum RawVerifyTests {
                 lg[0..., 7] = lg[0..., 3]                       // 意図的 tie
                 lg.eval()
                 let refA: [Int] = (0 ..< M).map { MLX.argMax(lg[$0], axis: -1).item(Int.self) }
-                guard let gotA = RawFusedVerify.argmaxRowsRaw(lg, M: M, V: V)
+                guard let gotA = SeedlessFusedVerify.argmaxRowsRaw(lg, M: M, V: V)
                 else { return (false, "argmax nil M=\(M)") }
                 if gotA != refA { return (false, "argmax M=\(M): got=\(gotA) ref=\(refA)") }
             }
@@ -1206,7 +1206,7 @@ public enum RawVerifyTests {
         }
         // Returns (MoEBlockW, gW, gSf16, gBf16, uW, uSf16, uBf16, dW, dSf16, dBf16)
         // so callers can share expert arrays between MoEBlockW and TestExpertProvider.
-        typealias MoEWithArrays = (w: RawVerifyForward.MoEBlockW,
+        typealias MoEWithArrays = (w: SeedlessVerifyForward.MoEBlockW,
                                    gW: MLXArray, gSf16: MLXArray, gBf16: MLXArray,
                                    uW: MLXArray, uSf16: MLXArray, uBf16: MLXArray,
                                    dW: MLXArray, dSf16: MLXArray, dBf16: MLXArray)
@@ -1216,7 +1216,7 @@ public enum RawVerifyTests {
             let (b0, b1, b2) = stQ4e(stE, stI, stH)
             let (c0, c1, c2) = stQ4e(stE, stH, stI)
             let (d0, d1, d2) = stQ4(stI, stH); let (e0, e1, e2) = stQ4(stI, stH); let (f0, f1, f2) = stQ4(stH, stI)
-            let moeW = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+            let moeW = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                 swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                 swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                 shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
@@ -1228,10 +1228,10 @@ public enum RawVerifyTests {
         }
         let stHk = 16, stDk = 128, stHv = 32, stDv = 128, stCK = 4
         let stConvDim = stHk * stDk * 2 + stHv * stDv
-        func stMkGdnW() -> RawVerifyForward.GDNLayerW {
+        func stMkGdnW() -> SeedlessVerifyForward.GDNLayerW {
             let (qkvW, qkvS, qkvB) = stQ4(stConvDim, stH); let (zW, zS, zB) = stQ4(stHv * stDv, stH)
             let (bW, bS, bB) = stQ4(stHv, stH); let (aW, aS, aB) = stQ4(stHv, stH); let (oW, oS, oB) = stQ4(stH, stHv * stDv)
-            return RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            return SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                 zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
                 outWq: oW, outSc: oS, outBi: oB,
                 conv1dW: MLXRandom.normal([stConvDim, stCK]).asType(.float16),
@@ -1239,17 +1239,17 @@ public enum RawVerifyTests {
                 aLog: MLXRandom.normal([stHv]).asType(.float32), dtBias: MLXRandom.normal([stHv]).asType(.float32))
         }
         let stNh = 16, stNkv = 2, stHd = 256
-        func stMkAttnW() -> RawVerifyForward.AttnLayerW {
+        func stMkAttnW() -> SeedlessVerifyForward.AttnLayerW {
             let (aqW, aqS, aqB) = stQ4(stNh * 2 * stHd, stH); let (akW, akS, akB) = stQ4(stNkv * stHd, stH)
             let (avW, avS, avB) = stQ4(stNkv * stHd, stH); let (aoW, aoS, aoB) = stQ4(stH, stNh * stHd)
-            return RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+            return SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
                 vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
                 qNorm: MLXRandom.normal([stHd]).asType(.float16), kNorm: MLXRandom.normal([stHd]).asType(.float16))
         }
 
         // Test 25 (D1-A): strict streaming ≡ resident — C=8<E=16, multi-plan, chunk assertion.
         run("stream_fused_strict_bitexact") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let C = 8
             let moe0 = stMkMoE(), moe1 = stMkMoE()
             let gdnW = stMkGdnW(), attnW = stMkAttnW()
@@ -1258,15 +1258,15 @@ public enum RawVerifyTests {
             let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             MLX.eval([stCs0, stRs0, stKc0, stVc0])
-            func freshC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
-                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            func freshC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
             }
             let layerSpecs = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
             ]
@@ -1282,9 +1282,9 @@ public enum RawVerifyTests {
             var sawMultiChunk = false
             let plans: [[Int]] = [[1], [2], [9], [9, 3]]
             for plan in plans {
-                guard let res = RawFusedVerify.RawFusedForward(
+                guard let res = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64),
-                      let str = RawFusedVerify.RawFusedForward(
+                      let str = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64,
                         providers: [tp0, tp1])
                 else { return (false, "init nil plan=\(plan)") }
@@ -1305,7 +1305,7 @@ public enum RawVerifyTests {
 
         // Test 26 (D1-B): strict streaming M=17 — 複数 chunk 確実に発生、bit-exact。
         run("stream_fused_strict_m17_chunking") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let C = 8
             let moe0 = stMkMoE(), moe1 = stMkMoE()
             let gdnW = stMkGdnW(), attnW = stMkAttnW()
@@ -1315,10 +1315,10 @@ public enum RawVerifyTests {
             let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             MLX.eval([stCs0, stRs0, stKc0, stVc0])
             let layerSpecs = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
             ]
@@ -1331,12 +1331,12 @@ public enum RawVerifyTests {
                     uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
                     dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
             else { return (false, "TestExpertProvider nil") }
-            let freshC: [RawVerifyForward.LayerCaches] = [
-                RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
-                RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
-            guard let res = RawFusedVerify.RawFusedForward(
+            let freshC: [SeedlessVerifyForward.LayerCaches] = [
+                SeedlessVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                SeedlessVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            guard let res = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC, maxM: 17, H: stH, maxSeqLen: 64),
-                  let str = RawFusedVerify.RawFusedForward(
+                  let str = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC, maxM: 17, H: stH, maxSeqLen: 64,
                     providers: [tp0, tp1])
             else { return (false, "init nil") }
@@ -1354,7 +1354,7 @@ public enum RawVerifyTests {
 
         // Test 27 (D1-C): eviction chain — 3-step [3,3,3] に渡る LRU 退去・再ロードが bit-exact を保持する。
         run("stream_fused_eviction_chain") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let C = 8  // C < E=16 → eviction forced
             let moe0 = stMkMoE(), moe1 = stMkMoE()
             let gdnW = stMkGdnW(), attnW = stMkAttnW()
@@ -1363,15 +1363,15 @@ public enum RawVerifyTests {
             let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             MLX.eval([stCs0, stRs0, stKc0, stVc0])
-            func freshC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
-                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            func freshC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
             }
             let layerSpecs = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
             ]
@@ -1384,9 +1384,9 @@ public enum RawVerifyTests {
                     uW: moe1.uW, uSf16: moe1.uSf16, uBf16: moe1.uBf16,
                     dW: moe1.dW, dSf16: moe1.dSf16, dBf16: moe1.dBf16, device: device)
             else { return (false, "TestExpertProvider nil") }
-            guard let res = RawFusedVerify.RawFusedForward(
+            guard let res = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC(), maxM: 9, H: stH, maxSeqLen: 64),
-                  let str = RawFusedVerify.RawFusedForward(
+                  let str = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC(), maxM: 9, H: stH, maxSeqLen: 64,
                     providers: [tp0, tp1])
             else { return (false, "init nil") }
@@ -1405,7 +1405,7 @@ public enum RawVerifyTests {
 
         // Test 28 (D1-D): bolt streaming ≡ resident — C=E=16 全エキスパート事前ロード+frozen table。
         run("stream_fused_bolt_exact_table") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let C = stE  // C = E: all experts fit without eviction
             let moe0 = stMkMoE(), moe1 = stMkMoE()
             let gdnW = stMkGdnW(), attnW = stMkAttnW()
@@ -1414,15 +1414,15 @@ public enum RawVerifyTests {
             let stKc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             let stVc0 = MLXRandom.normal([stNkv, 16, stHd]).asType(.float16)
             MLX.eval([stCs0, stRs0, stKc0, stVc0])
-            func freshC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
-                 RawVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
+            func freshC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: stCs0, recState: stRs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: stKc0, vCache: stVc0)]
             }
             let layerSpecs = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([stH]).asType(.float16), postLN: MLXRandom.normal([stH]).asType(.float16),
                     gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
             ]
@@ -1442,9 +1442,9 @@ public enum RawVerifyTests {
             for (e, s) in sm0 { tbl0[e] = Int32(s) }
             for (e, s) in sm1 { tbl1[e] = Int32(s) }
             // Create resident (no providers) and bolt (with providers) forwards.
-            guard let res = RawFusedVerify.RawFusedForward(
+            guard let res = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64),
-                  let blt = RawFusedVerify.RawFusedForward(
+                  let blt = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecs, caches: freshC(), maxM: 17, H: stH, maxSeqLen: 64,
                     providers: [tp0, tp1])
             else { return (false, "init nil") }
@@ -1489,7 +1489,7 @@ public enum RawVerifyTests {
         //
         // GREEN by premise: per-row order-stability is proven by test 23 (fused_forward_rows_bitexact).
         // This test specialises that property for the A3 pending-prefix shapes and serves as
-        // a regression guard. It does NOT require A3 implementation in RawSpecRunner.swift.
+        // a regression guard. It does NOT require A3 implementation in SeedlessSpecRunner.swift.
         run("a3_fuse_invariant") {
             let H = stH
             let moe0a = stMkMoE(), moe1a = stMkMoE()
@@ -1505,23 +1505,23 @@ public enum RawVerifyTests {
             let pLN1a = MLXRandom.normal([H]).asType(.float16)
             MLX.eval([iLN0a, pLN0a, iLN1a, pLN1a])
             let layersA = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLN0a, postLN: pLN0a,
                     gdn: gdnWa, attn: nil, moe: moe0a.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLN1a, postLN: pLN1a,
                     gdn: nil, attn: attnWa, moe: moe1a.w, moeE: stE, moeI: stI),
             ]
-            func freshCachesA() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: csA, recState: rsA),
-                 RawVerifyForward.LayerCaches(kCache: kcA, vCache: vcA)]
+            func freshCachesA() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: csA, recState: rsA),
+                 SeedlessVerifyForward.LayerCaches(kCache: kcA, vCache: vcA)]
             }
             // spec §6 G1 matrix: pk ∈ {0,3,7,17} × D ∈ {1,4,8}
             for pk in [0, 3, 7, 17] {
                 for D in [1, 4, 8] {
                     let M = pk + 1 + D   // total rows in the batched call
                     // maxSeqLen covers initial 8 + M + margin
-                    guard let fused = RawFusedVerify.RawFusedForward(
+                    guard let fused = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layersA, caches: freshCachesA(),
                         maxM: M + 2, H: H, maxSeqLen: 8 + M + 8)
                     else { return (false, "init nil pk=\(pk) D=\(D)") }
@@ -1586,23 +1586,23 @@ public enum RawVerifyTests {
             let pLN1b = MLXRandom.normal([H]).asType(.float16)
             MLX.eval([iLN0b, pLN0b, iLN1b, pLN1b])
             let layersB = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLN0b, postLN: pLN0b,
                     gdn: gdnWb, attn: nil, moe: moe0b.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLN1b, postLN: pLN1b,
                     gdn: nil, attn: attnWb, moe: moe1b.w, moeE: stE, moeI: stI),
             ]
-            func freshCachesB() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: csB, recState: rsB),
-                 RawVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
+            func freshCachesB() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: csB, recState: rsB),
+                 SeedlessVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
             }
             let maxSeqB = 4 + M1 + M2 + 8    // initial(4) + max scenario(M1 or M2) + margin
             let maxMb   = Swift.max(M1, M2) + 2
             // Two independent fused forwards starting from identical state B
-            guard let fusedNA = RawFusedVerify.RawFusedForward(
+            guard let fusedNA = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layersB, caches: freshCachesB(), maxM: maxMb, H: H, maxSeqLen: maxSeqB),
-                  let fusedA3 = RawFusedVerify.RawFusedForward(
+                  let fusedA3 = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layersB, caches: freshCachesB(), maxM: maxMb, H: H, maxSeqLen: maxSeqB)
             else { return (false, "init nil") }
             // Random hidden inputs shared between paths
@@ -1672,23 +1672,23 @@ public enum RawVerifyTests {
             let pLN1c = MLXRandom.normal([H]).asType(.float16)
             MLX.eval([iLN0c, pLN0c, iLN1c, pLN1c])
             let layersC = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLN0c, postLN: pLN0c,
                     gdn: gdnWc, attn: nil, moe: moe0c.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLN1c, postLN: pLN1c,
                     gdn: nil, attn: attnWc, moe: moe1c.w, moeE: stE, moeI: stI),
             ]
-            func freshCachesC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: csC, recState: rsC),
-                 RawVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
+            func freshCachesC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: csC, recState: rsC),
+                 SeedlessVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
             }
             // maxSeqLen: initial(4) + M_total(28) + margin = 40; use 64 for safety
             // maxM: must cover flushN=24 (largest single call in flush path)
-            guard let refFused = RawFusedVerify.RawFusedForward(
+            guard let refFused = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layersC, caches: freshCachesC(),
                     maxM: flushN + 2, H: H, maxSeqLen: 64),
-                  let flushFused = RawFusedVerify.RawFusedForward(
+                  let flushFused = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layersC, caches: freshCachesC(),
                     maxM: flushN + 2, H: H, maxSeqLen: 64)
             else { return (false, "init nil") }
@@ -1750,17 +1750,17 @@ public enum RawVerifyTests {
                         let inds = MLXArray(indsFlat, [M * Ktop])
                         MLX.eval([x, inds])
                         // Reference: existing 3-kernel chain (production kernels only — no MLX/CPU reimpl)
-                        guard let g = RawMetalForward.gatherQmmRows(x, wGq, scales: wGS, biases: wGB,
+                        guard let g = SeedlessMetalForward.gatherQmmRows(x, wGq, scales: wGS, biases: wGB,
                                                                      inds: inds, M: M, Ktop: Ktop, K: K, N: N),
-                              let u = RawMetalForward.gatherQmmRows(x, wUq, scales: wUS, biases: wUB,
+                              let u = SeedlessMetalForward.gatherQmmRows(x, wUq, scales: wUS, biases: wUB,
                                                                      inds: inds, M: M, Ktop: Ktop, K: K, N: N)
                         else { return (false, "ref gather nil M=\(M) Ktop=\(Ktop) N=\(N)") }
                         g.eval(); u.eval()
-                        guard let hRef = RawMetalForward.swigluRaw(g, u)
+                        guard let hRef = SeedlessMetalForward.swigluRaw(g, u)
                         else { return (false, "ref swiglu nil M=\(M) Ktop=\(Ktop) N=\(N)") }
                         hRef.eval()
                         // Stub under test
-                        guard let hGot = RawFusedVerify.gatherQmmSwigluRows(
+                        guard let hGot = SeedlessFusedVerify.gatherQmmSwigluRows(
                             x: x, inds: inds,
                             wG: wGq, sG: wGS, bG: wGB,
                             wU: wUq, sU: wUS, bU: wUB,
@@ -1797,7 +1797,7 @@ public enum RawVerifyTests {
             let inds = MLXArray(indsFlat, [M * Ktop])
             MLX.eval([wGq, wGS, wGB, wUq, wUS, wUB, x, inds])
             // Batched call M=8
-            guard let hBatch = RawFusedVerify.gatherQmmSwigluRows(
+            guard let hBatch = SeedlessFusedVerify.gatherQmmSwigluRows(
                 x: x, inds: inds,
                 wG: wGq, sG: wGS, bG: wGB,
                 wU: wUq, sU: wUS, bU: wUB,
@@ -1810,7 +1810,7 @@ public enum RawVerifyTests {
                 let xm = x[m ..< m+1]
                 let rowInds = MLXArray(Array(indsFlat[m*Ktop ..< (m+1)*Ktop]), [Ktop])
                 xm.eval(); rowInds.eval()
-                guard let hm = RawFusedVerify.gatherQmmSwigluRows(
+                guard let hm = SeedlessFusedVerify.gatherQmmSwigluRows(
                     x: xm, inds: rowInds,
                     wG: wGq, sG: wGS, bG: wGB,
                     wU: wUq, sU: wUS, bU: wUB,
@@ -1852,7 +1852,7 @@ public enum RawVerifyTests {
             let (aW,   aS,   aB)   = quant(numVH,    H)
             MLX.eval([qkvW, qkvS, qkvB, zW, zS, zB, bW, bS, bB, aW, aS, aB])
             // Fused: build concatenated in-proj triple (stub under test)
-            guard let (catW, catS, catB) = RawFusedVerify.gdnInProjConcat(
+            guard let (catW, catS, catB) = SeedlessFusedVerify.gdnInProjConcat(
                 qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
                 zW:   zW,   zS:   zS,   zB:   zB,
                 bW:   bW,   bS:   bS,   bB:   bB,
@@ -1863,18 +1863,18 @@ public enum RawVerifyTests {
             for M in [1, 8] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 // Reference: 4 separate qmmRows (existing production kernel)
-                guard let refQkv = RawMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
+                guard let refQkv = SeedlessMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
                                                             M: M, K: H, N: convDim),
-                      let refZ   = RawMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
+                      let refZ   = SeedlessMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
                                                             M: M, K: H, N: valueDim),
-                      let refB   = RawMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
+                      let refB   = SeedlessMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
                                                             M: M, K: H, N: numVH),
-                      let refA   = RawMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
+                      let refA   = SeedlessMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
                                                             M: M, K: H, N: numVH)
                 else { return (false, "ref qmmRows nil M=\(M)") }
                 MLX.eval([refQkv, refZ, refB, refA])
                 // Fused: single qmmRows on concatenated weight, sliced at offsets
-                guard let fused = RawMetalForward.qmmRows(x, catW, scales: catS, biases: catB,
+                guard let fused = SeedlessMetalForward.qmmRows(x, catW, scales: catS, biases: catB,
                                                            M: M, K: H, N: totalN)
                 else { return (false, "fused qmmRows nil M=\(M)") }
                 fused.eval()
@@ -1910,14 +1910,14 @@ public enum RawVerifyTests {
                 let convInput = MLX.concatenated([histIn, qkv], axis: 0); convInput.eval()
                 let windowParts = (0 ..< M).map { convInput[$0 ..< $0 + K].reshaped([1, K, C]) }
                 let windows = MLX.concatenated(windowParts, axis: 0); windows.eval()
-                guard let convOutRef = RawMetalForward.conv1dSiluRows(windows, convW, M: M, K: K, C: C)
+                guard let convOutRef = SeedlessMetalForward.conv1dSiluRows(windows, convW, M: M, K: K, C: C)
                 else { return (false, "ref conv1dSiluRows nil M=\(M)") }
                 // Reference histOut: tail K-1 frames of (histIn‖qkv) — pure data movement,
                 // same bytes shift_conv_rows copies; not a computation reimplementation.
                 let histOutRef = convInput[M ..< M + K - 1].asType(.float16)
                 MLX.eval([convOutRef, histOutRef])
                 // Fused: stub under test
-                guard let (convOutGot, histOutGot) = RawFusedVerify.gdnConvShiftFused(
+                guard let (convOutGot, histOutGot) = SeedlessFusedVerify.gdnConvShiftFused(
                     histIn: histIn, qkv: qkv, w: convW, M: M, K: K, C: C)
                 else { return (false, "not implemented (M=\(M))") }
                 MLX.eval([convOutGot, histOutGot])
@@ -1943,18 +1943,18 @@ public enum RawVerifyTests {
                     let normW = MLXRandom.normal([Dv]).asType(promote ? .float32 : .float16)
                     normW.eval()
                     // Reference: rmsNormRows (existing production kernel)
-                    guard let normedRef = RawMetalForward.rmsNormRows(coreOut, normW,
+                    guard let normedRef = SeedlessMetalForward.rmsNormRows(coreOut, normW,
                                                                         M: M * Hv, eps: 1e-6, D: Dv,
                                                                         promoteF32: promote)
                     else { return (false, "ref rmsNormRows nil M=\(M) promote=\(promote)") }
                     normedRef.eval()
                     // then gateRaw (existing production kernel wrapping encodeGate)
-                    guard let outVRef = RawFusedVerify.gateRaw(z, normedRef,
+                    guard let outVRef = SeedlessFusedVerify.gateRaw(z, normedRef,
                                                                 promote: promote, total: M * valueDim)
                     else { return (false, "ref gateRaw nil M=\(M) promote=\(promote)") }
                     outVRef.eval()
                     // Fused: stub under test
-                    guard let outVGot = RawFusedVerify.gdnNormGateFused(
+                    guard let outVGot = SeedlessFusedVerify.gdnNormGateFused(
                         coreOut: coreOut, z: z, normWeight: normW,
                         M: M, Hv: Hv, Dv: Dv, eps: 1e-6, promoteF32: promote)
                     else { return (false, "not implemented (M=\(M) promote=\(promote))") }
@@ -1967,17 +1967,17 @@ public enum RawVerifyTests {
         }
 
         // Test 37 (fuseGU M-branch): structural predicate gate for the fuseGU M-branch.
-        // Asserts that RawFusedForward.fuseGUActive(M:) is implemented and returns:
+        // Asserts that SeedlessFusedForward.fuseGUActive(M:) is implemented and returns:
         //   true  iff QWISP_FUSE_GU=1 AND M==1   (fused gather+swiglu, M=1 only)
         //   false iff QWISP_FUSE_GU=1 AND M>1    (register-pressure fallback)
         //   false iff QWISP_FUSE_GU=0             (flag disabled)
         // Stub returns nil → RED. Behavioral correctness (actual tokens) is gated by G2.
         run("fuse_gu_m_branch") {
-            guard let active1 = RawFusedVerify.RawFusedForward.fuseGUActive(M: 1)
+            guard let active1 = SeedlessFusedVerify.SeedlessFusedForward.fuseGUActive(M: 1)
             else { return (false, "not implemented") }
-            guard let active8 = RawFusedVerify.RawFusedForward.fuseGUActive(M: 8)
+            guard let active8 = SeedlessFusedVerify.SeedlessFusedForward.fuseGUActive(M: 8)
             else { return (false, "not implemented M=8") }
-            let fuseOn = RawFusedVerify.RawFusedForward.fuseGU
+            let fuseOn = SeedlessFusedVerify.SeedlessFusedForward.fuseGU
             if fuseOn {
                 if !active1 { return (false, "fuseGU=1: expected fuseGUActive(1)=true, got false") }
                 if  active8 { return (false, "fuseGU=1: expected fuseGUActive(8)=false, got true") }
@@ -1999,7 +1999,7 @@ public enum RawVerifyTests {
 
         // Test 38 (F1-demux): gdnInProjDemux — single qmm4 dispatch over concatenated in-proj
         //   weights writes DIRECTLY into 4 separate output buffers (no downstream concat+slice).
-        //   Reference: 4 separate RawMetalForward.qmmRows (existing production kernel).
+        //   Reference: 4 separate SeedlessMetalForward.qmmRows (existing production kernel).
         //   Dims: qkv=1024, z=512, b=64, a=64 (all multiples of 8, threadgroup column alignment),
         //   K=512. Build triples via the existing gdnInProjConcat helper. M∈{1,8}.
         run("fuse_gdn_inproj_demux") {
@@ -2016,7 +2016,7 @@ public enum RawVerifyTests {
             let (aW,   aS,   aB)   = quant(dims.a,   K)
             MLX.eval([qkvW, qkvS, qkvB, zW, zS, zB, bW, bS, bB, aW, aS, aB])
             // Build concatenated weight triple via existing gdnInProjConcat helper
-            guard let (catW, catS, catB) = RawFusedVerify.gdnInProjConcat(
+            guard let (catW, catS, catB) = SeedlessFusedVerify.gdnInProjConcat(
                 qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
                 zW:   zW,   zS:   zS,   zB:   zB,
                 bW:   bW,   bS:   bS,   bB:   bB,
@@ -2026,18 +2026,18 @@ public enum RawVerifyTests {
             for M in [1, 8] {
                 let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
                 // Reference: 4 separate qmmRows (existing production kernel)
-                guard let refQkv = RawMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
+                guard let refQkv = SeedlessMetalForward.qmmRows(x, qkvW, scales: qkvS, biases: qkvB,
                                                             M: M, K: K, N: dims.qkv),
-                      let refZ   = RawMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
+                      let refZ   = SeedlessMetalForward.qmmRows(x, zW,   scales: zS,   biases: zB,
                                                             M: M, K: K, N: dims.z),
-                      let refB   = RawMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
+                      let refB   = SeedlessMetalForward.qmmRows(x, bW,   scales: bS,   biases: bB,
                                                             M: M, K: K, N: dims.b),
-                      let refA   = RawMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
+                      let refA   = SeedlessMetalForward.qmmRows(x, aW,   scales: aS,   biases: aB,
                                                             M: M, K: K, N: dims.a)
                 else { return (false, "ref qmmRows nil M=\(M)") }
                 MLX.eval([refQkv, refZ, refB, refA])
                 // Stub under test: single dispatch demuxing into 4 output buffers
-                guard let (gotQkv, gotZ, gotB, gotA) = RawFusedVerify.gdnInProjDemux(
+                guard let (gotQkv, gotZ, gotB, gotA) = SeedlessFusedVerify.gdnInProjDemux(
                     x: x, catW: catW, catS: catS, catB: catB,
                     M: M, K: K, dims: dims)
                 else { return (false, "not implemented (M=\(M))") }
@@ -2069,17 +2069,17 @@ public enum RawVerifyTests {
                     let normW = MLXRandom.normal([Dv]).asType(promote ? .float32 : .float16)
                     normW.eval()
                     // Reference: rmsNormRows (existing production kernel) then gateRaw
-                    guard let normedRef = RawMetalForward.rmsNormRows(coreOut, normW,
+                    guard let normedRef = SeedlessMetalForward.rmsNormRows(coreOut, normW,
                                                                        M: M * Hv, eps: 1e-6, D: Dv,
                                                                        promoteF32: promote)
                     else { return (false, "ref rmsNormRows nil M=\(M) promote=\(promote)") }
                     normedRef.eval()
-                    guard let outVRef = RawFusedVerify.gateRaw(z, normedRef,
+                    guard let outVRef = SeedlessFusedVerify.gateRaw(z, normedRef,
                                                                 promote: promote, total: M * valueDim)
                     else { return (false, "ref gateRaw nil M=\(M) promote=\(promote)") }
                     outVRef.eval()
                     // Stub under test: single-dispatch production kernel (distinct from wrapper)
-                    guard let outVGot = RawFusedVerify.gdnNormGateRows(
+                    guard let outVGot = SeedlessFusedVerify.gdnNormGateRows(
                         coreOut: coreOut, z: z, normWeight: normW,
                         M: M, Hv: Hv, Dv: Dv, eps: 1e-6, promoteF32: promote)
                     else { return (false, "not implemented (M=\(M) promote=\(promote))") }
@@ -2129,11 +2129,11 @@ public enum RawVerifyTests {
                 let v1 = convOut[0..., 2 * keyDim ..< 2 * keyDim + valueDim].asType(.float16)
                 MLX.eval([q1, k1, v1])
                 // ⑪ rmsnorm qn (ones weight, per-head over headKDim)
-                guard let qnNorm = RawMetalForward.rmsNormRows(
+                guard let qnNorm = SeedlessMetalForward.rmsNormRows(
                         q1, onesQ, M: M * numKHeads, eps: eps, D: headKDim)
                 else { return (false, "ref rmsNorm qn nil M=\(M)") }
                 // ⑫ rmsnorm kn (ones weight, per-head over headKDim)
-                guard let knNorm = RawMetalForward.rmsNormRows(
+                guard let knNorm = SeedlessMetalForward.rmsNormRows(
                         k1, onesQ, M: M * numKHeads, eps: eps, D: headKDim)
                 else { return (false, "ref rmsNorm kn nil M=\(M)") }
                 qnNorm.eval(); knNorm.eval()
@@ -2147,12 +2147,12 @@ public enum RawVerifyTests {
                 else { return (false, "scale_mul kernel failed M=\(M)") }
                 qnRef.eval(); knRef.eval()
                 // ⑮ compute_g_beta (per-op production wrapper)
-                guard let (gRef, betaRef) = RawFusedVerify.computeGBetaRowsRaw(
+                guard let (gRef, betaRef) = SeedlessFusedVerify.computeGBetaRowsRaw(
                         aP, bP, aLog, dtBias, M: M, Hv: numVHeads)
                 else { return (false, "ref computeGBeta nil M=\(M)") }
                 gRef.eval(); betaRef.eval()
                 // ── Fused stub ──
-                guard let (qnGot, knGot, vGot, gGot, betaGot) = RawFusedVerify.gdnPrepFused(
+                guard let (qnGot, knGot, vGot, gGot, betaGot) = SeedlessFusedVerify.gdnPrepFused(
                     convOut: convOut, aP: aP, bP: bP, aLog: aLog, dtBias: dtBias,
                     M: M, keyDim: keyDim, valueDim: valueDim,
                     numKHeads: numKHeads, headKDim: headKDim, numVHeads: numVHeads,
@@ -2188,11 +2188,11 @@ public enum RawVerifyTests {
                 // resid_add: (half)((float)h[i] + (float)r[i]) — matches Metal kernel semantics
                 let hRef = (hBuf.asType(.float32) + mixerOut.asType(.float32)).asType(.float16)
                 hRef.eval()
-                guard let postNormRef = RawMetalForward.rmsNormRows(hRef, postW, M: M, eps: eps, D: H)
+                guard let postNormRef = SeedlessMetalForward.rmsNormRows(hRef, postW, M: M, eps: eps, D: H)
                 else { return (false, "ref rmsNormRows nil M=\(M)") }
                 postNormRef.eval()
                 // ── Fused stub ──
-                guard let (hGot, postNormGot) = RawFusedVerify.gdnResidPostNormFused(
+                guard let (hGot, postNormGot) = SeedlessFusedVerify.gdnResidPostNormFused(
                     hBuf: hBuf, mixerOut: mixerOut, postW: postW, M: M, H: H, eps: eps)
                 else { return (false, "not implemented (M=\(M))") }
                 MLX.eval([hGot, postNormGot])
@@ -2237,13 +2237,13 @@ public enum RawVerifyTests {
             for M in [1, 8] {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
                 // Reference: 3 separate qmmRows calls (existing production kernel)
-                guard let qRef = RawMetalForward.qmmRows(x, qW, scales: qS, biases: qB, M: M, K: H, N: Nq),
-                      let kRef = RawMetalForward.qmmRows(x, kW, scales: kS, biases: kB, M: M, K: H, N: Nk),
-                      let vRef = RawMetalForward.qmmRows(x, vW, scales: vS, biases: vB, M: M, K: H, N: Nv)
+                guard let qRef = SeedlessMetalForward.qmmRows(x, qW, scales: qS, biases: qB, M: M, K: H, N: Nq),
+                      let kRef = SeedlessMetalForward.qmmRows(x, kW, scales: kS, biases: kB, M: M, K: H, N: Nk),
+                      let vRef = SeedlessMetalForward.qmmRows(x, vW, scales: vS, biases: vB, M: M, K: H, N: Nv)
                 else { return (false, "ref qmmRows nil M=\(M)") }
                 MLX.eval([qRef, kRef, vRef])
                 // Stub under test
-                guard let (qGot, kGot, vGot) = RawFusedVerify.attnQkvDemux(x,
+                guard let (qGot, kGot, vGot) = SeedlessFusedVerify.attnQkvDemux(x,
                         qW: qW, qS: qS, qB: qB,
                         kW: kW, kS: kS, kB: kB,
                         vW: vW, vS: vS, vB: vB,
@@ -2277,18 +2277,18 @@ public enum RawVerifyTests {
                 let qX = qOut[0..., 0..<headDim].asType(.float16)   // [M*numHeads, headDim]
                 qX.eval()
                 // ⑤ rmsnorm q (per-head, weight qNorm[headDim])
-                guard let qN = RawMetalForward.rmsNormRows(qX, qNorm,
+                guard let qN = SeedlessMetalForward.rmsNormRows(qX, qNorm,
                                                             M: M * numHeads, eps: eps, D: headDim)
                 else { return (false, "ref rmsNormRows nil M=\(M)") }
                 qN.eval()
                 // ⑦ rope q (numHeads lanes, position = startOffset + m)
-                guard let qRot = RawMetalForward.ropeRows(qN, headDim: headDim, ropeDim: ropeDim,
+                guard let qRot = SeedlessMetalForward.ropeRows(qN, headDim: headDim, ropeDim: ropeDim,
                                                            base: ropeBase, startOffset: startOffset,
                                                            M: M, numHeads: numHeads)
                 else { return (false, "ref ropeRows nil M=\(M)") }
                 qRot.eval()
                 // Stub under test
-                guard let qRotGot = RawFusedVerify.attnQPrepFused(qOut, qNorm: qNorm,
+                guard let qRotGot = SeedlessFusedVerify.attnQPrepFused(qOut, qNorm: qNorm,
                         startOffset: startOffset, M: M,
                         numHeads: numHeads, headDim: headDim,
                         ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
@@ -2317,12 +2317,12 @@ public enum RawVerifyTests {
                 let kOut = MLXRandom.normal([M * numKV, headDim]).asType(.float16); kOut.eval()
                 // Reference chain:
                 // ⑥ rmsnorm k (per-kv-head, weight kNorm[headDim])
-                guard let kN = RawMetalForward.rmsNormRows(kOut, kNorm,
+                guard let kN = SeedlessMetalForward.rmsNormRows(kOut, kNorm,
                                                             M: M * numKV, eps: eps, D: headDim)
                 else { return (false, "ref rmsNormRows nil M=\(M)") }
                 kN.eval()
                 // ⑧ rope k (numHeads=numKV for k-path, position = baseLen + m)
-                guard let kRot = RawMetalForward.ropeRows(kN, headDim: headDim, ropeDim: ropeDim,
+                guard let kRot = SeedlessMetalForward.ropeRows(kN, headDim: headDim, ropeDim: ropeDim,
                                                            base: ropeBase, startOffset: baseLen,
                                                            M: M, numHeads: numKV)
                 else { return (false, "ref ropeRows nil M=\(M)") }
@@ -2338,7 +2338,7 @@ public enum RawVerifyTests {
                 kCacheRef.eval()
                 // Stub under test
                 let maxLen = baseLen + M + 4
-                guard let (kRotGot, kCacheGot) = RawFusedVerify.attnKPrepFused(kOut, kNorm: kNorm,
+                guard let (kRotGot, kCacheGot) = SeedlessFusedVerify.attnKPrepFused(kOut, kNorm: kNorm,
                         kCacheInit: kCacheInit, startOffset: baseLen, maxLen: maxLen, M: M,
                         numKV: numKV, headDim: headDim,
                         ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
@@ -2369,17 +2369,17 @@ public enum RawVerifyTests {
             let M = 1   // M==1 branch only (S1 fuseSHEXPActive gate)
             let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
             // Reference: 3 existing production kernels (qmmRows×2 + swigluRaw)
-            guard let sg = RawMetalForward.qmmRows(x, shGW, scales: shGS, biases: shGB,
+            guard let sg = SeedlessMetalForward.qmmRows(x, shGW, scales: shGS, biases: shGB,
                                                     M: M, K: H, N: I),
-                  let su = RawMetalForward.qmmRows(x, shUW, scales: shUS, biases: shUB,
+                  let su = SeedlessMetalForward.qmmRows(x, shUW, scales: shUS, biases: shUB,
                                                     M: M, K: H, N: I)
             else { return (false, "ref qmmRows nil") }
             sg.eval(); su.eval()
-            guard let shActRef = RawMetalForward.swigluRaw(sg, su)
+            guard let shActRef = SeedlessMetalForward.swigluRaw(sg, su)
             else { return (false, "ref swigluRaw nil") }
             shActRef.eval()
             // Stub under test
-            guard let shActGot = RawFusedVerify.sharedGUSwigluFused(x,
+            guard let shActGot = SeedlessFusedVerify.sharedGUSwigluFused(x,
                     shGW: shGW, shGS: shGS, shGB: shGB,
                     shUW: shUW, shUS: shUS, shUB: shUB,
                     M: M, H: H, I: I)
@@ -2409,15 +2409,15 @@ public enum RawVerifyTests {
                 let sharedY = MLXRandom.normal([M, H]).asType(.float16)
                 MLX.eval([x, y, sharedY])
                 // Reference: qmm8 then finalCombineRowsRaw (both production kernels)
-                guard let sgl = RawMetalForward.qmm8(x, sgW, scales: sgS, biases: sgB,
+                guard let sgl = SeedlessMetalForward.qmm8(x, sgW, scales: sgS, biases: sgB,
                                                       M: M, K: H, N: 8)
                 else { return (false, "ref qmm8 nil M=\(M)") }
                 sgl.eval()
-                guard let outRef = RawFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
+                guard let outRef = SeedlessFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
                 else { return (false, "ref finalCombineRowsRaw nil M=\(M)") }
                 outRef.eval()
                 // Stub under test
-                guard let outGot = RawFusedVerify.sharedGateCombineFused(x, y: y, sharedY: sharedY,
+                guard let outGot = SeedlessFusedVerify.sharedGateCombineFused(x, y: y, sharedY: sharedY,
                         sgW: sgW, sgS: sgS, sgB: sgB, M: M, H: H)
                 else { return (false, "not implemented (M=\(M))") }
                 outGot.eval()
@@ -2453,10 +2453,10 @@ public enum RawVerifyTests {
             let pLNC1 = MLXRandom.normal([stH]).asType(.float16)
             MLX.eval([iLNC0, pLNC0, iLNC1, pLNC1])
             let layerSpecsC = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLNC0, postLN: pLNC0,
                     gdn: gdnWC, attn: nil, moe: moeC0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLNC1, postLN: pLNC1,
                     gdn: nil, attn: attnWC, moe: moeC1.w, moeE: stE, moeI: stI),
             ]
@@ -2466,9 +2466,9 @@ public enum RawVerifyTests {
             let kcC = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)   // 8 initial KV positions
             let vcC = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
             MLX.eval([csC, rsC, kcC, vcC])
-            func freshCachesC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: csC, recState: rsC),
-                 RawVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
+            func freshCachesC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: csC, recState: rsC),
+                 SeedlessVerifyForward.LayerCaches(kCache: kcC, vCache: vcC)]
             }
             // Shared head weights (same objects for both engines — embed = lm_head = 4-bit q)
             let ewf = MLXRandom.normal([V, stH]).asType(.float16)
@@ -2485,7 +2485,7 @@ public enum RawVerifyTests {
             let firstToken = Int32(7)
             for K in [2, 3, 8] {
                 // Chain engine — will call chainedStepArgmax (stub → RED)
-                guard let eng1 = RawFusedVerify.RawFusedForward(
+                guard let eng1 = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layerSpecsC, caches: freshCachesC(),
                         maxM: 4, H: stH, maxSeqLen: maxSeqC)
                 else { return (false, "init eng1 nil K=\(K)") }
@@ -2494,7 +2494,7 @@ public enum RawVerifyTests {
                                       fnW: fnWC, vocab: V)
                 else { return (false, "attachHead eng1 nil K=\(K)") }
                 // Reference engine — will call stepArgmax K times
-                guard let eng2 = RawFusedVerify.RawFusedForward(
+                guard let eng2 = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layerSpecsC, caches: freshCachesC(),
                         maxM: 4, H: stH, maxSeqLen: maxSeqC)
                 else { return (false, "init eng2 nil K=\(K)") }
@@ -2567,10 +2567,10 @@ public enum RawVerifyTests {
             let pLNB1 = MLXRandom.normal([stH]).asType(.float16)
             MLX.eval([iLNB0, pLNB0, iLNB1, pLNB1])
             let layerSpecsB = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLNB0, postLN: pLNB0,
                     gdn: gdnWB, attn: nil, moe: moeB0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLNB1, postLN: pLNB1,
                     gdn: nil, attn: attnWB, moe: moeB1.w, moeE: stE, moeI: stI),
             ]
@@ -2579,9 +2579,9 @@ public enum RawVerifyTests {
             let kcB = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
             let vcB = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
             MLX.eval([csB, rsB, kcB, vcB])
-            func freshCachesB() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: csB, recState: rsB),
-                 RawVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
+            func freshCachesB() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: csB, recState: rsB),
+                 SeedlessVerifyForward.LayerCaches(kCache: kcB, vCache: vcB)]
             }
             let ewfB = MLXRandom.normal([V, stH]).asType(.float16)
             let (ewqB, escB, ebiOptB) = MLX.quantized(ewfB, groupSize: 64, bits: 4, mode: .affine)
@@ -2595,7 +2595,7 @@ public enum RawVerifyTests {
             let maxSeqB = 32
             let seedToken = Int32(13)
             // Interleaved engine (chain → step × K2 → chain)
-            guard let engC = RawFusedVerify.RawFusedForward(
+            guard let engC = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecsB, caches: freshCachesB(),
                     maxM: 4, H: stH, maxSeqLen: maxSeqB)
             else { return (false, "init engC nil") }
@@ -2604,7 +2604,7 @@ public enum RawVerifyTests {
                                    fnW: fnWB, vocab: V)
             else { return (false, "attachHead engC nil") }
             // Reference engine (all sequential stepArgmax)
-            guard let engR = RawFusedVerify.RawFusedForward(
+            guard let engR = SeedlessFusedVerify.SeedlessFusedForward(
                     layers: layerSpecsB, caches: freshCachesB(),
                     maxM: 4, H: stH, maxSeqLen: maxSeqB)
             else { return (false, "init engR nil") }
@@ -2678,8 +2678,8 @@ public enum RawVerifyTests {
         // env vars become opt-OUT (QWISP_FUSE_X=0 / QWISP_CHAIN_K=0 disable), and the
         // flag-off paths stay reachable via explicit =0 for bisection.
         //
-        // These read the SAME production statics/constant that RawFusedForward and
-        // RawSpecRunner consume at runtime — no reimplemented oracle. They are RED on
+        // These read the SAME production statics/constant that SeedlessFusedForward and
+        // SeedlessSpecRunner consume at runtime — no reimplemented oracle. They are RED on
         // the pre-flip tree (fuse statics are ["QWISP_FUSE_X"] == "1" = false when
         // unset; chainKDefault == 0) and GREEN once the driver flips the defaults
         // (fuse statics → != "0"; chainKDefault → 8).
@@ -2689,10 +2689,10 @@ public enum RawVerifyTests {
         // fuseGUActive / fuseSHEXPActive branch on). RED now because each resolves to
         // false when its QWISP_FUSE_* var is unset; GREEN after the flip to != "0".
         run("default_fuse_flags_on") {
-            let gu    = RawFusedVerify.RawFusedForward.fuseGU
-            let gdn   = RawFusedVerify.RawFusedForward.fuseGDN
-            let attn  = RawFusedVerify.RawFusedForward.fuseATTN
-            let shexp = RawFusedVerify.RawFusedForward.fuseSHEXP
+            let gu    = SeedlessFusedVerify.SeedlessFusedForward.fuseGU
+            let gdn   = SeedlessFusedVerify.SeedlessFusedForward.fuseGDN
+            let attn  = SeedlessFusedVerify.SeedlessFusedForward.fuseATTN
+            let shexp = SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP
             if !gu    { return (false, "fuseGU default expected ON, got OFF") }
             if !gdn   { return (false, "fuseGDN default expected ON, got OFF") }
             if !attn  { return (false, "fuseATTN default expected ON, got OFF") }
@@ -2700,19 +2700,19 @@ public enum RawVerifyTests {
             return (true, "ok")
         }
 
-        // Test 50: chain default K == 8 (opt-out). RawSpecRunner resolves the chain
-        // length as Tell.envInt("QWISP_CHAIN_K", RawFusedForward.chainKDefault); with
+        // Test 50: chain default K == 8 (opt-out). SeedlessSpecRunner resolves the chain
+        // length as Tell.envInt("QWISP_CHAIN_K", SeedlessFusedForward.chainKDefault); with
         // QWISP_CHAIN_K unset the resolved value equals this seam constant, so pinning
         // the constant to 8 pins the production default. Reads the wired production
-        // seam (RawSpecRunner references chainKDefault) — not a reimplemented parse.
+        // seam (SeedlessSpecRunner references chainKDefault) — not a reimplemented parse.
         // Also asserts the opt-out contract via the SAME Tell.envInt production path
-        // RawSpecRunner uses: unset → chainKDefault, explicit "0" → 0 (disabled).
+        // SeedlessSpecRunner uses: unset → chainKDefault, explicit "0" → 0 (disabled).
         // RED now because chainKDefault == 0; GREEN after the flip to 8.
         run("default_chain_k_eight") {
-            let d = RawFusedVerify.RawFusedForward.chainKDefault
+            let d = SeedlessFusedVerify.SeedlessFusedForward.chainKDefault
             if d != 8 { return (false, "chainKDefault expected 8, got \(d)") }
             // Unset env resolves to the seam default (raw-tests sets no QWISP_CHAIN_K).
-            let resolvedUnset = Tell.envInt("QWISP_CHAIN_K", RawFusedVerify.RawFusedForward.chainKDefault)
+            let resolvedUnset = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
             if resolvedUnset != 8 {
                 return (false, "unset QWISP_CHAIN_K expected 8, got \(resolvedUnset)")
             }
@@ -2727,9 +2727,9 @@ public enum RawVerifyTests {
         // and doing so MUST be bit-identical to per-step greedy (bolt = deterministic
         // buddy-greedy → chain must never change tokens).
         //
-        // Seam under test: RawSpecRunner.boltGreedyChainSpan (STUB → nil → RED). It is the
+        // Seam under test: SeedlessSpecRunner.boltGreedyChainSpan (STUB → nil → RED). It is the
         // shared span decoder that runBoltMode delegates its D==0 branch to. The backend's
-        // chainedStepArgmax / stepArgmax here are the PRODUCTION RawFusedForward methods on a
+        // chainedStepArgmax / stepArgmax here are the PRODUCTION SeedlessFusedForward methods on a
         // real bolt engine (providers + setBoltTables + attachHead) — no reimplemented oracle.
         //
         // References:
@@ -2746,7 +2746,7 @@ public enum RawVerifyTests {
         //   (d) determinism: emitted + [nextU] == [u] + K sequential bolt greedy tokens
         //       (chain-on OUT_TOKENS byte-identical to chain-off).
         run("bolt_chain_span_wired") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let V = 256
             let C = stE                    // C = E: all experts fit, deterministic slot table
             let chainK = 4
@@ -2761,10 +2761,10 @@ public enum RawVerifyTests {
             let pLN1 = MLXRandom.normal([stH]).asType(.float16)
             MLX.eval([iLN0, pLN0, iLN1, pLN1])
             let layerSpecs = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: iLN0, postLN: pLN0,
                     gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: iLN1, postLN: pLN1,
                     gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
             ]
@@ -2774,9 +2774,9 @@ public enum RawVerifyTests {
             let kc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
             let vc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
             MLX.eval([cs0, rs0, kc0, vc0])
-            func freshC() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
-                 RawVerifyForward.LayerCaches(kCache: kc0, vCache: vc0)]
+            func freshC() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kc0, vCache: vc0)]
             }
             // Shared head weights (embed = lm_head = 4-bit q), same objects for both engines.
             let ewf = MLXRandom.normal([V, stH]).asType(.float16)
@@ -2790,7 +2790,7 @@ public enum RawVerifyTests {
             let maxSeq = 32
 
             // Build a bolt engine: providers (warm all E) + frozen slot tables + head.
-            func mkBoltEngine() -> RawFusedVerify.RawFusedForward? {
+            func mkBoltEngine() -> SeedlessFusedVerify.SeedlessFusedForward? {
                 guard let tp0 = TestExpertProvider(E: stE, I: stI, H: stH, C: C,
                         gW: moe0.gW, gSf16: moe0.gSf16, gBf16: moe0.gBf16,
                         uW: moe0.uW, uSf16: moe0.uSf16, uBf16: moe0.uBf16,
@@ -2804,7 +2804,7 @@ public enum RawVerifyTests {
                 var tbl0 = [Int32](repeating: 0, count: stE), tbl1 = [Int32](repeating: 0, count: stE)
                 for (e, s) in sm0 { tbl0[e] = Int32(s) }
                 for (e, s) in sm1 { tbl1[e] = Int32(s) }
-                guard let eng = RawFusedVerify.RawFusedForward(
+                guard let eng = SeedlessFusedVerify.SeedlessFusedForward(
                         layers: layerSpecs, caches: freshC(), maxM: 4, H: stH,
                         maxSeqLen: maxSeq, providers: [tp0, tp1])
                 else { return nil }
@@ -2829,7 +2829,7 @@ public enum RawVerifyTests {
             // Instrument a SpecBackend wrapping the chain bolt engine. stepArgmax counts
             // per-step calls so we can prove the chained tail did NOT go per-step.
             var perStepCalls = 0
-            var backend = RawSpecRunner.SpecBackend(
+            var backend = SeedlessSpecRunner.SpecBackend(
                 forward: { _ in nil },     // not used by the greedy chain span
                 stepArgmax: { toks in perStepCalls += 1; return bltEng.stepArgmax(toks) },
                 snapshot: { bltEng.snapshot() },
@@ -2837,7 +2837,7 @@ public enum RawVerifyTests {
             backend.chainedStepArgmax = { token, k in bltEng.chainedStepArgmax(token, K: k) }
 
             // Under test: bolt-runner greedy span with budget = chainK (emit u + K-1 tail).
-            guard let (emitted, nextU) = RawSpecRunner.boltGreedyChainSpan(
+            guard let (emitted, nextU) = SeedlessSpecRunner.boltGreedyChainSpan(
                 backend: backend, u: Int(firstToken), chainK: chainK, budget: chainK)
             else { return (false, "not implemented (boltGreedyChainSpan nil)") }
 
@@ -2916,18 +2916,18 @@ public enum RawVerifyTests {
             let (gW, gS, gB)   = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
             let (a0, a1, a2)   = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
             let (d0, d1, d2)   = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-            let w = RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                 swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                 swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                 shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
                 sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
 
             // Snapshot of flags we toggle, restored unconditionally at the end.
-            let savedMOE2  = RawFusedVerify.RawFusedForward.fuseMOE2Enabled
-            let savedSHEXP = RawFusedVerify.RawFusedForward.fuseSHEXP
+            let savedMOE2  = SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled
+            let savedSHEXP = SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP
 
             // Ensure S2 path is active for both arms (fold applies only when fuseSHEXP is ON).
-            RawFusedVerify.RawFusedForward.fuseSHEXP = true
+            SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP = true
 
             for M in [1, 8] {
                 // M==1 folds (dispatch skipped); M>1 keeps the separate combine dispatch.
@@ -2936,33 +2936,33 @@ public enum RawVerifyTests {
                 let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
 
                 // ── Reference (fold-OFF): combine_rows separate dispatch + S2 reads sc.y ──
-                RawFusedVerify.RawFusedForward.fuseMOE2Enabled = false
-                guard let ref = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = false
+                guard let ref = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
                 else {
-                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
-                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = savedMOE2
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP       = savedSHEXP
                     return (false, "fold-OFF ref nil M=\(M)")
                 }
                 ref.eval()
 
                 // ── Candidate (fold-ON flag): M==1 folds, M>1 keeps the separate path ──
-                RawFusedVerify.RawFusedForward.fuseMOE2Enabled = true
-                RawFusedVerify._combineRowsDispatchCount = 0   // reset before fold-ON call
-                guard let got = RawFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = true
+                SeedlessFusedVerify._combineRowsDispatchCount = 0   // reset before fold-ON call
+                guard let got = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
                 else {
-                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
-                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = savedMOE2
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP       = savedSHEXP
                     return (false, "fold-ON nil M=\(M)")
                 }
                 got.eval()
-                let dispatchCount = RawFusedVerify._combineRowsDispatchCount
+                let dispatchCount = SeedlessFusedVerify._combineRowsDispatchCount
 
                 // (a) moeOut byte-identical to fold-OFF reference (both M cases).
                 //     M==1: through the fold kernel. M==8: through the unchanged path.
                 let (okOut, dOut) = bitEqual(got, ref)
                 if !okOut {
-                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
-                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = savedMOE2
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP       = savedSHEXP
                     return (false, "M=\(M) out mismatch: \(dOut)")
                 }
 
@@ -2970,16 +2970,16 @@ public enum RawVerifyTests {
                 //     RED on current tree: M==8 folds (count 0) but contract wants 1.
                 //     GREEN when fold is M==1-gated (skip at M==1, keep at M>1).
                 if dispatchCount != expectedCount {
-                    RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
-                    RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = savedMOE2
+                    SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP       = savedSHEXP
                     return (false,
                             "M=\(M) combine_rows dispatch count=\(dispatchCount) want \(expectedCount) " +
                             "(fold must be M==1-gated: skip at M==1, keep separate combine at M>1)")
                 }
             }
 
-            RawFusedVerify.RawFusedForward.fuseMOE2Enabled = savedMOE2
-            RawFusedVerify.RawFusedForward.fuseSHEXP       = savedSHEXP
+            SeedlessFusedVerify.SeedlessFusedForward.fuseMOE2Enabled = savedMOE2
+            SeedlessFusedVerify.SeedlessFusedForward.fuseSHEXP       = savedSHEXP
             return (true, "ok")
         }
 
@@ -2987,7 +2987,7 @@ public enum RawVerifyTests {
         //
         // WRITE-LOCKED: implementer MUST NOT modify tests 52-53.
         //
-        // Goal: two lossless default-path wiring fixes in RawSpecRunner —
+        // Goal: two lossless default-path wiring fixes in SeedlessSpecRunner —
         //   (1) resident useFused defaults ON (fused 1-CB ~92 tok/s), not the
         //       composedBackend footgun (~1.3 tok/s); QWISP_RAW_FUSED=0 restores
         //       composed for debug.
@@ -2996,28 +2996,28 @@ public enum RawVerifyTests {
         //       explicit QWISP_RAW_C still overrides.
         // Both are output-invariant (fused ≡ composed greedy byte-identical; C only
         // changes streaming footprint, not tokens). Encoded via pure production
-        // seams RawSpecRunner.resolveUseFused / resolveRawC (STUB → RED now).
+        // seams SeedlessSpecRunner.resolveUseFused / resolveRawC (STUB → RED now).
 
         // Test 52: resident useFused default resolves ON when QWISP_RAW_FUSED unset.
-        // Seam = RawSpecRunner.resolveUseFused (STUB returns false → RED). Also pins
+        // Seam = SeedlessSpecRunner.resolveUseFused (STUB returns false → RED). Also pins
         // the opt-out contract ("0" → composed) and the pass-through ("1" → fused),
         // and binds to the live production env value (raw-tests sets no QWISP_RAW_FUSED
         // → unset → must be true).
         run("raw_resident_fused_default_on") {
             // unset → fused ON (the fix; STUB false → RED here)
-            if RawSpecRunner.resolveUseFused(env: nil) != true {
+            if SeedlessSpecRunner.resolveUseFused(env: nil) != true {
                 return (false, "unset QWISP_RAW_FUSED must resolve useFused=true (fused default ON)")
             }
             // explicit "0" → composed (debug opt-out preserved)
-            if RawSpecRunner.resolveUseFused(env: "0") != false {
+            if SeedlessSpecRunner.resolveUseFused(env: "0") != false {
                 return (false, "QWISP_RAW_FUSED=0 must resolve useFused=false (composed)")
             }
             // explicit "1" → fused
-            if RawSpecRunner.resolveUseFused(env: "1") != true {
+            if SeedlessSpecRunner.resolveUseFused(env: "1") != true {
                 return (false, "QWISP_RAW_FUSED=1 must resolve useFused=true (fused)")
             }
             // live production env (raw-tests sets no QWISP_RAW_FUSED → unset → true)
-            let live = RawSpecRunner.resolveUseFused(
+            let live = SeedlessSpecRunner.resolveUseFused(
                 env: ProcessInfo.processInfo.environment["QWISP_RAW_FUSED"])
             if live != true {
                 return (false, "live unset QWISP_RAW_FUSED must resolve useFused=true, got \(live)")
@@ -3026,29 +3026,29 @@ public enum RawVerifyTests {
         }
 
         // Test 53: raw-spec C consults DeviceCalibration.defaultC() when QWISP_RAW_C
-        // unset, and an explicit value overrides. Seam = RawSpecRunner.resolveRawC
+        // unset, and an explicit value overrides. Seam = SeedlessSpecRunner.resolveRawC
         // (STUB returns -1 → RED). References the PRODUCTION tier fn (no reimplemented
         // oracle): the unset result must equal DeviceCalibration.defaultC().
         run("raw_c_tier_default_wired") {
             let tierC = DeviceCalibration.defaultC()
             // unset → tiered default (the fix; STUB -1 → RED here)
-            if RawSpecRunner.resolveRawC(envC: nil, defaultC: tierC) != tierC {
+            if SeedlessSpecRunner.resolveRawC(envC: nil, defaultC: tierC) != tierC {
                 return (false, "unset QWISP_RAW_C must consult DeviceCalibration.defaultC()=\(tierC)")
             }
             // arbitrary tier default is honored when unset (not hard-coded to resident)
-            if RawSpecRunner.resolveRawC(envC: nil, defaultC: 128) != 128 {
+            if SeedlessSpecRunner.resolveRawC(envC: nil, defaultC: 128) != 128 {
                 return (false, "unset QWISP_RAW_C must return the passed defaultC (128)")
             }
             // explicit streaming C overrides the tier default
-            if RawSpecRunner.resolveRawC(envC: "64", defaultC: 256) != 64 {
+            if SeedlessSpecRunner.resolveRawC(envC: "64", defaultC: 256) != 64 {
                 return (false, "explicit QWISP_RAW_C=64 must override defaultC")
             }
             // explicit "0" (resident) overrides too (distinct from unset)
-            if RawSpecRunner.resolveRawC(envC: "0", defaultC: 128) != 0 {
+            if SeedlessSpecRunner.resolveRawC(envC: "0", defaultC: 128) != 0 {
                 return (false, "explicit QWISP_RAW_C=0 must override to resident (0), not defaultC")
             }
             // live production env (raw-tests sets no QWISP_RAW_C → unset → tiered)
-            let live = RawSpecRunner.resolveRawC(
+            let live = SeedlessSpecRunner.resolveRawC(
                 envC: ProcessInfo.processInfo.environment["QWISP_RAW_C"], defaultC: tierC)
             if live != tierC {
                 return (false, "live unset QWISP_RAW_C must resolve to defaultC=\(tierC), got \(live)")
@@ -3108,7 +3108,7 @@ public enum RawVerifyTests {
             }
             let oracle1 = MLX.concatenated(oracle1Parts, axis: 0); oracle1.eval()   // [Ktop, N]
             // Stub — goes RED here (gqmm3 returns nil)
-            guard let got1 = RawMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
+            guard let got1 = SeedlessMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
                                                      inds: inds1, Ktop: Ktop, K: K, N: N)
             else { return (false, "gqmm3 not implemented (M=1 f16)") }
             got1.eval()
@@ -3134,7 +3134,7 @@ public enum RawVerifyTests {
                     }
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
-                guard let got = RawMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
+                guard let got = SeedlessMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
                                                            inds: inds, M: M, Ktop: Ktop, K: K, N: N)
                 else { return (false, "gqmm3Rows not implemented (M=\(M) f16)") }
                 got.eval()
@@ -3171,7 +3171,7 @@ public enum RawVerifyTests {
             }
             let oracle1 = MLX.concatenated(oracle1Parts, axis: 0); oracle1.eval()   // [Ktop, N]
             // Stub — goes RED here (gqmm3 returns nil)
-            guard let got1 = RawMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
+            guard let got1 = SeedlessMetalForward.gqmm3(x1, wq, scales: sc, biases: bi,
                                                      inds: inds1, Ktop: Ktop, K: K, N: N)
             else { return (false, "gqmm3 not implemented (M=1 bf16)") }
             got1.eval()
@@ -3197,7 +3197,7 @@ public enum RawVerifyTests {
                     }
                 }
                 let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
-                guard let got = RawMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
+                guard let got = SeedlessMetalForward.gqmm3Rows(x, wq, scales: sc, biases: bi,
                                                            inds: inds, M: M, Ktop: Ktop, K: K, N: N)
                 else { return (false, "gqmm3Rows not implemented (M=\(M) bf16)") }
                 got.eval()
@@ -3395,7 +3395,7 @@ public enum RawVerifyTests {
             // f16-exact gate logits so the half round-trip is lossless.
             let gl: [Float16] = [1.0, 5.0, 3.0, 2.0, 9.0, 0.5, 7.0, 4.0]
             for li in [0, 2, 1] {
-                guard let (gotI, gotG) = RawFusedVerify.RawFusedForward.diagCopyRouteSelfTest(
+                guard let (gotI, gotG) = SeedlessFusedVerify.SeedlessFusedForward.diagCopyRouteSelfTest(
                     inds: inds, gl: gl, Ktop: Ktop, E: E, numLayers: numLayers, li: li)
                 else { return (false, "not implemented (li=\(li))") }
                 if gotI != inds { return (false, "li=\(li) inds \(gotI) != \(inds)") }
@@ -3419,7 +3419,7 @@ public enum RawVerifyTests {
             // Case A: routed=[4,1,6,2]; resident={0,1,2,3}; resident∉routed={0,3}.
             //   cold selected = {4,6}. max{gl[0],gl[3]} = max(1,2) = 2.
             //   margin[4]=9-2=7, margin[6]=7-2=5.
-            let (coldA, marA) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+            let (coldA, marA) = SeedlessFusedVerify.SeedlessFusedForward.computeRouteDiag(
                 inds: [4, 1, 6, 2], gl: gl, resident: Set([0, 1, 2, 3]),
                 buddyExpert: buddyExpert, Ktop: Ktop)
             if Set(coldA) != Set([4, 6]) { return (false, "A coldSelected=\(coldA) want {4,6}") }
@@ -3431,7 +3431,7 @@ public enum RawVerifyTests {
             if mA[6] != 5.0 { return (false, "A margin[6]=\(String(describing: mA[6])) want 5.0") }
 
             // Case B (+inf): resident={0,1}, routed=[0,1,5], resident∉routed={} → margin[5]=+inf.
-            let (coldB, marB) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+            let (coldB, marB) = SeedlessFusedVerify.SeedlessFusedForward.computeRouteDiag(
                 inds: [0, 1, 5], gl: gl, resident: Set([0, 1]),
                 buddyExpert: buddyExpert, Ktop: 3)
             if coldB != [5] { return (false, "B coldSelected=\(coldB) want [5]") }
@@ -3440,7 +3440,7 @@ public enum RawVerifyTests {
             }
 
             // Case C (no cold): all routed experts hot → empty.
-            let (coldC, marC) = RawFusedVerify.RawFusedForward.computeRouteDiag(
+            let (coldC, marC) = SeedlessFusedVerify.SeedlessFusedForward.computeRouteDiag(
                 inds: [0, 1, 2, 3], gl: gl, resident: Set([0, 1, 2, 3]),
                 buddyExpert: buddyExpert, Ktop: Ktop)
             if !coldC.isEmpty || !marC.isEmpty { return (false, "C cold=\(coldC) mar=\(marC) want empty") }
@@ -3463,7 +3463,7 @@ public enum RawVerifyTests {
                 for li in [0, 2] {
                     for M in [1, 4] {
                         let src = Array(src16.prefix(M * Ktop))
-                        guard let buf = RawFusedVerify.RawFusedForward.diagCopySlotMLayoutSelfTest(
+                        guard let buf = SeedlessFusedVerify.SeedlessFusedForward.diagCopySlotMLayoutSelfTest(
                             inds: src, slot: slot, li: li, M: M,
                             diagObsMaxM: diagObsMaxM, nLayers: nLayers,
                             chainKMax: chainKMax, Ktop: Ktop, E: E)
@@ -3486,7 +3486,7 @@ public enum RawVerifyTests {
             // defaults(slot=0, diagObsMaxM=1, M=1) → element offset li*Ktop == old byte offset li*Ktop*4
             for li in [0, 2, 1] {
                 let src = Array(src16.prefix(Ktop))
-                guard let buf = RawFusedVerify.RawFusedForward.diagCopySlotMLayoutSelfTest(
+                guard let buf = SeedlessFusedVerify.SeedlessFusedForward.diagCopySlotMLayoutSelfTest(
                     inds: src, slot: 0, li: li, M: 1,
                     diagObsMaxM: 1, nLayers: nLayers, chainKMax: chainKMax, Ktop: Ktop, E: E)
                 else { return (false, "not implemented defaults li=\(li)") }
@@ -3512,7 +3512,7 @@ public enum RawVerifyTests {
             // Call 1: M=2 rows.
             //   row0 [1,2,3,2] → distinct {1,2,3} (2 dedup within row)
             //   row1 [3,4,5,3] → distinct {3,4,5} (3 dedup within row; 3 also in row0 → counts twice)
-            guard RawFusedVerify.RawFusedForward.recalibAccumulate(
+            guard SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                 inds: [1, 2, 3, 2,  3, 4, 5, 3], M: 2, Ktop: Ktop, nE: nE,
                 counts: &counts, coact: &coact)
             else { return (false, "not implemented (call1)") }
@@ -3533,7 +3533,7 @@ public enum RawVerifyTests {
             if let f = chk(2, 5, 0, "call1 cross-row") { return f }
 
             // Call 2: M=1 row [1,1,6,7] → distinct {1,6,7} (1 dedup within row) — must ADD.
-            guard RawFusedVerify.RawFusedForward.recalibAccumulate(
+            guard SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                 inds: [1, 1, 6, 7], M: 1, Ktop: Ktop, nE: nE,
                 counts: &counts, coact: &coact)
             else { return (false, "not implemented (call2)") }
@@ -3821,7 +3821,7 @@ public enum RawVerifyTests {
 
 
         // Test 69 (notes/14 TODO-2): QWISP_BOLT_WORKLOAD per-workload preset (R/B).
-        // Pure function RawSpecRunner.boltWorkloadPreset maps a workload name to the
+        // Pure function SeedlessSpecRunner.boltWorkloadPreset maps a workload name to the
         // proven-optimal (recalib R, refresh B). Known names get tuned values; any
         // other string ("", "longctx", unknown) falls back to the current default
         // (R=128, B=32) so QWISP_BOLT_WORKLOAD unset is byte-identical to old bolt.
@@ -3835,13 +3835,13 @@ public enum RawVerifyTests {
                 ("zzz",     128, 32),   // arbitrary unknown → default
             ]
             for (w, wantR, wantB) in cases {
-                let got = RawSpecRunner.boltWorkloadPreset(w)
+                let got = SeedlessSpecRunner.boltWorkloadPreset(w)
                 if got.r != wantR || got.b != wantB {
                     return (false, "workload=\(w): got (R=\(got.r), B=\(got.b)) want (R=\(wantR), B=\(wantB))")
                 }
             }
             // Empty string must also yield the default (unset-env path).
-            let empty = RawSpecRunner.boltWorkloadPreset("")
+            let empty = SeedlessSpecRunner.boltWorkloadPreset("")
             if empty.r != 128 || empty.b != 32 {
                 return (false, "empty workload: got (R=\(empty.r), B=\(empty.b)) want (R=128, B=32)")
             }
@@ -3894,7 +3894,7 @@ public enum RawVerifyTests {
 
         // Test 71 (notes/11 レバー② measure-first): missWeightStats — pure function.
         // bolt の cold-selection(miss)の gate-weight 分布 + top-8 内 rank 集計。
-        // Calls RawSpecRunner.missWeightStats directly (no process-env / GPU dependency).
+        // Calls SeedlessSpecRunner.missWeightStats directly (no process-env / GPU dependency).
         // Hand-computed cases: 分位点 index=floor(q*(n-1)), top1Share=fraction 0..1,
         // meanMissMass = Σ(miss weight) / topInds.count(全観測数), missCount=総 miss 数。
         // RED until the stub returns real values (stub returns -1 sentinel).
@@ -3946,7 +3946,7 @@ public enum RawVerifyTests {
                      p10: 0.05, p50: 0.05, p90: 0.05, top1: 0.5, mass: 0.325, misses: 2),
             ]
             for c in cases {
-                let g = RawSpecRunner.missWeightStats(topInds: c.inds, topWeights: c.w, resident: c.res)
+                let g = SeedlessSpecRunner.missWeightStats(topInds: c.inds, topWeights: c.w, resident: c.res)
                 if g.missCount != c.misses {
                     return (false, "\(c.name): missCount=\(g.missCount) want \(c.misses)")
                 }
@@ -3970,7 +3970,7 @@ public enum RawVerifyTests {
         //   in synthetic and its input path (embed) differs from forwardRows(x); forwardRows
         //   side is the verifiable goal per task spec.
         run("fused_hidden_rows") {
-            guard let (device, _) = RawMetalForward.ensure() else { return (false, "no device") }
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
             let H = 2048, E = 16, I = 512
             func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
                 let wf = MLXRandom.normal([n, k]).asType(.float16)
@@ -3984,11 +3984,11 @@ public enum RawVerifyTests {
                 let wf = MLXRandom.normal([e, n, k]).asType(.float16)
                 let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
             }
-            func mkMoE() -> RawVerifyForward.MoEBlockW {
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
                 let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
                 let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
                 let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
-                return RawVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
                     swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
                     swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
                     shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
@@ -3998,7 +3998,7 @@ public enum RawVerifyTests {
             let convDim = Hk * Dk * 2 + Hv * Dv
             let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
             let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
-            let gdnW = RawVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
                 zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
                 outWq: oW, outSc: oS, outBi: oB,
                 conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
@@ -4007,14 +4007,14 @@ public enum RawVerifyTests {
             let nH = 16, nKV = 2, hD = 256
             let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
             let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
-            let attnW = RawVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
                 vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
                 qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
             let layers = [
-                RawVerifyForward.LayerSpec(isLinear: true,
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
-                RawVerifyForward.LayerSpec(isLinear: false,
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
                     inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
                     gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
             ]
@@ -4023,17 +4023,17 @@ public enum RawVerifyTests {
             let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
             MLX.eval([cs0, rs0, kC0, vC0])
-            func freshCaches() -> [RawVerifyForward.LayerCaches] {
-                [RawVerifyForward.LayerCaches(convState: cs0, recState: rs0),
-                 RawVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
             }
             let maxM = 8
-            guard let fused = RawFusedVerify.RawFusedForward(layers: layers, caches: freshCaches(),
+            guard let fused = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
                                                              maxM: maxM, H: H, maxSeqLen: 64)
             else { return (false, "fused init nil") }
             // final RMSNorm weight → MTLBuffer (same helper attachHead uses for fnW).
             let fnA = MLXRandom.normal([H]).asType(.float16); fnA.eval()
-            guard let fn = RawMetalForward.mtlBuf(fnA, device) else { return (false, "fn buf nil") }
+            guard let fn = SeedlessMetalForward.mtlBuf(fnA, device) else { return (false, "fn buf nil") }
 
             let M = 3
             let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
@@ -4062,25 +4062,25 @@ public enum RawVerifyTests {
         // M-invariance MANDATORY: row m of M=3 call must be bit-identical to the
         // corresponding M=1 call (order-stable rule).
         run("mtp_fmm_rows_vs_mlx") {
-            guard let (device, queue) = RawMetalForward.ensure() else {
+            guard let (device, queue) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
             // Non-aligned dimensions per spec (K=96, N=40).
             let K = 96, N = 40
             // W[N,K] f16
             let wF = MLXRandom.normal([N, K]).asType(.float16); wF.eval()
-            guard let wBuf = RawMetalForward.mtlBuf(wF, device) else {
+            guard let wBuf = SeedlessMetalForward.mtlBuf(wF, device) else {
                 return (false, "w buf nil")
             }
             // Helper: run encodeFmmRows in a fresh CB for M rows of x, return [M,N] f16.
             func runFmm(_ x: MLXArray, M: Int) -> MLXArray? {
                 x.eval()
-                guard let xBuf = RawMetalForward.mtlBuf(x.asType(.float16), device),
+                guard let xBuf = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
                       let outBuf = device.makeBuffer(length: M * N * 2,
                                                      options: .storageModeShared) else { return nil }
                 let cb = queue.makeCommandBuffer()!
                 let enc = cb.makeComputeCommandEncoder()!
-                RawFusedVerify.encodeFmmRows(enc, w: wBuf, x: xBuf, out: outBuf,
+                SeedlessFusedVerify.encodeFmmRows(enc, w: wBuf, x: xBuf, out: outBuf,
                                              M: M, K: K, N: N)
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
                 // If the stub did nothing, output will be zeros — distinct from any real result.
@@ -4127,7 +4127,7 @@ public enum RawVerifyTests {
             return (true, "ok")
         }
 
-        // Test 74 (T-head): RawMTPHead end-to-end draft vs production MLX class composition.
+        // Test 74 (T-head): SeedlessMTPHead end-to-end draft vs production MLX class composition.
         // Real-shape synthetic: H=2048, V=256, E=16, Ktop=8, I=512, nH=16, nKV=2, hD=256, rD=64.
         // WeightsSpec injection (seed-trick impossible: weights arrive as MLXArray, not regenerated
         // inside the impl).  Reference = AttentionLayer(.plain) + MoEBlock(expertGroupSize:64) +
@@ -4137,7 +4137,7 @@ public enum RawVerifyTests {
         // Assert (c) re-draft after (b) returns same token and len is unchanged (READ-ONLY proof).
         // RED: init?(spec:) returns nil → "STUB not implemented" FAIL on all three asserts.
         run("mtp_head_vs_mlx_ref") {
-            guard let (device, _) = RawMetalForward.ensure() else {
+            guard let (device, _) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
 
@@ -4186,7 +4186,7 @@ public enum RawVerifyTests {
                       swUWq, swUSc, swUBi, swDWq, swDSc, swDBi, lmWq, lmSc, lmBi])
 
             // ── WeightsSpec ───────────────────────────────────────────────
-            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+            let spec = SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
                 H: H, V: V, E: E, I: I, Ktop: Ktop,
                 numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
                 ropeBase: ropeBase, eps: eps, maxSeqLen: 128,
@@ -4204,7 +4204,7 @@ public enum RawVerifyTests {
                 lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
 
             // RED: stub returns nil
-            guard let head = RawFusedVerify.RawMTPHead(spec: spec) else {
+            guard let head = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) else {
                 return (false, "init? nil (STUB not implemented)")
             }
 
@@ -4255,7 +4255,7 @@ public enum RawVerifyTests {
             // ── (a) len=0 draft: raw argmax == MLX argmax ────────────────
             let tok0: Int32 = 42
             let hPrev0 = MLXRandom.normal([1, 1, H]).asType(.float16); hPrev0.eval()
-            guard let hBuf0 = RawMetalForward.mtlBuf(hPrev0.reshaped([1, H]).asType(.float16), device)
+            guard let hBuf0 = SeedlessMetalForward.mtlBuf(hPrev0.reshaped([1, H]).asType(.float16), device)
             else { return (false, "hBuf0 nil") }
 
             guard let rawDraft0 = head.draftArgmax(hPrevBuf: hBuf0, hPrevRow: 0, tok: tok0)
@@ -4273,7 +4273,7 @@ public enum RawVerifyTests {
             // Build hBuf for 2 feed rows [2, H] f16.
             let hFeed = MLXRandom.normal([2, H]).asType(.float16); hFeed.eval()
             let toks2: [Int32] = [7, 19]
-            guard let hBufFeed = RawMetalForward.mtlBuf(hFeed, device)
+            guard let hBufFeed = SeedlessMetalForward.mtlBuf(hFeed, device)
             else { return (false, "hBufFeed nil") }
 
             // Feed 2 pairs into raw head.
@@ -4293,7 +4293,7 @@ public enum RawVerifyTests {
             // Now raw draft at len=2 must match MLX draft with same KV history.
             let tok1: Int32 = 99
             let hPrev1 = MLXRandom.normal([1, 1, H]).asType(.float16); hPrev1.eval()
-            guard let hBuf1 = RawMetalForward.mtlBuf(hPrev1.reshaped([1, H]).asType(.float16), device)
+            guard let hBuf1 = SeedlessMetalForward.mtlBuf(hPrev1.reshaped([1, H]).asType(.float16), device)
             else { return (false, "hBuf1 nil") }
 
             guard let rawDraft1 = head.draftArgmax(hPrevBuf: hBuf1, hPrevRow: 0, tok: tok1)
@@ -4330,7 +4330,7 @@ public enum RawVerifyTests {
         // position-index bug (e.g., all rows landing at position 0) would produce different
         // attention and diverge. RED: init? nil → "STUB not implemented" FAIL.
         run("mtp_kv_batch_vs_sequential") {
-            guard let (device, _) = RawMetalForward.ensure() else {
+            guard let (device, _) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
 
@@ -4374,8 +4374,8 @@ public enum RawVerifyTests {
                       embedWq, embedSc, embedBi, swGWq, swGSc, swGBi,
                       swUWq, swUSc, swUBi, swDWq, swDSc, swDBi, lmWq, lmSc, lmBi])
 
-            func makeSpec() -> RawFusedVerify.RawMTPHead.WeightsSpec {
-                RawFusedVerify.RawMTPHead.WeightsSpec(
+            func makeSpec() -> SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec {
+                SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
                     H: H, V: V, E: E, I: I, Ktop: Ktop,
                     numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
                     ropeBase: ropeBase, eps: eps, maxSeqLen: 128,
@@ -4394,8 +4394,8 @@ public enum RawVerifyTests {
             }
 
             // Two independent heads with identical weights.
-            guard let headA = RawFusedVerify.RawMTPHead(spec: makeSpec()),
-                  let headB = RawFusedVerify.RawMTPHead(spec: makeSpec()) else {
+            guard let headA = SeedlessFusedVerify.SeedlessMTPHead(spec: makeSpec()),
+                  let headB = SeedlessFusedVerify.SeedlessMTPHead(spec: makeSpec()) else {
                 return (false, "init? nil (STUB not implemented)")
             }
 
@@ -4403,7 +4403,7 @@ public enum RawVerifyTests {
             let nPairs = 3
             let hFeed = MLXRandom.normal([nPairs, H]).asType(.float16); hFeed.eval()
             let toks: [Int32] = [3, 11, 27]
-            guard let hBufFeed = RawMetalForward.mtlBuf(hFeed, device)
+            guard let hBufFeed = SeedlessMetalForward.mtlBuf(hFeed, device)
             else { return (false, "hBufFeed nil") }
 
             // head A: batch ingest all 3 at once.
@@ -4421,7 +4421,7 @@ public enum RawVerifyTests {
             // Draft from both heads must agree.
             let tokQ: Int32 = 55
             let hQ = MLXRandom.normal([1, H]).asType(.float16); hQ.eval()
-            guard let hBufQ = RawMetalForward.mtlBuf(hQ, device)
+            guard let hBufQ = SeedlessMetalForward.mtlBuf(hQ, device)
             else { return (false, "hBufQ nil") }
 
             guard let draftA = headA.draftArgmax(hPrevBuf: hBufQ, hPrevRow: 0, tok: tokQ)
@@ -4441,7 +4441,7 @@ public enum RawVerifyTests {
             return (true, "ok")
         }
 
-        // Test 76 (T-seam, ①③ Step 4): RawSpecRunner.mtpDraftSpan — the D==0 draft seam.
+        // Test 76 (T-seam, ①③ Step 4): SeedlessSpecRunner.mtpDraftSpan — the D==0 draft seam.
         // (a) head nil (QWISP_MTP_DRAFT unset) → nil: the greedy path is untouched =
         //     flag-off byte-identity by construction.
         // (b) rowOfU < 0 (invalid hidden row, e.g. after a chained span) → nil.
@@ -4451,7 +4451,7 @@ public enum RawVerifyTests {
         //     same state ⇒ same argmax — a wrong-but-stable draft is lossless because
         //     verify rejects it; a nondeterministic seam would break rowOfU reasoning).
         run("mtp_draft_span_seam") {
-            guard let (device, _) = RawMetalForward.ensure() else {
+            guard let (device, _) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
             // Synthetic head, same real-shape geometry as tests 74/75 (H=2048, gs=64).
@@ -4474,7 +4474,7 @@ public enum RawVerifyTests {
             let (swUWq, swUSc, swUBi) = q4e(E, I, H)
             let (swDWq, swDSc, swDBi) = q4e(E, H, I)
             let (lmWq, lmSc, lmBi) = q4(V, H)
-            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+            let spec = SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
                 H: H, V: V, E: E, I: I, Ktop: Ktop,
                 numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
                 ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
@@ -4492,38 +4492,38 @@ public enum RawVerifyTests {
                 swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
                 swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
                 lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
-            guard let head = RawFusedVerify.RawMTPHead(spec: spec) else {
+            guard let head = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) else {
                 return (false, "head init nil")
             }
             // Fake normed buffer: 4 rows, hidden of u at row 2.
             let hRows = (MLXRandom.normal([4, H]) * 0.05).asType(.float16); hRows.eval()
-            guard let hBuf = RawMetalForward.mtlBuf(hRows, device) else {
+            guard let hBuf = SeedlessMetalForward.mtlBuf(hRows, device) else {
                 return (false, "hBuf nil")
             }
             let u = 7
 
             // (a) flag-off: head nil → nil
-            if RawSpecRunner.mtpDraftSpan(head: nil, hPrevBuf: hBuf, rowOfU: 2, u: u) != nil {
+            if SeedlessSpecRunner.mtpDraftSpan(head: nil, hPrevBuf: hBuf, rowOfU: 2, u: u) != nil {
                 return (false, "(a) head nil must yield nil")
             }
             // (b) invalid row → nil
-            if RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: -1, u: u) != nil {
+            if SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: -1, u: u) != nil {
                 return (false, "(b) rowOfU=-1 must yield nil")
             }
             // (c) active: draft token in range, len unchanged
-            guard let d1 = RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            guard let d1 = SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
             else { return (false, "(c) active span returned nil") }
             if d1 < 0 || d1 >= V { return (false, "(c) draft out of range: \(d1)") }
             if head.len != 0 { return (false, "(c) len changed through seam: \(head.len)") }
             // (d) determinism (read-only ⇒ identical repeat)
-            guard let d2 = RawSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            guard let d2 = SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
             else { return (false, "(d) repeat span returned nil") }
             if d1 != d2 { return (false, "(d) nondeterministic: \(d1) vs \(d2)") }
 
             return (true, "ok")
         }
 
-        // Test 77 (T-lifetime, ①③ Step 5 real-bug regression): RawMTPHead must retain the
+        // Test 77 (T-lifetime, ①③ Step 5 real-bug regression): SeedlessMTPHead must retain the
         // backing MLXArrays of its noCopy weight buffers. THE BUG: init converted weights via
         // temporary MLXArrays (asType) and bound their Metal buffers noCopy; once the caller's
         // WeightsSpec went out of scope, the MLX allocator recycled the weight memory and the
@@ -4532,17 +4532,17 @@ public enum RawVerifyTests {
         // draft with spec alive → drop the spec scope → churn the MLX allocator hard →
         // same (h, tok) draft must be identical.
         run("mtp_head_weight_lifetime") {
-            guard let (device, _) = RawMetalForward.ensure() else {
+            guard let (device, _) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
             let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
             let nH = 16, nKV = 2, hD = 256, rD = 64
             let gs = 64
             let hQ = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); hQ.eval()
-            guard let hBuf = RawMetalForward.mtlBuf(hQ, device) else { return (false, "hBuf nil") }
+            guard let hBuf = SeedlessMetalForward.mtlBuf(hQ, device) else { return (false, "hBuf nil") }
             let tok: Int32 = 42
 
-            var head: RawFusedVerify.RawMTPHead? = nil
+            var head: SeedlessFusedVerify.SeedlessMTPHead? = nil
             var d0 = -1
             do {  // spec lives ONLY in this scope
                 func f16(_ shape: [Int]) -> MLXArray { (MLXRandom.normal(shape) * 0.05).asType(.float16) }
@@ -4561,7 +4561,7 @@ public enum RawVerifyTests {
                 let (swUWq, swUSc, swUBi) = q4e(E, I, H)
                 let (swDWq, swDSc, swDBi) = q4e(E, H, I)
                 let (lmWq, lmSc, lmBi) = q4(V, H)
-                let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+                let spec = SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
                     H: H, V: V, E: E, I: I, Ktop: Ktop,
                     numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
                     ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
@@ -4579,7 +4579,7 @@ public enum RawVerifyTests {
                     swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
                     swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
                     lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
-                guard let h = RawFusedVerify.RawMTPHead(spec: spec) else {
+                guard let h = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) else {
                     return (false, "head init nil")
                 }
                 head = h
@@ -4610,7 +4610,7 @@ public enum RawVerifyTests {
         // Protocol: two heads, identical weights. A: draftArgmax(h0,t0) → commitLastDraft.
         // B: feedPairs(h0,[t0]). Then both draft (h1,t1): tokens must match, len must match.
         run("mtp_commit_last_draft_fold") {
-            guard let (device, _) = RawMetalForward.ensure() else {
+            guard let (device, _) = SeedlessMetalForward.ensure() else {
                 return (false, "no device")
             }
             let H = 2048, V = 256, E = 16, Ktop = 8, I = 512
@@ -4632,7 +4632,7 @@ public enum RawVerifyTests {
             let (swUWq, swUSc, swUBi) = q4e(E, I, H)
             let (swDWq, swDSc, swDBi) = q4e(E, H, I)
             let (lmWq, lmSc, lmBi) = q4(V, H)
-            let spec = RawFusedVerify.RawMTPHead.WeightsSpec(
+            let spec = SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
                 H: H, V: V, E: E, I: I, Ktop: Ktop,
                 numHeads: nH, numKV: nKV, headDim: hD, ropeDim: rD,
                 ropeBase: 1e7, eps: 1e-6, maxSeqLen: 128,
@@ -4650,14 +4650,14 @@ public enum RawVerifyTests {
                 swUWq: swUWq, swUSc: swUSc, swUBi: swUBi,
                 swDWq: swDWq, swDSc: swDSc, swDBi: swDBi,
                 lmWq: lmWq, lmSc: lmSc, lmBi: lmBi)
-            guard let headA = RawFusedVerify.RawMTPHead(spec: spec),
-                  let headB = RawFusedVerify.RawMTPHead(spec: spec) else {
+            guard let headA = SeedlessFusedVerify.SeedlessMTPHead(spec: spec),
+                  let headB = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) else {
                 return (false, "head init nil")
             }
             let h0 = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); h0.eval()
             let h1 = (MLXRandom.normal([1, H]) * 0.05).asType(.float16); h1.eval()
-            guard let b0 = RawMetalForward.mtlBuf(h0, device),
-                  let b1 = RawMetalForward.mtlBuf(h1, device) else { return (false, "hBuf nil") }
+            guard let b0 = SeedlessMetalForward.mtlBuf(h0, device),
+                  let b1 = SeedlessMetalForward.mtlBuf(h1, device) else { return (false, "hBuf nil") }
             let t0: Int32 = 9, t1: Int32 = 77
 
             // A: draft then fold-commit
@@ -4681,7 +4681,7 @@ public enum RawVerifyTests {
         }
 
         // Test 79: seedless_config — facade tier sizing (productization step 2).
-        // Pure/GPU-free seam; mirrors RawSpecRunner.run()'s tier arithmetic:
+        // Pure/GPU-free seam; mirrors SeedlessSpecRunner.run()'s tier arithmetic:
         //   maxK        = streaming ? max(4, C*3/8) : 96
         //   maxM        = max(pendingCap(24) + maxK + 1, 64)
         //   maxSeqLen   = promptLen + maxTokens + maxK + 64
@@ -4704,7 +4704,7 @@ public enum RawVerifyTests {
     /// t(M)/t(1)≈M なら再読が丸コスト(→tiled ピボット検討)、≪M なら吸収(→このまま統合へ)。
     /// GPU 時間は 1 command buffer に reps 回 encode して gpuEnd-gpuStart/reps で計測(dispatch 償却)。
     public static func runPerfProbe() -> String {
-        guard let (device, queue) = RawMetalForward.ensure() else { return "no device" }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return "no device" }
         MLXRandom.seed(UInt64(7))
         var lines: [String] = []
         func gpuMs(_ reps: Int, _ encode: (MTLComputeCommandEncoder) -> Void) -> Double {
@@ -4724,7 +4724,7 @@ public enum RawVerifyTests {
             let xAll = MLXRandom.normal([25, K]).asType(.float16)
             MLX.eval([wq, sc, bi, xAll])
             // warm compile
-            _ = RawMetalForward.qmm(xAll[0 ..< 1], wq, scales: sc, biases: bi, M: 1, K: K, N: N)
+            _ = SeedlessMetalForward.qmm(xAll[0 ..< 1], wq, scales: sc, biases: bi, M: 1, K: K, N: N)
             guard let bx = xAll.asType(.float16).asMTLBuffer(device: device, noCopy: false),
                   let bwq = wq.asMTLBuffer(device: device, noCopy: false),
                   let bsc = sc.asType(.float16).asMTLBuffer(device: device, noCopy: false),
@@ -4734,13 +4734,13 @@ public enum RawVerifyTests {
             var row = "[raw-perf] qmm4 N=\(N) K=\(K):"
             for M in [1, 5, 9, 13, 17, 25] {
                 let ms = gpuMs(50) { enc in
-                    enc.setComputePipelineState(RawMetalForward._qmmPipeline!)
+                    enc.setComputePipelineState(SeedlessMetalForward._qmmPipeline!)
                     enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
                     enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
                     enc.setBuffer(outBuf, offset: 0, index: 4)
                     var kk = Int32(K), nn = Int32(N)
                     enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
-                    RawMetalForward.bindStop(enc, 16)
+                    SeedlessMetalForward.bindStop(enc, 16)
                     enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
                                              threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
                 }
@@ -4774,7 +4774,7 @@ public enum RawVerifyTests {
             let pool: [Int32] = (0 ..< 200).map { Int32(($0 * 13) % E) }   // 行ごとに異なる expert 集合(重なりは現実的に発生)
             let indsAll = MLXArray((0 ..< 25 * Ktop).map { pool[$0 % pool.count] }, [25 * Ktop])
             MLX.eval([wq, sc, bi, xAll, indsAll])
-            _ = RawMetalForward.gatherQmmRows(xAll[0 ..< 1], wq, scales: sc, biases: bi,
+            _ = SeedlessMetalForward.gatherQmmRows(xAll[0 ..< 1], wq, scales: sc, biases: bi,
                                               inds: indsAll[0 ..< Ktop], M: 1, Ktop: Ktop, K: K, N: N)   // warm compile
             guard let bx = xAll.asType(.float16).asMTLBuffer(device: device, noCopy: false),
                   let bwq = wq.asMTLBuffer(device: device, noCopy: false),
@@ -4786,14 +4786,14 @@ public enum RawVerifyTests {
             var row = "[raw-perf] gqmm4_rows E=\(E) N=\(N) Ktop=\(Ktop):"
             for M in [1, 5, 9, 13, 17, 25] {
                 let ms = gpuMs(50) { enc in
-                    enc.setComputePipelineState(RawMetalForward._gqmmRowsPipeline!)
+                    enc.setComputePipelineState(SeedlessMetalForward._gqmmRowsPipeline!)
                     enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
                     enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
                     enc.setBuffer(bin, offset: 0, index: 4); enc.setBuffer(outBuf, offset: 0, index: 5)
                     var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
                     enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7)
                     enc.setBytes(&kt, length: 4, index: 8)
-                    RawMetalForward.bindStop(enc, 9)
+                    SeedlessMetalForward.bindStop(enc, 9)
                     enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                              threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
                 }

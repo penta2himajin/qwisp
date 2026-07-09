@@ -8,14 +8,14 @@ import Metal
 /// 融合経路。per-op CB commit/wait/readback(composed 経路の律速)を除去し、fused アーキテクチャへ
 /// 収束させる。**演算(per-thread reduction)は rows kernel と同一のまま** — CB を束ねるだけなので
 /// order-stable が構造的に保たれ、既存 test_raw.sh(15/15)がそのままゲートする。
-public enum RawFusedVerify {
+public enum SeedlessFusedVerify {
 
     /// qmm4(f16)を「既存 encoder に encode するだけ」の形で提供。cb/commit/readback 無し。
     /// out/x/w/s/b は全て MTLBuffer(常駐)。_qmmPipeline(qmm と共有)を使う。
     static func encodeQmmRows(_ enc: MTLComputeCommandEncoder,
                               w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                               x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int) {
-        enc.setComputePipelineState(RawMetalForward._qmmPipeline!)
+        enc.setComputePipelineState(SeedlessMetalForward._qmmPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
         enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2)
@@ -24,7 +24,7 @@ public enum RawFusedVerify {
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5)
         enc.setBytes(&nn, length: 4, index: 6)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
@@ -39,8 +39,8 @@ public enum RawFusedVerify {
                                     xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0,
                                     gs: Int = 64) {
         // gs=32 は mtp experts 専用の additive pipeline(production gs=64 は不変)。
-        enc.setComputePipelineState(gs == 32 ? RawMetalForward._gqmmRowsPipelineGS32!
-                                             : RawMetalForward._gqmmRowsPipeline!)
+        enc.setComputePipelineState(gs == 32 ? SeedlessMetalForward._gqmmRowsPipelineGS32!
+                                             : SeedlessMetalForward._gqmmRowsPipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2)
         enc.setBuffer(x, offset: xByteOffset, index: 3)
@@ -48,7 +48,7 @@ public enum RawFusedVerify {
         enc.setBuffer(out, offset: outByteOffset, index: 5)
         var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
-        RawMetalForward.bindStop(enc, 9)
+        SeedlessMetalForward.bindStop(enc, 9)
         var lp = UInt32(lhsPer ? 1 : 0); enc.setBytes(&lp, length: 4, index: 10)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
@@ -62,7 +62,7 @@ public enum RawFusedVerify {
                                           x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
                                           M: Int, Ktop: Int, K: Int, N: Int,
                                           xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
-        enc.setComputePipelineState(RawMetalForward._gqmmSwigluRowsPipeline!)
+        enc.setComputePipelineState(SeedlessMetalForward._gqmmSwigluRowsPipeline!)
         enc.setBuffer(wG, offset: 0, index: 0); enc.setBuffer(sG, offset: 0, index: 1); enc.setBuffer(bG, offset: 0, index: 2)
         enc.setBuffer(wU, offset: 0, index: 3); enc.setBuffer(sU, offset: 0, index: 4); enc.setBuffer(bU, offset: 0, index: 5)
         enc.setBuffer(x,  offset: xByteOffset, index: 6)
@@ -70,7 +70,7 @@ public enum RawFusedVerify {
         enc.setBuffer(out, offset: outByteOffset, index: 8)
         var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 9); enc.setBytes(&nn, length: 4, index: 10); enc.setBytes(&kt, length: 4, index: 11)
-        RawMetalForward.bindStop(enc, 12)
+        SeedlessMetalForward.bindStop(enc, 12)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
@@ -81,17 +81,17 @@ public enum RawFusedVerify {
                                         w1: (MLXArray, MLXArray, MLXArray), I: Int,
                                         w2: (MLXArray, MLXArray, MLXArray), K2: Int,
                                         M: Int, Ktop: Int, K: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
-        _ = RawMetalForward.gatherQmmRows(x[0 ..< 1], w1.0, scales: w1.1, biases: w1.2,
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
+        _ = SeedlessMetalForward.gatherQmmRows(x[0 ..< 1], w1.0, scales: w1.1, biases: w1.2,
                                           inds: inds[0 ..< Ktop], M: 1, Ktop: Ktop, K: K, N: I)   // warm compile
-        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bin = RawMetalForward.mtlBuf(inds.asType(.int32), device),
-              let bw1 = RawMetalForward.mtlBuf(w1.0, device),
-              let bs1 = RawMetalForward.mtlBuf(w1.1.asType(.float16), device),
-              let bb1 = RawMetalForward.mtlBuf(w1.2.asType(.float16), device),
-              let bw2 = RawMetalForward.mtlBuf(w2.0, device),
-              let bs2 = RawMetalForward.mtlBuf(w2.1.asType(.float16), device),
-              let bb2 = RawMetalForward.mtlBuf(w2.2.asType(.float16), device) else { return nil }
+        guard let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let bin = SeedlessMetalForward.mtlBuf(inds.asType(.int32), device),
+              let bw1 = SeedlessMetalForward.mtlBuf(w1.0, device),
+              let bs1 = SeedlessMetalForward.mtlBuf(w1.1.asType(.float16), device),
+              let bb1 = SeedlessMetalForward.mtlBuf(w1.2.asType(.float16), device),
+              let bw2 = SeedlessMetalForward.mtlBuf(w2.0, device),
+              let bs2 = SeedlessMetalForward.mtlBuf(w2.1.asType(.float16), device),
+              let bb2 = SeedlessMetalForward.mtlBuf(w2.2.asType(.float16), device) else { return nil }
         let midBuf = device.makeBuffer(length: M * Ktop * I * 2, options: .storageModeShared)!
         let outBuf = device.makeBuffer(length: M * Ktop * K2 * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -117,7 +117,7 @@ public enum RawFusedVerify {
     /// 非一致だが、engine 自己整合(batched≡sequential)は保たれ、出力トークンが最重要=owner 方針)。
     /// logits[M,N] f16 → inds[M,K] int32, scores[M,K] f16(row 毎 renorm 済)。
     public static func routeTop8Rows(_ logits: MLXArray, M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         if _routeRowsPipeline == nil {
             let src = """
             #include <metal_stdlib>
@@ -158,11 +158,11 @@ public enum RawFusedVerify {
                 if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
             }
             """
-            do { let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            do { let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
                  _routeRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows")!)
             } catch { print("[raw-route-rows] compile: \(error)"); return nil }
         }
-        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        guard let bl = SeedlessMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
         let bInds = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
         let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -183,7 +183,7 @@ public enum RawFusedVerify {
     /// int32 mask を長さ N で渡す。返り値は routeTop8Rows と同一形状 (inds[M,K] int32, scores[M,K] f16)。
     public static func routeTop8RowsBias(_ logits: MLXArray, residentMask: [Int32], eps: Float,
                                          M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         if _routeRowsBiasPipeline == nil {
             let src = """
             #include <metal_stdlib>
@@ -226,11 +226,11 @@ public enum RawFusedVerify {
                 if (tid == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
             }
             """
-            do { let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            do { let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
                  _routeRowsBiasPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows_bias")!)
             } catch { print("[raw-route-rows-bias] compile: \(error)"); return nil }
         }
-        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        guard let bl = SeedlessMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
         let bInds   = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
         let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
         guard let bRes = residentMask.withUnsafeBytes({ ptr in
@@ -253,27 +253,27 @@ public enum RawFusedVerify {
 
     /// _qmmPipeline が未コンパイルなら小さな qmm 呼びで確実にコンパイルさせる(big qmm 関数を触らない)。
     static func ensureQmmPipeline() {
-        if RawMetalForward._qmmPipeline != nil { return }
+        if SeedlessMetalForward._qmmPipeline != nil { return }
         let x = MLXRandom.normal([1, 512]).asType(.float16)
         let wf = MLXRandom.normal([8, 512]).asType(.float16)
         let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
         MLX.eval([x, wq, s, b!])
-        _ = RawMetalForward.qmm(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
+        _ = SeedlessMetalForward.qmm(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
     }
 
     /// P2a テスト支援: x → (w1) → mid → (w2) → out を **単一 CB + 常駐中間 midBuf** で実行し out を返す。
     /// per-op 版(qmmRows 2 回)と bit 一致すれば「CB 融合 + 中間常駐」が順序保存であることの証明。
     public static func fusedTwoQmm(_ x: MLXArray, w1: (MLXArray, MLXArray, MLXArray), N1: Int,
                                    w2: (MLXArray, MLXArray, MLXArray), N2: Int, M: Int, K: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         ensureQmmPipeline()
-        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bw1 = RawMetalForward.mtlBuf(w1.0, device),
-              let bs1 = RawMetalForward.mtlBuf(w1.1.asType(.float16), device),
-              let bb1 = RawMetalForward.mtlBuf(w1.2.asType(.float16), device),
-              let bw2 = RawMetalForward.mtlBuf(w2.0, device),
-              let bs2 = RawMetalForward.mtlBuf(w2.1.asType(.float16), device),
-              let bb2 = RawMetalForward.mtlBuf(w2.2.asType(.float16), device) else { return nil }
+        guard let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let bw1 = SeedlessMetalForward.mtlBuf(w1.0, device),
+              let bs1 = SeedlessMetalForward.mtlBuf(w1.1.asType(.float16), device),
+              let bb1 = SeedlessMetalForward.mtlBuf(w1.2.asType(.float16), device),
+              let bw2 = SeedlessMetalForward.mtlBuf(w2.0, device),
+              let bs2 = SeedlessMetalForward.mtlBuf(w2.1.asType(.float16), device),
+              let bb2 = SeedlessMetalForward.mtlBuf(w2.2.asType(.float16), device) else { return nil }
         let midBuf = device.makeBuffer(length: M * N1 * 2, options: .storageModeShared)!
         let outBuf = device.makeBuffer(length: M * N2 * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!
@@ -321,7 +321,7 @@ public enum RawFusedVerify {
     /// S1 production wiring: dummy inds=[0] for gqmm4_swiglu_rows plain-qmm (no gather) path.
     nonisolated(unsafe) static var _zeroOneInds: MTLBuffer?
     static func zeroOneIndsBuf() -> MTLBuffer? {
-        if _zeroOneInds == nil, let (device, _) = RawMetalForward.ensure() {
+        if _zeroOneInds == nil, let (device, _) = SeedlessMetalForward.ensure() {
             let buf = device.makeBuffer(length: 4, options: .storageModeShared)!
             buf.contents().bindMemory(to: Int32.self, capacity: 1)[0] = 0
             _zeroOneInds = buf
@@ -332,7 +332,7 @@ public enum RawFusedVerify {
     /// M-row elementwise 補助 kernel(combine/final)。composed の MLX glue と同一の演算列を
     /// per-element/per-token 独立で再現(f16 逐次和・stable sigmoid)→ M 非依存。
     static func ensureRowsAuxPipelines() -> Bool {
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
         if _combineRowsPipeline != nil && _finalCombineRowsPipeline != nil && _writeKVRowsPipeline != nil
             && _convHistRowsPipeline != nil && _shiftConvRowsPipeline != nil
             && _sliceRowsPipeline != nil && _computeGBetaRowsPipeline != nil
@@ -484,7 +484,7 @@ public enum RawFusedVerify {
         }
         """
         do {
-            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             _combineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "combine_rows")!)
             _finalCombineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine_rows")!)
             _writeKVRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "write_kv_rows")!)
@@ -894,7 +894,7 @@ public enum RawFusedVerify {
         // ── Wave 1 conv+shift fused kernel only. norm+gate fusion is realised at the encode level
         // (chaining the existing _rmsPipeline[_F32] and _gate[_16] in one encoder = bit-exact by
         // construction and reduces the wave-1 dispatch count by 1 with no kernel duplication).
-        let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+        let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
         _convShiftFusedRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "conv_shift_fused_rows")!)
         _qmmInProjDemuxRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_inproj_demux_rows")!)
         _gdnNormGateRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_norm_gate_rows")!)
@@ -902,8 +902,8 @@ public enum RawFusedVerify {
         _gdnPrepRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_prep_rows")!)
         _gdnResidPostNormRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gdn_resid_postnorm_rows")!)
         // norm+gate: reuse existing per-op kernels chained in one encoder (bit-exact by construction).
-        _normGateFusedPipeline = RawMetalForward._rmsPipeline
-        _normGateFusedF32Pipeline = RawMetalForward._rmsPipelineF32
+        _normGateFusedPipeline = SeedlessMetalForward._rmsPipeline
+        _normGateFusedF32Pipeline = SeedlessMetalForward._rmsPipelineF32
     }
 
     /// ── Wave 3 attn+shexp fusion pipelines (notes/08 §3) ──
@@ -914,7 +914,7 @@ public enum RawFusedVerify {
     ///   (option-independent). FMA contraction of `xi*xi` is harmless: float16 squared is
     ///   exact in float32 (≤22 mantissa bits < 24), so fma(xi,xi,acc) == (float)(xi*xi)+acc.
     static func ensureWave3Pipelines() -> Bool {
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
         if _sharedGateCombineRowsPipeline != nil && _sharedGateCombineRowsFoldPipeline != nil && _attnQPrepRowsPipeline != nil && _attnKPrepRowsPipeline != nil { return true }
         // S2 kernel: safe-math (matches qmm8 + final_combine_rows)
         let s2Src = """
@@ -1248,7 +1248,7 @@ public enum RawFusedVerify {
         }
         """
         do {
-            let libSafe = try device.makeLibrary(source: s2Src, options: RawMetalForward.mlxMatchCompileOpts())
+            let libSafe = try device.makeLibrary(source: s2Src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             _sharedGateCombineRowsPipeline = try device.makeComputePipelineState(function: libSafe.makeFunction(name: "shared_gate_combine_rows")!)
             _sharedGateCombineRowsFoldPipeline = try device.makeComputePipelineState(function: libSafe.makeFunction(name: "shared_gate_combine_rows_fold")!)
             let libFast = try device.makeLibrary(source: a23Src, options: nil)
@@ -1280,7 +1280,7 @@ public enum RawFusedVerify {
         enc.setBytes(&mm,  length: 4, index: 10); enc.setBytes(&nkh, length: 4, index: 11)
         enc.setBytes(&hkd, length: 4, index: 12); enc.setBytes(&nvh, length: 4, index: 13)
         enc.setBytes(&kd,  length: 4, index: 14); enc.setBytes(&vd,  length: 4, index: 15)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         var ee = eps, qs = qScale, ks = kScale
         enc.setBytes(&ee, length: 4, index: 17); enc.setBytes(&qs, length: 4, index: 18)
         enc.setBytes(&ks, length: 4, index: 19)
@@ -1302,7 +1302,7 @@ public enum RawFusedVerify {
         enc.setBuffer(w,        offset: 0, index: 2); enc.setBuffer(postNorm, offset: 0, index: 3)
         var ee = eps, hh = UInt32(H)
         enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&hh, length: 4, index: 5)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         let tgNeeded = (H + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
@@ -1344,7 +1344,7 @@ public enum RawFusedVerify {
         var qkvN = Int32(dims.qkv), zN = Int32(dims.z), bN = Int32(dims.b)
         enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&nn, length: 4, index: 9)
         enc.setBytes(&qkvN, length: 4, index: 10); enc.setBytes(&zN, length: 4, index: 11); enc.setBytes(&bN, length: 4, index: 12)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: totalN / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
@@ -1363,7 +1363,7 @@ public enum RawFusedVerify {
         enc.setBuffer(normWeight, offset: 0, index: 2); enc.setBuffer(outV, offset: 0, index: 3)
         var ee = eps, asz = UInt32(Dv), ws = UInt32(1)
         enc.setBytes(&ee, length: 4, index: 4); enc.setBytes(&asz, length: 4, index: 5); enc.setBytes(&ws, length: 4, index: 6)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         let tgNeeded = (Dv + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: M * Hv, height: 1, depth: 1),
@@ -1374,13 +1374,13 @@ public enum RawFusedVerify {
     static func encodeQmm8Rows(_ enc: MTLComputeCommandEncoder,
                                w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                                x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int) {
-        enc.setComputePipelineState(RawMetalForward._qmm8Pipeline!)
+        enc.setComputePipelineState(SeedlessMetalForward._qmm8Pipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
         enc.setBuffer(out, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
@@ -1419,7 +1419,7 @@ public enum RawFusedVerify {
     /// byteOffset: streaming chunk で g/u/h の共通バイトオフセット(3 バッファとも同一)。
     static func encodeSwiglu(_ enc: MTLComputeCommandEncoder, g: MTLBuffer, u: MTLBuffer, h: MTLBuffer,
                               total: Int, byteOffset: Int = 0) {
-        let p = RawMetalForward._swigluPipeline!
+        let p = SeedlessMetalForward._swigluPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(g, offset: byteOffset, index: 0)
         enc.setBuffer(u, offset: byteOffset, index: 1)
@@ -1460,12 +1460,12 @@ public enum RawFusedVerify {
     /// per-op wrapper(テスト用): embed_rows_q4 単発実行。tokens[M] → x[M,H] f16。
     public static func embedRowsRaw(_ tokens: [Int32], w: MLXArray, scales: MLXArray, biases: MLXArray,
                                     H: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
         let M = tokens.count
         let sc = scales.asType(.float16), bi = biases.asType(.float16)
-        guard let bw = RawMetalForward.mtlBuf(w, device),
-              let bs = RawMetalForward.mtlBuf(sc, device),
-              let bb = RawMetalForward.mtlBuf(bi, device),
+        guard let bw = SeedlessMetalForward.mtlBuf(w, device),
+              let bs = SeedlessMetalForward.mtlBuf(sc, device),
+              let bb = SeedlessMetalForward.mtlBuf(bi, device),
               let bt = device.makeBuffer(length: M * 4, options: .storageModeShared),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         bt.contents().bindMemory(to: Int32.self, capacity: M).update(from: tokens, count: M)
@@ -1486,8 +1486,8 @@ public enum RawFusedVerify {
 
     /// per-op wrapper(テスト用): argmax_rows 単発実行。logits[M,V] f16 → [M] int(先頭一致 tie)。
     public static func argmaxRowsRaw(_ logits: MLXArray, M: Int, V: Int) -> [Int]? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
-        guard let bl = RawMetalForward.mtlBuf(logits.asType(.float16), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let bl = SeedlessMetalForward.mtlBuf(logits.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * 4, options: .storageModeShared) else { return nil }
         let p = _argmaxRowsPipeline!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -1504,9 +1504,9 @@ public enum RawFusedVerify {
     /// per-op wrapper: combine_rows(y[m,n]=Σ_k d·scores)を単発 CB で実行。composed が使うことで
     /// fused と combine の丸め列(FMA 有無含む)を共有する。
     public static func combineRowsRaw(_ d: MLXArray, _ scores: MLXArray, M: Int, Ktop: Int, N: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
-        guard let bd = RawMetalForward.mtlBuf(d.asType(.float16), device),
-              let bs = RawMetalForward.mtlBuf(scores.asType(.float16), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let bd = SeedlessMetalForward.mtlBuf(d.asType(.float16), device),
+              let bs = SeedlessMetalForward.mtlBuf(scores.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeCombineRows(enc, d: bd, scores: bs, y: outBuf, Ktop: Ktop, N: N, M: M)
@@ -1519,10 +1519,10 @@ public enum RawFusedVerify {
     /// composed moeBlockRows がこれを使うことで fused と elementwise 数値系を共有する。
     public static func finalCombineRowsRaw(_ y: MLXArray, _ sharedY: MLXArray, _ sgl: MLXArray,
                                            M: Int, N: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
-        guard let by = RawMetalForward.mtlBuf(y.asType(.float16), device),
-              let bs = RawMetalForward.mtlBuf(sharedY.asType(.float16), device),
-              let bg = RawMetalForward.mtlBuf(sgl.asType(.float16), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let by = SeedlessMetalForward.mtlBuf(y.asType(.float16), device),
+              let bs = SeedlessMetalForward.mtlBuf(sharedY.asType(.float16), device),
+              let bg = SeedlessMetalForward.mtlBuf(sgl.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeFinalCombineRows(enc, y: by, sharedY: bs, sgl: bg, out: outBuf, N: N, M: M)
@@ -1549,15 +1549,15 @@ public enum RawFusedVerify {
     /// expertOverride 非 nil 時は sw*(routed expert)フィールドをそこから取り、
     /// w.swGWq 等は一切 materialize しない(streaming 時は mmap-lazy 重みをメモリに展開しないため)。
     /// gate/shared/sharedGate は常に w から変換。
-    static func prepareMoEBlockBufs(_ w: RawVerifyForward.MoEBlockW, _ device: MTLDevice,
+    static func prepareMoEBlockBufs(_ w: SeedlessVerifyForward.MoEBlockW, _ device: MTLDevice,
                                      expertOverride: [MTLBuffer]? = nil) -> MoEBlockBufs? {
         var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
             let sc = s.asType(.float16), bc = b.asType(.float16)
             keep.append(contentsOf: [q, sc, bc])
-            guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(sc, device),
-                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
+            guard let bq = SeedlessMetalForward.mtlBuf(q, device),
+                  let bs = SeedlessMetalForward.mtlBuf(sc, device),
+                  let bb = SeedlessMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
         guard let g = trio(w.gateWq, w.gateSc, w.gateBi) else { return nil }
@@ -1650,12 +1650,12 @@ public enum RawFusedVerify {
         let yOff    = r0 * H * 2
 
         if let st = slotTable {
-            RawMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
+            SeedlessMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
                                                 table: st, count: Mc * Ktop)
         }
         // gather g/u + swiglu: flag-on で 1-dispatch 融合(但し M=1 のみ=register 圧迫退行)、
         // flag-off or M>1 で既存 3-kernel 連鎖(byte 不変)。fuseGUActive(M) == (fuseGU && M==1)。
-        if RawFusedForward.fuseGUActive(M: Mc) ?? false {
+        if SeedlessFusedForward.fuseGUActive(M: Mc) ?? false {
             encodeGatherQmmSwigluRows(enc, wG: w.swGW, sG: w.swGS, bG: w.swGB,
                                       wU: w.swUW, sU: w.swUS, bU: w.swUB,
                                       x: x, inds: sc.inds, out: sc.h,
@@ -1682,7 +1682,7 @@ public enum RawFusedVerify {
         // combine → sc.y[r0*H .. r1*H]
         // MOE2 fold: fuseMOE2Enabled && fuseSHEXP && Mc==1 → S2 inlines combine; skip separate dispatch.
         // M>1 (verify batches) keeps the separate combine_rows dispatch (fold inactive at M>1).
-        if !(RawFusedForward.fuseMOE2Enabled && RawFusedForward.fuseSHEXP && Mc == 1) {
+        if !(SeedlessFusedForward.fuseMOE2Enabled && SeedlessFusedForward.fuseSHEXP && Mc == 1) {
             encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y,
                               Ktop: Ktop, N: H, M: Mc,
                               dByteOffset: dOff, scoresOffset: scOff, yByteOffset: yOff)
@@ -1695,10 +1695,10 @@ public enum RawFusedVerify {
                                      w: MoEBlockBufs, sc: MoEScratch, M: Int, I: Int, H: Int, Ktop: Int) {
         // S1: M==1 branch only (register-pressure gate, same doctrine as fuseGU).
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_S1=0 で S1 のみ無効。
-        if RawFusedForward.fuseSHEXPActive(M: M) ?? false,
-           RawFusedForward.fuseS1Enabled,
+        if SeedlessFusedForward.fuseSHEXPActive(M: M) ?? false,
+           SeedlessFusedForward.fuseS1Enabled,
            let zeroInds = zeroOneIndsBuf(),
-           RawMetalForward._gqmmSwigluRowsPipeline != nil {
+           SeedlessMetalForward._gqmmSwigluRowsPipeline != nil {
             // gqmm4_swiglu_rows with Ktop=1, inds=[0]: bit-exact with qmmRows×2+swiglu (no gather)
             encodeGatherQmmSwigluRows(enc, wG: w.shGW, sG: w.shGS, bG: w.shGB,
                                       wU: w.shUW, sU: w.shUS, bU: w.shUB,
@@ -1713,8 +1713,8 @@ public enum RawFusedVerify {
         // S2(fuseSHEXP): qmm8(N=8)+final_combine → ONE dispatch (safe-math, bit-exact, −1/MoEブロック)。
         // MOE2 fold-ON: S2 inlines combine_rows (encodeCombineRows was skipped in encodeMoEGatherRowsRange).
         // Fold applies only at M==1 (same M==1 gate as fuseGU/fuseSHEXP-S1): M>1 uses non-fold S2 path.
-        if RawFusedForward.fuseSHEXP && ensureWave3Pipelines() {
-            if RawFusedForward.fuseMOE2Enabled && M == 1 {
+        if SeedlessFusedForward.fuseSHEXP && ensureWave3Pipelines() {
+            if SeedlessFusedForward.fuseMOE2Enabled && M == 1 {
                 encodeSharedGateCombineRowsFold(enc, sgW: w.sgW, sgS: w.sgS, sgB: w.sgB,
                                                 x: x, d: sc.d, scores: sc.scores,
                                                 sharedY: sc.sharedY, out: out,
@@ -1745,8 +1745,8 @@ public enum RawFusedVerify {
         // diag_copy_route (notes/11 Stage 0 / notes/13 一般化): route 直後・slot_remap 前に expert-id
         // inds(M 行)と raw gl を層別 side-buffer へコピー(measurement-only、diag=nil で dispatch ゼロ)。
         // offset/長さは呼び出し側(encodeLayerBolt)が slot/M layout で計算済み。
-        if let d = diag, RawMetalForward._diagCopyRoutePipeline != nil {
-            RawMetalForward.encodeDiagCopyRoute(enc, inds: sc.inds, gl: sc.gl,
+        if let d = diag, SeedlessMetalForward._diagCopyRoutePipeline != nil {
+            SeedlessMetalForward.encodeDiagCopyRoute(enc, inds: sc.inds, gl: sc.gl,
                                                 indsDst: d.indsDst, indsDstByteOffset: d.indsOff,
                                                 glDst: d.glDst, glDstByteOffset: d.glOff,
                                                 Ktop: d.indsCount, E: d.glCount)
@@ -1758,37 +1758,37 @@ public enum RawFusedVerify {
     /// 全 pipeline を warm(compile)。fused 経路の前提(encode 時に force-unwrap するため)。
     static func ensureMoEPipelines(E: Int = 256, Ktop: Int = 8) -> Bool {
         ensureQmmPipeline()
-        guard RawMetalForward.compileQmm8(), RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines()
+        guard SeedlessMetalForward.compileQmm8(), SeedlessMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines()
         else { return false }
         // slot_remap_rows(streaming chunk remap 用 grid kernel)も同時に warm
-        _ = RawMetalForward.compileSlotRemapRows()
+        _ = SeedlessMetalForward.compileSlotRemapRows()
         if _routeRowsPipeline == nil {
             let dummy = MLXArray.zeros([1, E]).asType(.float16); dummy.eval()
             _ = routeTop8Rows(dummy, M: 1, N: E, K: Ktop)
         }
-        if RawMetalForward._gqmmRowsPipeline == nil {
+        if SeedlessMetalForward._gqmmRowsPipeline == nil {
             let x = MLXRandom.normal([1, 512]).asType(.float16)
             let wf = MLXRandom.normal([2, 8, 512]).asType(.float16)
             let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
             let inds = MLXArray([Int32(0)], [1])
             MLX.eval([x, wq, s, b!, inds])
-            _ = RawMetalForward.gatherQmmRows(x, wq, scales: s, biases: b!, inds: inds, M: 1, Ktop: 1, K: 512, N: 8)
+            _ = SeedlessMetalForward.gatherQmmRows(x, wq, scales: s, biases: b!, inds: inds, M: 1, Ktop: 1, K: 512, N: 8)
         }
-        if RawMetalForward._gqmmSwigluRowsPipeline == nil {
-            _ = RawMetalForward.compileGqmmSwigluRows()
+        if SeedlessMetalForward._gqmmSwigluRowsPipeline == nil {
+            _ = SeedlessMetalForward.compileGqmmSwigluRows()
         }
-        return _routeRowsPipeline != nil && RawMetalForward._gqmmRowsPipeline != nil && RawMetalForward._gqmmSwigluRowsPipeline != nil
+        return _routeRowsPipeline != nil && SeedlessMetalForward._gqmmRowsPipeline != nil && SeedlessMetalForward._gqmmSwigluRowsPipeline != nil
     }
 
     /// debug: fused MoE block の全中間 buffer を読み出して返す(段階別バイセクト用)。
-    public static func fusedMoEBlockRowsDump(_ x: MLXArray, _ w: RawVerifyForward.MoEBlockW,
+    public static func fusedMoEBlockRowsDump(_ x: MLXArray, _ w: SeedlessVerifyForward.MoEBlockW,
                                              M: Int, E: Int, I: Int, Ktop: Int = 8) -> [String: MLXArray]? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         let H = x.dim(-1)
         guard ensureMoEPipelines(E: E, Ktop: Ktop) else { return nil }
         guard let bufs = prepareMoEBlockBufs(w, device),
               let sc = makeMoEScratch(device, M: M, E: E, I: I, Ktop: Ktop, H: H),
-              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeMoEBlockRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, M: M, E: E, I: I, Ktop: Ktop, H: H)
@@ -1818,14 +1818,14 @@ public enum RawFusedVerify {
     }
 
     /// テスト支援: fused MoE block 単発実行(単一 CB + 常駐中間)。moeBlockRows(metalRoute) と bit 一致すべき。
-    public static func fusedMoEBlockRows(_ x: MLXArray, _ w: RawVerifyForward.MoEBlockW,
+    public static func fusedMoEBlockRows(_ x: MLXArray, _ w: SeedlessVerifyForward.MoEBlockW,
                                          M: Int, E: Int, I: Int, Ktop: Int = 8) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         let H = x.dim(-1)
         guard ensureMoEPipelines(E: E, Ktop: Ktop) else { return nil }
         guard let bufs = prepareMoEBlockBufs(w, device),
               let sc = makeMoEScratch(device, M: M, E: E, I: I, Ktop: Ktop, H: H),
-              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeMoEBlockRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, M: M, E: E, I: I, Ktop: Ktop, H: H)
@@ -1840,12 +1840,12 @@ public enum RawFusedVerify {
     /// weight は非 nil buffer(no-weight は ones を渡す)。promoteF32 は _rmsPipelineF32(out f32)。
     static func encodeRmsNormRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, w: MTLBuffer, out: MTLBuffer,
                                   rows: Int, D: Int, eps: Float, promoteF32: Bool = false) {
-        let p = promoteF32 ? RawMetalForward._rmsPipelineF32! : RawMetalForward._rmsPipeline!
+        let p = promoteF32 ? SeedlessMetalForward._rmsPipelineF32! : SeedlessMetalForward._rmsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(w, offset: 0, index: 1); enc.setBuffer(out, offset: 0, index: 2)
         var ee = eps, asz = UInt32(D), ws = UInt32(1)
         enc.setBytes(&ee, length: 4, index: 3); enc.setBytes(&asz, length: 4, index: 4); enc.setBytes(&ws, length: 4, index: 5)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         let tgNeeded = (D + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
@@ -1856,7 +1856,7 @@ public enum RawFusedVerify {
     static func encodeRopeRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
                                headDim: Int, ropeDim: Int, base: Float, startOffset: Int,
                                M: Int, numHeads: Int) {
-        let p = RawMetalForward._ropeRowsPipeline!
+        let p = SeedlessMetalForward._ropeRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
         var h = UInt32(headDim), r = UInt32(ropeDim), b = base, so = UInt32(startOffset), nh = UInt32(numHeads)
@@ -1872,7 +1872,7 @@ public enum RawFusedVerify {
     /// (stride を maxLen 基準で渡す — 論理位置の値列は composed と同一なので bit 一致)。
     static func encodeSdpaRows(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
                                H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int) {
-        let p = RawMetalForward._sdpaRowsPipeline!
+        let p = SeedlessMetalForward._sdpaRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
         enc.setBuffer(v, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
@@ -1889,7 +1889,7 @@ public enum RawFusedVerify {
     /// extract_q(既存 aux kernel, 純コピー)を encode-only で提供。qOut[R,qd2] の先頭 headDim 列 → q[R,headDim]。
     static func encodeExtractQ(_ enc: MTLComputeCommandEncoder, qOut: MTLBuffer, q: MTLBuffer,
                                headDim: Int, qd2: Int, total: Int) {
-        let p = RawMetalForward._extractQPipeline!
+        let p = SeedlessMetalForward._extractQPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(qOut, offset: 0, index: 0); enc.setBuffer(q, offset: 0, index: 1)
         var hd = UInt32(headDim), q2 = UInt32(qd2), t = UInt32(total)
@@ -1901,7 +1901,7 @@ public enum RawFusedVerify {
     /// sigmoid_mul(既存 aux kernel): gated[i]=attnOut[i]·sigmoid(qOut[h·qd2+headDim+d])。
     static func encodeSigmoidMul(_ enc: MTLComputeCommandEncoder, attnOut: MTLBuffer, qOut: MTLBuffer, gated: MTLBuffer,
                                  headDim: Int, qd2: Int, total: Int) {
-        let p = RawMetalForward._sigmoidMulPipeline!
+        let p = SeedlessMetalForward._sigmoidMulPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(attnOut, offset: 0, index: 0); enc.setBuffer(qOut, offset: 0, index: 1); enc.setBuffer(gated, offset: 0, index: 2)
         var hd = UInt32(headDim), q2 = UInt32(qd2), t = UInt32(total)
@@ -1940,7 +1940,7 @@ public enum RawFusedVerify {
         enc.setBytes(&rd, length: 4, index: 5); enc.setBytes(&bs, length: 4, index: 6)
         enc.setBytes(&so, length: 4, index: 7); enc.setBytes(&nh, length: 4, index: 8)
         enc.setBytes(&ee, length: 4, index: 9)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         let tgNeeded = (headDim + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: M * numHeads, height: 1, depth: 1),
@@ -1966,7 +1966,7 @@ public enum RawFusedVerify {
         enc.setBytes(&bs, length: 4, index: 6); enc.setBytes(&so, length: 4, index: 7)
         enc.setBytes(&nkv, length: 4, index: 8); enc.setBytes(&ml, length: 4, index: 9)
         enc.setBytes(&ee, length: 4, index: 10)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         let tgNeeded = (headDim + 3) / 4
         let tgSize = ((tgNeeded + 31) / 32) * 32
         enc.dispatchThreadgroups(MTLSize(width: M * numKV, height: 1, depth: 1),
@@ -1987,7 +1987,7 @@ public enum RawFusedVerify {
         enc.setBuffer(out,    offset: 0, index: 6)
         var kk = Int32(K), hh = Int32(H)
         enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&hh, length: 4, index: 8)
-        RawMetalForward.bindStop(enc, 9)
+        SeedlessMetalForward.bindStop(enc, 9)
         // ★grid 再設計: (M, ceil(H/256)) × 256 threads(8 simdgroups)。tg ごとに row-0 dot を
         // 冗長計算し、combine を H 全並列で行う(旧 (M,1)×64 は combine 直列化で −384µs)。
         enc.dispatchThreadgroups(MTLSize(width: M, height: (H + 255) / 256, depth: 1),
@@ -2011,7 +2011,7 @@ public enum RawFusedVerify {
         var kk = Int32(K), hh = Int32(H), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&hh, length: 4, index: 9)
         enc.setBytes(&kt, length: 4, index: 10)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         enc.dispatchThreadgroups(MTLSize(width: M, height: (H + 255) / 256, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
     }
@@ -2020,9 +2020,9 @@ public enum RawFusedVerify {
     /// attnOut[R, headDim] × qOut[R, qd2](gate 部 strided 読み)→ gated[R, headDim]。
     public static func sigmoidMulRaw(_ attnOut: MLXArray, _ qOut: MLXArray,
                                      headDim: Int, qd2: Int, total: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), RawMetalForward.ensureAuxPipelines() else { return nil }
-        guard let ba = RawMetalForward.mtlBuf(attnOut.asType(.float16), device),
-              let bq = RawMetalForward.mtlBuf(qOut.asType(.float16), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), SeedlessMetalForward.ensureAuxPipelines() else { return nil }
+        guard let ba = SeedlessMetalForward.mtlBuf(attnOut.asType(.float16), device),
+              let bq = SeedlessMetalForward.mtlBuf(qOut.asType(.float16), device),
               let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeSigmoidMul(enc, attnOut: ba, qOut: bq, gated: outBuf, headDim: headDim, qd2: qd2, total: total)
@@ -2044,35 +2044,35 @@ public enum RawFusedVerify {
         let catQkvDummy: MTLBuffer?   // aN=0 placeholder(4th demux output, never written)
     }
 
-    static func prepareAttnLayerBufs(_ w: RawVerifyForward.AttnLayerW, _ device: MTLDevice) -> AttnLayerBufs? {
+    static func prepareAttnLayerBufs(_ w: SeedlessVerifyForward.AttnLayerW, _ device: MTLDevice) -> AttnLayerBufs? {
         var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
             let sc = s.asType(.float16), bc = b.asType(.float16)
             keep.append(contentsOf: [q, sc, bc])
-            guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(sc, device),
-                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
+            guard let bq = SeedlessMetalForward.mtlBuf(q, device),
+                  let bs = SeedlessMetalForward.mtlBuf(sc, device),
+                  let bb = SeedlessMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
         let qnA = w.qNorm.asType(.float16), knA = w.kNorm.asType(.float16)
         keep.append(contentsOf: [qnA, knA])
         guard let q = trio(w.qWq, w.qSc, w.qBi), let k = trio(w.kWq, w.kSc, w.kBi),
               let v = trio(w.vWq, w.vSc, w.vBi), let o = trio(w.oWq, w.oSc, w.oBi),
-              let qn = RawMetalForward.mtlBuf(qnA, device),
-              let kn = RawMetalForward.mtlBuf(knA, device) else { return nil }
+              let qn = SeedlessMetalForward.mtlBuf(qnA, device),
+              let kn = SeedlessMetalForward.mtlBuf(knA, device) else { return nil }
         // Wave 3 A1: build concat q/k/v in-proj weights when fuseATTN or PROF_AB is active.
         let profAB = ProcessInfo.processInfo.environment["QWISP_PROF_AB"] == "1"
         var catQkvW: MTLBuffer? = nil, catQkvS: MTLBuffer? = nil, catQkvB: MTLBuffer? = nil
         var catQkvDummy: MTLBuffer? = nil
-        if RawFusedForward.fuseATTN || profAB {
+        if SeedlessFusedForward.fuseATTN || profAB {
             let catWArr = MLX.concatenated([w.qWq, w.kWq, w.vWq], axis: 0)
             let catSArr = MLX.concatenated([w.qSc.asType(.float16), w.kSc.asType(.float16), w.vSc.asType(.float16)], axis: 0)
             let catBArr = MLX.concatenated([w.qBi.asType(.float16), w.kBi.asType(.float16), w.vBi.asType(.float16)], axis: 0)
             MLX.eval([catWArr, catSArr, catBArr])
             keep.append(contentsOf: [catWArr, catSArr, catBArr])
-            catQkvW = RawMetalForward.mtlBuf(catWArr, device)
-            catQkvS = RawMetalForward.mtlBuf(catSArr, device)
-            catQkvB = RawMetalForward.mtlBuf(catBArr, device)
+            catQkvW = SeedlessMetalForward.mtlBuf(catWArr, device)
+            catQkvS = SeedlessMetalForward.mtlBuf(catSArr, device)
+            catQkvB = SeedlessMetalForward.mtlBuf(catBArr, device)
             catQkvDummy = device.makeBuffer(length: 4, options: .storageModeShared)
         }
         return AttnLayerBufs(qW: q.0, qS: q.1, qB: q.2, kW: k.0, kS: k.1, kB: k.2,
@@ -2171,8 +2171,8 @@ public enum RawFusedVerify {
         // A1(fuseATTN): 3 separate qmm4 dispatches → 1 demux dispatch(−2 per attn layer).
         // Cat weights built at prepare time; bit-exact by qmm4_inproj_demux_rows construction.
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_A1=0 で A1 のみ無効。
-        if RawFusedForward.fuseATTN,
-           RawFusedForward.fuseA1Enabled,
+        if SeedlessFusedForward.fuseATTN,
+           SeedlessFusedForward.fuseA1Enabled,
            let cw = w.catQkvW, let cs = w.catQkvS, let cb = w.catQkvB, let dummy = w.catQkvDummy {
             let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
             encodeQmmInProjDemuxRows(enc, w: cw, scales: cs, biases: cb, x: x,
@@ -2184,7 +2184,7 @@ public enum RawFusedVerify {
             encodeQmmRows(enc, w: w.vW, scales: w.vS, biases: w.vB, x: x, out: sc.vOut, M: M, K: H, N: numKV * headDim)
         }
         // ②③④ qk-norm + RoPE + cache scatter / A2+A3(fuseATTN): ONE dispatch each(−4 dispatches per attn layer)
-        if RawFusedForward.fuseATTN && ensureWave3Pipelines() {
+        if SeedlessFusedForward.fuseATTN && ensureWave3Pipelines() {
             // A2: extract_q + rmsnorm_q + rope_q → qRot (ONE dispatch, bit-exact)
             encodeAttnQPrepRows(enc, qOut: sc.qOut, qNorm: w.qNorm, qRot: sc.qRot,
                                 qd2: qd2, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
@@ -2220,38 +2220,38 @@ public enum RawFusedVerify {
     /// Stage B の pipeline warm。
     static func ensureAttnPipelines() -> Bool {
         ensureQmmPipeline()
-        guard RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines() else { return false }
-        if RawMetalForward._rmsPipeline == nil {
+        guard SeedlessMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines() else { return false }
+        if SeedlessMetalForward._rmsPipeline == nil {
             let x = MLXRandom.normal([1, 128]).asType(.float16); x.eval()
-            _ = RawMetalForward.rmsNorm(x, nil, eps: 1e-6, D: 128)
+            _ = SeedlessMetalForward.rmsNorm(x, nil, eps: 1e-6, D: 128)
         }
-        if RawMetalForward._ropeRowsPipeline == nil {
+        if SeedlessMetalForward._ropeRowsPipeline == nil {
             let x = MLXRandom.normal([1, 256]).asType(.float16); x.eval()
-            _ = RawMetalForward.ropeRows(x, headDim: 256, ropeDim: 64, base: 1e7, startOffset: 0, M: 1, numHeads: 1)
+            _ = SeedlessMetalForward.ropeRows(x, headDim: 256, ropeDim: 64, base: 1e7, startOffset: 0, M: 1, numHeads: 1)
         }
-        if RawMetalForward._sdpaRowsPipeline == nil {
+        if SeedlessMetalForward._sdpaRowsPipeline == nil {
             let q = MLXRandom.normal([1, 256]).asType(.float16)
             let k = MLXRandom.normal([1, 2, 256]).asType(.float16)
             let v = MLXRandom.normal([1, 2, 256]).asType(.float16)
             MLX.eval([q, k, v])
-            _ = RawMetalForward.sdpaRows(q, k, v, H: 1, KV: 1, D: 256, baseLen: 2, M: 1, scale: 1.0)
+            _ = SeedlessMetalForward.sdpaRows(q, k, v, H: 1, KV: 1, D: 256, baseLen: 2, M: 1, scale: 1.0)
         }
-        return RawMetalForward._rmsPipeline != nil && RawMetalForward._ropeRowsPipeline != nil
-            && RawMetalForward._sdpaRowsPipeline != nil
+        return SeedlessMetalForward._rmsPipeline != nil && SeedlessMetalForward._ropeRowsPipeline != nil
+            && SeedlessMetalForward._sdpaRowsPipeline != nil
     }
 
     /// テスト支援: fused attn 層 単発実行(単一 CB)。attnLayerRows と出力+cache が bit 一致すべき。
-    public static func fusedAttnLayerRows(_ x: MLXArray, _ w: RawVerifyForward.AttnLayerW,
+    public static func fusedAttnLayerRows(_ x: MLXArray, _ w: SeedlessVerifyForward.AttnLayerW,
                                           kInit: MLXArray, vInit: MLXArray, maxLen: Int, M: Int,
                                           numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
                                           ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6)
         -> (out: MLXArray, kCache: MLXArray, vCache: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureAttnPipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureAttnPipelines() else { return nil }
         let H = x.dim(-1)
         guard let bufs = prepareAttnLayerBufs(w, device),
               let sc = makeAttnScratch(device, M: M, numHeads: numHeads, numKV: numKV, headDim: headDim),
               let kv = makeKVCacheBufs(device, kInit: kInit, vInit: vInit, maxLen: maxLen, KV: numKV, D: headDim),
-              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeAttnLayerRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, kv: kv, M: M, H: H,
@@ -2285,7 +2285,7 @@ public enum RawFusedVerify {
                                      M: Int, H: Int,
                                      numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256)
         -> (qOut: MLXArray, kOut: MLXArray, vOut: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
         let qd2 = 2 * headDim
         let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
         // Concatenate q/k/v weights for the demux kernel (same logic as prepareAttnLayerBufs)
@@ -2293,10 +2293,10 @@ public enum RawFusedVerify {
         let catS = MLX.concatenated([qS.asType(.float16), kS.asType(.float16), vS.asType(.float16)], axis: 0)
         let catB = MLX.concatenated([qB.asType(.float16), kB.asType(.float16), vB.asType(.float16)], axis: 0)
         MLX.eval([catW, catS, catB])
-        guard let bx    = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bw    = RawMetalForward.mtlBuf(catW, device),
-              let bs    = RawMetalForward.mtlBuf(catS, device),
-              let bb    = RawMetalForward.mtlBuf(catB, device),
+        guard let bx    = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let bw    = SeedlessMetalForward.mtlBuf(catW, device),
+              let bs    = SeedlessMetalForward.mtlBuf(catS, device),
+              let bb    = SeedlessMetalForward.mtlBuf(catB, device),
               let qOutBuf = device.makeBuffer(length: M * Nq * 2, options: .storageModeShared),
               let kOutBuf = device.makeBuffer(length: M * Nk * 2, options: .storageModeShared),
               let vOutBuf = device.makeBuffer(length: M * Nv * 2, options: .storageModeShared),
@@ -2325,11 +2325,11 @@ public enum RawFusedVerify {
                                        ropeDim: Int = 64, ropeBase: Float = 1e7,
                                        eps: Float = 1e-6)
         -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
         let qd2 = 2 * headDim
         let rows = M * numHeads
-        guard let bqOut  = RawMetalForward.mtlBuf(qOut.asType(.float16), device),
-              let bqNorm = RawMetalForward.mtlBuf(qNorm.asType(.float16), device),
+        guard let bqOut  = SeedlessMetalForward.mtlBuf(qOut.asType(.float16), device),
+              let bqNorm = SeedlessMetalForward.mtlBuf(qNorm.asType(.float16), device),
               let qRotBuf = device.makeBuffer(length: rows * headDim * 2, options: .storageModeShared)
         else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -2355,11 +2355,11 @@ public enum RawFusedVerify {
                                        ropeDim: Int = 64, ropeBase: Float = 1e7,
                                        eps: Float = 1e-6)
         -> (kRot: MLXArray, kCache: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureWave3Pipelines() else { return nil }
         let rows = M * numKV
         let baseLen = startOffset  // positions [0..baseLen) are pre-filled; kernel writes [baseLen..baseLen+M)
-        guard let bkOut   = RawMetalForward.mtlBuf(kOut.asType(.float16), device),
-              let bkNorm  = RawMetalForward.mtlBuf(kNorm.asType(.float16), device),
+        guard let bkOut   = SeedlessMetalForward.mtlBuf(kOut.asType(.float16), device),
+              let bkNorm  = SeedlessMetalForward.mtlBuf(kNorm.asType(.float16), device),
               let kRotBuf   = device.makeBuffer(length: rows * headDim * 2, options: .storageModeShared),
               let kCacheBuf = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)
         else { return nil }
@@ -2419,17 +2419,17 @@ public enum RawFusedVerify {
                                                sgW: MLXArray, sgS: MLXArray, sgB: MLXArray,
                                                M: Int, H: Int)
         -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(),
-              RawMetalForward.compileQmm8(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
+              SeedlessMetalForward.compileQmm8(),
               ensureWave3Pipelines() else { return nil }
         guard H % 512 == 0 else { return nil }
         let sgSF = sgS.asType(.float16), sgBF = sgB.asType(.float16)
-        guard let bsgW = RawMetalForward.mtlBuf(sgW, device),
-              let bsgS = RawMetalForward.mtlBuf(sgSF, device),
-              let bsgB = RawMetalForward.mtlBuf(sgBF, device),
-              let bx   = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let by   = RawMetalForward.mtlBuf(y.asType(.float16), device),
-              let bsY  = RawMetalForward.mtlBuf(sharedY.asType(.float16), device),
+        guard let bsgW = SeedlessMetalForward.mtlBuf(sgW, device),
+              let bsgS = SeedlessMetalForward.mtlBuf(sgSF, device),
+              let bsgB = SeedlessMetalForward.mtlBuf(sgBF, device),
+              let bx   = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let by   = SeedlessMetalForward.mtlBuf(y.asType(.float16), device),
+              let bsY  = SeedlessMetalForward.mtlBuf(sharedY.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared)
         else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -2495,7 +2495,7 @@ public enum RawFusedVerify {
 
     /// scale_mul(既存 aux kernel, in-place x[i]=(half)s·x[i])を encode-only で提供。
     static func encodeScaleMul(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, s: Float, total: Int) {
-        let p = RawMetalForward._scalePipeline!
+        let p = SeedlessMetalForward._scalePipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(x, offset: 0, index: 0)
         var ss = s, t = UInt32(total)
@@ -2507,7 +2507,7 @@ public enum RawFusedVerify {
     /// gate/gate16(既存 aux kernel): outV=(half)(silu(z)·normed)。promote=normed f32。
     static func encodeGate(_ enc: MTLComputeCommandEncoder, z: MTLBuffer, normed: MTLBuffer, outV: MTLBuffer,
                            total: Int, promote: Bool) {
-        let p = promote ? RawMetalForward._gatePipeline! : RawMetalForward._gate16Pipeline!
+        let p = promote ? SeedlessMetalForward._gatePipeline! : SeedlessMetalForward._gate16Pipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(z, offset: 0, index: 0); enc.setBuffer(normed, offset: 0, index: 1); enc.setBuffer(outV, offset: 0, index: 2)
         var t = UInt32(total); enc.setBytes(&t, length: 4, index: 3)
@@ -2521,13 +2521,13 @@ public enum RawFusedVerify {
                                          g: MTLBuffer, beta: MTLBuffer,
                                          stateIn: MTLBuffer, stateOut: MTLBuffer, y: MTLBuffer,
                                          T: Int, B: Int, Hv: Int, Dv: Int) {
-        let p = RawMetalForward._recurPipeline!
+        let p = SeedlessMetalForward._recurPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1); enc.setBuffer(v, offset: 0, index: 2)
         enc.setBuffer(g, offset: 0, index: 3); enc.setBuffer(beta, offset: 0, index: 4); enc.setBuffer(stateIn, offset: 0, index: 5)
         var tt = Int32(T); enc.setBytes(&tt, length: 4, index: 6)
         enc.setBuffer(y, offset: 0, index: 7); enc.setBuffer(stateOut, offset: 0, index: 8)
-        RawMetalForward.bindStop(enc, 16)
+        SeedlessMetalForward.bindStop(enc, 16)
         enc.dispatchThreads(MTLSize(width: 32, height: Dv, depth: B * Hv),
                             threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
     }
@@ -2536,11 +2536,11 @@ public enum RawFusedVerify {
     /// aP/bP[M,Hv] f16, aLog/dtBias[Hv] f32 → (g, beta) 各 [1,M,Hv] f32。
     public static func computeGBetaRowsRaw(_ aP: MLXArray, _ bP: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
                                            M: Int, Hv: Int) -> (MLXArray, MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
-        guard let ba = RawMetalForward.mtlBuf(aP.asType(.float16), device),
-              let bb = RawMetalForward.mtlBuf(bP.asType(.float16), device),
-              let bal = RawMetalForward.mtlBuf(aLog.asType(.float32), device),
-              let bdt = RawMetalForward.mtlBuf(dtBias.asType(.float32), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let ba = SeedlessMetalForward.mtlBuf(aP.asType(.float16), device),
+              let bb = SeedlessMetalForward.mtlBuf(bP.asType(.float16), device),
+              let bal = SeedlessMetalForward.mtlBuf(aLog.asType(.float32), device),
+              let bdt = SeedlessMetalForward.mtlBuf(dtBias.asType(.float32), device),
               let gBuf = device.makeBuffer(length: M * Hv * 4, options: .storageModeShared),
               let betaBuf = device.makeBuffer(length: M * Hv * 4, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -2555,9 +2555,9 @@ public enum RawFusedVerify {
     /// per-op wrapper: gate/gate16(composed gdnLayerRows が使い fused と silu-gate 数値系を共有)。
     /// z[M,valueDim] f16 × normed(f32 promote / f16)→ outV [total] f16。
     public static func gateRaw(_ z: MLXArray, _ normed: MLXArray, promote: Bool, total: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure(), RawMetalForward.ensureAuxPipelines() else { return nil }
-        guard let bz = RawMetalForward.mtlBuf(z.asType(.float16), device),
-              let bn = RawMetalForward.mtlBuf(normed.asType(promote ? .float32 : .float16), device),
+        guard let (device, queue) = SeedlessMetalForward.ensure(), SeedlessMetalForward.ensureAuxPipelines() else { return nil }
+        guard let bz = SeedlessMetalForward.mtlBuf(z.asType(.float16), device),
+              let bn = SeedlessMetalForward.mtlBuf(normed.asType(promote ? .float32 : .float16), device),
               let outBuf = device.makeBuffer(length: total * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeGate(enc, z: bz, normed: bn, outV: outBuf, total: total, promote: promote)
@@ -2586,14 +2586,14 @@ public enum RawFusedVerify {
         let retained: [MLXArray]        // zero-copy buffer の裏 array 保持(寿命規約)
     }
 
-    static func prepareGdnLayerBufs(_ w: RawVerifyForward.GDNLayerW, Dk: Int, _ device: MTLDevice) -> GdnLayerBufs? {
+    static func prepareGdnLayerBufs(_ w: SeedlessVerifyForward.GDNLayerW, Dk: Int, _ device: MTLDevice) -> GdnLayerBufs? {
         var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
             let sc = s.asType(.float16), bc = b.asType(.float16)
             keep.append(contentsOf: [q, sc, bc])
-            guard let bq = RawMetalForward.mtlBuf(q, device),
-                  let bs = RawMetalForward.mtlBuf(sc, device),
-                  let bb = RawMetalForward.mtlBuf(bc, device) else { return nil }
+            guard let bq = SeedlessMetalForward.mtlBuf(q, device),
+                  let bs = SeedlessMetalForward.mtlBuf(sc, device),
+                  let bb = SeedlessMetalForward.mtlBuf(bc, device) else { return nil }
             return (bq, bs, bb)
         }
         let promote = (w.normWeight.dtype == .float32)
@@ -2605,11 +2605,11 @@ public enum RawFusedVerify {
         guard let qkv = trio(w.qkvWq, w.qkvSc, w.qkvBi), let z = trio(w.zWq, w.zSc, w.zBi),
               let b = trio(w.bWq, w.bSc, w.bBi), let a = trio(w.aWq, w.aSc, w.aBi),
               let o = trio(w.outWq, w.outSc, w.outBi),
-              let cw = RawMetalForward.mtlBuf(cwA, device),
-              let nw = RawMetalForward.mtlBuf(nwA, device),
-              let al = RawMetalForward.mtlBuf(alA, device),
-              let dt = RawMetalForward.mtlBuf(dtA, device),
-              let od = RawMetalForward.mtlBuf(ones, device) else { return nil }
+              let cw = SeedlessMetalForward.mtlBuf(cwA, device),
+              let nw = SeedlessMetalForward.mtlBuf(nwA, device),
+              let al = SeedlessMetalForward.mtlBuf(alA, device),
+              let dt = SeedlessMetalForward.mtlBuf(dtA, device),
+              let od = SeedlessMetalForward.mtlBuf(ones, device) else { return nil }
         // ── Wave 1 GDN fusion: 連結 in-proj 4-bit trio(qkv‖z‖b‖a)を prepare 時に 1 回 build。
         //   gs=64 行独立性で連結は bit-exact by construction。flag-on 時のみ使用(nil なら flag-off 経路)。
         //   gdnInProjConcat は MLXArray 連結→retained に保持し noCopy buffer の寿命を守る。
@@ -2617,16 +2617,16 @@ public enum RawFusedVerify {
         let profAB = ProcessInfo.processInfo.environment["QWISP_PROF_AB"] == "1"
         var catWBuf: MTLBuffer? = nil, catSBuf: MTLBuffer? = nil, catBBuf: MTLBuffer? = nil
         var totalInProjN = 0
-        if RawFusedForward.fuseGDN || profAB {
+        if SeedlessFusedForward.fuseGDN || profAB {
             if let cat = gdnInProjConcat(qkvW: w.qkvWq, qkvS: w.qkvSc, qkvB: w.qkvBi,
                                            zW: w.zWq,   zS: w.zSc,   zB: w.zBi,
                                            bW: w.bWq,   bS: w.bSc,   bB: w.bBi,
                                            aW: w.aWq,   aS: w.aSc,   aB: w.aBi) {
                 keep.append(contentsOf: [cat.w, cat.s, cat.b])
                 totalInProjN = cat.w.shape[0]
-                catWBuf = RawMetalForward.mtlBuf(cat.w, device)
-                catSBuf = RawMetalForward.mtlBuf(cat.s.asType(.float16), device)
-                catBBuf = RawMetalForward.mtlBuf(cat.b.asType(.float16), device)
+                catWBuf = SeedlessMetalForward.mtlBuf(cat.w, device)
+                catSBuf = SeedlessMetalForward.mtlBuf(cat.s.asType(.float16), device)
+                catBBuf = SeedlessMetalForward.mtlBuf(cat.b.asType(.float16), device)
             }
         }
 
@@ -2731,7 +2731,7 @@ public enum RawFusedVerify {
         // qmm4_inproj_demux_rows 1 dispatch で qkv/z/bP/aP の 4 buffer に書き分ける(−3/層)。
         // dot 演算は既存 qmm4_rows と同一順 = bit-exact by construction。catInProjW は
         // prepareGdnLayerBufs が fuseGDN||QWISP_PROF_AB 時のみ build(nil なら flag-off 4 dispatch へ)。
-        if RawFusedForward.fuseGDN, let cw = w.catInProjW, let cs = w.catInProjS, let cb = w.catInProjB,
+        if SeedlessFusedForward.fuseGDN, let cw = w.catInProjW, let cs = w.catInProjS, let cb = w.catInProjB,
            w.totalInProjN == convDim + valueDim + numVHeads + numVHeads {
             encodeQmmInProjDemuxRows(enc, w: cw, scales: cs, biases: cb, x: x,
                                      outQkv: sc.qkv, outZ: sc.z, outB: sc.bP, outA: sc.aP,
@@ -2747,7 +2747,7 @@ public enum RawFusedVerify {
         // F3(notes/07 §3 Wave 1): fuseGDN 時に 2→1 dispatch 融合。conv_shift_fused_rows は
         // conv1d_silu_hist_rows + shift_conv_rows と bit-exact by construction(RAWTESTS test35)。
         // ensureGdnPipelines が init 時に _convShiftFusedRowsPipeline を保証する。
-        if RawFusedForward.fuseGDN {
+        if SeedlessFusedForward.fuseGDN {
             encodeGdnFusionConvShift(enc, hist: cache.convHist, qkv: sc.qkv, w: w.conv1dW,
                                      convOut: sc.convOut, histOut: cache.convHistOut,
                                      M: M, K: convKernel, C: convDim)
@@ -2761,7 +2761,7 @@ public enum RawFusedVerify {
         // split q/k/v + rmsnorm qn/kn + scale_mul q/k + compute_g_beta を融合(−7/層)。
         // scale_mul semantics: (half)s * x[i] — 既存 encodeScaleMul kernel と bit-exact。
         let invScale = Float(pow(Double(headKDim), -0.5))
-        if RawFusedForward.fuseGDN, _gdnPrepRowsPipeline != nil {
+        if SeedlessFusedForward.fuseGDN, _gdnPrepRowsPipeline != nil {
             encodeGdnPrepRows(enc, convOut: sc.convOut, aP: sc.aP, bP: sc.bP,
                               aLog: w.aLog, dtBias: w.dtBias,
                               qn: sc.qn, kn: sc.kn, v: sc.v1, g: sc.g, beta: sc.beta,
@@ -2789,7 +2789,7 @@ public enum RawFusedVerify {
         // F4 re-design (notes/07 §6): fuseGDN 時は gdn_norm_gate_rows 1 dispatch で
         // per-head rmsnorm(coreOut) + silu(z)⊙normed を融合(−1/層)。reduction tree は既存
         // rmsnorm kernel と同一(N_READS=4 + simd_sum 二段 + precise::rsqrt)= bit-exact。
-        if RawFusedForward.fuseGDN, _gdnNormGateRowsPipeline != nil {
+        if SeedlessFusedForward.fuseGDN, _gdnNormGateRowsPipeline != nil {
             encodeGdnNormGateRows(enc, coreOut: sc.coreOut, z: sc.z, normWeight: w.normWeight,
                                   outV: sc.outV, M: M, Hv: numVHeads, Dv: headVDim,
                                   eps: eps, promoteF32: w.promoteRMS)
@@ -2805,30 +2805,30 @@ public enum RawFusedVerify {
     /// Stage C の pipeline warm(recurrent は #define 次元固定なので実次元で warm)。
     static func ensureGdnPipelines(Hk: Int = 16, Dk: Int = 128, Hv: Int = 32, Dv: Int = 128) -> Bool {
         ensureQmmPipeline()
-        guard RawMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines() else { return false }
-        if RawMetalForward._rmsPipeline == nil {
+        guard SeedlessMetalForward.ensureAuxPipelines(), ensureRowsAuxPipelines() else { return false }
+        if SeedlessMetalForward._rmsPipeline == nil {
             let x = MLXRandom.normal([1, 128]).asType(.float16); x.eval()
-            _ = RawMetalForward.rmsNorm(x, nil, eps: 1e-6, D: 128)
+            _ = SeedlessMetalForward.rmsNorm(x, nil, eps: 1e-6, D: 128)
         }
-        if RawMetalForward._recurPipeline == nil {
+        if SeedlessMetalForward._recurPipeline == nil {
             let q = MLXArray.zeros([1, 1, Hk, Dk]).asType(.float16)
             let v = MLXArray.zeros([1, 1, Hv, Dv]).asType(.float16)
             let g = MLXArray.zeros([1, 1, Hv]).asType(.float32)
             let st = MLXArray.zeros([1, Hv, Dv, Dk]).asType(.float32)
             MLX.eval([q, v, g, st])
-            _ = RawMetalForward.recurrent(q, q, v, g: g, beta: g, state: st, B: 1, T: 1, Hk: Hk, Dk: Dk, Hv: Hv, Dv: Dv)
+            _ = SeedlessMetalForward.recurrent(q, q, v, g: g, beta: g, state: st, B: 1, T: 1, Hk: Hk, Dk: Dk, Hv: Hv, Dv: Dv)
         }
-        return RawMetalForward._rmsPipeline != nil && RawMetalForward._recurPipeline != nil
+        return SeedlessMetalForward._rmsPipeline != nil && SeedlessMetalForward._recurPipeline != nil
     }
 
     /// テスト支援: fused GDN 層 単発実行(単一 CB)。gdnLayerRows と出力+conv/rec state が bit 一致すべき。
-    public static func fusedGdnLayerRows(_ x: MLXArray, _ w: RawVerifyForward.GDNLayerW,
+    public static func fusedGdnLayerRows(_ x: MLXArray, _ w: SeedlessVerifyForward.GDNLayerW,
                                          convInit: MLXArray, recInit: MLXArray, M: Int,
                                          numKHeads: Int = 16, numVHeads: Int = 32,
                                          headKDim: Int = 128, headVDim: Int = 128,
                                          convKernel: Int = 4, eps: Float = 1e-6)
         -> (out: MLXArray, convState: MLXArray, recState: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
               ensureGdnPipelines(Hk: numKHeads, Dk: headKDim, Hv: numVHeads, Dv: headVDim) else { return nil }
         let H = x.dim(-1)
         let keyDim = headKDim * numKHeads
@@ -2839,7 +2839,7 @@ public enum RawFusedVerify {
                                       Hv: numVHeads, promote: bufs.promoteRMS),
               let cache = makeGdnCacheBufs(device, convInit: convInit, recInit: recInit,
                                            K: convKernel, C: convDim, Hv: numVHeads, Dv: headVDim, Dk: headKDim),
-              let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
+              let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
               let outBuf = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeGdnLayerRows(enc, x: bx, out: outBuf, w: bufs, sc: sc, cache: cache, M: M, H: H,
@@ -2857,7 +2857,7 @@ public enum RawFusedVerify {
 
     /// resid_add(既存 aux kernel, in-place h[i]+=r[i])を encode-only で提供。
     static func encodeResidAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, r: MTLBuffer, total: Int) {
-        let p = RawMetalForward._residAddPipeline!
+        let p = SeedlessMetalForward._residAddPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(h, offset: 0, index: 0); enc.setBuffer(r, offset: 0, index: 1)
         var t = UInt32(total); enc.setBytes(&t, length: 4, index: 2)
@@ -2867,7 +2867,7 @@ public enum RawFusedVerify {
 
     /// verifyForwardRows と同一 op 列の M-row fused forward。全層を単一 CB に encode し、
     /// residual stream h は GPU 常駐 buffer。cache(KV/conv/rec)も常駐で複数 step チェーン可。
-    public final class RawFusedForward {
+    public final class SeedlessFusedForward {
         struct Layer {
             let isLinear: Bool
             let inputLN: MTLBuffer, postLN: MTLBuffer
@@ -2931,8 +2931,8 @@ public enum RawFusedVerify {
             ProcessInfo.processInfo.environment["QWISP_FUSE_MOE2"] == "1"
 
         /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
-        /// for the chained GPU token-feedback decode default. RawSpecRunner resolves the
-        /// chain length as Tell.envInt("QWISP_CHAIN_K", RawFusedForward.chainKDefault),
+        /// for the chained GPU token-feedback decode default. SeedlessSpecRunner resolves the
+        /// chain length as Tell.envInt("QWISP_CHAIN_K", SeedlessFusedForward.chainKDefault),
         /// so this constant is the sole source of the unset default. QWISP_CHAIN_K=0
         /// still disables (envInt returns 0).
         public static let chainKDefault = 8
@@ -2964,8 +2964,8 @@ public enum RawFusedVerify {
         public static func diagCopyRouteSelfTest(inds: [Int32], gl: [Float16],
                                                  Ktop: Int, E: Int, numLayers: Int, li: Int)
             -> (inds: [Int32], gl: [Float16])? {
-            guard let (device, queue) = RawMetalForward.ensure(),
-                  RawMetalForward.compileDiagCopyRoute() else { return nil }
+            guard let (device, queue) = SeedlessMetalForward.ensure(),
+                  SeedlessMetalForward.compileDiagCopyRoute() else { return nil }
             guard let srcI = inds.withUnsafeBytes({ p in
                       device.makeBuffer(bytes: p.baseAddress!, length: Ktop * 4, options: .storageModeShared) }),
                   let srcG = gl.withUnsafeBytes({ p in
@@ -2974,7 +2974,7 @@ public enum RawFusedVerify {
                   let gBuf = device.makeBuffer(length: numLayers * E * 2,    options: .storageModeShared),
                   let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder()
             else { return nil }
-            RawMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: srcG,
+            SeedlessMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: srcG,
                                                 indsDst: iBuf, indsDstByteOffset: li * Ktop * 4,
                                                 glDst: gBuf, glDstByteOffset: li * E * 2,
                                                 Ktop: Ktop, E: E)
@@ -3026,8 +3026,8 @@ public enum RawFusedVerify {
             inds: [Int32], slot: Int, li: Int, M: Int,
             diagObsMaxM: Int, nLayers: Int, chainKMax: Int, Ktop: Int, E: Int
         ) -> [Int32]? {
-            guard let (device, queue) = RawMetalForward.ensure(),
-                  RawMetalForward.compileDiagCopyRoute() else { return nil }
+            guard let (device, queue) = SeedlessMetalForward.ensure(),
+                  SeedlessMetalForward.compileDiagCopyRoute() else { return nil }
             let bufLen = chainKMax * nLayers * diagObsMaxM * Ktop
             let srcLen = M * Ktop
             guard let srcI = inds.withUnsafeBytes({ p in
@@ -3040,7 +3040,7 @@ public enum RawFusedVerify {
             memset(iBuf.contents(), 0, bufLen * 4)
             let dstByteOffset = ((slot * nLayers + li) * diagObsMaxM) * Ktop * 4
             // ponytail: reuse encodeDiagCopyRoute with kE.x = M*Ktop for M-row copy; E=0 skips gl.
-            RawMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: glDummy,
+            SeedlessMetalForward.encodeDiagCopyRoute(enc, inds: srcI, gl: glDummy,
                                                 indsDst: iBuf, indsDstByteOffset: dstByteOffset,
                                                 glDst: glDst, glDstByteOffset: 0,
                                                 Ktop: srcLen, E: 0)
@@ -3075,10 +3075,10 @@ public enum RawFusedVerify {
         }
 
         // ── streaming mode ─────────────────────────────────────────────────────────────
-        public enum RawStreamMode { case resident, strict, bolt }
-        public private(set) var streamMode: RawStreamMode = .resident
+        public enum SeedlessStreamMode { case resident, strict, bolt }
+        public private(set) var streamMode: SeedlessStreamMode = .resident
         /// per-layer provider(streaming 時非 nil)。layers と等長。
-        var providers: [RawFusedExpertProvider]? = nil
+        var providers: [SeedlessFusedExpertProvider]? = nil
         /// per-layer slot table buffer([E] int32, storageModeShared)。strict/bolt で ensure 結果を書き込む。
         var slotTables: [MTLBuffer] = []
         /// 直近 step の最大 chunk 数/層(strict モードのテスト検証用)。
@@ -3087,14 +3087,14 @@ public enum RawFusedVerify {
         /// (layerIndex, inds[M*Ktop]) — nil の間は呼び出しコスト無し。
         public var indsCaptureHook: ((Int, [Int32]) -> Void)? = nil
 
-        public init?(layers specs: [RawVerifyForward.LayerSpec], caches: [RawVerifyForward.LayerCaches],
+        public init?(layers specs: [SeedlessVerifyForward.LayerSpec], caches: [SeedlessVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
                      numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
                      ropeDim: Int = 64, ropeBase: Float = 1e7,
                      numKHeads: Int = 16, numVHeads: Int = 32, headKDim: Int = 128, headVDim: Int = 128,
                      convKernel: Int = 4, eps: Float = 1e-6,
-                     providers initProviders: [RawFusedExpertProvider]? = nil) {
-            guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+                     providers initProviders: [SeedlessFusedExpertProvider]? = nil) {
+            guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
             self.device = device; self.queue = queue
             self.maxM = maxM; self.H = H
             self.numHeads = numHeads; self.numKV = numKV; self.headDim = headDim
@@ -3108,9 +3108,9 @@ public enum RawFusedVerify {
             // pipeline warm(全種)
             let maxE = specs.map { $0.moeE }.max() ?? 256
             let maxKtop = specs.map { $0.moeKtop }.max() ?? 8
-            guard RawFusedVerify.ensureMoEPipelines(E: maxE, Ktop: maxKtop),
-                  RawFusedVerify.ensureAttnPipelines(),
-                  RawFusedVerify.ensureGdnPipelines(Hk: numKHeads, Dk: headKDim, Hv: numVHeads, Dv: headVDim)
+            guard SeedlessFusedVerify.ensureMoEPipelines(E: maxE, Ktop: maxKtop),
+                  SeedlessFusedVerify.ensureAttnPipelines(),
+                  SeedlessFusedVerify.ensureGdnPipelines(Hk: numKHeads, Dk: headKDim, Hv: numVHeads, Dv: headVDim)
             else { return nil }
             // 共有 scratch
             let maxI = specs.map { $0.moeI }.max() ?? 512
@@ -3120,10 +3120,10 @@ public enum RawFusedVerify {
                   let mB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
                   let pB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
                   let oB = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared),
-                  let aSc = RawFusedVerify.makeAttnScratch(device, M: maxM, numHeads: numHeads, numKV: numKV, headDim: headDim),
-                  let gSc = RawFusedVerify.makeGdnScratch(device, M: maxM, C: convDim, keyDim: keyDim,
+                  let aSc = SeedlessFusedVerify.makeAttnScratch(device, M: maxM, numHeads: numHeads, numKV: numKV, headDim: headDim),
+                  let gSc = SeedlessFusedVerify.makeGdnScratch(device, M: maxM, C: convDim, keyDim: keyDim,
                                                           valueDim: valueDim, Hv: numVHeads, promote: anyPromote),
-                  let mSc = RawFusedVerify.makeMoEScratch(device, M: maxM, E: maxE, I: maxI, Ktop: maxKtop, H: H)
+                  let mSc = SeedlessFusedVerify.makeMoEScratch(device, M: maxM, E: maxE, I: maxI, Ktop: maxKtop, H: H)
             else { return nil }
             hBuf = hB; normed = nB; mixerOut = mB; postNorm = pB; moeOut = oB
             attnSc = aSc; gdnSc = gSc; moeSc = mSc
@@ -3133,22 +3133,22 @@ public enum RawFusedVerify {
                 retainedArrays.append(contentsOf: [lnA, pnA])
                 // streaming: sw*(routed expert)は provider の arena buffer を使う
                 let ov = initProviders?[i].gatherBuffers(device: device)
-                guard let ln = RawMetalForward.mtlBuf(lnA, device),
-                      let pn = RawMetalForward.mtlBuf(pnA, device),
-                      let moe = RawFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov) else { return nil }
+                guard let ln = SeedlessMetalForward.mtlBuf(lnA, device),
+                      let pn = SeedlessMetalForward.mtlBuf(pnA, device),
+                      let moe = SeedlessFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov) else { return nil }
                 var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
                 var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
                 if s.isLinear, let gw = s.gdn {
-                    guard let gb = RawFusedVerify.prepareGdnLayerBufs(gw, Dk: headKDim, device),
-                          let gc = RawFusedVerify.makeGdnCacheBufs(device, convInit: caches[i].convState,
+                    guard let gb = SeedlessFusedVerify.prepareGdnLayerBufs(gw, Dk: headKDim, device),
+                          let gc = SeedlessFusedVerify.makeGdnCacheBufs(device, convInit: caches[i].convState,
                                                                    recInit: caches[i].recState,
                                                                    K: convKernel, C: convDim,
                                                                    Hv: numVHeads, Dv: headVDim, Dk: headKDim)
                     else { return nil }
                     gdnB = gb; gdnC = gc
                 } else if let aw = s.attn {
-                    guard let ab = RawFusedVerify.prepareAttnLayerBufs(aw, device),
-                          let kc = RawFusedVerify.makeKVCacheBufs(device, kInit: caches[i].kCache,
+                    guard let ab = SeedlessFusedVerify.prepareAttnLayerBufs(aw, device),
+                          let kc = SeedlessFusedVerify.makeKVCacheBufs(device, kInit: caches[i].kCache,
                                                                   vInit: caches[i].vCache,
                                                                   maxLen: maxSeqLen, KV: numKV, D: headDim)
                     else { return nil }
@@ -3174,9 +3174,9 @@ public enum RawFusedVerify {
         /// 1 層を encoder に encode(norm→mixer→resid→postNorm→MoE→resid)。resident/bolt 経路のみ。
         func encodeLayer(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
             encodePreMoE(enc, L, M: M)
-            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+            SeedlessFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
-            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
         /// bolt routing telemetry (notes/11 Stage 0 → notes/13 採用で一般化): 非 nil のとき
@@ -3206,36 +3206,36 @@ public enum RawFusedVerify {
                 guard routeBiasEps > 0, let masks = routeBiasMasks, li < masks.count else { return nil }
                 return (masks[li], routeBiasEps)
             }()
-            RawFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+            SeedlessFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
                                               slotTable: slotTables[li], diag: diag, bias: biasTuple)
-            RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
         /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
         func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
-            RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
             if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
-                RawFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
+                SeedlessFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
                                                   M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                   headKDim: headKDim, headVDim: headVDim,
                                                   convKernel: convKernel, eps: eps)
                 gc.swapState()
             } else if let aw = L.attn, let kv = L.kvCache {
-                RawFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
+                SeedlessFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                    M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
                                                    ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
                 kv.len += M
             }
             // F5 (notes/07 §3 Wave 2): fuseGDN 時は gdn_resid_postnorm_rows 1 dispatch で
             // resid_add ⑳ + rmsnorm post ㉑ を融合(−1/層)。全層型(GDN/Attn)に適用。
-            if RawFusedForward.fuseGDN, RawFusedVerify._gdnResidPostNormRowsPipeline != nil {
-                RawFusedVerify.encodeGdnResidPostNormRows(enc, h: hBuf, r: mixerOut,
+            if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
+                SeedlessFusedVerify.encodeGdnResidPostNormRows(enc, h: hBuf, r: mixerOut,
                                                           w: L.postLN, postNorm: postNorm,
                                                           M: M, H: H, eps: eps)
             } else {
-                RawFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
-                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
+                SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: mixerOut, total: M * H)
+                SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
             }
         }
 
@@ -3304,12 +3304,12 @@ public enum RawFusedVerify {
         public func setRouteBias(masks: [[Int32]], eps: Float) {
             guard eps > 0, !masks.isEmpty else { routeBiasMasks = nil; routeBiasEps = 0; return }
             // bias kernel の確実なコンパイル(wrapper 経由で pipeline をキャッシュ)
-            if RawFusedVerify._routeRowsBiasPipeline == nil {
+            if SeedlessFusedVerify._routeRowsBiasPipeline == nil {
                 let dummy = MLXArray([Float16](repeating: 0, count: 256), [1, 256])
-                _ = RawFusedVerify.routeTop8RowsBias(dummy, residentMask: [Int32](repeating: 0, count: 256),
+                _ = SeedlessFusedVerify.routeTop8RowsBias(dummy, residentMask: [Int32](repeating: 0, count: 256),
                                                      eps: eps, M: 1, N: 256, K: 8)
             }
-            guard RawFusedVerify._routeRowsBiasPipeline != nil else { return }
+            guard SeedlessFusedVerify._routeRowsBiasPipeline != nil else { return }
             var bufs: [MTLBuffer] = []
             for m in masks {
                 guard let buf = m.withUnsafeBytes({ ptr in
@@ -3342,25 +3342,25 @@ public enum RawFusedVerify {
                 let enc = cb.makeComputeCommandEncoder()!
                 for L in layers { encodeLayer(enc, L, M: M) }
                 if let fw = finalNormW {
-                    RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+                    SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
                 }
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .bolt:
                 let cb = queue.makeCommandBuffer()!
                 let enc = cb.makeComputeCommandEncoder()!
                 for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }
                 if let fw = finalNormW {
-                    RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
+                    SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
                 }
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .strict:
                 runStrictLayers(M: M, firstCBExtra: nil, finalCBExtra: { enc in
                     if let fw = finalNormW {
-                        RawFusedVerify.encodeRmsNormRows(enc, x: self.hBuf, w: fw, out: self.normed,
+                        SeedlessFusedVerify.encodeRmsNormRows(enc, x: self.hBuf, w: fw, out: self.normed,
                                                          rows: M, D: self.H, eps: self.eps)
                     }
                 })
@@ -3397,7 +3397,7 @@ public enum RawFusedVerify {
             openCB()
             firstCBExtra?(curEnc!)
             encodePreMoE(curEnc!, layers[0], M: M)
-            RawFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[0].moe, sc: moeSc,
+            SeedlessFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[0].moe, sc: moeSc,
                                               M: M, E: layers[0].E, H: H, Ktop: layers[0].Ktop)
             flushCB()   // route 読み出しのため待機
 
@@ -3420,7 +3420,7 @@ public enum RawFusedVerify {
                     for (e, slot) in slotMap { stPtr[e] = Int32(slot) }
 
                     if curEnc == nil { openCB() }
-                    RawFusedVerify.encodeMoEGatherRowsRange(curEnc!, x: postNorm, w: L.moe, sc: moeSc,
+                    SeedlessFusedVerify.encodeMoEGatherRowsRange(curEnc!, x: postNorm, w: L.moe, sc: moeSc,
                                                             r0: chunk.r0, r1: chunk.r1,
                                                             Ktop: L.Ktop, I: L.I, H: H,
                                                             slotTable: slotTables[li])
@@ -3428,14 +3428,14 @@ public enum RawFusedVerify {
                 }
 
                 // 最後 chunk の CB にそのまま shared + resid を連結
-                RawFusedVerify.encodeMoESharedRows(curEnc!, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
+                SeedlessFusedVerify.encodeMoESharedRows(curEnc!, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                     M: M, I: L.I, H: H, Ktop: L.Ktop)
-                RawFusedVerify.encodeResidAdd(curEnc!, h: hBuf, r: moeOut, total: M * H)
+                SeedlessFusedVerify.encodeResidAdd(curEnc!, h: hBuf, r: moeOut, total: M * H)
 
                 if li + 1 < layers.count {
                     // 次層の pre-MoE + route を同 CB に連結してから flush(route 読み出し)
                     encodePreMoE(curEnc!, layers[li + 1], M: M)
-                    RawFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[li + 1].moe, sc: moeSc,
+                    SeedlessFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[li + 1].moe, sc: moeSc,
                                                       M: M, E: layers[li + 1].E, H: H, Ktop: layers[li + 1].Ktop)
                     flushCB()
                 }
@@ -3447,7 +3447,7 @@ public enum RawFusedVerify {
             flushCB()
 
             lastStepChunks = maxChunks
-            RawFusedForward.profLastGPUMs = gpuMs
+            SeedlessFusedForward.profLastGPUMs = gpuMs
         }
 
         // ── head 同梱(1-CB step): embed → 40層 → final norm → lm_head(qmmTiled) → argmax ──
@@ -3467,26 +3467,26 @@ public enum RawFusedVerify {
         public func attachHead(embedW: MLXArray, embedS: MLXArray, embedB: MLXArray,
                                lmW: MLXArray, lmS: MLXArray, lmB: MLXArray,
                                fnW: MLXArray, vocab: Int) -> Bool {
-            if RawMetalForward._qmm4TiledPipeline == nil {                 // pipeline warm(compile)
+            if SeedlessMetalForward._qmm4TiledPipeline == nil {                 // pipeline warm(compile)
                 let x = MLXRandom.normal([1, 512]).asType(.float16)
                 let wf = MLXRandom.normal([8, 512]).asType(.float16)
                 let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
                 MLX.eval([x, wq, s, b!])
-                _ = RawMetalForward.qmmTiled(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
+                _ = SeedlessMetalForward.qmmTiled(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
             }
-            guard RawMetalForward._qmm4TiledPipeline != nil else { return false }
+            guard SeedlessMetalForward._qmm4TiledPipeline != nil else { return false }
             var keep: [MLXArray] = []
             let esA = embedS.asType(.float16), ebA = embedB.asType(.float16)
             let lsA = lmS.asType(.float16), lbA = lmB.asType(.float16)
             let fnA = fnW.asType(.float16)
             keep.append(contentsOf: [embedW, esA, ebA, lmW, lsA, lbA, fnA])
-            guard let ew = RawMetalForward.mtlBuf(embedW, device),
-                  let es = RawMetalForward.mtlBuf(esA, device),
-                  let eb = RawMetalForward.mtlBuf(ebA, device),
-                  let lw = RawMetalForward.mtlBuf(lmW, device),
-                  let ls = RawMetalForward.mtlBuf(lsA, device),
-                  let lb = RawMetalForward.mtlBuf(lbA, device),
-                  let fn = RawMetalForward.mtlBuf(fnA, device),
+            guard let ew = SeedlessMetalForward.mtlBuf(embedW, device),
+                  let es = SeedlessMetalForward.mtlBuf(esA, device),
+                  let eb = SeedlessMetalForward.mtlBuf(ebA, device),
+                  let lw = SeedlessMetalForward.mtlBuf(lmW, device),
+                  let ls = SeedlessMetalForward.mtlBuf(lsA, device),
+                  let lb = SeedlessMetalForward.mtlBuf(lbA, device),
+                  let fn = SeedlessMetalForward.mtlBuf(fnA, device),
                   let ti = device.makeBuffer(length: maxM * 4, options: .storageModeShared),
                   let lg = device.makeBuffer(length: maxM * vocab * 2, options: .storageModeShared),
                   let to = device.makeBuffer(length: maxM * 4, options: .storageModeShared) else { return false }
@@ -3504,7 +3504,7 @@ public enum RawFusedVerify {
 
             // embed: tokens → hBuf [M, H]
             func encodeEmbed(_ enc: MTLComputeCommandEncoder) {
-                let ep = RawFusedVerify._embedRowsPipeline!
+                let ep = SeedlessFusedVerify._embedRowsPipeline!
                 enc.setComputePipelineState(ep)
                 enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
                 enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
@@ -3520,12 +3520,12 @@ public enum RawFusedVerify {
             // QWISP_LMHEAD_QMV=1: qmm4(per-row qmv, threadgroup dequant 無し=高 occupancy)= M=1 decode で有利。
             // 両者とも M 不変(test 済)ゆえ flag を run 中固定なら decode≡verify(self-consistent)。速度トレードオフのみ。
             func encodeFinalOps(_ enc: MTLComputeCommandEncoder) {
-                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
-                if RawFusedForward.lmHeadQmv {
-                    RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
+                if SeedlessFusedForward.lmHeadQmv {
+                    SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
                                                  x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
                 } else {
-                    let qp = RawMetalForward._qmm4TiledPipeline!
+                    let qp = SeedlessMetalForward._qmm4TiledPipeline!
                     enc.setComputePipelineState(qp)
                     enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
                     enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
@@ -3535,7 +3535,7 @@ public enum RawFusedVerify {
                     enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
                                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
                 }
-                let ap = RawFusedVerify._argmaxRowsPipeline!
+                let ap = SeedlessFusedVerify._argmaxRowsPipeline!
                 enc.setComputePipelineState(ap)
                 enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(hd.tokensOut, offset: 0, index: 1)
                 var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
@@ -3551,7 +3551,7 @@ public enum RawFusedVerify {
                 for L in layers { encodeLayer(enc, L, M: M) }
                 encodeFinalOps(enc)
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .bolt:
                 let cb = queue.makeCommandBuffer()!
@@ -3560,7 +3560,7 @@ public enum RawFusedVerify {
                 for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }
                 encodeFinalOps(enc)
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-                RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .strict:
                 runStrictLayers(M: M, firstCBExtra: encodeEmbed, finalCBExtra: encodeFinalOps)
@@ -3585,8 +3585,8 @@ public enum RawFusedVerify {
         /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
         public func readLayerCache(_ i: Int) -> (MLXArray?, MLXArray?) {
             let L = layers[i]
-            if let gc = L.gdnCache { let (c, r) = RawFusedVerify.readGdnCache(gc); return (c, r) }
-            if let kv = L.kvCache { let (k, v) = RawFusedVerify.readKVCache(kv); return (k, v) }
+            if let gc = L.gdnCache { let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r) }
+            if let kv = L.kvCache { let (k, v) = SeedlessFusedVerify.readKVCache(kv); return (k, v) }
             return (nil, nil)
         }
 
@@ -3631,8 +3631,8 @@ public enum RawFusedVerify {
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
 
-            let ep = RawFusedVerify._embedRowsPipeline!
-            let ap = RawFusedVerify._argmaxRowsPipeline!
+            let ep = SeedlessFusedVerify._embedRowsPipeline!
+            let ap = SeedlessFusedVerify._argmaxRowsPipeline!
 
             for k in 0 ..< K {
                 // ── Embed 1 token ──────────────────────────────────────────────────
@@ -3671,13 +3671,13 @@ public enum RawFusedVerify {
                 }
 
                 // ── Final ops: fnorm + lm_head + argmax → chainBuf[k] ─────────────
-                RawFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed,
+                SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed,
                                                  rows: 1, D: H, eps: eps)
-                if RawFusedForward.lmHeadQmv {
-                    RawFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                if SeedlessFusedForward.lmHeadQmv {
+                    SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
                                                  x: normed, out: hd.logits, M: 1, K: H, N: hd.vocab)
                 } else {
-                    let qp = RawMetalForward._qmm4TiledPipeline!
+                    let qp = SeedlessMetalForward._qmm4TiledPipeline!
                     enc.setComputePipelineState(qp)
                     enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
                     enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
@@ -3698,7 +3698,7 @@ public enum RawFusedVerify {
 
             if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            RawFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             let ptr = chainBuf.contents().bindMemory(to: Int32.self, capacity: K)
             return (0 ..< K).map { Int(ptr[$0]) }
@@ -3724,7 +3724,7 @@ public enum RawFusedVerify {
     // Operand order must reproduce the existing 3-kernel chain (gqmm4_rows×2 + swigluRaw) bit-exactly:
     //   gv = (half)simd_sum(g_acc),  uv = (half)simd_sum(u_acc)   [cast to half before swiglu]
     //   y = (gv*sigmoid(gv))*uv                                    [stable sigmoid as in existing swiglu]
-    // (This matches the existing gqmm4_swiglu kernel at RawMetalForward.swift ~1298-1337.)
+    // (This matches the existing gqmm4_swiglu kernel at SeedlessMetalForward.swift ~1298-1337.)
     //
     // Note: integration-level flag QWISP_FUSE_GU (encodeMoEGatherRowsRange branch) is gated
     // separately by G2 real-weight identity and does NOT depend on these unit tests.
@@ -3767,15 +3767,15 @@ public enum RawFusedVerify {
         histIn: MLXArray, qkv: MLXArray, w: MLXArray,
         M: Int, K: Int, C: Int
     ) -> (convOut: MLXArray, histOut: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure(), ensureRowsAuxPipelines() else { return nil }
         // fused pipeline を compile（既存 rows aux の後に呼ばれる; rms pipeline は gateRaw 側で要る）
         if _convShiftFusedRowsPipeline == nil {
             do { try ensureGdnFusionPipelines(device) } catch { print("[gdn-fusion] compile: \(error)"); return nil }
         }
         guard _convShiftFusedRowsPipeline != nil else { return nil }
-        guard let bHist = RawMetalForward.mtlBuf(histIn.asType(.float16), device),
-              let bqkv = RawMetalForward.mtlBuf(qkv.asType(.float16), device),
-              let bw = RawMetalForward.mtlBuf(w.asType(.float32), device),
+        guard let bHist = SeedlessMetalForward.mtlBuf(histIn.asType(.float16), device),
+              let bqkv = SeedlessMetalForward.mtlBuf(qkv.asType(.float16), device),
+              let bw = SeedlessMetalForward.mtlBuf(w.asType(.float32), device),
               let bConv = device.makeBuffer(length: M * C * 2, options: .storageModeShared),
               let bHistOut = device.makeBuffer(length: (K - 1) * C * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
@@ -3803,9 +3803,9 @@ public enum RawFusedVerify {
         eps: Float = 1e-6, promoteF32: Bool = false
     ) -> MLXArray? {
         let valueDim = Hv * Dv
-        guard let normed = RawMetalForward.rmsNormRows(coreOut, normWeight, M: M * Hv, eps: eps, D: Dv, promoteF32: promoteF32)
+        guard let normed = SeedlessMetalForward.rmsNormRows(coreOut, normWeight, M: M * Hv, eps: eps, D: Dv, promoteF32: promoteF32)
         else { return nil }
-        guard let outV = RawFusedVerify.gateRaw(z, normed, promote: promoteF32, total: M * valueDim)
+        guard let outV = SeedlessFusedVerify.gateRaw(z, normed, promote: promoteF32, total: M * valueDim)
         else { return nil }
         return outV.reshaped([M, valueDim])
     }
@@ -3825,16 +3825,16 @@ public enum RawFusedVerify {
         M: Int, K: Int,
         dims: (qkv: Int, z: Int, b: Int, a: Int)
     ) -> (qkv: MLXArray, z: MLXArray, bP: MLXArray, aP: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
               ensureRowsAuxPipelines() else { return nil }
         // warm the demux pipeline (compiled inside ensureGdnFusionPipelines via ensureRowsAuxPipelines)
         guard _qmmInProjDemuxRowsPipeline != nil else { return nil }
         guard dims.qkv % 8 == 0, dims.z % 8 == 0, dims.b % 8 == 0, dims.a % 8 == 0,
               K % 512 == 0 else { print("[gdn-demux] 非fast / 非8整列"); return nil }
-        guard let bx = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bw = RawMetalForward.mtlBuf(catW, device),
-              let bs = RawMetalForward.mtlBuf(catS.asType(.float16), device),
-              let bb = RawMetalForward.mtlBuf(catB.asType(.float16), device),
+        guard let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let bw = SeedlessMetalForward.mtlBuf(catW, device),
+              let bs = SeedlessMetalForward.mtlBuf(catS.asType(.float16), device),
+              let bb = SeedlessMetalForward.mtlBuf(catB.asType(.float16), device),
               let bQkv = device.makeBuffer(length: M * dims.qkv * 2, options: .storageModeShared),
               let bZ   = device.makeBuffer(length: M * dims.z   * 2, options: .storageModeShared),
               let bB   = device.makeBuffer(length: M * dims.b   * 2, options: .storageModeShared),
@@ -3867,13 +3867,13 @@ public enum RawFusedVerify {
         eps: Float, promoteF32: Bool
     ) -> MLXArray? {
         let valueDim = Hv * Dv
-        guard let (device, queue) = RawMetalForward.ensure(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
               ensureRowsAuxPipelines() else { return nil }
         guard _gdnNormGateRowsPipeline != nil else { return nil }
         let wType: DType = promoteF32 ? .float32 : .float16
-        guard let bx = RawMetalForward.mtlBuf(coreOut.asType(.float16), device),
-              let bz = RawMetalForward.mtlBuf(z.asType(.float16), device),
-              let bw = RawMetalForward.mtlBuf(normWeight.asType(wType), device),
+        guard let bx = SeedlessMetalForward.mtlBuf(coreOut.asType(.float16), device),
+              let bz = SeedlessMetalForward.mtlBuf(z.asType(.float16), device),
+              let bw = SeedlessMetalForward.mtlBuf(normWeight.asType(wType), device),
               let bOut = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeGdnNormGateRows(enc, coreOut: bx, z: bz, normWeight: bw, outV: bOut,
@@ -3896,13 +3896,13 @@ public enum RawFusedVerify {
         M: Int, keyDim: Int, valueDim: Int, numKHeads: Int, headKDim: Int,
         numVHeads: Int, invScale: Float, eps: Float = 1e-6
     ) -> (qn: MLXArray, kn: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
               ensureGdnPipelines(), _gdnPrepRowsPipeline != nil else { return nil }
-        guard let bConv = RawMetalForward.mtlBuf(convOut.asType(.float16), device),
-              let bA    = RawMetalForward.mtlBuf(aP.asType(.float16), device),
-              let bB    = RawMetalForward.mtlBuf(bP.asType(.float16), device),
-              let bALog = RawMetalForward.mtlBuf(aLog.asType(.float32), device),
-              let bDt   = RawMetalForward.mtlBuf(dtBias.asType(.float32), device) else { return nil }
+        guard let bConv = SeedlessMetalForward.mtlBuf(convOut.asType(.float16), device),
+              let bA    = SeedlessMetalForward.mtlBuf(aP.asType(.float16), device),
+              let bB    = SeedlessMetalForward.mtlBuf(bP.asType(.float16), device),
+              let bALog = SeedlessMetalForward.mtlBuf(aLog.asType(.float32), device),
+              let bDt   = SeedlessMetalForward.mtlBuf(dtBias.asType(.float32), device) else { return nil }
         guard let bQn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
               let bKn   = device.makeBuffer(length: M * keyDim * 2, options: .storageModeShared),
               let bV    = device.makeBuffer(length: M * valueDim * 2, options: .storageModeShared),
@@ -3937,12 +3937,12 @@ public enum RawFusedVerify {
         hBuf: MLXArray, mixerOut: MLXArray, postW: MLXArray,
         M: Int, H: Int, eps: Float
     ) -> (h: MLXArray, postNorm: MLXArray)? {
-        guard let (device, queue) = RawMetalForward.ensure(),
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
               ensureGdnPipelines(), _gdnResidPostNormRowsPipeline != nil else { return nil }
         // bH is a CPU-side copy of hBuf (mtlBuf copies the data); resid_add modifies it in-place.
-        guard let bH    = RawMetalForward.mtlBuf(hBuf.asType(.float16), device),
-              let bR    = RawMetalForward.mtlBuf(mixerOut.asType(.float16), device),
-              let bW    = RawMetalForward.mtlBuf(postW.asType(.float16), device),
+        guard let bH    = SeedlessMetalForward.mtlBuf(hBuf.asType(.float16), device),
+              let bR    = SeedlessMetalForward.mtlBuf(mixerOut.asType(.float16), device),
+              let bW    = SeedlessMetalForward.mtlBuf(postW.asType(.float16), device),
               let bPost = device.makeBuffer(length: M * H * 2, options: .storageModeShared) else { return nil }
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         // ONE dispatch — gdn_resid_postnorm_rows fuses resid_add + rmsnorm
@@ -3986,7 +3986,7 @@ public enum RawFusedVerify {
     /// Each thread (n,m) computes one dot product independently → M-invariant.
     static func ensureFmmPipeline() -> Bool {
         if _fmmRowsPipeline != nil { return true }
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -4008,16 +4008,16 @@ public enum RawFusedVerify {
         }
         """
         do {
-            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             _fmmRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "fmm_rows")!)
         } catch { print("[raw-fmm-rows] compile: \(error)"); return false }
         return _fmmRowsPipeline != nil
     }
 
-    /// Compiles the MTP aux kernels (copy_row, concat, argmax) needed by RawMTPHead.
+    /// Compiles the MTP aux kernels (copy_row, concat, argmax) needed by SeedlessMTPHead.
     static func ensureMTPAuxPipelines() -> Bool {
         if _mtpCopyRowPipeline != nil && _mtpConcatPipeline != nil && _mtpArgmaxPipeline != nil { return true }
-        guard let (device, _) = RawMetalForward.ensure() else { return false }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -4073,7 +4073,7 @@ public enum RawFusedVerify {
         }
         """
         do {
-            let lib = try device.makeLibrary(source: src, options: RawMetalForward.mlxMatchCompileOpts())
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             _mtpCopyRowPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_copy_row_f16")!)
             _mtpConcatPipeline  = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_concat_f16")!)
             _mtpArgmaxPipeline  = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_argmax_rows")!)
@@ -4081,12 +4081,12 @@ public enum RawFusedVerify {
         return _mtpCopyRowPipeline != nil && _mtpConcatPipeline != nil && _mtpArgmaxPipeline != nil
     }
 
-    /// RawMTPHead: raw Metal MTP draft head (§Step 3, notes/17).
+    /// SeedlessMTPHead: raw Metal MTP draft head (§Step 3, notes/17).
     /// Weights are INJECTED via WeightsSpec (MLXArrays → MTLBuffers in init).
     /// KV discipline: draftArgmax reads KV[0..<len]+self at pos len but does NOT commit (len unchanged).
     /// feedPairs is the ONLY KV writer.
     /// No MLX ops in draftArgmax/feedPairs — all compute is Metal kernels via existing encoders.
-    public final class RawMTPHead {
+    public final class SeedlessMTPHead {
         /// Geometry + injected weights (all MLXArrays; init converts to MTLBuffers).
         public struct WeightsSpec {
             // geometry
@@ -4184,23 +4184,23 @@ public enum RawFusedVerify {
 
         // ── init? ───────────────────────────────────────────────────────────
         public init?(spec: WeightsSpec) {
-            guard let (dev, q) = RawMetalForward.ensure() else { return nil }
-            guard RawFusedVerify.ensureRowsAuxPipelines(),
-                  RawFusedVerify.ensureFmmPipeline(),
-                  RawFusedVerify.ensureMTPAuxPipelines(),
-                  RawFusedVerify.ensureMoEPipelines(E: spec.E, Ktop: spec.Ktop),
-                  RawFusedVerify.ensureAttnPipelines(),
-                  RawMetalForward.ensureAuxPipelines() else { return nil }
-            RawFusedVerify.ensureQmmPipeline()
+            guard let (dev, q) = SeedlessMetalForward.ensure() else { return nil }
+            guard SeedlessFusedVerify.ensureRowsAuxPipelines(),
+                  SeedlessFusedVerify.ensureFmmPipeline(),
+                  SeedlessFusedVerify.ensureMTPAuxPipelines(),
+                  SeedlessFusedVerify.ensureMoEPipelines(E: spec.E, Ktop: spec.Ktop),
+                  SeedlessFusedVerify.ensureAttnPipelines(),
+                  SeedlessMetalForward.ensureAuxPipelines() else { return nil }
+            SeedlessFusedVerify.ensureQmmPipeline()
             // mtp experts は gs=32 — encode 時に force-unwrap するので init で compile(fresh-process SIGTRAP 対策)。
             if spec.expertGroupSize == 32 {
-                guard RawMetalForward.compileGqmmRowsGS32() else { return nil }
+                guard SeedlessMetalForward.compileGqmmRowsGS32() else { return nil }
             }
             // encodeRmsNormRows force-unwraps the lazily-compiled _rmsPipeline(F32) —
             // warm both here (a fresh process without prior tests/engine hits nil otherwise).
             let warmW = MLXArray.ones([8]).asType(.float16)
-            guard RawMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8) != nil,
-                  RawMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8, promoteF32: true) != nil
+            guard SeedlessMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8) != nil,
+                  SeedlessMetalForward.rmsNormRows(warmW, warmW, M: 1, eps: 1e-6, D: 8, promoteF32: true) != nil
             else { return nil }
 
             device = dev; queue = q
@@ -4217,12 +4217,12 @@ public enum RawFusedVerify {
             var retained: [MLXArray] = []
             func f16b(_ a: MLXArray) -> MTLBuffer? {
                 let c = a.asType(.float16); c.eval(); retained.append(c)
-                return RawMetalForward.mtlBuf(c, dev)
+                return SeedlessMetalForward.mtlBuf(c, dev)
             }
             // Helper: packed weights (uint32 / already typed) — pass as-is
             func rawb(_ a: MLXArray) -> MTLBuffer? {
                 a.eval(); retained.append(a)
-                return RawMetalForward.mtlBuf(a, dev)
+                return SeedlessMetalForward.mtlBuf(a, dev)
             }
 
             // F16 plain weights
@@ -4321,7 +4321,7 @@ public enum RawFusedVerify {
         // ── Private encoder helpers ─────────────────────────────────────────
 
         private func encodeCopyRow(_ enc: MTLComputeCommandEncoder, src: MTLBuffer, dst: MTLBuffer, row: Int) {
-            let p = RawFusedVerify._mtpCopyRowPipeline!
+            let p = SeedlessFusedVerify._mtpCopyRowPipeline!
             enc.setComputePipelineState(p)
             enc.setBuffer(src, offset: 0, index: 0)
             enc.setBuffer(dst, offset: 0, index: 1)
@@ -4333,7 +4333,7 @@ public enum RawFusedVerify {
         }
 
         private func encodeConcat(_ enc: MTLComputeCommandEncoder, a: MTLBuffer, b: MTLBuffer, out: MTLBuffer) {
-            let p = RawFusedVerify._mtpConcatPipeline!
+            let p = SeedlessFusedVerify._mtpConcatPipeline!
             enc.setComputePipelineState(p)
             enc.setBuffer(a, offset: 0, index: 0)
             enc.setBuffer(b, offset: 0, index: 1)
@@ -4347,7 +4347,7 @@ public enum RawFusedVerify {
         /// Encode embed(tok from tokBuf[tokOffset]) → embOut.
         private func encodeEmbed(_ enc: MTLComputeCommandEncoder, embOut: MTLBuffer,
                                  tokBuf: MTLBuffer, tokOffset: Int) {
-            let p = RawFusedVerify._embedRowsPipeline!
+            let p = SeedlessFusedVerify._embedRowsPipeline!
             enc.setComputePipelineState(p)
             enc.setBuffer(embedWBuf, offset: 0, index: 0)
             enc.setBuffer(embedSBuf, offset: 0, index: 1)
@@ -4370,39 +4370,39 @@ public enum RawFusedVerify {
             let qd2 = 2 * headDim
             let scale = 1.0 / sqrt(Float(headDim))
             // q/k/v proj (F16 fmm)
-            RawFusedVerify.encodeFmmRows(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
-            RawFusedVerify.encodeFmmRows(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
-            RawFusedVerify.encodeFmmRows(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
             // extract_q: qOut[nH, 2*hD] → qX[nH, hD]
-            RawFusedVerify.encodeExtractQ(enc, qOut: _sQOut, q: _sQX,
+            SeedlessFusedVerify.encodeExtractQ(enc, qOut: _sQOut, q: _sQX,
                                           headDim: headDim, qd2: qd2, total: numHeads * headDim)
             // qk-norm
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sQX,   w: qNormBuf, out: _sQNS,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sQX,   w: qNormBuf, out: _sQNS,
                                               rows: numHeads, D: headDim, eps: eps)
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sKOut, w: kNormBuf, out: _sKNS,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sKOut, w: kNormBuf, out: _sKNS,
                                               rows: numKV,    D: headDim, eps: eps)
             // RoPE
-            RawFusedVerify.encodeRopeRows(enc, x: _sQNS, out: _sQRot,
+            SeedlessFusedVerify.encodeRopeRows(enc, x: _sQNS, out: _sQRot,
                                            headDim: headDim, ropeDim: ropeDim, base: ropeBase,
                                            startOffset: pos, M: 1, numHeads: numHeads)
-            RawFusedVerify.encodeRopeRows(enc, x: _sKNS, out: _sKRot,
+            SeedlessFusedVerify.encodeRopeRows(enc, x: _sKNS, out: _sKRot,
                                            headDim: headDim, ropeDim: ropeDim, base: ropeBase,
                                            startOffset: pos, M: 1, numHeads: numKV)
             // write k/v to cache at pos
-            RawFusedVerify.encodeWriteKVRows(enc, src: _sKRot, cache: kCache,
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: _sKRot, cache: kCache,
                                               KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: 1)
-            RawFusedVerify.encodeWriteKVRows(enc, src: _sVOut, cache: vCache,
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: _sVOut, cache: vCache,
                                               KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: 1)
             // SDPA: totalKeys = pos+1 for draft, len+i+1 for feed
-            RawFusedVerify.encodeSdpaRows(enc, q: _sQRot, k: kCache, v: vCache, out: _sAttnOut,
+            SeedlessFusedVerify.encodeSdpaRows(enc, q: _sQRot, k: kCache, v: vCache, out: _sAttnOut,
                                            H: numHeads, KV: numKV, D: headDim,
                                            baseLenPlus1: totalKeys,
                                            M: 1, scale: scale, maxLen: maxSeqLen)
             // sigmoid gate
-            RawFusedVerify.encodeSigmoidMul(enc, attnOut: _sAttnOut, qOut: _sQOut, gated: _sGated,
+            SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: _sAttnOut, qOut: _sQOut, gated: _sGated,
                                              headDim: headDim, qd2: qd2, total: numHeads * headDim)
             // o_proj
-            RawFusedVerify.encodeFmmRows(enc, w: oBuf, x: _sGated, out: out,
+            SeedlessFusedVerify.encodeFmmRows(enc, w: oBuf, x: _sGated, out: out,
                                           M: 1, K: numHeads * headDim, N: H)
         }
 
@@ -4410,34 +4410,34 @@ public enum RawFusedVerify {
         /// x: [H] post_ln input; out: [H] MoE output.
         private func encodeMoE(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer) {
             // Router gate: F16 fmm [E, H]
-            RawFusedVerify.encodeFmmRows(enc, w: routerGateBuf, x: x, out: _sRGl,
+            SeedlessFusedVerify.encodeFmmRows(enc, w: routerGateBuf, x: x, out: _sRGl,
                                           M: 1, K: H, N: E)
             // Top-K routing
-            RawFusedVerify.encodeRouteTop8Rows(enc, logits: _sRGl, inds: _sRInds,
+            SeedlessFusedVerify.encodeRouteTop8Rows(enc, logits: _sRGl, inds: _sRInds,
                                                 scores: _sRScores, M: 1, N: E, K: Ktop)
             // Routed experts: 4bit gather
-            RawFusedVerify.encodeGatherQmmRows(enc, w: swGWBuf, scales: swGSBuf, biases: swGBBuf,
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swGWBuf, scales: swGSBuf, biases: swGBBuf,
                                                 x: x, inds: _sRInds, out: _sExpG,
                                                 M: 1, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
-            RawFusedVerify.encodeGatherQmmRows(enc, w: swUWBuf, scales: swUSBuf, biases: swUBBuf,
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swUWBuf, scales: swUSBuf, biases: swUBBuf,
                                                 x: x, inds: _sRInds, out: _sExpU,
                                                 M: 1, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
-            RawFusedVerify.encodeSwiglu(enc, g: _sExpG, u: _sExpU, h: _sExpH, total: Ktop * I)
-            RawFusedVerify.encodeGatherQmmRows(enc, w: swDWBuf, scales: swDSBuf, biases: swDBBuf,
+            SeedlessFusedVerify.encodeSwiglu(enc, g: _sExpG, u: _sExpU, h: _sExpH, total: Ktop * I)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swDWBuf, scales: swDSBuf, biases: swDBBuf,
                                                 x: _sExpH, inds: _sRInds, out: _sExpD,
                                                 M: 1, Ktop: Ktop, K: I, N: H, lhsPer: true, gs: expertGS)
-            RawFusedVerify.encodeCombineRows(enc, d: _sExpD, scores: _sRScores, y: _sMoeY,
+            SeedlessFusedVerify.encodeCombineRows(enc, d: _sExpD, scores: _sRScores, y: _sMoeY,
                                               Ktop: Ktop, N: H, M: 1)
             // Shared expert: F16 fmm
-            RawFusedVerify.encodeFmmRows(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
-            RawFusedVerify.encodeFmmRows(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
-            RawFusedVerify.encodeSwiglu(enc, g: _sShG, u: _sShU, h: _sShAct, total: I)
-            RawFusedVerify.encodeFmmRows(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
+            SeedlessFusedVerify.encodeSwiglu(enc, g: _sShG, u: _sShU, h: _sShAct, total: I)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
             // Shared gate scalar: sharedGate [1,H] → sgl[0]; _sSgl is sized [8] so index 0 for
             // final_combine_rows which reads sgl[m*8].
-            RawFusedVerify.encodeFmmRows(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
             // Final combine: out = moeY + sigmoid(sgl[0]) * sharedY
-            RawFusedVerify.encodeFinalCombineRows(enc, y: _sMoeY, sharedY: _sShY,
+            SeedlessFusedVerify.encodeFinalCombineRows(enc, y: _sMoeY, sharedY: _sShY,
                                                    sgl: _sSgl, out: out, N: H, M: 1)
         }
 
@@ -4453,42 +4453,42 @@ public enum RawFusedVerify {
             // 1. embed(tok) → _sEmb
             encodeEmbed(enc, embOut: _sEmb, tokBuf: tokBuf ?? _sTok, tokOffset: tokOffset)
             // 2. rmsNorm(emb, preEmb) → _sEmbN
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sEmb, w: preEmbBuf, out: _sEmbN,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sEmb, w: preEmbBuf, out: _sEmbN,
                                               rows: 1, D: H, eps: eps)
             // 3. extract hPrev row → _sHN temp, then rmsNorm
             encodeCopyRow(enc, src: hPrevBuf, dst: _sHN, row: hRow)
             // 4. rmsNorm(hPrevRow, preHid) → _sHN (in-place: copy first, then norm into same buf is fine
             //    since encodeRmsNormRows writes to `out` not in-place)
             //    Use _sAN as tmp for hPrev norm output (reuse before attn norm step)
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sHN, w: preHidBuf, out: _sAN,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sHN, w: preHidBuf, out: _sAN,
                                               rows: 1, D: H, eps: eps)
             // 5. concat(embNormed, hidNormed) → _sCat
             encodeConcat(enc, a: _sEmbN, b: _sAN, out: _sCat)
             // 6. fc: _sCat @ fcᵀ → _sX
-            RawFusedVerify.encodeFmmRows(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
+            SeedlessFusedVerify.encodeFmmRows(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
             // 7. attn input norm: rmsNorm(_sX, inputLN) → _sAN (inputLN must be [H])
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: inputLNBuf, out: _sAN,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: inputLNBuf, out: _sAN,
                                               rows: 1, D: H, eps: eps)
             // 8. attn (writes k/v to cache at pos, reads keys 0..totalKeys)
             encodeAttn(enc, x: _sAN, out: _sAttnRes, pos: pos, totalKeys: totalKeys)
             // 9. resid add: _sX += attnRes
-            RawFusedVerify.encodeResidAdd(enc, h: _sX, r: _sAttnRes, total: H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: _sX, r: _sAttnRes, total: H)
             // 10. post-attn norm: rmsNorm(_sX, postLN) → _sMN
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: postLNBuf, out: _sMN,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: postLNBuf, out: _sMN,
                                               rows: 1, D: H, eps: eps)
             // 11. MoE(_sMN) → _sMO
             encodeMoE(enc, x: _sMN, out: _sMO)
             // 12. resid add: _sX += moeOut
-            RawFusedVerify.encodeResidAdd(enc, h: _sX, r: _sMO, total: H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: _sX, r: _sMO, total: H)
             // 13. finalNorm: rmsNorm(_sX, finalNorm) → _sNormed
-            RawFusedVerify.encodeRmsNormRows(enc, x: _sX, w: finalNormBuf, out: _sNormed,
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: finalNormBuf, out: _sNormed,
                                               rows: 1, D: H, eps: eps)
             if doLMHead {
                 // 14. lm_head: qmm4 (_sNormed → _sLogits)
-                RawFusedVerify.encodeQmmRows(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf,
+                SeedlessFusedVerify.encodeQmmRows(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf,
                                               x: _sNormed, out: _sLogits, M: 1, K: H, N: V)
                 // 15. argmax → _sDraft (use mtp_argmax_rows: bi=0 matches MLX argMax NaN semantics)
-                let ap = RawFusedVerify._mtpArgmaxPipeline!
+                let ap = SeedlessFusedVerify._mtpArgmaxPipeline!
                 enc.setComputePipelineState(ap)
                 enc.setBuffer(_sLogits, offset: 0, index: 0)
                 enc.setBuffer(_sDraft,  offset: 0, index: 1)
@@ -4561,17 +4561,17 @@ public enum RawFusedVerify {
                                            wG: MLXArray, sG: MLXArray, bG: MLXArray,
                                            wU: MLXArray, sU: MLXArray, bU: MLXArray,
                                            M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
-        guard let (device, queue) = RawMetalForward.ensure() else { return nil }
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return nil }
         guard N % 8 == 0, K % 512 == 0 else { print("[raw-gqmm-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil }
-        _ = RawMetalForward.compileGqmmSwigluRows()
-        guard let bx  = RawMetalForward.mtlBuf(x.asType(.float16), device),
-              let bin = RawMetalForward.mtlBuf(inds.asType(.int32), device),
-              let bwG = RawMetalForward.mtlBuf(wG, device),
-              let bsG = RawMetalForward.mtlBuf(sG.asType(.float16), device),
-              let bbG = RawMetalForward.mtlBuf(bG.asType(.float16), device),
-              let bwU = RawMetalForward.mtlBuf(wU, device),
-              let bsU = RawMetalForward.mtlBuf(sU.asType(.float16), device),
-              let bbU = RawMetalForward.mtlBuf(bU.asType(.float16), device) else { return nil }
+        _ = SeedlessMetalForward.compileGqmmSwigluRows()
+        guard let bx  = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+              let bin = SeedlessMetalForward.mtlBuf(inds.asType(.int32), device),
+              let bwG = SeedlessMetalForward.mtlBuf(wG, device),
+              let bsG = SeedlessMetalForward.mtlBuf(sG.asType(.float16), device),
+              let bbG = SeedlessMetalForward.mtlBuf(bG.asType(.float16), device),
+              let bwU = SeedlessMetalForward.mtlBuf(wU, device),
+              let bsU = SeedlessMetalForward.mtlBuf(sU.asType(.float16), device),
+              let bbU = SeedlessMetalForward.mtlBuf(bU.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
         encodeGatherQmmSwigluRows(enc, wG: bwG, sG: bsG, bG: bbG,

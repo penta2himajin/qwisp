@@ -7,15 +7,15 @@ import Metal
 /// Full expert tensors from the store, no arena/guard/cert/VSEQ.
 /// Batched == sequential is bit-exact by construction (proven by raw-smoke U2a).
 ///
-/// Factors out model-building from RawSmokeRunner so that RawSpecRunner
+/// Factors out model-building from RawSmokeRunner so that SeedlessSpecRunner
 /// and future raw-engine runners can share a single load path.
-public struct RawEngine {
+public struct SeedlessEngine {
     public static let eps: Float         = 1e-6
     public static let H: Int             = 2048
     public static let numLayers: Int     = 40
     static let fullAttnInterval: Int     = 4
 
-    public let layers: [RawVerifyForward.LayerSpec]
+    public let layers: [SeedlessVerifyForward.LayerSpec]
     public let moeI: Int
 
     // ── shared weight handles (extracted once at build time) ──────────────
@@ -30,7 +30,7 @@ public struct RawEngine {
 
     // ── layer-spec construction ───────────────────────────────────────────
 
-    public static func buildLayerSpec(_ i: Int, store: WeightStore, moeI: Int) -> RawVerifyForward.LayerSpec {
+    public static func buildLayerSpec(_ i: Int, store: WeightStore, moeI: Int) -> SeedlessVerifyForward.LayerSpec {
         let p  = "language_model.model.layers.\(i)"
         let mp = "\(p).mlp"
         let lin = isLinear(i)
@@ -38,12 +38,12 @@ public struct RawEngine {
         let inputLN = store.req("\(p).input_layernorm.weight")
         let postLN  = store.req("\(p).post_attention_layernorm.weight")
 
-        var gdnW:  RawVerifyForward.GDNLayerW? = nil
-        var attnW: RawVerifyForward.AttnLayerW? = nil
+        var gdnW:  SeedlessVerifyForward.GDNLayerW? = nil
+        var attnW: SeedlessVerifyForward.AttnLayerW? = nil
 
         if lin {
             let la = "\(p).linear_attn"
-            gdnW = RawVerifyForward.GDNLayerW(
+            gdnW = SeedlessVerifyForward.GDNLayerW(
                 qkvWq: store.req("\(la).in_proj_qkv.weight"),
                 qkvSc: store.req("\(la).in_proj_qkv.scales"),
                 qkvBi: store.req("\(la).in_proj_qkv.biases"),
@@ -65,7 +65,7 @@ public struct RawEngine {
                 dtBias: store.req("\(la).dt_bias"))
         } else {
             let sa = "\(p).self_attn"
-            attnW = RawVerifyForward.AttnLayerW(
+            attnW = SeedlessVerifyForward.AttnLayerW(
                 qWq: store.req("\(sa).q_proj.weight"),
                 qSc: store.req("\(sa).q_proj.scales"),
                 qBi: store.req("\(sa).q_proj.biases"),
@@ -92,7 +92,7 @@ public struct RawEngine {
         let sgBPad = MLX.concatenated(Array(repeating: sgB0, count: 8), axis: 0)
         MLX.eval([sgWPad, sgSPad, sgBPad])
 
-        let moeW = RawVerifyForward.MoEBlockW(
+        let moeW = SeedlessVerifyForward.MoEBlockW(
             gateWq: store.req("\(mp).gate.weight"),
             gateSc: store.req("\(mp).gate.scales"),
             gateBi: store.req("\(mp).gate.biases"),
@@ -118,7 +118,7 @@ public struct RawEngine {
             sharedGateSc: sgSPad,
             sharedGateBi: sgBPad)
 
-        return RawVerifyForward.LayerSpec(
+        return SeedlessVerifyForward.LayerSpec(
             isLinear: lin, inputLN: inputLN, postLN: postLN,
             gdn: gdnW, attn: attnW, moe: moeW, moeE: 256, moeI: moeI)
     }
@@ -126,11 +126,11 @@ public struct RawEngine {
     // ── public factory ────────────────────────────────────────────────────
 
     /// Build engine from a loaded WeightStore (caller must have called residentAll()).
-    public static func build(store: WeightStore) -> RawEngine {
+    public static func build(store: WeightStore) -> SeedlessEngine {
         let gateW0 = store.req("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight")
         let moeI   = gateW0.shape[1]
         let layers = (0 ..< numLayers).map { i in buildLayerSpec(i, store: store, moeI: moeI) }
-        return RawEngine(
+        return SeedlessEngine(
             layers:  layers,
             moeI:    moeI,
             embedW:  store.req("language_model.model.embed_tokens.weight"),
@@ -146,14 +146,14 @@ public struct RawEngine {
     // ── core operations ───────────────────────────────────────────────────
 
     /// Fresh cold caches for all 40 layers.
-    public func freshCaches() -> [RawVerifyForward.LayerCaches] {
+    public func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
         (0 ..< Self.numLayers).map { i in
             if Self.isLinear(i) {
-                return RawVerifyForward.LayerCaches(
+                return SeedlessVerifyForward.LayerCaches(
                     convState: MLX.zeros([3, 8192],          dtype: .float16),
                     recState:  MLX.zeros([1, 32, 128, 128],  dtype: .float32))
             } else {
-                return RawVerifyForward.LayerCaches(
+                return SeedlessVerifyForward.LayerCaches(
                     kCache: MLX.zeros([2, 0, 256], dtype: .float16),
                     vCache: MLX.zeros([2, 0, 256], dtype: .float16))
             }
@@ -169,16 +169,16 @@ public struct RawEngine {
 
     /// verifyForwardRows(x, ...) + final rmsNorm. Returns normed hidden [M, H] or nil.
     /// Caches are mutated in place (advancing the KV / recurrent state).
-    public func forwardRows(_ x: MLXArray, caches: [RawVerifyForward.LayerCaches], M: Int) -> MLXArray? {
+    public func forwardRows(_ x: MLXArray, caches: [SeedlessVerifyForward.LayerCaches], M: Int) -> MLXArray? {
         let mr = ProcessInfo.processInfo.environment["QWISP_RAW_METAL_ROUTE"] == "1"
-        guard let h = RawVerifyForward.verifyForwardRows(x, layers: layers, caches: caches, M: M, metalRoute: mr)
+        guard let h = SeedlessVerifyForward.verifyForwardRows(x, layers: layers, caches: caches, M: M, metalRoute: mr)
         else { return nil }
-        return RawMetalForward.rmsNormRows(h, fnW, M: M, eps: Self.eps, D: Self.H)
+        return SeedlessMetalForward.rmsNormRows(h, fnW, M: M, eps: Self.eps, D: Self.H)
     }
 
     /// qmmTiled lm_head. Input normed [M, H]; returns logits [M, vocab] or nil.
     public func logits(_ normed: MLXArray, M: Int) -> MLXArray? {
-        RawMetalForward.qmmTiled(normed, lmW, scales: lmS, biases: lmB, M: M, K: Self.H, N: vocab)
+        SeedlessMetalForward.qmmTiled(normed, lmW, scales: lmS, biases: lmB, M: M, K: Self.H, N: vocab)
     }
 
     // ── fused (single-CB) forward path — P3 speed plumbing ────────────────
@@ -188,8 +188,8 @@ public struct RawEngine {
     /// Returns (forward, fnBuf, providers). providers は bolt calib 用に expose。
     public func makeFusedStreaming(modelDir: String, maxM: Int, maxSeqLen: Int, C: Int,
                                    existingProviders: [ArenaExpertProvider]? = nil)
-        -> (RawFusedVerify.RawFusedForward, MTLBuffer, [ArenaExpertProvider])? {
-        guard let (device, _) = RawMetalForward.ensure() else { return nil }
+        -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer, [ArenaExpertProvider])? {
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return nil }
 
         let providers: [ArenaExpertProvider]
         if let ep = existingProviders {
@@ -216,14 +216,14 @@ public struct RawEngine {
             providers = ps
         }
 
-        guard let fwd = RawFusedVerify.RawFusedForward(
+        guard let fwd = SeedlessFusedVerify.SeedlessFusedForward(
             layers: layers, caches: freshCaches(),
             maxM: maxM, H: Self.H, maxSeqLen: maxSeqLen,
             providers: providers) else { return nil }
 
         let fnA = fnW.asType(.float16)
         fwd.retainedArrays.append(fnA)
-        guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
+        guard let fnBuf = SeedlessMetalForward.mtlBuf(fnA, device) else { return nil }
         _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
                            lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
         return (fwd, fnBuf, providers)
@@ -231,13 +231,13 @@ public struct RawEngine {
 
     /// 全層 1-CB fused forward(cache 常駐)を cold cache で構築。final norm buffer も返す。
     /// forwardRows(x, M, finalNormW: fnBuf) で「40層+final norm」が 1 CB になる。
-    public func makeFused(maxM: Int, maxSeqLen: Int) -> (RawFusedVerify.RawFusedForward, MTLBuffer)? {
-        guard let (device, _) = RawMetalForward.ensure(),
-              let fwd = RawFusedVerify.RawFusedForward(layers: layers, caches: freshCaches(),
+    public func makeFused(maxM: Int, maxSeqLen: Int) -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer)? {
+        guard let (device, _) = SeedlessMetalForward.ensure(),
+              let fwd = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
                                                        maxM: maxM, H: Self.H, maxSeqLen: maxSeqLen) else { return nil }
         let fnA = fnW.asType(.float16)
         fwd.retainedArrays.append(fnA)   // zero-copy buffer の寿命規約(変換一時 array の保持)
-        guard let fnBuf = RawMetalForward.mtlBuf(fnA, device) else { return nil }
+        guard let fnBuf = SeedlessMetalForward.mtlBuf(fnA, device) else { return nil }
         // head 同梱(embed→層→norm→lm_head→argmax の 1-CB step)。失敗しても forwardRows 経路は生きる。
         _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
                            lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)

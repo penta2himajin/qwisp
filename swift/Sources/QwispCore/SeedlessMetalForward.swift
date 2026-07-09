@@ -8,7 +8,7 @@ import MLXRandom
 /// issue#5 raw-Metal forward 本実装の足場。MLX を迂回し forward を自前 Metal kernel + 単一 encoder で
 /// 組むための基盤。第一歩 = quantized matmul(4-bit affine, gs=64)を MLX の quantizedMatmul と bit-exact
 /// 照合（最難関の format + MLX weight buffer 共有 を検証）。
-public enum RawMetalForward {
+public enum SeedlessMetalForward {
     nonisolated(unsafe) static var metalRoute = false    // task#8 検証: MoE routing を Metal(qmm8+route_top8)で行う
     // ── profile（task#9 owner 指摘①: per-kernel GPU-exec 帰属）──
     nonisolated(unsafe) static var lastGPUExecMs = 0.0    // 直近 fusedForwardGPU の GPU-exec(gpuEnd-gpuStart)
@@ -3764,7 +3764,7 @@ public enum RawMetalForward {
                 qNorm: r["q_norm_weight"]!, kNorm: r["k_norm_weight"]!)
         }
         let layer = DecoderLayer(isLinear: isLinear, eps: 1e-6, inputLayernorm: iln, postAttentionLayernorm: pln,
-                                 gdn: gdn, attn: attn, mlp: DecoderLayerValidation.mlpFrom(r))
+                                 gdn: gdn, attn: attn, mlp: MoEBlock.from(r))
         let prevF32 = GatedDeltaNetLayer.f32Conv; GatedDeltaNetLayer.f32Conv = true
         defer { GatedDeltaNetLayer.f32Conv = prevF32 }
         let x = MLXRandom.normal([1, 1, H]).asType(.float16)

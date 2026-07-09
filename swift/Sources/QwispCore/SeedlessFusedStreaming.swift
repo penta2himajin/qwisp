@@ -9,7 +9,7 @@ import Metal
 /// ensure(experts): map each expert id to a slot in [0,C), pread/copying misses into the arena
 ///   SYNCHRONOUSLY. Caller guarantees GPU has finished all previously-encoded gathers that read
 ///   these buffers before calling ensure (command buffer waited).
-public protocol RawFusedExpertProvider: AnyObject {
+public protocol SeedlessFusedExpertProvider: AnyObject {
     var C: Int { get }
     func gatherBuffers(device: MTLDevice) -> [MTLBuffer]?
     func ensure(_ experts: [Int]) -> [Int: Int]
@@ -20,7 +20,7 @@ public protocol RawFusedExpertProvider: AnyObject {
 /// ensure: cache.ensure(experts) をそのまま委譲。
 /// noCopy buffer の寿命規約: arena arrays は ExpertArena の persistent slot であり class member だが、
 /// 安全のため retainedArrays にも保持する(noCopy lifetime は retain に依存)。
-public final class ArenaExpertProvider: RawFusedExpertProvider {
+public final class ArenaExpertProvider: SeedlessFusedExpertProvider {
     public let cache: LayerExpertCache
     public var C: Int { cache.C }
 
@@ -49,7 +49,7 @@ public final class ArenaExpertProvider: RawFusedExpertProvider {
                     // 初回 scales チェック(最初の scales は gate_proj.scales)
                 }
                 arrays.append(arr)
-                guard let buf = RawMetalForward.mtlBuf(arr, device) else {
+                guard let buf = SeedlessMetalForward.mtlBuf(arr, device) else {
                     print("[ArenaExpertProvider] ERROR: mtlBuf failed for \(proj).\(part)")
                     return nil
                 }
@@ -77,7 +77,7 @@ public final class ArenaExpertProvider: RawFusedExpertProvider {
 /// テスト用 synthetic provider。
 /// 全エキスパートの量子化重みを保持し、arena([C, ...])へ CPU memcpy でロード。
 /// LRU eviction。noCopy MTLBuffer の寿命規約を retained で担保。
-final class TestExpertProvider: RawFusedExpertProvider {
+final class TestExpertProvider: SeedlessFusedExpertProvider {
     let C: Int
     let E: Int, I: Int, H: Int
 
@@ -121,15 +121,15 @@ final class TestExpertProvider: RawFusedExpertProvider {
 
         MLX.eval([gW, gSf16, gBf16, uW, uSf16, uBf16, dW, dSf16, dBf16])
 
-        guard let fgW = RawMetalForward.mtlBuf(gW, device),
-              let fgS = RawMetalForward.mtlBuf(gSf16, device),
-              let fgB = RawMetalForward.mtlBuf(gBf16, device),
-              let fuW = RawMetalForward.mtlBuf(uW, device),
-              let fuS = RawMetalForward.mtlBuf(uSf16, device),
-              let fuB = RawMetalForward.mtlBuf(uBf16, device),
-              let fdW = RawMetalForward.mtlBuf(dW, device),
-              let fdS = RawMetalForward.mtlBuf(dSf16, device),
-              let fdB = RawMetalForward.mtlBuf(dBf16, device) else { return nil }
+        guard let fgW = SeedlessMetalForward.mtlBuf(gW, device),
+              let fgS = SeedlessMetalForward.mtlBuf(gSf16, device),
+              let fgB = SeedlessMetalForward.mtlBuf(gBf16, device),
+              let fuW = SeedlessMetalForward.mtlBuf(uW, device),
+              let fuS = SeedlessMetalForward.mtlBuf(uSf16, device),
+              let fuB = SeedlessMetalForward.mtlBuf(uBf16, device),
+              let fdW = SeedlessMetalForward.mtlBuf(dW, device),
+              let fdS = SeedlessMetalForward.mtlBuf(dSf16, device),
+              let fdB = SeedlessMetalForward.mtlBuf(dBf16, device) else { return nil }
         fullGW = fgW; fullGS = fgS; fullGB = fgB
         fullUW = fuW; fullUS = fuS; fullUB = fuB
         fullDW = fdW; fullDS = fdS; fullDB = fdB

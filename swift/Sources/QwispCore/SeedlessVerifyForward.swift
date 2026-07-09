@@ -3,12 +3,12 @@ import MLX
 import Metal
 import MLXNN
 
-/// D1 U1: M-row verify 合成層。RawMetalForward の M-row kernel 群(全て rows≡M=1ループ bit一致検証済み)を
+/// D1 U1: M-row verify 合成層。SeedlessMetalForward の M-row kernel 群(全て rows≡M=1ループ bit一致検証済み)を
 /// 実 decoder 層の op 列どおりに合成する。参照実装は attnLayerRaw / gdnLayerRaw / runMoeBlockTest の
 /// M=1 chain(いずれも MLX と bit-exact 照合済み)。
 /// 設計規律: 全 matmul/attention/conv/recurrence は tested Rows wrapper のみ。MLX glue は
 /// elementwise/位置毎/データ移動(reshape/transpose/concat/slice)に限定 — cross-row reduction 禁止。
-public enum RawVerifyForward {
+public enum SeedlessVerifyForward {
 
     /// attention 層重み(qwen3.5: fused q+gate proj, qk-norm, sigmoid-gated output)。
     public struct AttnLayerW {
@@ -44,21 +44,21 @@ public enum RawVerifyForward {
         let scale = Float(pow(Double(headDim), -0.5))
         let qd2 = 2 * headDim
         // q(+gate)/k/v projection — per-row order-stable qmmRows
-        guard let qOut = RawMetalForward.qmmRows(x, w.qWq, scales: w.qSc, biases: w.qBi, M: M, K: H, N: numHeads * qd2),
-              let kOut = RawMetalForward.qmmRows(x, w.kWq, scales: w.kSc, biases: w.kBi, M: M, K: H, N: numKV * headDim),
-              let vOut = RawMetalForward.qmmRows(x, w.vWq, scales: w.vSc, biases: w.vBi, M: M, K: H, N: numKV * headDim)
+        guard let qOut = SeedlessMetalForward.qmmRows(x, w.qWq, scales: w.qSc, biases: w.qBi, M: M, K: H, N: numHeads * qd2),
+              let kOut = SeedlessMetalForward.qmmRows(x, w.kWq, scales: w.kSc, biases: w.kBi, M: M, K: H, N: numKV * headDim),
+              let vOut = SeedlessMetalForward.qmmRows(x, w.vWq, scales: w.vSc, biases: w.vBi, M: M, K: H, N: numKV * headDim)
         else { return nil }
         let qOutR = qOut.reshaped([M * numHeads, qd2])
         let queries = qOutR[0..., 0 ..< headDim]                                   // [M*numHeads, headDim]
         // qk-norm(f16 weight, per-row = per-head)
-        guard let qN = RawMetalForward.rmsNormRows(queries, w.qNorm.asType(.float16), M: M * numHeads, eps: eps, D: headDim),
-              let kN = RawMetalForward.rmsNormRows(kOut.reshaped([M * numKV, headDim]), w.kNorm.asType(.float16),
+        guard let qN = SeedlessMetalForward.rmsNormRows(queries, w.qNorm.asType(.float16), M: M * numHeads, eps: eps, D: headDim),
+              let kN = SeedlessMetalForward.rmsNormRows(kOut.reshaped([M * numKV, headDim]), w.kNorm.asType(.float16),
                                                    M: M * numKV, eps: eps, D: headDim)
         else { return nil }
         // RoPE: 行 m の位置 = baseLen + m(q は numHeads 群、k は numKV 群)
-        guard let qRot = RawMetalForward.ropeRows(qN, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+        guard let qRot = SeedlessMetalForward.ropeRows(qN, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
                                                   startOffset: baseLen, M: M, numHeads: numHeads),
-              let kRot = RawMetalForward.ropeRows(kN, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+              let kRot = SeedlessMetalForward.ropeRows(kN, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
                                                   startOffset: baseLen, M: M, numHeads: numKV)
         else { return nil }
         // cache append: [M*numKV, headDim] → [M, numKV, headDim] → [numKV, M, headDim] → concat(L 軸)
@@ -73,15 +73,15 @@ public enum RawVerifyForward {
             vCache = MLX.concatenated([vCache, vNew], axis: 1); vCache.eval()
         }
         // SDPA: 行 m は先頭 baseLen+m+1 key(自身含む)を見る → sdpaRows の baseN = baseLen+1
-        guard let attnOut = RawMetalForward.sdpaRows(qRot, kCache, vCache,
+        guard let attnOut = SeedlessMetalForward.sdpaRows(qRot, kCache, vCache,
                                                      H: numHeads, KV: numKV, D: headDim,
                                                      baseLen: baseLen + 1, M: M, scale: scale)
         else { return nil }
         // sigmoid-gated output — raw kernel(sigmoid_mul, gate は qOut から strided 読み)= fused と同一数値系
-        guard let gated0 = RawFusedVerify.sigmoidMulRaw(attnOut, qOut, headDim: headDim, qd2: qd2,
+        guard let gated0 = SeedlessFusedVerify.sigmoidMulRaw(attnOut, qOut, headDim: headDim, qd2: qd2,
                                                         total: M * numHeads * headDim) else { return nil }
         let gated = gated0.reshaped([M, numHeads * headDim])
-        return RawMetalForward.qmmRows(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: M, K: numHeads * headDim, N: H)
+        return SeedlessMetalForward.qmmRows(gated, w.oWq, scales: w.oSc, biases: w.oBi, M: M, K: numHeads * headDim, N: H)
     }
 
     /// GDN 層重み(qwen3.5: in_proj 4分割, grouped conv, gated-delta recurrence, RMSNormGated)。
@@ -123,10 +123,10 @@ public enum RawVerifyForward {
         let valueDim = headVDim * numVHeads
         let convDim = keyDim * 2 + valueDim
         // ① in_proj ×4(per-row order-stable)
-        guard let qkv = RawMetalForward.qmmRows(x, w.qkvWq, scales: w.qkvSc, biases: w.qkvBi, M: M, K: H, N: convDim),
-              let z   = RawMetalForward.qmmRows(x, w.zWq,   scales: w.zSc,   biases: w.zBi,   M: M, K: H, N: valueDim),
-              let bP  = RawMetalForward.qmmRows(x, w.bWq,   scales: w.bSc,   biases: w.bBi,   M: M, K: H, N: numVHeads),
-              let aP  = RawMetalForward.qmmRows(x, w.aWq,   scales: w.aSc,   biases: w.aBi,   M: M, K: H, N: numVHeads)
+        guard let qkv = SeedlessMetalForward.qmmRows(x, w.qkvWq, scales: w.qkvSc, biases: w.qkvBi, M: M, K: H, N: convDim),
+              let z   = SeedlessMetalForward.qmmRows(x, w.zWq,   scales: w.zSc,   biases: w.zBi,   M: M, K: H, N: valueDim),
+              let bP  = SeedlessMetalForward.qmmRows(x, w.bWq,   scales: w.bSc,   biases: w.bBi,   M: M, K: H, N: numVHeads),
+              let aP  = SeedlessMetalForward.qmmRows(x, w.aWq,   scales: w.aSc,   biases: w.aBi,   M: M, K: H, N: numVHeads)
         else { return nil }
         // ② conv 窓構築(データ移動のみ): convInput = [convState; qkv] → 行 m の窓 = convInput[m .. m+K-1]
         let convInput = MLX.concatenated([convState, qkv.asType(.float16)], axis: 0)   // [K-1+M, convDim]
@@ -134,7 +134,7 @@ public enum RawVerifyForward {
         for m in 0 ..< M { windowParts.append(convInput[m ..< m + convKernel]) }       // 各 [K, convDim]
         let windows = MLX.stacked(windowParts, axis: 0)                                 // [M, K, convDim]
         MLX.eval([windows])
-        guard let convOut = RawMetalForward.conv1dSiluRows(windows, w.conv1dW, M: M, K: convKernel, C: convDim)
+        guard let convOut = SeedlessMetalForward.conv1dSiluRows(windows, w.conv1dW, M: M, K: convKernel, C: convDim)
         else { return nil }                                                             // [M, convDim]
         convState = convInput[M ..< M + convKernel - 1]; convState.eval()               // 窓の残り = 新 conv state
         // ③ split → q,k,v(行毎)
@@ -143,29 +143,29 @@ public enum RawVerifyForward {
         let v1 = convOut[0..., (2 * keyDim)...].reshaped([1, M, numVHeads, headVDim])
         // ④ qk-norm(no-weight)+ scalar scale(elementwise)
         let invScale = Float(pow(Double(headKDim), -0.5))
-        guard let qn0 = RawMetalForward.rmsNormRows(q1, nil, M: M * numKHeads, eps: eps, D: headKDim),
-              let kn0 = RawMetalForward.rmsNormRows(k1, nil, M: M * numKHeads, eps: eps, D: headKDim) else { return nil }
+        guard let qn0 = SeedlessMetalForward.rmsNormRows(q1, nil, M: M * numKHeads, eps: eps, D: headKDim),
+              let kn0 = SeedlessMetalForward.rmsNormRows(k1, nil, M: M * numKHeads, eps: eps, D: headKDim) else { return nil }
         let qN = ((invScale * invScale) * qn0).reshaped([1, M, numKHeads, headKDim])
         let kN = (invScale * kn0).reshaped([1, M, numKHeads, headKDim])
         // ⑤ recurrence: in-kernel T=M 逐次(chained T=1 と bit 一致は kernel テスト済み)。
         // g/β は raw kernel(compute_g_beta_rows)— fused と数値系共有
-        guard let (g, beta) = RawFusedVerify.computeGBetaRowsRaw(aP, bP, w.aLog, w.dtBias, M: M, Hv: numVHeads)
+        guard let (g, beta) = SeedlessFusedVerify.computeGBetaRowsRaw(aP, bP, w.aLog, w.dtBias, M: M, Hv: numVHeads)
         else { return nil }
-        guard let (coreOut, stOut) = RawMetalForward.gatedDeltaStepRows(qN, kN, v1, g: g, beta: beta, state: recState,
+        guard let (coreOut, stOut) = SeedlessMetalForward.gatedDeltaStepRows(qN, kN, v1, g: g, beta: beta, state: recState,
                                                                         M: M, B: 1, Hk: numKHeads, Dk: headKDim,
                                                                         Hv: numVHeads, Dv: headVDim) else { return nil }
         recState = stOut; recState.eval()
         // ⑥ RMSNormGated(per-row)
         let promoteRMS = (w.normWeight.dtype == .float32)
-        guard let normed = RawMetalForward.rmsNormRows(coreOut.reshaped([M * numVHeads, headVDim]), w.normWeight,
+        guard let normed = SeedlessMetalForward.rmsNormRows(coreOut.reshaped([M * numVHeads, headVDim]), w.normWeight,
                                                        M: M * numVHeads, eps: eps, D: headVDim, promoteF32: promoteRMS)
         else { return nil }
         // silu(z)·normed は raw kernel(gate/gate16)— fused と数値系共有
-        guard let gated = RawFusedVerify.gateRaw(z, normed, promote: promoteRMS, total: M * valueDim)
+        guard let gated = SeedlessFusedVerify.gateRaw(z, normed, promote: promoteRMS, total: M * valueDim)
         else { return nil }
         let outV = gated.reshaped([M, valueDim])
         // ⑦ out_proj
-        return RawMetalForward.qmmRows(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: M, K: valueDim, N: H)
+        return SeedlessMetalForward.qmmRows(outV, w.outWq, scales: w.outSc, biases: w.outBi, M: M, K: valueDim, N: H)
     }
 
     /// MoE block 重み(routed experts + shared expert + shared gate)。
@@ -206,11 +206,11 @@ public enum RawVerifyForward {
                                     M: Int, E: Int, I: Int, Ktop: Int = 8, metalRoute: Bool = false) -> MLXArray? {
         let H = x.dim(-1)
         // routing(per-row)
-        guard let gl = RawMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E)
+        guard let gl = SeedlessMetalForward.qmm8(x, w.gateWq, scales: w.gateSc, biases: w.gateBi, M: M, K: H, N: E)
         else { return nil }
         let inds: MLXArray, scores: MLXArray
         if metalRoute {
-            guard let (mi, ms) = RawFusedVerify.routeTop8Rows(gl, M: M, N: E, K: Ktop) else { return nil }
+            guard let (mi, ms) = SeedlessFusedVerify.routeTop8Rows(gl, M: M, N: E, K: Ktop) else { return nil }
             inds = mi; scores = ms                                              // [M,Ktop] 選択+renorm 済
         } else {
             let gates = MLX.softmax(gl, axis: -1, precise: true)
@@ -221,30 +221,30 @@ public enum RawVerifyForward {
         }
         let indsFlat = inds.reshaped([M * Ktop]).asType(.int32); indsFlat.eval()
         // routed experts: gate/up(行共有 x)→ swiglu → down(per-mk lhs)
-        guard let g = RawMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
+        guard let g = SeedlessMetalForward.gatherQmmRows(x, w.swGWq, scales: w.swGSc, biases: w.swGBi,
                                                     inds: indsFlat, M: M, Ktop: Ktop, K: H, N: I),
-              let u = RawMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
+              let u = SeedlessMetalForward.gatherQmmRows(x, w.swUWq, scales: w.swUSc, biases: w.swUBi,
                                                     inds: indsFlat, M: M, Ktop: Ktop, K: H, N: I)
         else { return nil }
         // swiglu は raw Metal kernel(stable sigmoid, f16)— fused 経路と同一数値系(engine 内自己整合が規範)
-        guard let h = RawMetalForward.swigluRaw(g, u) else { return nil }       // [M*Ktop, I] elementwise
-        guard let d = RawMetalForward.gatherQmmRows(h, w.swDWq, scales: w.swDSc, biases: w.swDBi,
+        guard let h = SeedlessMetalForward.swigluRaw(g, u) else { return nil }       // [M*Ktop, I] elementwise
+        guard let d = SeedlessMetalForward.gatherQmmRows(h, w.swDWq, scales: w.swDSc, biases: w.swDBi,
                                                     inds: indsFlat, M: M, Ktop: Ktop, K: I, N: H,
                                                     lhsPerExpert: true)
         else { return nil }
         // combine: raw kernel(k 昇順 f16 逐次和)— fused の combine_rows と丸め列を共有(M 非依存)
-        guard let y = RawFusedVerify.combineRowsRaw(d, scores, M: M, Ktop: Ktop, N: H) else { return nil }
+        guard let y = SeedlessFusedVerify.combineRowsRaw(d, scores, M: M, Ktop: Ktop, N: H) else { return nil }
         // shared expert + sigmoid(sharedGate) — sharedGate は pad 8 列の列 0 を使用
-        guard let sg = RawMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
-              let su = RawMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I)
+        guard let sg = SeedlessMetalForward.qmmRows(x, w.shGWq, scales: w.shGSc, biases: w.shGBi, M: M, K: H, N: I),
+              let su = SeedlessMetalForward.qmmRows(x, w.shUWq, scales: w.shUSc, biases: w.shUBi, M: M, K: H, N: I)
         else { return nil }
-        guard let shAct = RawMetalForward.swigluRaw(sg, su) else { return nil } // raw swiglu(fused と同一)
-        guard let sharedY = RawMetalForward.qmmRows(shAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
-              let sgl = RawMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi,
+        guard let shAct = SeedlessMetalForward.swigluRaw(sg, su) else { return nil } // raw swiglu(fused と同一)
+        guard let sharedY = SeedlessMetalForward.qmmRows(shAct, w.shDWq, scales: w.shDSc, biases: w.shDBi, M: M, K: I, N: H),
+              let sgl = SeedlessMetalForward.qmm8(x, w.sharedGateWq, scales: w.sharedGateSc, biases: w.sharedGateBi,
                                              M: M, K: H, N: 8)
         else { return nil }
         // final: y + sigmoid(sgl[:,0])·sharedY — raw kernel(fused の final_combine_rows と同一)
-        return RawFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
+        return SeedlessFusedVerify.finalCombineRowsRaw(y, sharedY, sgl, M: M, N: H)
     }
 
     /// decoder 層 1 枚の仕様(mixer 種別 + 重み + MoE)。
@@ -286,7 +286,7 @@ public enum RawVerifyForward {
         let H = x.dim(-1)
         var h = x
         for (i, L) in layers.enumerated() {
-            guard let normed = RawMetalForward.rmsNormRows(h, L.inputLN, M: M, eps: eps, D: H) else { return nil }
+            guard let normed = SeedlessMetalForward.rmsNormRows(h, L.inputLN, M: M, eps: eps, D: H) else { return nil }
             let r: MLXArray?
             if L.isLinear, let gw = L.gdn {
                 var cs = caches[i].convState!, rs = caches[i].recState!
@@ -299,7 +299,7 @@ public enum RawVerifyForward {
             } else { return nil }
             guard let rr = r else { return nil }
             h = h + rr                                                            // residual(elementwise)
-            guard let postNorm = RawMetalForward.rmsNormRows(h, L.postLN, M: M, eps: eps, D: H) else { return nil }
+            guard let postNorm = SeedlessMetalForward.rmsNormRows(h, L.postLN, M: M, eps: eps, D: H) else { return nil }
             guard let moeOut = moeBlockRows(postNorm, L.moe, M: M, E: L.moeE, I: L.moeI, Ktop: L.moeKtop, metalRoute: metalRoute)
             else { return nil }
             h = h + moeOut

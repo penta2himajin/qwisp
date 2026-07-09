@@ -3,7 +3,7 @@ import MLX
 import MLXRandom
 import Metal
 
-/// ①③ Step 3 real-model gate (notes/17 §検証 runner): raw RawMTPHead vs MLX MTPHead
+/// ①③ Step 3 real-model gate (notes/17 §検証 runner): raw SeedlessMTPHead vs MLX MTPHead
 /// on the actual mtp.safetensors weights. QWISP_RUN=mtp-raw-validate.
 ///
 /// Protocol: per probe i, draw (hPrev_i, tok_i); MLX reference drafts WITH cache
@@ -11,12 +11,12 @@ import Metal
 /// sides walk the same growing KV positions. Gate: argmax match on every probe.
 /// This is the only gate that exercises the real expert layout (4bit gs=32 vs the
 /// synthetic tests' gs=64) and the real vocab-sized lm_head.
-public enum RawMTPValidate {
+public enum SeedlessMTPValidate {
     /// Build the production WeightsSpec from mtp.safetensors + shared embed/lm_head
     /// (store must have residentNonExperts or residentAll done). Shared by the
     /// validate gate below and the run() draft-head wiring (①③ Step 4).
     public static func loadSpec(modelDir: String, store: WeightStore, maxSeqLen: Int = 256) throws
-        -> RawFusedVerify.RawMTPHead.WeightsSpec {
+        -> SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec {
         let H = 2048
         // Raw head from the same arrays (mirror MTPHead.init recovery exactly)
         let url = URL(fileURLWithPath: modelDir).appendingPathComponent("mtp.safetensors")
@@ -34,7 +34,7 @@ public enum RawMTPValidate {
         let lmB = store.req("language_model.lm_head.biases")
         let V = lmW.dim(0)
 
-        return RawFusedVerify.RawMTPHead.WeightsSpec(
+        return SeedlessFusedVerify.SeedlessMTPHead.WeightsSpec(
             H: H, V: V, E: 256, I: 512, Ktop: 8,
             numHeads: 16, numKV: 2, headDim: 256, ropeDim: 64,
             ropeBase: 1e7, eps: 1e-6, maxSeqLen: maxSeqLen,
@@ -68,7 +68,7 @@ public enum RawMTPValidate {
 
     public static func run(modelDir: String) throws -> String {
         let H = 2048
-        guard let (device, _) = RawMetalForward.ensure() else { return "[mtp-raw] no device" }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return "[mtp-raw] no device" }
 
         // MLX reference = production MTPHead (loads + recovers norms itself)
         let store = try WeightStore(modelDir: modelDir)
@@ -77,7 +77,7 @@ public enum RawMTPValidate {
 
         let spec = try loadSpec(modelDir: modelDir, store: store)
         let V = spec.V
-        guard let raw = RawFusedVerify.RawMTPHead(spec: spec) else { return "[mtp-raw] init nil" }
+        guard let raw = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) else { return "[mtp-raw] init nil" }
 
         // Probes: both sides walk the same growing KV history.
         MLXRandom.seed(7)
@@ -92,7 +92,7 @@ public enum RawMTPValidate {
             let dl = mlxHead(hPrev, MLXArray([tok], [1, 1]), cache: kv)   // appends pair to kv
             let refD = MLX.argMax(dl[0, 0], axis: -1).item(Int.self)
 
-            guard let hBuf = RawMetalForward.mtlBuf(hPrev.reshaped([1, H]).asType(.float16), device)
+            guard let hBuf = SeedlessMetalForward.mtlBuf(hPrev.reshaped([1, H]).asType(.float16), device)
             else { return "[mtp-raw] hBuf nil probe \(i)" }
             guard let rawD = raw.draftArgmax(hPrevBuf: hBuf, hPrevRow: 0, tok: tok)
             else { return "[mtp-raw] draftArgmax nil probe \(i)" }

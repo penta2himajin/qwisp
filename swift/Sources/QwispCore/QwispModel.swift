@@ -150,11 +150,11 @@ public final class QwispModel {
     /// raw decoder layer 1 層（input_norm→mixer raw→res→post_norm→MoE raw→res）。h[1,H]→[1,H]。
     func rawDecoderLayer(_ h: MLXArray, _ i: Int) -> MLXArray? {
         let p = "language_model.model.layers.\(i)", H = h.dim(-1)
-        guard let normed = RawMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
+        guard let normed = SeedlessMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
         let r: MLXArray
         if isLinear(i) {
             let la = "\(p).linear_attn"
-            let rw = RawMetalForward.GDNRawWeights(
+            let rw = SeedlessMetalForward.GDNRawWeights(
                 qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
                 zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
                 bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
@@ -162,25 +162,25 @@ public final class QwispModel {
                 outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
                 conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
                 aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
-            guard let ro = RawMetalForward.gdnLayerRaw(normed.reshaped([1, 1, H]), rw) else { return nil }
+            guard let ro = SeedlessMetalForward.gdnLayerRaw(normed.reshaped([1, 1, H]), rw) else { return nil }
             r = ro
         } else {
             let sa = "\(p).self_attn"
-            let aw = RawMetalForward.AttnRawWeights(
+            let aw = SeedlessMetalForward.AttnRawWeights(
                 qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
                 kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
                 vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
                 oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
                 qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
             let pf = (store.req("\(sa).q_norm.weight").dtype == .float32)
-            guard let ro = RawMetalForward.attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: pf) else { return nil }
+            guard let ro = SeedlessMetalForward.attnLayerRaw(normed.reshaped([1, 1, H]), aw, promoteF32: pf) else { return nil }
             r = ro.asType(h.dtype)
         }
         let h2 = h + r
-        guard let postNorm = RawMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
+        guard let postNorm = SeedlessMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
         let mp = "\(p).mlp"
         func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
-        guard let mlpOut = RawMetalForward.moeRawForward(postNorm, gate: q("\(mp).gate", 8), sharedGate: q("\(mp).shared_expert_gate", 8),
+        guard let mlpOut = SeedlessMetalForward.moeRawForward(postNorm, gate: q("\(mp).gate", 8), sharedGate: q("\(mp).shared_expert_gate", 8),
             swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
             shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"))
         else { return nil }
@@ -188,19 +188,19 @@ public final class QwispModel {
     }
 
     // ── SE full forward（task#4 速度）: GDN SE + MoE expert SE（resident buffer）。──
-    nonisolated(unsafe) var gdnBufCache: [Int: RawMetalForward.GDNBuffers] = [:]
-    nonisolated(unsafe) var moeBufCache: [Int: RawMetalForward.MoEBuffers] = [:]
-    nonisolated(unsafe) var attnBufCache: [Int: RawMetalForward.AttnBuffers] = [:]
+    nonisolated(unsafe) var gdnBufCache: [Int: SeedlessMetalForward.GDNBuffers] = [:]
+    nonisolated(unsafe) var moeBufCache: [Int: SeedlessMetalForward.MoEBuffers] = [:]
+    nonisolated(unsafe) var attnBufCache: [Int: SeedlessMetalForward.AttnBuffers] = [:]
 
     /// SE decoder layer 1 層（GDN: SE / attn: round-trip raw / MoE: routing=MLX + expert SE + combine=MLX）。
     func seDecoderLayer(_ h: MLXArray, _ i: Int) -> MLXArray? {
         let p = "language_model.model.layers.\(i)", H = h.dim(-1)
-        guard let normed = RawMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
+        guard let normed = SeedlessMetalForward.rmsNorm(h, store.req("\(p).input_layernorm.weight"), eps: eps, D: H) else { return nil }
         let r: MLXArray
         if isLinear(i) {
             let la = "\(p).linear_attn"
             if gdnBufCache[i] == nil {
-                let rw = RawMetalForward.GDNRawWeights(
+                let rw = SeedlessMetalForward.GDNRawWeights(
                     qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
                     zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
                     bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
@@ -208,26 +208,26 @@ public final class QwispModel {
                     outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
                     conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
                     aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
-                gdnBufCache[i] = RawMetalForward.prepareGDNBuffers(rw, H: H)
+                gdnBufCache[i] = SeedlessMetalForward.prepareGDNBuffers(rw, H: H)
             }
-            guard let buf = gdnBufCache[i], let ro = RawMetalForward.gdnLayerSingleEncoder(normed.reshaped([1, 1, H]), buf, eps: eps) else { return nil }
+            guard let buf = gdnBufCache[i], let ro = SeedlessMetalForward.gdnLayerSingleEncoder(normed.reshaped([1, 1, H]), buf, eps: eps) else { return nil }
             r = ro
         } else {
             let sa = "\(p).self_attn"
             if attnBufCache[i] == nil {
-                let aw = RawMetalForward.AttnRawWeights(
+                let aw = SeedlessMetalForward.AttnRawWeights(
                     qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
                     kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
                     vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
                     oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
                     qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
-                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H)
+                attnBufCache[i] = SeedlessMetalForward.prepareAttnBuffers(aw, H: H)
             }
-            guard let abuf = attnBufCache[i], let ro = RawMetalForward.attnLayerSingleEncoder(normed.reshaped([1, 1, H]), abuf) else { return nil }
+            guard let abuf = attnBufCache[i], let ro = SeedlessMetalForward.attnLayerSingleEncoder(normed.reshaped([1, 1, H]), abuf) else { return nil }
             r = ro.asType(h.dtype)
         }
         let h2 = h + r
-        guard let postNorm = RawMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
+        guard let postNorm = SeedlessMetalForward.rmsNorm(h2, store.req("\(p).post_attention_layernorm.weight"), eps: eps, D: H) else { return nil }
         // MoE: routing(MLX) + expert SE + combine(MLX)
         let mp = "\(p).mlp"
         let gates = MLX.softmax(q("\(mp).gate", 8).apply(postNorm), axis: -1, precise: true)
@@ -237,20 +237,20 @@ public final class QwispModel {
         scores = scores / scores.sum(axis: -1, keepDims: true)
         if moeBufCache[i] == nil {
             func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
-            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+            moeBufCache[i] = SeedlessMetalForward.prepareMoEBuffers(
                 swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
                 shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
                 Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
         }
         guard let moeBuf = moeBufCache[i],
-              let (d, sharedY) = RawMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return nil }
+              let (d, sharedY) = SeedlessMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return nil }
         let y = (d * scores.reshaped([8, 1])).sum(axis: 0).reshaped([1, H])
         let gateScale = MLX.sigmoid(q("\(mp).shared_expert_gate", 8).apply(postNorm))
         return h2 + (y + gateScale * sharedY)
     }
 
     // ── 層全体融合 full forward（task#4）: residual stream を resident GPU buffer に保持 ──
-    nonisolated(unsafe) var normWeightCache: [Int: RawMetalForward.NormWeightBuffers] = [:]
+    nonisolated(unsafe) var normWeightCache: [Int: SeedlessMetalForward.NormWeightBuffers] = [:]
     nonisolated(unsafe) var hBuf: MTLBuffer?          // residual stream（H f16, 全40層常駐）
     nonisolated(unsafe) var postNormBuf: MTLBuffer?   // post_norm 出力（routing 用 readback）
     nonisolated(unsafe) var combinedBuf: MTLBuffer?   // MoE residual scratch
@@ -259,13 +259,13 @@ public final class QwispModel {
     func ensureFusedBuffers(_ i: Int, H: Int) -> Bool {
         let p = "language_model.model.layers.\(i)"
         if normWeightCache[i] == nil {
-            normWeightCache[i] = RawMetalForward.prepareNormWeights(
+            normWeightCache[i] = SeedlessMetalForward.prepareNormWeights(
                 input: store.req("\(p).input_layernorm.weight"), post: store.req("\(p).post_attention_layernorm.weight"))
         }
         if moeBufCache[i] == nil {
             let mp = "\(p).mlp"
             func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
-            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+            moeBufCache[i] = SeedlessMetalForward.prepareMoEBuffers(
                 swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
                 shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
                 Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
@@ -273,7 +273,7 @@ public final class QwispModel {
         if isLinear(i) {
             if gdnBufCache[i] == nil {
                 let la = "\(p).linear_attn"
-                let rw = RawMetalForward.GDNRawWeights(
+                let rw = SeedlessMetalForward.GDNRawWeights(
                     qkvWq: store.req("\(la).in_proj_qkv.weight"), qkvSc: store.req("\(la).in_proj_qkv.scales"), qkvBi: store.req("\(la).in_proj_qkv.biases"),
                     zWq: store.req("\(la).in_proj_z.weight"), zSc: store.req("\(la).in_proj_z.scales"), zBi: store.req("\(la).in_proj_z.biases"),
                     bWq: store.req("\(la).in_proj_b.weight"), bSc: store.req("\(la).in_proj_b.scales"), bBi: store.req("\(la).in_proj_b.biases"),
@@ -281,19 +281,19 @@ public final class QwispModel {
                     outWq: store.req("\(la).out_proj.weight"), outSc: store.req("\(la).out_proj.scales"), outBi: store.req("\(la).out_proj.biases"),
                     conv1dW: store.req("\(la).conv1d.weight").reshaped([8192, 4]).asType(.float32), normWeight: store.req("\(la).norm.weight"),
                     aLog: store.req("\(la).A_log"), dtBias: store.req("\(la).dt_bias"))
-                gdnBufCache[i] = RawMetalForward.prepareGDNBuffers(rw, H: H)
+                gdnBufCache[i] = SeedlessMetalForward.prepareGDNBuffers(rw, H: H)
             }
             return true
         } else {
             if attnBufCache[i] == nil {
                 let sa = "\(p).self_attn"
-                let aw = RawMetalForward.AttnRawWeights(
+                let aw = SeedlessMetalForward.AttnRawWeights(
                     qWq: store.req("\(sa).q_proj.weight"), qSc: store.req("\(sa).q_proj.scales"), qBi: store.req("\(sa).q_proj.biases"),
                     kWq: store.req("\(sa).k_proj.weight"), kSc: store.req("\(sa).k_proj.scales"), kBi: store.req("\(sa).k_proj.biases"),
                     vWq: store.req("\(sa).v_proj.weight"), vSc: store.req("\(sa).v_proj.scales"), vBi: store.req("\(sa).v_proj.biases"),
                     oWq: store.req("\(sa).o_proj.weight"), oSc: store.req("\(sa).o_proj.scales"), oBi: store.req("\(sa).o_proj.biases"),
                     qNorm: store.req("\(sa).q_norm.weight"), kNorm: store.req("\(sa).k_norm.weight"))
-                attnBufCache[i] = RawMetalForward.prepareAttnBuffers(aw, H: H, maxLen: gpuMaxLen)
+                attnBufCache[i] = SeedlessMetalForward.prepareAttnBuffers(aw, H: H, maxLen: gpuMaxLen)
             }
             return false
         }
@@ -304,16 +304,16 @@ public final class QwispModel {
     func fusedDecoderLayer(_ i: Int, H: Int, pendingResid: MTLBuffer?) -> Bool {
         let isGDN = ensureFusedBuffers(i, H: H)
         guard let nw = normWeightCache[i], let hb = hBuf, let pnb = postNormBuf, let cb = combinedBuf else { return false }
-        guard let postNorm = RawMetalForward.fusedMixerHalf(
+        guard let postNorm = SeedlessMetalForward.fusedMixerHalf(
             hBuf: hb, nw: nw, postNormBuf: pnb,
             gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i], H: H, eps: eps,
             pendingResid: pendingResid) else { return false }
         // MoE: routing(MLX or Metal) + expert SE + combine(MLX) + residual(kernel)
         let p = "language_model.model.layers.\(i)", mp = "\(p).mlp"
         let inds: MLXArray, scores: MLXArray
-        if RawMetalForward.metalRoute {
+        if SeedlessMetalForward.metalRoute {
             // ★ Metal routing: gate qmm8(bit-exact) + route_top8。combine/shared は MLX のまま（誤差源分離）。
-            guard let (ri, rs) = RawMetalForward.metalRouteGate(
+            guard let (ri, rs) = SeedlessMetalForward.metalRouteGate(
                 postNorm, gateW: store.req("\(mp).gate.weight"), gateS: store.req("\(mp).gate.scales"),
                 gateB: store.req("\(mp).gate.biases"), H: H) else { return false }
             inds = ri.reshaped([1, 8]); scores = rs.asType(.float16).reshaped([1, 8])
@@ -327,72 +327,72 @@ public final class QwispModel {
         }
         if moeBufCache[i] == nil {
             func tup(_ n: String) -> (MLXArray, MLXArray, MLXArray) { (store.req("\(n).weight"), store.req("\(n).scales"), store.req("\(n).biases")) }
-            moeBufCache[i] = RawMetalForward.prepareMoEBuffers(
+            moeBufCache[i] = SeedlessMetalForward.prepareMoEBuffers(
                 swG: tup("\(mp).switch_mlp.gate_proj"), swU: tup("\(mp).switch_mlp.up_proj"), swD: tup("\(mp).switch_mlp.down_proj"),
                 shG: tup("\(mp).shared_expert.gate_proj"), shU: tup("\(mp).shared_expert.up_proj"), shD: tup("\(mp).shared_expert.down_proj"),
                 Hin: H, I: store.req("\(mp).switch_mlp.gate_proj.weight").dim(-2), topK: 8)
         }
         guard let moeBuf = moeBufCache[i],
-              let (d, sharedY) = RawMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return false }
+              let (d, sharedY) = SeedlessMetalForward.moeExpertSingleEncoder(postNorm, inds.reshaped([8]), moeBuf) else { return false }
         let y = (d * scores.reshaped([8, 1])).sum(axis: 0).reshaped([1, H])
         let gateScale = MLX.sigmoid(q("\(mp).shared_expert_gate", 8).apply(postNorm))
         let combined = y + gateScale * sharedY
         combined.eval()
-        RawMetalForward.writeBuffer(cb, combined, H)   // combinedBuf に保存→次層 mixer 先頭で hBuf に畳む
+        SeedlessMetalForward.writeBuffer(cb, combined, H)   // combinedBuf に保存→次層 mixer 先頭で hBuf に畳む
         return true
     }
 
     /// ★ 層融合 full forward: residual stream を hBuf に常駐し全40層で MLXArray 往復を排除。decode T=1。
     public func fusedRawForward(_ ids: MLXArray) -> MLXArray? {
         let e = embed(ids); let H = e.dim(-1)
-        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
-        if postNormBuf == nil { postNormBuf = RawMetalForward.makeResidentBuffer(H * 2) }
-        if combinedBuf == nil { combinedBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        if hBuf == nil { hBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
+        if postNormBuf == nil { postNormBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
+        if combinedBuf == nil { combinedBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let cb = combinedBuf else { return nil }
-        RawMetalForward.writeBuffer(hb, e, H)                      // embed → hBuf
+        SeedlessMetalForward.writeBuffer(hb, e, H)                      // embed → hBuf
         // 各層 MoE residual は次層 mixer encoder 先頭に畳む（pendingResid）。初層は無し。
         for i in 0 ..< numLayers {
             if !fusedDecoderLayer(i, H: H, pendingResid: i == 0 ? nil : cb) { return nil }
         }
-        RawMetalForward.fusedMoEResidual(hBuf: hb, combinedBuf: cb, H: H)  // 最終層 MoE residual を flush
-        let h = RawMetalForward.readBuffer(hb, H)                  // hBuf → MLXArray（最後だけ readback）
-        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        SeedlessMetalForward.fusedMoEResidual(hBuf: hb, combinedBuf: cb, H: H)  // 最終層 MoE residual を flush
+        let h = SeedlessMetalForward.readBuffer(hb, H)                  // hBuf → MLXArray（最後だけ readback）
+        guard let fn = SeedlessMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
     // ── all-GPU 多層 1-CB forward（task#8: routing/combine も Metal＝MLX 非依存, 層間 sync 排除）──
-    nonisolated(unsafe) var gate8Cache: [Int: RawMetalForward.Gate8Buffers] = [:]
-    nonisolated(unsafe) var sharedGate8Cache: [Int: RawMetalForward.Gate8Buffers] = [:]
-    nonisolated(unsafe) var gpuScratch: RawMetalForward.GPUScratch?
+    nonisolated(unsafe) var gate8Cache: [Int: SeedlessMetalForward.Gate8Buffers] = [:]
+    nonisolated(unsafe) var sharedGate8Cache: [Int: SeedlessMetalForward.Gate8Buffers] = [:]
+    nonisolated(unsafe) var gpuScratch: SeedlessMetalForward.GPUScratch?
     nonisolated(unsafe) var gpuWarmed = false
-    nonisolated(unsafe) var gpuLayers: [RawMetalForward.GPULayer]?
+    nonisolated(unsafe) var gpuLayers: [SeedlessMetalForward.GPULayer]?
     nonisolated(unsafe) var gpuMaxLen = 2048      // decode KV cache 最大長（prompt+生成）
     nonisolated(unsafe) var finalNormBuf: MTLBuffer?   // final norm weight（GPU CB 同梱用）
 
     func ensureFinalNorm() -> MTLBuffer? {
         if finalNormBuf == nil {
-            finalNormBuf = RawMetalForward.f16Buffer(store.req("language_model.model.norm.weight"))
+            finalNormBuf = SeedlessMetalForward.f16Buffer(store.req("language_model.model.norm.weight"))
         }
         return finalNormBuf
     }
 
     /// 全層 GPU buffer を ensure し [GPULayer] を構築（初回のみ, cache）。
-    func buildGPULayers(_ ids: MLXArray, _ H: Int) -> [RawMetalForward.GPULayer]? {
-        if !gpuWarmed { _ = rawForward(ids)?.eval(); _ = RawMetalForward.compileGqmmSwiglu(); gpuWarmed = true }   // 標準 + 融合 kernel compile
+    func buildGPULayers(_ ids: MLXArray, _ H: Int) -> [SeedlessMetalForward.GPULayer]? {
+        if !gpuWarmed { _ = rawForward(ids)?.eval(); _ = SeedlessMetalForward.compileGqmmSwiglu(); gpuWarmed = true }   // 標準 + 融合 kernel compile
         if let cached = gpuLayers { return cached }
-        var layers: [RawMetalForward.GPULayer] = []
+        var layers: [SeedlessMetalForward.GPULayer] = []
         for i in 0 ..< numLayers {
             let isGDN = ensureFusedBuffers(i, H: H)
             let mp = "language_model.model.layers.\(i).mlp"
             if gate8Cache[i] == nil {
-                gate8Cache[i] = RawMetalForward.prepareGate8(store.req("\(mp).gate.weight"), store.req("\(mp).gate.scales"), store.req("\(mp).gate.biases"))
+                gate8Cache[i] = SeedlessMetalForward.prepareGate8(store.req("\(mp).gate.weight"), store.req("\(mp).gate.scales"), store.req("\(mp).gate.biases"))
             }
             if sharedGate8Cache[i] == nil {
-                sharedGate8Cache[i] = RawMetalForward.prepareGate8(store.req("\(mp).shared_expert_gate.weight"), store.req("\(mp).shared_expert_gate.scales"), store.req("\(mp).shared_expert_gate.biases"))
+                sharedGate8Cache[i] = SeedlessMetalForward.prepareGate8(store.req("\(mp).shared_expert_gate.weight"), store.req("\(mp).shared_expert_gate.scales"), store.req("\(mp).shared_expert_gate.biases"))
             }
             guard let nw = normWeightCache[i], let moe = moeBufCache[i],
                   let g8 = gate8Cache[i], let sg8 = sharedGate8Cache[i] else { return nil }
-            layers.append(RawMetalForward.GPULayer(
+            layers.append(SeedlessMetalForward.GPULayer(
                 nw: nw, gdn: isGDN ? gdnBufCache[i] : nil, attn: isGDN ? nil : attnBufCache[i],
                 moe: moe, gate: g8, sharedGate: sg8))
         }
@@ -413,13 +413,13 @@ public final class QwispModel {
     public func fusedRawForwardGPU(_ ids: MLXArray) -> MLXArray? {
         let e = embed(ids); let H = e.dim(-1)
         guard let layers = buildGPULayers(ids, H) else { return nil }
-        if gpuScratch == nil { gpuScratch = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
-        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        if gpuScratch == nil { gpuScratch = SeedlessMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
+        if hBuf == nil { hBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
-        RawMetalForward.writeBuffer(hb, e, H)
-        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
+        SeedlessMetalForward.writeBuffer(hb, e, H)
+        SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
                                         finalNormW: ensureFinalNorm())
-        let fn = RawMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
+        let fn = SeedlessMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
@@ -427,14 +427,14 @@ public final class QwispModel {
     /// 事前に buildGPULayers + resetGPUState（シーケンス先頭）が必要。
     public func fusedDecodeStepGPU(_ tokenId: Int32, pos: Int, H: Int) -> MLXArray? {
         guard let layers = gpuLayers else { return nil }
-        if gpuScratch == nil { gpuScratch = RawMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
-        if hBuf == nil { hBuf = RawMetalForward.makeResidentBuffer(H * 2) }
+        if gpuScratch == nil { gpuScratch = SeedlessMetalForward.makeGPUScratch(H: H, E: 256, K: 8) }
+        if hBuf == nil { hBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         let e = embed(MLXArray([tokenId], [1, 1]))
-        RawMetalForward.writeBuffer(hb, e, H)
-        RawMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
+        SeedlessMetalForward.writeBuffer(hb, e, H)
+        SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
                                         decode: true, pos: pos, finalNormW: ensureFinalNorm())
-        let fn = RawMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
+        let fn = SeedlessMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
@@ -443,7 +443,7 @@ public final class QwispModel {
         let e = embed(ids); let H = e.dim(-1)
         var h = e.reshaped([1, H])
         for i in 0 ..< numLayers { guard let h2 = seDecoderLayer(h, i) else { return nil }; h = h2 }
-        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        guard let fn = SeedlessMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
@@ -452,7 +452,7 @@ public final class QwispModel {
         let e = embed(ids); let H = e.dim(-1)
         var h = e.reshaped([1, H])                                          // T=1
         for i in 0 ..< numLayers { guard let h2 = rawDecoderLayer(h, i) else { return nil }; h = h2 }
-        guard let fn = RawMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
+        guard let fn = SeedlessMetalForward.rmsNorm(h, store.req("language_model.model.norm.weight"), eps: eps, D: H) else { return nil }
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
 
