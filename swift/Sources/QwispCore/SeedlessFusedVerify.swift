@@ -2931,7 +2931,7 @@ public enum SeedlessFusedVerify {
             ProcessInfo.processInfo.environment["QWISP_FUSE_MOE2"] == "1"
 
         /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
-        /// for the chained GPU token-feedback decode default. SeedlessSpecRunner resolves the
+        /// for the chained GPU token-feedback decode default. Tell resolves the
         /// chain length as Tell.envInt("QWISP_CHAIN_K", SeedlessFusedForward.chainKDefault),
         /// so this constant is the sole source of the unset default. QWISP_CHAIN_K=0
         /// still disables (envInt returns 0).

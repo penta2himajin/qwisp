@@ -1489,7 +1489,7 @@ public enum SeedlessVerifyTests {
         //
         // GREEN by premise: per-row order-stability is proven by test 23 (fused_forward_rows_bitexact).
         // This test specialises that property for the A3 pending-prefix shapes and serves as
-        // a regression guard. It does NOT require A3 implementation in SeedlessSpecRunner.swift.
+        // a regression guard. It does NOT require A3 implementation in Tell.swift.
         run("a3_fuse_invariant") {
             let H = stH
             let moe0a = stMkMoE(), moe1a = stMkMoE()
@@ -2679,7 +2679,7 @@ public enum SeedlessVerifyTests {
         // flag-off paths stay reachable via explicit =0 for bisection.
         //
         // These read the SAME production statics/constant that SeedlessFusedForward and
-        // SeedlessSpecRunner consume at runtime — no reimplemented oracle. They are RED on
+        // Tell consume at runtime — no reimplemented oracle. They are RED on
         // the pre-flip tree (fuse statics are ["QWISP_FUSE_X"] == "1" = false when
         // unset; chainKDefault == 0) and GREEN once the driver flips the defaults
         // (fuse statics → != "0"; chainKDefault → 8).
@@ -2700,13 +2700,13 @@ public enum SeedlessVerifyTests {
             return (true, "ok")
         }
 
-        // Test 50: chain default K == 8 (opt-out). SeedlessSpecRunner resolves the chain
+        // Test 50: chain default K == 8 (opt-out). Tell resolves the chain
         // length as Tell.envInt("QWISP_CHAIN_K", SeedlessFusedForward.chainKDefault); with
         // QWISP_CHAIN_K unset the resolved value equals this seam constant, so pinning
         // the constant to 8 pins the production default. Reads the wired production
-        // seam (SeedlessSpecRunner references chainKDefault) — not a reimplemented parse.
+        // seam (Tell references chainKDefault) — not a reimplemented parse.
         // Also asserts the opt-out contract via the SAME Tell.envInt production path
-        // SeedlessSpecRunner uses: unset → chainKDefault, explicit "0" → 0 (disabled).
+        // Tell uses: unset → chainKDefault, explicit "0" → 0 (disabled).
         // RED now because chainKDefault == 0; GREEN after the flip to 8.
         run("default_chain_k_eight") {
             let d = SeedlessFusedVerify.SeedlessFusedForward.chainKDefault
@@ -2727,7 +2727,7 @@ public enum SeedlessVerifyTests {
         // and doing so MUST be bit-identical to per-step greedy (bolt = deterministic
         // buddy-greedy → chain must never change tokens).
         //
-        // Seam under test: SeedlessSpecRunner.boltGreedyChainSpan (STUB → nil → RED). It is the
+        // Seam under test: Tell.boltGreedyChainSpan (STUB → nil → RED). It is the
         // shared span decoder that runBoltMode delegates its D==0 branch to. The backend's
         // chainedStepArgmax / stepArgmax here are the PRODUCTION SeedlessFusedForward methods on a
         // real bolt engine (providers + setBoltTables + attachHead) — no reimplemented oracle.
@@ -2829,7 +2829,7 @@ public enum SeedlessVerifyTests {
             // Instrument a SpecBackend wrapping the chain bolt engine. stepArgmax counts
             // per-step calls so we can prove the chained tail did NOT go per-step.
             var perStepCalls = 0
-            var backend = SeedlessSpecRunner.SpecBackend(
+            var backend = Tell.SpecBackend(
                 forward: { _ in nil },     // not used by the greedy chain span
                 stepArgmax: { toks in perStepCalls += 1; return bltEng.stepArgmax(toks) },
                 snapshot: { bltEng.snapshot() },
@@ -2837,7 +2837,7 @@ public enum SeedlessVerifyTests {
             backend.chainedStepArgmax = { token, k in bltEng.chainedStepArgmax(token, K: k) }
 
             // Under test: bolt-runner greedy span with budget = chainK (emit u + K-1 tail).
-            guard let (emitted, nextU) = SeedlessSpecRunner.boltGreedyChainSpan(
+            guard let (emitted, nextU) = Tell.boltGreedyChainSpan(
                 backend: backend, u: Int(firstToken), chainK: chainK, budget: chainK)
             else { return (false, "not implemented (boltGreedyChainSpan nil)") }
 
@@ -2987,7 +2987,7 @@ public enum SeedlessVerifyTests {
         //
         // WRITE-LOCKED: implementer MUST NOT modify tests 52-53.
         //
-        // Goal: two lossless default-path wiring fixes in SeedlessSpecRunner —
+        // Goal: two lossless default-path wiring fixes in Tell —
         //   (1) resident useFused defaults ON (fused 1-CB ~92 tok/s), not the
         //       composedBackend footgun (~1.3 tok/s); QWISP_RAW_FUSED=0 restores
         //       composed for debug.
@@ -2996,28 +2996,28 @@ public enum SeedlessVerifyTests {
         //       explicit QWISP_RAW_C still overrides.
         // Both are output-invariant (fused ≡ composed greedy byte-identical; C only
         // changes streaming footprint, not tokens). Encoded via pure production
-        // seams SeedlessSpecRunner.resolveUseFused / resolveRawC (STUB → RED now).
+        // seams Tell.resolveUseFused / resolveRawC (STUB → RED now).
 
         // Test 52: resident useFused default resolves ON when QWISP_RAW_FUSED unset.
-        // Seam = SeedlessSpecRunner.resolveUseFused (STUB returns false → RED). Also pins
+        // Seam = Tell.resolveUseFused (STUB returns false → RED). Also pins
         // the opt-out contract ("0" → composed) and the pass-through ("1" → fused),
         // and binds to the live production env value (raw-tests sets no QWISP_RAW_FUSED
         // → unset → must be true).
         run("raw_resident_fused_default_on") {
             // unset → fused ON (the fix; STUB false → RED here)
-            if SeedlessSpecRunner.resolveUseFused(env: nil) != true {
+            if Tell.resolveUseFused(env: nil) != true {
                 return (false, "unset QWISP_RAW_FUSED must resolve useFused=true (fused default ON)")
             }
             // explicit "0" → composed (debug opt-out preserved)
-            if SeedlessSpecRunner.resolveUseFused(env: "0") != false {
+            if Tell.resolveUseFused(env: "0") != false {
                 return (false, "QWISP_RAW_FUSED=0 must resolve useFused=false (composed)")
             }
             // explicit "1" → fused
-            if SeedlessSpecRunner.resolveUseFused(env: "1") != true {
+            if Tell.resolveUseFused(env: "1") != true {
                 return (false, "QWISP_RAW_FUSED=1 must resolve useFused=true (fused)")
             }
             // live production env (raw-tests sets no QWISP_RAW_FUSED → unset → true)
-            let live = SeedlessSpecRunner.resolveUseFused(
+            let live = Tell.resolveUseFused(
                 env: ProcessInfo.processInfo.environment["QWISP_RAW_FUSED"])
             if live != true {
                 return (false, "live unset QWISP_RAW_FUSED must resolve useFused=true, got \(live)")
@@ -3026,29 +3026,29 @@ public enum SeedlessVerifyTests {
         }
 
         // Test 53: raw-spec C consults DeviceCalibration.defaultC() when QWISP_RAW_C
-        // unset, and an explicit value overrides. Seam = SeedlessSpecRunner.resolveRawC
+        // unset, and an explicit value overrides. Seam = Tell.resolveRawC
         // (STUB returns -1 → RED). References the PRODUCTION tier fn (no reimplemented
         // oracle): the unset result must equal DeviceCalibration.defaultC().
         run("raw_c_tier_default_wired") {
             let tierC = DeviceCalibration.defaultC()
             // unset → tiered default (the fix; STUB -1 → RED here)
-            if SeedlessSpecRunner.resolveRawC(envC: nil, defaultC: tierC) != tierC {
+            if Tell.resolveRawC(envC: nil, defaultC: tierC) != tierC {
                 return (false, "unset QWISP_RAW_C must consult DeviceCalibration.defaultC()=\(tierC)")
             }
             // arbitrary tier default is honored when unset (not hard-coded to resident)
-            if SeedlessSpecRunner.resolveRawC(envC: nil, defaultC: 128) != 128 {
+            if Tell.resolveRawC(envC: nil, defaultC: 128) != 128 {
                 return (false, "unset QWISP_RAW_C must return the passed defaultC (128)")
             }
             // explicit streaming C overrides the tier default
-            if SeedlessSpecRunner.resolveRawC(envC: "64", defaultC: 256) != 64 {
+            if Tell.resolveRawC(envC: "64", defaultC: 256) != 64 {
                 return (false, "explicit QWISP_RAW_C=64 must override defaultC")
             }
             // explicit "0" (resident) overrides too (distinct from unset)
-            if SeedlessSpecRunner.resolveRawC(envC: "0", defaultC: 128) != 0 {
+            if Tell.resolveRawC(envC: "0", defaultC: 128) != 0 {
                 return (false, "explicit QWISP_RAW_C=0 must override to resident (0), not defaultC")
             }
             // live production env (raw-tests sets no QWISP_RAW_C → unset → tiered)
-            let live = SeedlessSpecRunner.resolveRawC(
+            let live = Tell.resolveRawC(
                 envC: ProcessInfo.processInfo.environment["QWISP_RAW_C"], defaultC: tierC)
             if live != tierC {
                 return (false, "live unset QWISP_RAW_C must resolve to defaultC=\(tierC), got \(live)")
@@ -3821,7 +3821,7 @@ public enum SeedlessVerifyTests {
 
 
         // Test 69 (notes/14 TODO-2): QWISP_BOLT_WORKLOAD per-workload preset (R/B).
-        // Pure function SeedlessSpecRunner.boltWorkloadPreset maps a workload name to the
+        // Pure function Tell.boltWorkloadPreset maps a workload name to the
         // proven-optimal (recalib R, refresh B). Known names get tuned values; any
         // other string ("", "longctx", unknown) falls back to the current default
         // (R=128, B=32) so QWISP_BOLT_WORKLOAD unset is byte-identical to old bolt.
@@ -3835,13 +3835,13 @@ public enum SeedlessVerifyTests {
                 ("zzz",     128, 32),   // arbitrary unknown → default
             ]
             for (w, wantR, wantB) in cases {
-                let got = SeedlessSpecRunner.boltWorkloadPreset(w)
+                let got = Tell.boltWorkloadPreset(w)
                 if got.r != wantR || got.b != wantB {
                     return (false, "workload=\(w): got (R=\(got.r), B=\(got.b)) want (R=\(wantR), B=\(wantB))")
                 }
             }
             // Empty string must also yield the default (unset-env path).
-            let empty = SeedlessSpecRunner.boltWorkloadPreset("")
+            let empty = Tell.boltWorkloadPreset("")
             if empty.r != 128 || empty.b != 32 {
                 return (false, "empty workload: got (R=\(empty.r), B=\(empty.b)) want (R=128, B=32)")
             }
@@ -3894,7 +3894,7 @@ public enum SeedlessVerifyTests {
 
         // Test 71 (notes/11 レバー② measure-first): missWeightStats — pure function.
         // bolt の cold-selection(miss)の gate-weight 分布 + top-8 内 rank 集計。
-        // Calls SeedlessSpecRunner.missWeightStats directly (no process-env / GPU dependency).
+        // Calls Tell.missWeightStats directly (no process-env / GPU dependency).
         // Hand-computed cases: 分位点 index=floor(q*(n-1)), top1Share=fraction 0..1,
         // meanMissMass = Σ(miss weight) / topInds.count(全観測数), missCount=総 miss 数。
         // RED until the stub returns real values (stub returns -1 sentinel).
@@ -3946,7 +3946,7 @@ public enum SeedlessVerifyTests {
                      p10: 0.05, p50: 0.05, p90: 0.05, top1: 0.5, mass: 0.325, misses: 2),
             ]
             for c in cases {
-                let g = SeedlessSpecRunner.missWeightStats(topInds: c.inds, topWeights: c.w, resident: c.res)
+                let g = Tell.missWeightStats(topInds: c.inds, topWeights: c.w, resident: c.res)
                 if g.missCount != c.misses {
                     return (false, "\(c.name): missCount=\(g.missCount) want \(c.misses)")
                 }
@@ -4441,7 +4441,7 @@ public enum SeedlessVerifyTests {
             return (true, "ok")
         }
 
-        // Test 76 (T-seam, ①③ Step 4): SeedlessSpecRunner.mtpDraftSpan — the D==0 draft seam.
+        // Test 76 (T-seam, ①③ Step 4): Tell.mtpDraftSpan — the D==0 draft seam.
         // (a) head nil (QWISP_MTP_DRAFT unset) → nil: the greedy path is untouched =
         //     flag-off byte-identity by construction.
         // (b) rowOfU < 0 (invalid hidden row, e.g. after a chained span) → nil.
@@ -4503,20 +4503,20 @@ public enum SeedlessVerifyTests {
             let u = 7
 
             // (a) flag-off: head nil → nil
-            if SeedlessSpecRunner.mtpDraftSpan(head: nil, hPrevBuf: hBuf, rowOfU: 2, u: u) != nil {
+            if Tell.mtpDraftSpan(head: nil, hPrevBuf: hBuf, rowOfU: 2, u: u) != nil {
                 return (false, "(a) head nil must yield nil")
             }
             // (b) invalid row → nil
-            if SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: -1, u: u) != nil {
+            if Tell.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: -1, u: u) != nil {
                 return (false, "(b) rowOfU=-1 must yield nil")
             }
             // (c) active: draft token in range, len unchanged
-            guard let d1 = SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            guard let d1 = Tell.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
             else { return (false, "(c) active span returned nil") }
             if d1 < 0 || d1 >= V { return (false, "(c) draft out of range: \(d1)") }
             if head.len != 0 { return (false, "(c) len changed through seam: \(head.len)") }
             // (d) determinism (read-only ⇒ identical repeat)
-            guard let d2 = SeedlessSpecRunner.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
+            guard let d2 = Tell.mtpDraftSpan(head: head, hPrevBuf: hBuf, rowOfU: 2, u: u)
             else { return (false, "(d) repeat span returned nil") }
             if d1 != d2 { return (false, "(d) nondeterministic: \(d1) vs \(d2)") }
 
@@ -4681,7 +4681,7 @@ public enum SeedlessVerifyTests {
         }
 
         // Test 79: seedless_config — facade tier sizing (productization step 2).
-        // Pure/GPU-free seam; mirrors SeedlessSpecRunner.run()'s tier arithmetic:
+        // Pure/GPU-free seam; mirrors Tell.run()'s tier arithmetic:
         //   maxK        = streaming ? max(4, C*3/8) : 96
         //   maxM        = max(pendingCap(24) + maxK + 1, 64)
         //   maxSeqLen   = promptLen + maxTokens + maxK + 64

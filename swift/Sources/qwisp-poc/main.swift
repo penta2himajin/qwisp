@@ -18,10 +18,10 @@ if CommandLine.arguments.contains("stream") {
 
     // Gate / bench entry points:
     //   test_raw.sh      → QWISP_RUN=raw-tests (SeedlessVerifyTests, the correctness gate)
-    //   bench_batch.sh   → QWISP_RUN=raw-spec  (SeedlessSpecRunner.run, strict/bolt)
+    //   bench_batch.sh   → QWISP_RUN=raw-spec  (Tell.run, strict/bolt)
     let runners: [(String, (String, String) throws -> String)] = [
         ("raw-tests", { _, _ in SeedlessVerifyTests.runAll() }),
-        ("raw-spec",  { try SeedlessSpecRunner.run(modelDir: $0, refPath: $1) }),
+        ("raw-spec",  { try Tell.run(modelDir: $0, refPath: $1) }),
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {
@@ -32,11 +32,11 @@ if CommandLine.arguments.contains("stream") {
         exit(0)
     }
 
-    // 既定: strict/bolt とも raw engine（SeedlessSpecRunner: resident=fused 1-CB / C<256=streaming、
+    // 既定: strict/bolt とも raw engine（Tell: resident=fused 1-CB / C<256=streaming、
     // C は QWISP_RAW_C 未指定なら RAM tier 自動）。QWISP_BOLT=1 は raw bolt(forceBolt, streaming 限定)。
     let boltDefault = env["QWISP_BOLT"] == "1"
     do {
-        print(try SeedlessSpecRunner.run(modelDir: md, refPath: mtpRef, forceBolt: boltDefault))
+        print(try Tell.run(modelDir: md, refPath: mtpRef, forceBolt: boltDefault))
     } catch { print("[\(boltDefault ? "RawBolt" : "RawSpec")] error: \(error)") }
     exit(0)
 }

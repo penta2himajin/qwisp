@@ -7,7 +7,7 @@ import Metal
 /// Full expert tensors from the store, no arena/guard/cert/VSEQ.
 /// Batched == sequential is bit-exact by construction (proven by raw-smoke U2a).
 ///
-/// Factors out model-building from RawSmokeRunner so that SeedlessSpecRunner
+/// Factors out model-building from RawSmokeRunner so that Tell
 /// and future raw-engine runners can share a single load path.
 public struct SeedlessEngine {
     public static let eps: Float         = 1e-6

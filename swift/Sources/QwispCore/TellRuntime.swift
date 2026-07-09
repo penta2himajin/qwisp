@@ -14,7 +14,7 @@ import MLXFast
 /// QWISP_RAWSPEC_CHECK=1   — also run pure sequential raw greedy and report spec-vs-greedy k/N
 /// QWISP_RAWSTREAM_CHECK=1 — (strict streaming only) compare stream output vs resident; needs ~20GB+
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
-public enum SeedlessSpecRunner {
+extension Tell {
 
     /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
     /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
@@ -938,7 +938,7 @@ public enum SeedlessSpecRunner {
         // (chain 全 step = slot 別 / verify M 行 = kE.x=M*Ktop)で全 coverage。
         // notes/14 TODO-2: QWISP_BOLT_WORKLOAD が preset (R,B) を選択。明示 env が常に上書き。
         let boltWL = Tell.envStr("QWISP_BOLT_WORKLOAD", "")
-        let preset = SeedlessSpecRunner.boltWorkloadPreset(boltWL)
+        let preset = Tell.boltWorkloadPreset(boltWL)
         let boltRecalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", preset.r)
         // notes/14 async refresh wiring (QWISP_BOLT_REFRESH_ASYNC, default 1)
         // B=32: chunk IO(~38ms@1.5GB/s)と decode の均衡 + 深さ2 pipeline で hide できる粒度。
@@ -1329,7 +1329,7 @@ public enum SeedlessSpecRunner {
                              pct(0.10), pct(0.50), pct(0.90), infN,
                              flips[0], flips[1], flips[2], flips[3]))
             }
-            let mw = SeedlessSpecRunner.missWeightStats(topInds: diagMissInds, topWeights: diagMissWeights, resident: diagMissResidents)
+            let mw = Tell.missWeightStats(topInds: diagMissInds, topWeights: diagMissWeights, resident: diagMissResidents)
             print(String(format: "[BoltDiag] missWeight p10/50/90=%.3f/%.3f/%.3f top1Share=%.1f%% missMass/token=%.3f misses=%d",
                          mw.p10, mw.p50, mw.p90, mw.top1Share * 100, mw.meanMissMass, mw.missCount))
         }

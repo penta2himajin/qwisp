@@ -6,7 +6,7 @@ import MLX
 // LLMBackend is the coarse MLX-compat surface the server swaps backends over.
 // It operates on token IDs `[Int]`; the tokenizer + chat template live ABOVE it
 // in the server layer. SeedlessBackend wraps the EXISTING shipped strict decode
-// (SeedlessSpecRunner.runSpecLoop + engine/backend builders) — it is the keep-set
+// (Tell.runSpecLoop + engine/backend builders) — it is the keep-set
 // anchor for delete-all. Bolt (runBoltMode) is entangled with measurement code
 // and stays an explicit keep-list entry until steps 3-4 thin it (see AGENTS.md /
 // HANDOFF.md).
@@ -30,9 +30,15 @@ public protocol LLMBackend {
     func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int>
 }
 
+// ponytail: SeedlessBackend is a thin LLMBackend conformer that holds the built
+// engine and delegates decode to the `Tell` runtime (Tell.runSpecLoop etc.).
+// The two layers (this + Tell) could collapse into one `final class Tell: LLMBackend`
+// (net −1 type), but only once a forcing function appears — step-5 server wiring
+// making the indirection bite, or per-instance state the static runtime can't thread.
+// Until then the split works and is gate-tested; don't restructure for tidiness.
 public final class SeedlessBackend: LLMBackend {
 
-    /// Pure, GPU-free sizing seam. Mirrors SeedlessSpecRunner.run()'s tier arithmetic so
+    /// Pure, GPU-free sizing seam. Mirrors Tell.run()'s tier arithmetic so
     /// the facade sizes the backend identically to the shipped strict path.
     struct Config: Equatable {
         var isStreaming: Bool
@@ -79,15 +85,15 @@ public final class SeedlessBackend: LLMBackend {
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
         let cfg = SeedlessBackend.config(tier: tier, promptLen: prompt.count, maxTokens: options.maxTokens)
         let promptIds = prompt.map { Int32($0) }
-        let backend: SeedlessSpecRunner.SpecBackend? = cfg.isStreaming
-            ? SeedlessSpecRunner.streamingBackend(engine: engine, modelDir: modelDir,
+        let backend: Tell.SpecBackend? = cfg.isStreaming
+            ? Tell.streamingBackend(engine: engine, modelDir: modelDir,
                                              maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen, C: cfg.c).map { $0.0 }
-            : SeedlessSpecRunner.fusedBackend(engine: engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
+            : Tell.fusedBackend(engine: engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
         // ponytail: batch-decode then replay as a stream. True incremental SSE streaming
         // (yield per accepted token) is a follow-up for when the server needs token latency
         // — runSpecLoop currently returns the full [Int], and the GPU is exclusive anyway.
         let out: [Int] = backend.flatMap {
-            SeedlessSpecRunner.runSpecLoop(promptIds: promptIds, backend: $0, engine: engine,
+            Tell.runSpecLoop(promptIds: promptIds, backend: $0, engine: engine,
                                       N: options.maxTokens, maxK: cfg.maxK)
         } ?? []
         return AsyncStream { cont in
