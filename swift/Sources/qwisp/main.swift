@@ -2,6 +2,7 @@ import Foundation
 import Hummingbird
 import Tokenizers
 import Hub
+import QwispCore
 
 // qwisp — product CLI + OpenAI-compatible server (productization step 5).
 // Scaffold: proves the dependency graph (Hummingbird + swift-transformers) resolves
@@ -15,7 +16,17 @@ switch args.first {
 case "serve":
     let port = Int(ProcessInfo.processInfo.environment["QWISP_PORT"] ?? "8080") ?? 8080
     let modelID = URL(fileURLWithPath: model).lastPathComponent
-    try await runServe(modelID: modelID, port: port)
+    let tok = try await QwispTokenizer(modelDir: model)
+    let backend: any LLMBackend
+    if ProcessInfo.processInfo.environment["QWISP_FAKE"] == "1" {
+        print("[qwisp serve] FAKE backend (no engine load) — wire-format testing only")
+        backend = FakeBackend(script: tok.encode("Hello! This is qwisp with a fake backend for wire-format testing."))
+    } else {
+        print("[qwisp serve] loading Seedless engine (loads the model) …")
+        backend = try SeedlessBackend(modelDir: model)
+    }
+    let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID)
+    try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
     print("qwisp chat — not yet implemented (step 6)")
 case "selftest":
