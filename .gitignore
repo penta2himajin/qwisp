@@ -17,3 +17,6 @@ tools/step1_routing_trace/corpora/*
 # generated measurement refs (reproduce via qwisp/bench_refs.py)
 /refs/
 .claude-glm-task.md
+
+# macOS
+.DS_Store
