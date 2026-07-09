@@ -13,7 +13,9 @@ let model = ProcessInfo.processInfo.environment["QWISP_MODEL"] ?? defaultModel
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "serve":
-    print("qwisp serve — not yet implemented (step 5c/5d)")
+    let port = Int(ProcessInfo.processInfo.environment["QWISP_PORT"] ?? "8080") ?? 8080
+    let modelID = URL(fileURLWithPath: model).lastPathComponent
+    try await runServe(modelID: modelID, port: port)
 case "chat":
     print("qwisp chat — not yet implemented (step 6)")
 case "selftest":
