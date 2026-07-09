@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # D1 TDD test runner: execute the raw-verify suite and exit nonzero on failure.
 #
-# Usage: qwisp/test_raw.sh
+# Usage: scripts/test_raw.sh
 # Env overrides (same as bench.sh):
 #   QWISP_BENCH_BIN  — path to compiled qwisp-poc binary
 #

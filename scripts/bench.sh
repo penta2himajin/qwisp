@@ -9,8 +9,8 @@
 # speed run's dumped output. (An efficiency variant folding all axes into one load would need a
 # shared-decode refactor; deferred for faithfulness.)
 #
-# Refs are generated (reproducibly) by qwisp/bench_refs.py into <repo>/refs (gitignored).
-# Usage: qwisp/bench.sh [C] [GEN] [throttle_GBs] [methods]
+# Refs are generated (reproducibly) by oracle/bench_refs.py into <repo>/refs (gitignored).
+# Usage: scripts/bench.sh [C] [GEN] [throttle_GBs] [methods]
 #   C=64 GEN=128 throttle=0 methods="suffix-spec bolt"  (defaults)
 # Env: QWISP_BENCH_MODEL, QWISP_BENCH_BIN, QWISP_BENCH_REFS, QWISP_BENCH_PY.
 set -u
@@ -23,7 +23,7 @@ C="${1:-64}"; GEN="${2:-128}"; THR="${3:-0}"; METHODS="${4:-suffix-spec bolt}"
 REGIMES="code agentic longctx shortnl"
 
 [ -x "$BIN" ] || { echo "ERROR: binary not found: $BIN"; exit 1; }
-[ -d "$REFS" ] || { echo "ERROR: refs dir not found: $REFS (run qwisp.bench_refs)"; exit 1; }
+[ -d "$REFS" ] || { echo "ERROR: refs dir not found: $REFS (run oracle.bench_refs)"; exit 1; }
 
 echo "== Qwisp bench: C=$C GEN=$GEN throttle=${THR}GB/s ($([ "$THR" = 0 ] && echo fast-SSD || echo slow-NAND)) =="
 printf '  %-12s %-8s %10s %12s  %s\n' method regime "tok/s" "fidelity" "correctness"
@@ -40,14 +40,14 @@ for m in $METHODS; do
     printf '%s\n' "$out" | grep -E 'PROMPT_TOKENS|OUT_TOKENS|BOLT_TOKENS' > "$dump"
     tokps="$(printf '%s\n' "$out" | grep -oE '[0-9.]+ tok/s' | head -1 | grep -oE '[0-9.]+')"
     # --- correctness (regime hook on the free-run output) ---
-    corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
+    corr="$("$PY" "$REPO/oracle/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
     [ -z "$corr" ] && corr="(checker error)"
     # --- fidelity ---
     if [ "$m" = suffix-spec ]; then
       # T0: strict fidelity == free-run tokens vs canonical ref (CPU compare, no 2nd model load;
       # stronger than TF: bit-verifies the actual trajectory). bolt keeps the TF pass (free-run
       # token-match is greedy-chaos, not the fidelity axis).
-      fid="$("$PY" "$REPO/qwisp/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
+      fid="$("$PY" "$REPO/oracle/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
     else
       # teacher-forced, chaos-free; throttle-independent so run unthrottled
       fout="$(QWISP_RUN=mlx-fidelity QWISP_MODEL="$MODEL" QWISP_MTP_REF="$ref" QWISP_CACHE_C="$C" \

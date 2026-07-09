@@ -1,54 +1,111 @@
 # Qwisp
 
-Apple Silicon (MLX) 上で **Qwen3.6 系 MoE モデル**を「制約デバイスでも実用速度で」動かすことを狙う、単一モデル特化ローカル推論エンジンの**調査・設計**リポジトリ。
+Fast, optionally-lossless local inference for **Qwen3.6-35B-A3B (MoE)** on Apple Silicon,
+served over an OpenAI-compatible HTTP API.
 
-antirez の [DwarfStar4 (DS4)](https://antirez.com/news/165) に着想を得つつ、方向性は逆 ―― DS4 が「巨大モデルを高メモリ機にギリ載せる」のに対し、本プロジェクトは **MoE のスパース性を活かして、より非力な Apple Silicon に reach を広げる**ことを目指す。中核アイデアは Apple の **AFM 3 Core Advanced** 戦略（大きなスパースモデルをフラッシュに常駐させ、必要なスライスだけ DRAM にロード）の自前 OSS 版。
+Qwisp is a single-model-specialised engine. Its decode core, **Seedless**, runs raw Metal
+command buffers *outside* the MLX op-graph (persistent buffers, int32 readback) to beat MLX's
+own decode path, while still using MLX as the numeric substrate (tensors, quantization, weight
+loading). The runtime that drives it is **Tell** (speculative decode, scheduling). MoE experts
+can stream from flash on RAM-constrained machines, so a 35B model reaches smaller Macs.
 
-実行時（ランタイム）は **Tell**、そのデコードエンジン（生 Metal 実装、旧 MLX）は **Seedless**。
+- **Runtime = Tell**, **engine = Seedless** (raw Metal; MLX is the substrate).
+- **Lossless option**: the strict path reproduces the quantised greedy token stream bit-for-bit.
+- **Drop-in**: OpenAI `/v1/chat/completions` (SSE) + `/v1/models`, plus a `qwisp chat` CLI.
 
-## Quickstart（server / CLI）
+## Requirements
+
+- **Apple Silicon Mac**, macOS 14+.
+- **Xcode with the Metal Toolchain** (the engine ships hand-written Metal kernels).
+- **The model** on disk — a Qwen3.6-35B-A3B MTPLX checkpoint (~20 GB). Point `QWISP_MODEL` at
+  its directory (must contain `config.json`, the `*.safetensors` shards, and `tokenizer.json` +
+  `chat_template.jinja`).
+- RAM sets the tier automatically: `<32 GB` streams experts from flash; `≥32 GB` keeps everything
+  resident (fastest decode). 16 GB is the practical floor for interactive use.
+
+## Quickstart
 
 ```bash
-# ビルド（Metal Toolchain 必須）
+# Build (Release; Metal Toolchain required; ~minutes on first build)
 cd swift && xcodebuild build -scheme qwisp -configuration Release \
   -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation
 BIN=swift/.xcode-build-rel/Build/Products/Release/qwisp
-export QWISP_MODEL=$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16
 
-# OpenAI 互換サーバ（QWISP_PORT 既定 8080）
+export QWISP_MODEL=/path/to/Qwen3.6-35B-A3B-MTPLX-…    # the model directory
+
+# OpenAI-compatible server (QWISP_PORT, default 8080)
 "$BIN" serve
-#   GET  /v1/models
-#   POST /v1/chat/completions   （stream:true で SSE、既定は非ストリーミング JSON）
 
-# CLI（in-process、stdout にストリーミング）
-"$BIN" chat "日本語で自己紹介して"
+# CLI (in-process, streams to stdout)
+"$BIN" chat "Explain MoE routing in two sentences."
 ```
 
-**サンプリングについて（重要）**: エンジンは *lossless greedy*。OpenAI リクエストの
-`temperature` / `top_p` / `n` は**受理するが無視**する（決定的・greedy 出力）。指定されると
-レスポンスに `x-qwisp-warning: sampling params ignored (greedy/lossless engine)` ヘッダが付き、
-`serve` 起動時にもその旨を表示する。tools / logprobs / n>1 は未対応。
+Talk to the server with any OpenAI client:
 
-## ターゲット
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwisp","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
 
-- **プラットフォーム**：Apple Silicon のみ、MLX ベース（llama.cpp ではなく MLX を出発点にする）
-- **モデル**：主 = Qwen3.6-35B-A3B (MoE, 35B total / 3B active)、従 = Qwen3.6-27B (dense)
-- **名前の由来**：**Qwen** + **wisp**（鬼火・小さな霊）。Qwen に紐づけつつ、軽量フットプリントで小さく速く働く助っ人。
+## API
 
-## ドキュメント
+| Endpoint | Notes |
+|---|---|
+| `GET /v1/models` | Lists the loaded model (id = model folder name). |
+| `POST /v1/chat/completions` | `stream:true` → SSE (`chat.completion.chunk`); otherwise a `chat.completion` JSON with `usage`. |
 
-| ファイル | 内容 |
-| --- | --- |
-| [`docs/00-overview.md`](docs/00-overview.md) | 基本方針・全体像・過拘束の認識 |
-| [`docs/01-research-notes.md`](docs/01-research-notes.md) | AFM 3 Core Advanced と関連研究（フラッシュ常駐／MoE offloading） |
-| [`docs/02-roadmap.md`](docs/02-roadmap.md) | 着手手順（Step 1–4）と go/no-go ゲート |
-| [`docs/03-conversation-log.md`](docs/03-conversation-log.md) | 設計に至る議論の記録 |
-| [`docs/04-benchmark-selection.md`](docs/04-benchmark-selection.md) | Step1 プロンプトのベンチ由来化（SWE-bench/BFCL/RULER 等） |
-| [`docs/05-go-no-go-first-read.md`](docs/05-go-no-go-first-read.md) | go/no-go 初回実測（GREEN、実 flash 帯域較正） |
-| [`docs/06-step4-poc.md`](docs/06-step4-poc.md) | Step4 PoC（expert streaming bit一致）・MTP×streaming・アーキ決定 |
-| [`docs/07-positioning.md`](docs/07-positioning.md) | ポジショニング（SwiftLM 比較）・哲学・4つ組・v0.1 計画 |
+**Sampling is ignored — the engine is lossless greedy.** `temperature` / `top_p` / `n` are
+accepted but have no effect (output is deterministic). When any are supplied, the response carries
+an `x-qwisp-warning: sampling params ignored (greedy/lossless engine)` header, and `serve` logs the
+same at startup. `tools`, `logprobs`, and `n > 1` are not supported.
 
-## ステータス / ライセンス
+## Architecture
 
-- Visibility: **Private**（公開したくなったら GitHub 側でフラグ切替）
-- License: 未定
+```
+OpenAI HTTP  (Hummingbird)          swift/Sources/qwisp/        ← server + CLI + tokenizer
+   │  messages ⇄ token ids  (swift-transformers Tokenizer + Qwen chat_template)
+   ▼
+LLMBackend  ── SeedlessBackend      swift/Sources/QwispCore/    ← the shipped engine
+   │  [Int] prompt → AsyncStream<Int>
+   ▼
+Tell (runtime)  ──▶  Seedless (engine, raw Metal)   ── MLX (tensors / quant / mmap loader)
+```
+
+The tokenizer and chat template are a **server-layer** concern; the backend operates purely on
+token ids. Design rationale for the engine lives in `notes/`, which the source comments reference
+by number (e.g. `notes/10`).
+
+## Development
+
+```bash
+# Correctness / regression gates:
+scripts/test_raw.sh          # RAWTESTS 79/79  — engine unit tests (GPU, no model needed)
+scripts/test_bench_batch.sh  # BENCHBATCHTEST  — bench-harness fixture (no GPU)
+scripts/test_tokenizer.sh    # TOKTEST 3/3     — tokenizer round-trip + chat template (needs model)
+scripts/test_completion.sh   # COMPTEST 4/4    — completion core, fake backend (needs model tokenizer)
+```
+
+`oracle/` holds the Python **reference oracle** (bit-exact comparison + benchmark prompts/refs).
+It is used only to validate the engine, never on the serving path, and needs an MLX-capable Python
+environment plus the model — see `oracle/README.md`.
+
+The dev conventions (TDD, commit style, the lossless doctrine, the frozen shipped path) are in
+[`AGENTS.md`](AGENTS.md).
+
+## Layout
+
+```
+swift/            # the product — Swift package
+  Sources/QwispCore/   Tell runtime + Seedless engine (+ locked engine tests)
+  Sources/qwisp/       OpenAI server + `qwisp chat` CLI + tokenizer
+  Sources/qwisp-poc/   bench/gate binary (RAWTESTS / bench harness)
+scripts/          # shell gate + benchmark scripts
+oracle/           # Python reference oracle (bit-compare; needs MLX python + model)
+notes/            # engine design rationale (referenced from source comments)
+docs/             # process docs (handoff protocol, i18n policy)
+```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

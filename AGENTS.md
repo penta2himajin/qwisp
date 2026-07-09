@@ -10,7 +10,7 @@ readback) that runs *outside* the MLX op-graph, peer to "MLX" as a backend.
 
 Positioning: fastest practical-accuracy local LLM for power-users + researchers, with
 **bit-exact lossless** (strict L1: reproduces the quantised greedy token stream) exposed as an
-option. See @docs/07-positioning.md.
+option. See @README.md.
 
 > **Status: productization.** The research phase is closed and the engine is frozen. Work is
 > converging the ~29K-line research PoC into a shippable OpenAI-compatible local server. Volatile
@@ -19,14 +19,15 @@ option. See @docs/07-positioning.md.
 ## Project Structure
 
 ```
-swift/            # Swift engine + product surface (the shipped path)
-  Sources/QwispCore/    # Seedless engine: raw-Metal forward, expert arena/streaming, spec-verify
-  Sources/qwisp-poc/    # runner CLI (research runners — most are delete candidates this campaign)
-qwisp/            # Python reference/bench oracle (bit-compare only; NEVER in the serving path)
-docs/             # design docs (00–), positioning, handoff-protocol, i18n-policy
-notes/            # engineering specs / verdicts (volatile working notes)
+swift/            # the product — Swift package
+  Sources/QwispCore/    # Tell runtime + Seedless engine (raw-Metal forward, arena/streaming, spec-verify) + locked tests
+  Sources/qwisp/        # OpenAI server + `qwisp chat` CLI + tokenizer (swift-transformers)
+  Sources/qwisp-poc/    # bench/gate binary (RAWTESTS + bench harness)
+scripts/          # shell gate + benchmark scripts
+oracle/           # Python reference/bench oracle (bit-compare only; NEVER in the serving path)
+notes/            # engine design rationale (referenced by number from source comments)
+docs/             # process docs (handoff-protocol, i18n-policy)
 refs/             # canonical measurement refs (raw-greedy) — GITIGNORED, regenerate locally
-tools/            # routing-trace / benchmark tooling
 ```
 
 The boundary that matters: **Swift = product + engine; Python = reference oracle only.** The
@@ -37,21 +38,24 @@ cannot cheaply reach.
 
 - **Xcode + Metal Toolchain** required (raw-Metal kernels). SourceKit shows "No such module 'MLX'"
   on QwispCore files — LSP-only noise; `xcodebuild` is the truth.
-- Model: `Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16` under `~/.mtplx/models/`.
-- Python reference uses the MTPLX runtime-venv python (has numpy/safetensors); Homebrew python3
-  does not. Path is recorded in `HANDOFF.md` → Commands.
+- Model: a Qwen3.6-35B-A3B MTPLX checkpoint; point `QWISP_MODEL` at its directory.
+- Python reference oracle needs an MLX-capable python (numpy/safetensors/mlx_lm), not Homebrew
+  python3 — see `oracle/README.md`.
 
 ## Build & Test
 
 ```bash
 # build (Release; Metal Toolchain required; ~minutes)
-cd swift && xcodebuild build -scheme qwisp-poc -configuration Release \
+#   scheme `qwisp` = product (server + CLI) ; scheme `qwisp-poc` = bench/gate binary
+cd swift && xcodebuild build -scheme qwisp -configuration Release \
   -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel \
   -skipPackagePluginValidation
 
-# correctness gate (must stay green through every commit)
-qwisp/test_raw.sh          # → RAWTESTS 78/78
-qwisp/test_bench_batch.sh  # → BENCHBATCHTEST PASS (fixture, no GPU)
+# correctness gates (must stay green through every commit)
+scripts/test_raw.sh          # → RAWTESTS 79/79     (engine, GPU, no model)
+scripts/test_bench_batch.sh  # → BENCHBATCHTEST PASS (fixture, no GPU)
+scripts/test_tokenizer.sh    # → TOKTEST 3/3        (needs model tokenizer files)
+scripts/test_completion.sh   # → COMPTEST 4/4       (needs model tokenizer files)
 ```
 
 `refs/*.safetensors` are gitignored. A fresh checkout / `git clean` loses them and makes the

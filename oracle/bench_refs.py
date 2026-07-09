@@ -1,6 +1,6 @@
 """Generate the Qwisp measurement ref set (code/agentic/longctx/shortnl) in ONE model load.
 
-Reproducible: prompts live in qwisp/bench_prompts.py (committed). Generated refs are written to
+Reproducible: prompts live in oracle/bench_prompts.py (committed). Generated refs are written to
 <repo>/refs/<regime>.safetensors (gitignored — regenerate with this script, do not commit).
 
 Each ref stores {spec_prompt, spec_greedy}. This is what the Swift runners (suffix-spec / bolt)
@@ -18,12 +18,12 @@ whenever the shipping engine or its shapes change.
 After generating, replace spec_greedy via --ingest-swift with a raw-spec dump:
   QWISP_RUN=raw-spec QWISP_RAW_C=0 QWISP_GEN=128 QWISP_DUMP_TOKENS=1 QWISP_MODEL=... \
     QWISP_MTP_REF=<repo>/refs/code.safetensors qwisp-poc stream > /tmp/code.toks
-  PYTHONPATH=<repo> "$PY" -m qwisp.bench_refs --ingest-swift code /tmp/code.toks
+  PYTHONPATH=<repo> "$PY" -m oracle.bench_refs --ingest-swift code /tmp/code.toks
   (legacy MLX canonical: QWISP_RUN=suffix-spec OUT_TOKENS / QWISP_RUN=bolt STRICT_TOKENS dumps)
 
 Run (MTPLX runtime venv has mlx_lm):
   PY="$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python3"
-  PYTHONPATH=<repo> "$PY" -m qwisp.bench_refs <model_dir> [--nspec 128]
+  PYTHONPATH=<repo> "$PY" -m oracle.bench_refs <model_dir> [--nspec 128]
 """
 from __future__ import annotations
 import argparse
@@ -31,8 +31,8 @@ import os
 
 import mlx.core as mx
 from mlx_lm import load
-import qwisp.mtp_decode as MD
-from qwisp.bench_prompts import PROMPTS
+import oracle.mtp_decode as MD
+from oracle.bench_prompts import PROMPTS
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(REPO_ROOT, "refs")

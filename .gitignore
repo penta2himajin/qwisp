@@ -8,11 +8,8 @@ traces*.jsonl
 results*.json
 
 # ベンチ由来の生成プロンプト（manifest+lock で再現可能・データ再配布回避）
-tools/step1_routing_trace/prompts.bench.jsonl
 
 # 長文脈の実素材（各自のコード/ログ）— README だけ追跡
-tools/step1_routing_trace/corpora/*
-!tools/step1_routing_trace/corpora/README.md
 
 # generated measurement refs (reproduce via qwisp/bench_refs.py)
 /refs/

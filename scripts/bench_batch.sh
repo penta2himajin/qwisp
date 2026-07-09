@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwisp measurement bench — SINGLE-PROCESS batch variant (T1). Same CLI + same human-readable
-# output table/footer as qwisp/bench.sh, but ONE binary invocation total for non-bolt methods:
+# output table/footer as scripts/bench.sh, but ONE binary invocation total for non-bolt methods:
 # the in-process batch runner (QWISP_RUN=bench-batch, swift TellBench.swift) loops methods ×
 # regimes with a single model load (vs 8-12 loads for bench.sh), resetting all engine state per
 # cell (cold-start equivalent; OS page-cache warmth is identical to the multi-process bench).
@@ -15,8 +15,8 @@
 #                bolt: [RawSpec] bolt TF fidelity vs strict-canonical: <a>/<b>=<Z>% (chaos-free)
 #   correctness  bench_correctness.py on the cell's dumped PROMPT/OUT/BOLT token lines
 #
-# Refs are generated (reproducibly) by qwisp/bench_refs.py into <repo>/refs (gitignored).
-# Usage: qwisp/bench_batch.sh [C] [GEN] [throttle_GBs] [methods]
+# Refs are generated (reproducibly) by oracle/bench_refs.py into <repo>/refs (gitignored).
+# Usage: scripts/bench_batch.sh [C] [GEN] [throttle_GBs] [methods]
 #   C=64 GEN=128 throttle=0 methods="suffix-spec bolt"  (defaults)
 # Env: QWISP_BENCH_MODEL, QWISP_BENCH_BIN, QWISP_BENCH_REFS, QWISP_BENCH_PY.
 #      QWISP_THROTTLE_DEFER=1 (T2) defers the SSD throttle to decode start (~2x faster slow-NAND
@@ -33,7 +33,7 @@ C="${1:-64}"; GEN="${2:-128}"; THR="${3:-0}"; METHODS="${4:-suffix-spec bolt}"
 REGIMES="code agentic longctx shortnl"
 
 [ -x "$BIN" ] || { echo "ERROR: binary not found: $BIN"; exit 1; }
-[ -d "$REFS" ] || { echo "ERROR: refs dir not found: $REFS (run qwisp.bench_refs)"; exit 1; }
+[ -d "$REFS" ] || { echo "ERROR: refs dir not found: $REFS (run oracle.bench_refs)"; exit 1; }
 
 echo "== Qwisp bench: C=$C GEN=$GEN throttle=${THR}GB/s ($([ "$THR" = 0 ] && echo fast-SSD || echo slow-NAND)) =="
 printf '  %-12s %-8s %10s %12s  %s\n' method regime "tok/s" "fidelity" "correctness"
@@ -77,7 +77,7 @@ for m in $METHODS; do
       fid="$(printf '%s\n' "$raw_out" \
         | grep '\[RawSpec\] bolt TF fidelity' | head -1 \
         | grep -oE '[0-9.]+%' | tail -1)"
-      corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
+      corr="$("$PY" "$REPO/oracle/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
       [ -z "$corr" ] && corr="(checker error)"
       rm -f "$dump"
     elif [ "$m" = suffix-spec ]; then
@@ -94,8 +94,8 @@ for m in $METHODS; do
         | grep '\[RawSpec\] raw engine(' | head -1 \
         | sed 's/.*): *\([0-9.]*\) tok\/s.*/\1/')"
       # T0 strict fidelity: free-run tokens vs canonical ref (same axis as the old in-process cell)
-      fid="$("$PY" "$REPO/qwisp/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
-      corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
+      fid="$("$PY" "$REPO/oracle/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
+      corr="$("$PY" "$REPO/oracle/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
       [ -z "$corr" ] && corr="(checker error)"
       rm -f "$dump"
     else
@@ -106,12 +106,12 @@ for m in $METHODS; do
       dump="$(mktemp)"
       printf '%s\n' "$cell" | grep -E 'PROMPT_TOKENS|OUT_TOKENS|BOLT_TOKENS' > "$dump"
       tokps="$(printf '%s\n' "$cell" | grep '^BENCH|' | head -1 | sed 's/.*tokps=//')"
-      corr="$("$PY" "$REPO/qwisp/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
+      corr="$("$PY" "$REPO/oracle/bench_correctness.py" "$r" "$MODEL" "$dump" 2>/dev/null)"
       [ -z "$corr" ] && corr="(checker error)"
       # T0: strict fidelity == free-run tokens vs canonical ref (CPU compare, no 2nd model load;
       # stronger than TF: bit-verifies the actual trajectory). bolt uses TF (free-run token-match
       # is greedy-chaos, not the fidelity axis).
-      fid="$("$PY" "$REPO/qwisp/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
+      fid="$("$PY" "$REPO/oracle/bench_tokcmp.py" "$ref" "$dump" 2>/dev/null | grep -oE '[0-9.]+%$')"
       rm -f "$dump"
     fi
 
