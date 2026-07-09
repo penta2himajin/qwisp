@@ -89,38 +89,3 @@ public final class MTPHead {
         return (head.apply(normed), x)
     }
 }
-
-public enum MTPHeadValidation {
-    public static func run(modelDir: String, refPath: String) throws -> String {
-        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        guard let hidden = r["hidden"], let tok = r["tok"], let expDraft = r["draft"],
-              let loHi = r["lo_hi"], let target = r["target"] else {
-            return "ERROR: mtp ref 不足"
-        }
-        let store = try WeightStore(modelDir: modelDir)
-        store.residentNonExperts()
-        let head = try MTPHead(modelDir: modelDir, store: store)
-
-        let L = hidden.dim(0)
-        let hPrev = hidden.reshaped([1, L, hidden.dim(1)])
-        let tokIn = tok.reshaped([1, L])
-        let logits = head(hPrev, tokIn)
-        let draft = MLX.argMax(logits[0], axis: -1).asType(.int32)   // [L]
-        draft.eval()
-
-        // 全位置で Python の draft argmax と一致するか
-        let lh = loHi.asArray(Int32.self); let lo = Int(lh[0]); let hi = Int(lh[1])
-        let dSwift = draft.asArray(Int32.self)
-        let dRef = expDraft.asArray(Int32.self)
-        var argmaxMatch = 0
-        for i in 0 ..< L where dSwift[i] == dRef[i] { argmaxMatch += 1 }
-        // eval 窓の acceptance（Swift draft vs target）
-        let tgt = target.asArray(Int32.self)
-        var acc = 0
-        for (j, i) in (lo ..< hi).enumerated() where j < tgt.count && dSwift[i] == tgt[j] { acc += 1 }
-        let accRate = Double(acc) / Double(hi - lo)
-        let ok = argmaxMatch == L
-        return String(format: "[M2c] MTP head: draft argmax %d/%d %@  acceptance=%.3f (Python 0.952)",
-                      argmaxMatch, L, ok ? "OK ✅ Python一致" : "MISMATCH ❌", accRate)
-    }
-}

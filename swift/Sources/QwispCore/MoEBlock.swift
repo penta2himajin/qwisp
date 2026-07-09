@@ -96,34 +96,3 @@ public struct MoEBlock {
         return y + gateScale * sharedY
     }
 }
-
-public enum MoEBlockValidation {
-    public static func run(refPath: String) throws -> String {
-        let r = try loadArrays(url: URL(fileURLWithPath: refPath))
-        func q8(_ n: String) -> Proj {
-            .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 8)
-        }
-        func q4(_ n: String) -> Proj {
-            .quantized(r["\(n).weight"]!, r["\(n).scales"]!, r["\(n).biases"]!, 4)
-        }
-        guard let x = r["x"], let expY = r["y"] else { return "ERROR: real-moe ref 不足" }
-        let blk = MoEBlock(
-            topK: 8, numExperts: 256, normTopk: true, expertBits: 4,
-            gate: q8("gate"),
-            swGateW: r["switch_mlp.gate_proj.weight"]!, swGateS: r["switch_mlp.gate_proj.scales"]!,
-            swGateB: r["switch_mlp.gate_proj.biases"]!,
-            swUpW: r["switch_mlp.up_proj.weight"]!, swUpS: r["switch_mlp.up_proj.scales"]!,
-            swUpB: r["switch_mlp.up_proj.biases"]!,
-            swDownW: r["switch_mlp.down_proj.weight"]!, swDownS: r["switch_mlp.down_proj.scales"]!,
-            swDownB: r["switch_mlp.down_proj.biases"]!,
-            shGate: q4("shared_expert.gate_proj"), shUp: q4("shared_expert.up_proj"),
-            shDown: q4("shared_expert.down_proj"), sharedGate: q8("shared_expert_gate"))
-        let y = blk(x)
-        y.eval()
-        let d = MLX.max(MLX.abs(y - expY)).item(Float.self)
-            / (MLX.max(MLX.abs(expY)).item(Float.self) + 1e-9)
-        let ok = d < 2e-3
-        return String(format: "[M2b-3] 実 MoE block(gate8/switch4/shared4): y_rel=%.2e  %@",
-                      d, ok ? "OK ✅ 実重み一致" : "MISMATCH ❌")
-    }
-}
