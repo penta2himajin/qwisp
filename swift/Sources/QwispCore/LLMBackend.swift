@@ -91,7 +91,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
         let cfg = SeedlessBackend.config(tier: tier, promptLen: prompt.count, maxTokens: options.maxTokens)
         let promptIds = prompt.map { Int32($0) }
+        let cancel = CancelFlag()
         return AsyncStream { continuation in
+            // Consumer dropped the stream (early stop token / maxTokens / client disconnect)
+            // → cancel the detached decode so it stops at the next spec-step boundary instead
+            // of running to maxTokens on the GPU. Without this the orphaned thread keeps the
+            // (exclusive) GPU busy and the next request's decode overlaps it.
+            continuation.onTermination = { _ in cancel.cancel() }
             // The decode loop is synchronous + GPU-bound. Run it off the caller's task and
             // yield each accepted token as it lands (true incremental streaming). The spec
             // backend is built INSIDE the thread so no non-Sendable state is captured;
@@ -105,11 +111,21 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
                 guard let sb = specBackend else { continuation.finish(); return }
                 _ = Tell.runSpecLoop(promptIds: promptIds, backend: sb, engine: self.engine,
-                                     N: options.maxTokens, maxK: cfg.maxK) { tok in
+                                     N: options.maxTokens, maxK: cfg.maxK,
+                                     isCancelled: { cancel.isCancelled }) { tok in
                     continuation.yield(tok)
                 }
                 continuation.finish()
             }
         }
     }
+}
+
+/// Thread-safe one-shot cancellation flag: set from the AsyncStream consumer side
+/// (onTermination), polled from the detached decode thread. NSLock keeps it boring.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    func cancel() { lock.lock(); flag = true; lock.unlock() }
 }
