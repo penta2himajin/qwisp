@@ -70,6 +70,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     let sp2 = splitThink("still thinking")
     check("think_no_close_all_reasoning", sp2.reasoning == "still thinking" && sp2.content == "")
 
+    // 8+. tool-call parsing (pure; Qwen3.6 <tool_call> → OpenAI tool_calls).
+    for (name, ok) in ToolParse.selfCheck() { check("tool_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 

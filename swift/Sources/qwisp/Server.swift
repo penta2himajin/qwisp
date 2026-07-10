@@ -70,8 +70,8 @@ final class QwispEngine: @unchecked Sendable {
     }
 
     private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int]) {
-        let msgs = req.messages.map { ["role": $0.role, "content": $0.content] }
-        let ids = try tokenizer.render(messages: msgs)
+        let msgs = req.messages.map { $0.renderDict }
+        let ids = try tokenizer.render(messages: msgs, tools: req.tools?.map { $0.spec })
         return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds)   // omitted → until EOS/context
     }
 
@@ -87,12 +87,15 @@ final class QwispEngine: @unchecked Sendable {
                                     logitBias: s.logitBias) { _ in }
         await lock.release()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
-        let (reasoning, content) = splitThink(r.text)
+        let (reasoning, afterThink) = splitThink(r.text)
+        let (content, toolCalls) = ToolParse.parse(afterThink)
+        let finish = toolCalls.isEmpty ? r.finishReason : "tool_calls"
         return ChatCompletionResponse(
             id: id, created: Int(Date().timeIntervalSince1970), model: modelID,
             choices: [Choice(index: 0, message: ResponseMessage(role: "assistant", content: content,
-                                                                reasoning_content: reasoning.isEmpty ? nil : reasoning),
-                             finish_reason: r.finishReason)],
+                                                                reasoning_content: reasoning.isEmpty ? nil : reasoning,
+                                                                tool_calls: toolCalls.isEmpty ? nil : toolCalls),
+                             finish_reason: finish)],
             usage: Usage(prompt_tokens: p.ids.count, completion_tokens: r.completionTokens,
                          total_tokens: p.ids.count + r.completionTokens))
     }
@@ -125,15 +128,23 @@ final class QwispEngine: @unchecked Sendable {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
             // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
-            let (r, c) = splitThink(tokenizer.decode(outIds))
+            let (r, afterThink) = splitThink(tokenizer.decode(outIds))
             if r.count > sentR.count, r.hasPrefix(sentR) {
                 try await send(Delta(reasoning_content: String(r.dropFirst(sentR.count))), nil); sentR = r
             }
-            if c.count > sentC.count, c.hasPrefix(sentC) {
-                try await send(Delta(content: String(c.dropFirst(sentC.count))), nil); sentC = c
+            // Stream only the answer text before any <tool_call>; the call XML is buffered, not shown.
+            let visible = afterThink.range(of: "<tool_call>").map { String(afterThink[..<$0.lowerBound]) } ?? afterThink
+            if visible.count > sentC.count, visible.hasPrefix(sentC) {
+                try await send(Delta(content: String(visible.dropFirst(sentC.count))), nil); sentC = visible
             }
             if p.maxTokens >= 0 && outIds.count >= p.maxTokens { finish = "length"; break }  // <0 = until EOS/context
         }
+        // Buffered tool calls: parse the completed output and emit them as tool_calls deltas.
+        let (_, toolCalls) = ToolParse.parse(splitThink(tokenizer.decode(outIds)).content)
+        for (i, tc) in toolCalls.enumerated() {
+            try await send(Delta(tool_calls: [ToolCallDelta(index: i, id: tc.id, type: "function", function: tc.function)]), nil)
+        }
+        if !toolCalls.isEmpty { finish = "tool_calls" }
         try await send(Delta(), finish)
         try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
     }

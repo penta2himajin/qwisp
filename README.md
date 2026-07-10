@@ -68,7 +68,12 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 `frequency_penalty`, `presence_penalty`, and `logit_bias` all take effect — via speculative
 sampling on the GPU, at near-greedy speed. `temperature: 0` (the default) stays deterministic and
 bit-exact to the strict greedy path. `n > 1` is ignored (single completion) and sets an
-`x-qwisp-warning` header; `tools` and `logprobs` are not supported.
+`x-qwisp-warning` header; `logprobs` is not supported.
+
+**Function calling is supported.** Pass `tools` (OpenAI function specs); the model's calls come
+back as `tool_calls` with `finish_reason: "tool_calls"`, and `role: "tool"` results feed back for
+the next turn — so agentic clients work. Parameter values are coerced to JSON scalars best-effort;
+streaming emits `tool_calls` once the call is complete (not token-incremental).
 
 **Reasoning is separated.** Qwen3.6 thinks before answering; qwisp splits that out so `content`
 is the clean answer and the thinking goes to `reasoning_content` (`delta.reasoning_content` when
