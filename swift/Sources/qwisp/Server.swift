@@ -87,9 +87,11 @@ final class QwispEngine: @unchecked Sendable {
                                     logitBias: s.logitBias) { _ in }
         await lock.release()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
+        let (reasoning, content) = splitThink(r.text)
         return ChatCompletionResponse(
             id: id, created: Int(Date().timeIntervalSince1970), model: modelID,
-            choices: [Choice(index: 0, message: ResponseMessage(role: "assistant", content: r.text),
+            choices: [Choice(index: 0, message: ResponseMessage(role: "assistant", content: content,
+                                                                reasoning_content: reasoning.isEmpty ? nil : reasoning),
                              finish_reason: r.finishReason)],
             usage: Usage(prompt_tokens: p.ids.count, completion_tokens: r.completionTokens,
                          total_tokens: p.ids.count + r.completionTokens))
@@ -112,8 +114,8 @@ final class QwispEngine: @unchecked Sendable {
         await lock.acquire()
         defer { Task { await lock.release() } }
 
-        try await send(Delta(role: "assistant", content: nil), nil)
-        var outIds: [Int] = [], emitted = "", finish = "stop"
+        try await send(Delta(role: "assistant"), nil)
+        var outIds: [Int] = [], sentR = "", sentC = "", finish = "stop"
         let s = sampling(req)
         let opts = GenerateOptions(maxTokens: p.maxTokens, stopTokens: p.stop,
                                    temperature: s.temperature, topP: s.topP, seed: s.seed,
@@ -122,13 +124,17 @@ final class QwispEngine: @unchecked Sendable {
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
-            let full = tokenizer.decode(outIds)
-            let d = full.hasPrefix(emitted) ? String(full[emitted.endIndex...]) : full
-            emitted = full
-            if !d.isEmpty { try await send(Delta(role: nil, content: d), nil) }
+            // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
+            let (r, c) = splitThink(tokenizer.decode(outIds))
+            if r.count > sentR.count, r.hasPrefix(sentR) {
+                try await send(Delta(reasoning_content: String(r.dropFirst(sentR.count))), nil); sentR = r
+            }
+            if c.count > sentC.count, c.hasPrefix(sentC) {
+                try await send(Delta(content: String(c.dropFirst(sentC.count))), nil); sentC = c
+            }
             if p.maxTokens >= 0 && outIds.count >= p.maxTokens { finish = "length"; break }  // <0 = until EOS/context
         }
-        try await send(Delta(role: nil, content: nil), finish)
+        try await send(Delta(), finish)
         try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
     }
 }

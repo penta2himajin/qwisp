@@ -27,8 +27,19 @@ struct ChatCompletionRequest: Codable {
     let logit_bias: [String: Double]?   // OpenAI: token-id string → bias
 }
 
+// Qwen3.6 is a reasoning model: the chat template injects `<think>` into the generation prompt,
+// so the model emits `[reasoning]</think>[answer]`. Split that so `content` is the clean answer
+// and the thinking goes to `reasoning_content` (DeepSeek convention) instead of leaking into
+// `content`. There is no plain-content phase before `</think>`, so an output that hasn't produced
+// `</think>` yet is treated as all-reasoning (empty content).
+func splitThink(_ s: String) -> (reasoning: String, content: String) {
+    guard let r = s.range(of: "</think>") else { return (s, "") }
+    let content = String(s[r.upperBound...]).drop(while: { $0 == "\n" })
+    return (String(s[..<r.lowerBound]), String(content))
+}
+
 // ── Response (non-streaming) ─────────────────────────────────────────────────
-struct ResponseMessage: Codable { let role: String; let content: String }
+struct ResponseMessage: Codable { let role: String; let content: String; var reasoning_content: String? = nil }
 struct Choice: Codable { let index: Int; let message: ResponseMessage; let finish_reason: String }
 struct Usage: Codable { let prompt_tokens: Int; let completion_tokens: Int; let total_tokens: Int }
 struct ChatCompletionResponse: Codable {
@@ -41,7 +52,7 @@ struct ChatCompletionResponse: Codable {
 }
 
 // ── Response (streaming chunk) ───────────────────────────────────────────────
-struct Delta: Codable { var role: String?; var content: String? }
+struct Delta: Codable { var role: String? = nil; var content: String? = nil; var reasoning_content: String? = nil }
 struct ChunkChoice: Codable { let index: Int; let delta: Delta; let finish_reason: String? }
 struct ChatCompletionChunk: Codable {
     let id: String
@@ -58,12 +69,22 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
     let promptIds: [Int]
     do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]]) }
     catch { fputs("chat: render error: \(error)\n", stderr); return }
+    // Route the reasoning to stderr and the answer to stdout, so `qwisp chat … > file` captures
+    // only the answer while the thinking still streams to the terminal.
+    var full = "", sentR = "", sentC = ""
     _ = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
                             decode: { tokenizer.decode($0) }, backend: backend,
                             temperature: temperature, topP: topP, seed: seed,
                             frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
                             logitBias: logitBias) { delta in
-        fputs(delta, stdout); fflush(stdout)   // real-time token output
+        full += delta
+        let (r, c) = splitThink(full)
+        if r.count > sentR.count, r.hasPrefix(sentR) {
+            FileHandle.standardError.write(Data(String(r.dropFirst(sentR.count)).utf8)); sentR = r
+        }
+        if c.count > sentC.count, c.hasPrefix(sentC) {
+            fputs(String(c.dropFirst(sentC.count)), stdout); fflush(stdout); sentC = c
+        }
     }
     fputs("\n", stdout)
 }

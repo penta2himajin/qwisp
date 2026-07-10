@@ -63,6 +63,13 @@ func runCompletionSelftest(modelDir: String) async -> String {
                                  decode: decode, backend: FakeBackend(script: helloIds)) { streamed += $0 }
     check("delta_concat", streamed == r4.text && !streamed.isEmpty)
 
+    // 5-7. splitThink: reasoning/content separation (pure; Qwen3.6 <think> handling).
+    let sp = splitThink("weighing options</think>\n\nThe answer is 42.")
+    check("think_split_content", sp.content == "The answer is 42.")
+    check("think_split_reasoning", sp.reasoning == "weighing options")
+    let sp2 = splitThink("still thinking")
+    check("think_no_close_all_reasoning", sp2.reasoning == "still thinking" && sp2.content == "")
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
