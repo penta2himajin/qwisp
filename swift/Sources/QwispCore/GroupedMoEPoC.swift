@@ -610,4 +610,132 @@ public enum GroupedMoEPoC {
         out.append("DENSEBENCH done")
         return out.joined(separator: "\n")
     }
+
+    // steel-route-bench: (1) MLX steel dense speed at prefill shapes (vs recorded scalar qmv
+    // baselines from dense-tiled-bench), (2) steel GATHER via CSR tiling — rows sorted by expert
+    // into fixed R=16 tiles (pad w/ zeros) so the inner matmul is M=16 => gather_qmm_t (matrix
+    // units) instead of production-shape gather_qmv (inner M=1), (3) tile-composition invariance
+    // (a row's output must not depend on which rows/pads share its tile), (4) MLX eval launch
+    // overhead (the raw-CB<->MLX sync cost per hybrid boundary).
+    public static func steelRouteBench() -> String {
+        var out = ["[steel-route] MLX steel dense + CSR-tiled steel gather"]
+        var rng = LCG(s: 99)
+        func randX(_ rows: Int, _ K: Int) -> MLXArray {
+            let a = (0..<(rows*K)).map { _ in Float16(Double(rng.next() % 2000) / 1000.0 - 1.0) }
+            return MLXArray(a, [rows, K])
+        }
+        func timeEval(_ iters: Int, _ f: () -> MLXArray) -> Double {
+            var best = Double.infinity
+            for _ in 0..<2 {
+                let t0 = Date()
+                for _ in 0..<iters { let y = f(); y.eval() }
+                best = Swift.min(best, Date().timeIntervalSince(t0) * 1000.0 / Double(iters))
+            }
+            return best
+        }
+        // ── (1) dense steel vs recorded scalar baselines ──
+        let scalarMs: [String: [Int: Double]] = [
+            "inproj 2048→12352": [64: 1.88, 256: 7.51, 1024: 30.03],
+            "qkv    2048→5120":  [64: 0.77, 256: 3.15, 1024: 12.39],
+            "shared 2048→512":   [64: 0.08, 256: 0.31, 1024: 1.24],
+            "d/out   512→2048":  [64: 0.11, 256: 0.42, 1024: 1.67]]
+        for (label, K, N) in [("inproj 2048→12352", 2048, 12352), ("qkv    2048→5120", 2048, 5120),
+                              ("shared 2048→512", 2048, 512), ("d/out   512→2048", 512, 2048)] {
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return "[steel-route] biases nil" }
+            MLX.eval([wq, sc, bi])
+            var line = "  \(label): "
+            for M in [64, 256, 1024] {
+                let x = randX(M, K); x.eval()
+                _ = timeEval(3) { MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4) }
+                let t = timeEval(10) { MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4) }
+                let base = scalarMs[label]?[M] ?? 0
+                line += String(format: "M%d %.2fms(%.1fx)  ", M, t, base / t)
+            }
+            out.append(line)
+        }
+        // ── (2)(3) steel gather via CSR R=16 tiles ──
+        let E = 256, Ktop = 8, K = 2048, N = 512, R = 16
+        let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+        let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+        guard let bi = biOpt else { return "[steel-route] gw nil" }
+        MLX.eval([wq, sc, bi])
+        out.append("  ── gather K=2048→N=512, E=256, top-8, R=16 tiles ──")
+        for T in [64, 256, 1024] {
+            var inds = [Int32]()
+            for _ in 0..<T { var s = Set<Int32>(); while s.count < Ktop { s.insert(Int32(rng.next() % UInt64(E))) }; inds.append(contentsOf: s.sorted()) }
+            let x = randX(T, K); x.eval()
+            let indsArr = MLXArray(inds, [T, Ktop])
+            // production shape: x[T,1,1,K], rhsIndices [T,Ktop] → inner M=1 gather_qmv
+            let xe = x.expandedDimensions(axes: [-2, -3])
+            _ = timeEval(3) { MLX.gatherQuantizedMatmul(xe, wq, scales: sc, biases: bi, rhsIndices: indsArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false) }
+            let tProd = timeEval(10) { MLX.gatherQuantizedMatmul(xe, wq, scales: sc, biases: bi, rhsIndices: indsArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false) }
+            // CSR tiles: rows (pair index mk uses x row mk/Ktop) grouped by expert, fixed R=16, zero-pad
+            var byE = [[Int32]](repeating: [], count: E)
+            for (mk, e) in inds.enumerated() { byE[Int(e)].append(Int32(mk)) }
+            var tileExpert = [Int32](), tileRows = [[Int32]]()   // each tile: expert + up-to-16 mk
+            for e in 0..<E {
+                var lo = 0
+                while lo < byE[e].count { tileExpert.append(Int32(e)); tileRows.append(Array(byE[e][lo ..< Swift.min(lo+R, byE[e].count)])); lo += R }
+            }
+            let Gt = tileExpert.count
+            let xh = x.asArray(Float16.self)
+            var xg = [Float16](repeating: 0, count: Gt * R * K)
+            for (ti, rows) in tileRows.enumerated() {
+                for (ri, mk) in rows.enumerated() {
+                    let src = Int(mk) / Ktop * K
+                    for k in 0..<K { xg[(ti * R + ri) * K + k] = xh[src + k] }
+                }
+            }
+            let xgArr = MLXArray(xg, [Gt, R, K]); xgArr.eval()
+            let teArr = MLXArray(tileExpert, [Gt])
+            _ = timeEval(3) { MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true) }
+            let tSteel = timeEval(10) { MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true) }
+            let padFactor = Double(Gt * R) / Double(T * Ktop)
+            out.append(String(format: "  T=%4d  prod(qmv) %7.3fms | steel-CSR %7.3fms  %5.2fx  (tiles=%d pad=%.2fx)",
+                              T, tProd, tSteel, tProd / tSteel, Gt, padFactor))
+            // (3) tile-composition invariance at this T: recompute with a DIFFERENT composition
+            // (shuffle rows into tiles of the same expert differently: reverse order within expert)
+            if T == 256 {
+                var tileRows2 = [[Int32]](), tileExpert2 = [Int32]()
+                for e in 0..<E {
+                    let rev = byE[e].reversed().map { $0 }
+                    var lo = 0
+                    while lo < rev.count { tileExpert2.append(Int32(e)); tileRows2.append(Array(rev[lo ..< Swift.min(lo+R, rev.count)])); lo += R }
+                }
+                var xg2 = [Float16](repeating: 0, count: tileExpert2.count * R * K)
+                for (ti, rows) in tileRows2.enumerated() {
+                    for (ri, mk) in rows.enumerated() {
+                        let src = Int(mk) / Ktop * K
+                        for k in 0..<K { xg2[(ti * R + ri) * K + k] = xh[src + k] }
+                    }
+                }
+                let xg2Arr = MLXArray(xg2, [tileExpert2.count, R, K])
+                let y1 = MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+                let y2 = MLX.gatherQuantizedMatmul(xg2Arr, wq, scales: sc, biases: bi, rhsIndices: MLXArray(tileExpert2, [tileExpert2.count]), transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+                MLX.eval([y1, y2])
+                // compare per-mk outputs across the two compositions
+                let a1 = y1.asArray(Float16.self), a2 = y2.asArray(Float16.self)
+                var ok = true
+                var pos1 = [Int32: Int](), pos2 = [Int32: Int]()
+                for (ti, rows) in tileRows.enumerated() { for (ri, mk) in rows.enumerated() { pos1[mk] = ti * R + ri } }
+                for (ti, rows) in tileRows2.enumerated() { for (ri, mk) in rows.enumerated() { pos2[mk] = ti * R + ri } }
+                outer: for mk in pos1.keys {
+                    let o1 = pos1[mk]! * N, o2 = pos2[mk]! * N
+                    for j in 0..<N where a1[o1 + j] != a2[o2 + j] { ok = false; break outer }
+                }
+                out.append("    tile-composition invariance @T=256: \(ok ? "IDENTICAL ✅" : "DIFFER ❌")")
+            }
+        }
+        // ── (4) MLX eval launch overhead (per hybrid boundary) ──
+        let wSmall = MLXRandom.normal([512, 512]).asType(.float16)
+        let (wq2, sc2, bi2o) = MLX.quantized(wSmall, groupSize: 64, bits: 4, mode: .affine)
+        let xs = randX(16, 512)
+        MLX.eval([wq2, sc2, bi2o!, xs])
+        let tiny = timeEval(50) { MLX.quantizedMatmul(xs, wq2, scales: sc2, biases: bi2o!, transpose: true, groupSize: 64, bits: 4) }
+        out.append(String(format: "  eval launch overhead (tiny qmm M=16): %.3fms/boundary → ~%.0fms/chunk at 80 boundaries", tiny, tiny * 80))
+        out.append("STEELROUTE done")
+        return out.joined(separator: "\n")
+    }
 }

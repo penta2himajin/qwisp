@@ -28,6 +28,7 @@ if CommandLine.arguments.contains("stream") {
         ("grouped-moe-bench", { _, _ in GroupedMoEPoC.bench() }),
         ("dense-tiled-bench", { _, _ in GroupedMoEPoC.denseBench() }),
         ("mlx-qmm-minv", { md, _ in Tell.mlxQmmInvariance(modelDir: md) }),
+        ("steel-route-bench", { _, _ in GroupedMoEPoC.steelRouteBench() }),
         ("prefix-cache-e2e", { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
         ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
