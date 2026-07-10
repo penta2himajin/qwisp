@@ -9,12 +9,13 @@ import QwispCore
 // and links. `serve` / `chat` are wired in follow-up sub-steps.
 
 let defaultModel = "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
-let model = ProcessInfo.processInfo.environment["QWISP_MODEL"] ?? defaultModel
+let qwispConfig = Config.load(path: Config.defaultPath)
+let model = Config.resolveModel(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: defaultModel)
 
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "serve":
-    let port = Int(ProcessInfo.processInfo.environment["QWISP_PORT"] ?? "8080") ?? 8080
+    let port = Config.resolvePort(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: 8080)
     let modelID = URL(fileURLWithPath: model).lastPathComponent
     let tok = try await QwispTokenizer(modelDir: model)
     let backend: any LLMBackend
@@ -84,6 +85,10 @@ case "gpusampletest":
     let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
     print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
     if passed != total { exit(1) }
+case "configtest":
+    let (passed, total, log) = Config.selfCheck()   // model/port resolution + config load (no GPU, no model)
+    print(log.joined(separator: "\n") + "\nCONFIGTEST \(passed)/\(total)")
+    if passed != total { exit(1) }
 default:
-    print("usage: qwisp [serve|chat|selftest|comptest|sampletest]")
+    print("usage: qwisp [serve|chat|selftest|comptest|sampletest|configtest]")
 }
