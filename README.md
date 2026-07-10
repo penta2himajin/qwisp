@@ -36,8 +36,9 @@ export QWISP_MODEL=/path/to/Qwen3.6-35B-A3B-MTPLX-…    # the model directory
 # OpenAI-compatible server (QWISP_PORT, default 8080)
 "$BIN" serve
 
-# CLI (in-process, streams to stdout)
+# CLI (in-process, streams to stdout; --max-tokens caps generation, default 512)
 "$BIN" chat "Explain MoE routing in two sentences."
+"$BIN" chat --max-tokens 256 "Explain MoE routing in two sentences."
 ```
 
 Talk to the server with any OpenAI client:

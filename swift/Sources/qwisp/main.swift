@@ -28,10 +28,25 @@ case "serve":
     let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID)
     try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
-    let promptText = args.dropFirst().joined(separator: " ")
+    // `--max-tokens N` | `--max-tokens=N` (matches mlx-lm); the rest of the args are the prompt.
+    var rest = Array(args.dropFirst())
+    var maxTokens = 512
+    if let i = rest.firstIndex(where: { $0 == "--max-tokens" || $0.hasPrefix("--max-tokens=") }) {
+        let flag = rest[i]
+        if let eq = flag.firstIndex(of: "=") {
+            maxTokens = Int(flag[flag.index(after: eq)...]) ?? maxTokens
+            rest.remove(at: i)
+        } else if i + 1 < rest.count, let v = Int(rest[i + 1]) {
+            maxTokens = v
+            rest.removeSubrange(i...(i + 1))
+        } else {
+            rest.remove(at: i)   // dangling flag → ignore, fall back to default
+        }
+    }
+    let promptText = rest.joined(separator: " ")
     let prompt = promptText.isEmpty ? (readLine(strippingNewline: true) ?? "") : promptText
     if prompt.isEmpty {
-        print("usage: qwisp chat <prompt>   (or pipe text via stdin)")
+        print("usage: qwisp chat [--max-tokens N] <prompt>   (or pipe text via stdin)")
     } else {
         let tok = try await QwispTokenizer(modelDir: model)
         let backend: any LLMBackend
@@ -40,7 +55,6 @@ case "chat":
         } else {
             backend = try SeedlessBackend(modelDir: model)
         }
-        let maxTokens = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "512") ?? 512
         await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens)
     }
 case "selftest":
