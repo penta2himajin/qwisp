@@ -64,6 +64,10 @@ case "sampletest":
     let (passed, total, log) = Sampler.selfCheck()   // GPU-free sampling-math check
     print(log.joined(separator: "\n") + "\nSAMPLETEST \(passed)/\(total)")
     if passed != total { exit(1) }
+case "gpusampletest":
+    let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
+    print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
+    if passed != total { exit(1) }
 default:
     print("usage: qwisp [serve|chat|selftest|comptest|sampletest]")
 }

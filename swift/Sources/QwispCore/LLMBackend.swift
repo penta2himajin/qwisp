@@ -133,10 +133,24 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // QWISP_FORCE_SAMPLE=1 forces the sampling loop even at temperature 0, so the
                 // T=0-equivalence gate can exercise runSpecSampleLoop against greedy.
                 let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
-                if options.sampling || forceSample {
-                    // Option B: speculative sampling. maxK capped (per-position logits readback is
-                    // the prototype cost; a GPU sampler kernel would lift the cap). Greedy path
-                    // (below) is untouched.
+                let wantSample = options.sampling || forceSample
+                // GPU sampler is eligible only for the temperature-only shape (no top_p / penalties /
+                // logit_bias, which still use the optimized CPU loop). QWISP_SAMPLE_CPU forces CPU.
+                let gpuEligible = wantSample && options.topP >= 1.0
+                    && options.frequencyPenalty == 0 && options.presencePenalty == 0 && options.logitBias.isEmpty
+                    && sb.stepSampleRows != nil && !Tell.envFlag("QWISP_SAMPLE_CPU")
+                if gpuEligible {
+                    // Option B "本速度化": softmax + categorical + accept on the GPU, tiny readback,
+                    // maxK uncapped. T=0 degenerates to argmax → byte-identical to greedy.
+                    _ = Tell.runSpecSampleLoopGPU(promptIds: promptIds, backend: sb, engine: self.engine,
+                                                  N: options.maxTokens, maxK: cfg.maxK,
+                                                  temperature: options.temperature, seed: options.seed,
+                                                  isCancelled: { cancel.isCancelled }) { tok in
+                        continuation.yield(tok)
+                    }
+                } else if wantSample {
+                    // CPU speculative sampling: handles top_p / penalties / logit_bias (per-position
+                    // logits readback → maxK capped at 8). Greedy path (below) is untouched.
                     _ = Tell.runSpecSampleLoop(promptIds: promptIds, backend: sb, engine: self.engine,
                                                N: options.maxTokens, maxK: Swift.min(cfg.maxK, 8),
                                                temperature: options.temperature, topP: options.topP,

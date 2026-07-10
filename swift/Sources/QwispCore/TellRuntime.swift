@@ -89,6 +89,9 @@ extension Tell {
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
         // Additive — greedy stepArgmax path is untouched.
         var stepLogitsRows: (([Int32]) -> [[Float]]?)? = nil
+        // Option B GPU sampler: (tokens, draftPerRow, invT, seed, basePos) → per-row
+        // (full sample, residual sample, accept). Returns the decision on-GPU, tiny readback.
+        var stepSampleRows: (([Int32], [Int], Float, UInt64, Int) -> (full: [Int], resid: [Int], accept: [Bool])?)? = nil
     }
 
     /// forward + lm_head logits, read back to CPU per row (for speculative sampling).
@@ -164,7 +167,12 @@ extension Tell {
         if fwd.head != nil {
             backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
         }
-        backend.stepLogitsRows = makeStepLogits(engine: engine, forward: forward)   // Option B sampling
+        backend.stepLogitsRows = makeStepLogits(engine: engine, forward: forward)   // Option B sampling (CPU)
+        if fwd.head != nil {                                                        // Option B GPU sampler
+            backend.stepSampleRows = { toks, drafts, invT, seed, base in
+                fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base)
+            }
+        }
         return (backend, fwd)
     }
 
@@ -482,6 +490,65 @@ extension Tell {
                 let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
                 guard let _ = backend.forward(rebuildTokens) else { return nil }   // realize accepted prefix
                 u = rejectTok!
+            }
+        }
+        flush()
+        return Array(out.prefix(N))
+    }
+
+    /// Option B GPU sampler loop: like runSpecSampleLoop but the softmax + categorical + accept
+    /// happen on the GPU (backend.stepSampleRows), so no full-logits readback and no CPU per-vocab
+    /// work — the maxK cap is lifted. Temperature only (top_p/penalties/logit_bias use the CPU loop).
+    /// T=0 (temperature 0) degenerates to argmax → byte-identical to greedy.
+    static func runSpecSampleLoopGPU(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
+                                     N: Int, maxK: Int, temperature: Double, seed: UInt64,
+                                     isCancelled: (() -> Bool)? = nil,
+                                     onToken: ((Int) -> Void)? = nil) -> [Int]? {
+        guard let stepSample = backend.stepSampleRows else { return nil }
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
+        guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
+        MLX.eval([lg0])
+        let invT: Float = temperature > 0 ? Float(1.0 / temperature) : -1
+        var rng = SplitMix64(seed: seed)
+        // First token from the prefill logits (one-time CPU sample; degenerates to argmax at T=0).
+        var u = Sampler.categorical(Sampler.probs(logits: lg0[0].asArray(Float.self),
+                                                  temperature: temperature, topP: 1.0), rng: &rng)
+        var hist = promptIds.map { Int($0) }
+        var out: [Int] = []
+        var streamed = 0
+        func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
+        func commit(_ t: Int) { out.append(t); hist.append(t) }
+
+        while out.count < N && !(isCancelled?() ?? false) {
+            flush()
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let D = drafts.count
+            let snap = backend.snapshot()
+            let basePos = out.count   // monotonic absolute position → reproducible per-position RNG
+
+            if D == 0 {
+                guard let r = stepSample([Int32(u)], [-1], invT, seed, basePos) else { return nil }
+                commit(u)
+                u = r.full[0]
+                continue
+            }
+
+            let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+            let draftRows = drafts + [-1]                       // row D is the bonus (no draft)
+            guard let r = stepSample(verifyTokens, draftRows, invT, seed, basePos) else { return nil }
+
+            var p = 0
+            while p < D && r.accept[p] { p += 1 }
+
+            if p == D {
+                commit(u); for d in drafts { commit(d) }
+                u = r.full[D]                                   // bonus sample
+            } else {
+                backend.rollback(snap)
+                commit(u); for d in drafts.prefix(p) { commit(d) }
+                let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                guard let _ = backend.forward(rebuildTokens) else { return nil }
+                u = r.resid[p]                                  // residual sample at reject row
             }
         }
         flush()

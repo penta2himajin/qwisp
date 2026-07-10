@@ -3462,6 +3462,9 @@ public enum SeedlessFusedVerify {
             let retained: [MLXArray]
         }
         var head: HeadBufs? = nil
+        // Option B GPU sampler scratch (lazily allocated on first stepSampleRows).
+        var sSampFull: MTLBuffer? = nil, sSampResid: MTLBuffer? = nil, sSampAccept: MTLBuffer? = nil
+        var sSampDraft: MTLBuffer? = nil, sSampAdj: MTLBuffer? = nil
 
         /// head(embed/lm_head/final norm)を常駐 buffer 化して 1-CB step を有効化する。
         public func attachHead(embedW: MLXArray, embedS: MLXArray, embedB: MLXArray,
@@ -3568,6 +3571,84 @@ public enum SeedlessFusedVerify {
 
             let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
             return (0 ..< M).map { Int(ptr[$0]) }
+        }
+
+        /// Option B GPU sampler: same 1-CB forward as stepArgmax, but the final op is spec_sample_rows
+        /// (Gumbel-max categorical + accept) instead of argmax. Returns per-row (full sample, residual
+        /// sample excluding the draft, accept flag). readback = 3·M ints (no full-logits transfer).
+        public func stepSampleRows(_ tokens: [Int32], drafts: [Int], invT: Float, seed: UInt64, basePos: Int)
+            -> (full: [Int], resid: [Int], accept: [Bool])? {
+            guard let hd = head, tokens.count <= maxM else { return nil }
+            guard SamplerGPU.ensurePipeline(device), let samp = SamplerGPU._pipeline else { return nil }
+            let M = tokens.count
+            hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
+            if sSampFull == nil {
+                sSampFull = device.makeBuffer(length: maxM * 4, options: .storageModeShared)
+                sSampResid = device.makeBuffer(length: maxM * 4, options: .storageModeShared)
+                sSampAccept = device.makeBuffer(length: maxM * 4, options: .storageModeShared)
+                sSampDraft = device.makeBuffer(length: maxM * 4, options: .storageModeShared)
+                sSampAdj = device.makeBuffer(length: max(1, hd.vocab) * 4, options: .storageModeShared)  // zeros (useAdj=0)
+            }
+            guard let sF = sSampFull, let sR = sSampResid, let sA = sSampAccept,
+                  let sD = sSampDraft, let sAdj = sSampAdj else { return nil }
+            let dp = sD.contents().bindMemory(to: Int32.self, capacity: maxM)
+            for i in 0 ..< M { dp[i] = Int32(i < drafts.count ? drafts[i] : -1) }
+
+            func encodeEmbed(_ enc: MTLComputeCommandEncoder) {
+                let ep = SeedlessFusedVerify._embedRowsPipeline!
+                enc.setComputePipelineState(ep)
+                enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
+                enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+                enc.setBuffer(hBuf, offset: 0, index: 4)
+                var hh = UInt32(H), tt = UInt32(M * H)
+                enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            }
+            func encodeFinalSample(_ enc: MTLComputeCommandEncoder) {
+                SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed, rows: M, D: H, eps: eps)
+                if SeedlessFusedForward.lmHeadQmv {
+                    SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                                 x: normed, out: hd.logits, M: M, K: H, N: hd.vocab)
+                } else {
+                    let qp = SeedlessMetalForward._qmm4TiledPipeline!
+                    enc.setComputePipelineState(qp)
+                    enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+                    enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(normed, offset: 0, index: 3)
+                    enc.setBuffer(hd.logits, offset: 0, index: 4)
+                    var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(M)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+                    enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                }
+                enc.setComputePipelineState(samp)
+                enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(sAdj, offset: 0, index: 1)
+                enc.setBuffer(sD, offset: 0, index: 2); enc.setBuffer(sF, offset: 0, index: 3)
+                enc.setBuffer(sR, offset: 0, index: 4); enc.setBuffer(sA, offset: 0, index: 5)
+                var it = invT, vv = UInt32(hd.vocab), sl = UInt32(truncatingIfNeeded: seed)
+                var sh = UInt32(truncatingIfNeeded: seed >> 32), bp = UInt32(truncatingIfNeeded: basePos), ua = UInt32(0)
+                enc.setBytes(&it, length: 4, index: 6); enc.setBytes(&vv, length: 4, index: 7)
+                enc.setBytes(&sl, length: 4, index: 8); enc.setBytes(&sh, length: 4, index: 9)
+                enc.setBytes(&bp, length: 4, index: 10); enc.setBytes(&ua, length: 4, index: 11)
+                enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+            switch streamMode {
+            case .resident:
+                let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                encodeEmbed(enc); for L in layers { encodeLayer(enc, L, M: M) }; encodeFinalSample(enc)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            case .bolt:
+                let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                encodeEmbed(enc); for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }; encodeFinalSample(enc)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            case .strict:
+                runStrictLayers(M: M, firstCBExtra: encodeEmbed, finalCBExtra: encodeFinalSample)
+            }
+            let fp = sF.contents().bindMemory(to: Int32.self, capacity: maxM)
+            let rp = sR.contents().bindMemory(to: Int32.self, capacity: maxM)
+            let ap = sA.contents().bindMemory(to: Int32.self, capacity: maxM)
+            return ((0..<M).map { Int(fp[$0]) }, (0..<M).map { Int(rp[$0]) }, (0..<M).map { ap[$0] != 0 })
         }
 
         /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。
