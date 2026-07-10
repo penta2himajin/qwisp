@@ -104,12 +104,21 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // ── Cross-request prefix cache (opt-in via QWISP_PREFIX_CACHE=1) ──────────
     // Persistent per-instance fused backend + a content-boundary fullSnapshot, so consecutive
     // requests (agentic loops) re-prefill only the new suffix. Serialized by the server lock.
-    let prefixCacheEnabled = Tell.envFlag("QWISP_PREFIX_CACHE")
-    var prefixCacheCap: Int { Swift.min(contextLen, Swift.max(2048, Tell.envInt("QWISP_PREFIX_CAP", 16384))) }
+    // Design B: the arena grows monotonically to fit each request (prompt+generation) instead of a
+    // fixed generation cap, so cached mode never truncates a long answer the segmented path would allow.
+    // Multi-slot: several stride-aligned restore points along the current path let a NEW conversation
+    // reuse a shared prefix (system+tools) instead of re-prefilling it. Lossless — SuffixSpec verifies
+    // every drafted token; snapshot/restore is byte-identical (PrefixCachePoC). ~60MB / slot (GDN state).
+    public var prefixCacheForced: Bool? = nil      // test/override hook; nil → env flag
+    var prefixCacheEnabled: Bool { prefixCacheForced ?? Tell.envFlag("QWISP_PREFIX_CACHE") }
+    var prefixArenaMax: Int { Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", 65536))) }
+    var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
+    var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
-    private var prefixEmptySnap: Any?          // fullSnapshot of the fresh cache, for reset
-    private var cachedContent: [Int32] = []    // content tokens currently represented in the cache
-    private var boundarySnap: Any?             // fullSnapshot taken at the last content boundary
+    private var prefixArenaLen = 0                          // current backend's maxSeqLen (0 = not built)
+    private var prefixEmptySnap: Any?                       // fullSnapshot of the fresh arena, for reset
+    private var arenaContent: [Int32] = []                  // tokens currently prefilled into the arena (one path)
+    private var prefixSlots: [(len: Int, snap: Any)] = []   // restore points along arenaContent, sorted by len
 
     /// Read `text_config.max_position_embeddings` from the checkpoint's config.json.
     /// Falls back to 32768 if absent — a sane bound that still lets any real chat reach EOS.
@@ -145,10 +154,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         // context; else the caller's cap. Both clamped to the context headroom.
         let headroom = Swift.max(0, contextLen - prompt.count)
         let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
-        // Prefix cache path: resident/fused, greedy, gen-prompt present, prompt fits the persistent
-        // cap with room to decode. Everything else falls through to the segmented-growth path below.
+        // Prefix cache path: resident/fused, greedy, gen-prompt present, prompt fits the arena with
+        // room to decode. Everything else falls through to the segmented-growth path below.
         if prefixCacheEnabled, !cfg.isStreaming, !options.sampling,
-           let cl = options.promptContentLen, cl < prompt.count, prompt.count + 256 <= prefixCacheCap {
+           let cl = options.promptContentLen, cl < prompt.count, prompt.count + 64 <= prefixArenaMax {
             return generateCached(prompt: prompt, contentLen: cl, ceiling: ceiling, cfg: cfg)
         }
         // First KV arena budget; grows geometrically to `ceiling` only if generation needs it.
@@ -224,49 +233,95 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         }
     }
 
-    // Prefix-cache generation: persistent fused backend, restore the content-boundary snapshot when
-    // the new content extends the cached content, and re-prefill only the delta. Greedy only;
-    // provably lossless — SuffixSpec verifies every drafted token (see prefix-cache-poc).
+    // Prefix-cache generation (Design B + multi-slot): a persistent fused backend whose KV arena grows
+    // to fit each request, plus stride-aligned restore points along the current path. Restores the
+    // longest cached prefix of the new content and re-prefills only the delta. Greedy only; provably
+    // lossless — SuffixSpec verifies every drafted token (see prefix-cache-poc).
     private func generateCached(prompt: [Int], contentLen: Int, ceiling: Int, cfg: Config) -> AsyncStream<Int> {
         let cancel = CancelFlag()
         return AsyncStream { continuation in
             continuation.onTermination = { _ in cancel.cancel() }
             Thread.detachNewThread {
-                if self.prefixBackend == nil {
-                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: self.prefixCacheCap) else {
+                // Design B: ensure the arena fits prompt + this request's generation; grow (rebuild,
+                // geometric, monotonic) if not. ponytail: unbounded/huge generations cap at
+                // prefixArenaMax (fits ≤64K total by default); >that falls through upstream. Mid-decode
+                // arena growth is the upgrade path if a real workload needs >prefixArenaMax generation.
+                let genBudget = Swift.max(1, Swift.min(ceiling, self.prefixArenaMax - prompt.count))
+                let needed = prompt.count + genBudget
+                if self.prefixBackend == nil || self.prefixArenaLen < needed {
+                    var newLen = Swift.max(self.prefixArenaLen, 16384)
+                    while newLen < needed { newLen *= 2 }
+                    newLen = Swift.min(newLen, self.prefixArenaMax)
+                    if newLen < needed { newLen = needed }
+                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: newLen) else {
                         continuation.finish(); return
                     }
-                    self.prefixBackend = b
+                    self.prefixBackend = b; self.prefixArenaLen = newLen
                     self.prefixEmptySnap = b.fullSnapshot?()
+                    self.prefixSlots = []; self.arenaContent = []   // new arena → old snapshots invalid
                 }
                 let backend = self.prefixBackend!
                 let full = prompt.map { Int32($0) }
                 let content = Array(full[0 ..< contentLen])
 
-                // Reuse the content-boundary snapshot iff the new content extends the cached content;
-                // otherwise reset to empty and prefill all of content.
-                let lcp = SeedlessBackend.commonPrefixLen(content, self.cachedContent)
-                if let snap = self.boundarySnap, lcp == self.cachedContent.count {
-                    backend.fullRestore?(snap)
-                    if lcp < content.count { _ = Tell.prefill(promptIds: Array(content[lcp...]), backend: backend) }
-                } else {
-                    if let e = self.prefixEmptySnap { backend.fullRestore?(e) }
-                    _ = Tell.prefill(promptIds: content, backend: backend)
+                // Multi-slot restore: the longest cached restore point that is a prefix of the new
+                // content (positions [0..len] still hold that prefix — append-only KV). A NEW
+                // conversation sharing the system+tools prefix restores a sub-content boundary instead
+                // of re-prefilling it. Boundaries past the divergence point are stale → drop them.
+                let lcp = SeedlessBackend.commonPrefixLen(content, self.arenaContent)
+                let restoreLen = self.prefixSlots.last(where: { $0.len <= lcp })?.len ?? 0
+                if restoreLen > 0, let s = self.prefixSlots.last(where: { $0.len == restoreLen })?.snap {
+                    backend.fullRestore?(s)
+                } else if let e = self.prefixEmptySnap {
+                    backend.fullRestore?(e)
                 }
-                // Snapshot at the content boundary (for the NEXT request); record what's cached.
-                self.boundarySnap = backend.fullSnapshot?()
-                self.cachedContent = content
+                self.prefixSlots.removeAll { $0.len > lcp }
 
-                // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (cache already
+                // Re-prefill the delta [restoreLen ..< contentLen], snapshotting at stride-aligned
+                // boundaries (so different conversations that share a prefix snapshot at the SAME
+                // positions → cross-conversation reuse), plus one at the content boundary.
+                var pos = restoreLen
+                while pos < contentLen {
+                    let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
+                    _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
+                    if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
+                    pos = end
+                }
+                if self.prefixSlots.last?.len != contentLen, let snap = backend.fullSnapshot?() {
+                    self.prefixSlots.append((len: contentLen, snap: snap))
+                }
+                self.prefixSlots.sort { $0.len < $1.len }
+                self.evictSlots()
+                self.arenaContent = content
+
+                // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
                 // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
                 let genSuffix = Array(full[contentLen...])
-                let N = Swift.max(1, Swift.min(ceiling, self.prefixCacheCap - prompt.count))
                 _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
-                                     N: N, maxK: cfg.maxK, prefillTokens: genSuffix,
+                                     N: genBudget, maxK: cfg.maxK, prefillTokens: genSuffix,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 continuation.finish()
             }
+        }
+    }
+
+    /// Test/override hook: drop the persistent arena + all restore points (start cold).
+    public func resetPrefixCache() {
+        prefixBackend = nil; prefixArenaLen = 0; prefixEmptySnap = nil
+        arenaContent = []; prefixSlots = []
+    }
+
+    // Cap resident snapshots (~60MB each) at prefixMaxSlots, evicting the densest neighbour so a coarse
+    // spread of low boundaries (cross-conversation reuse) and the top boundary (next turn) both survive.
+    private func evictSlots() {
+        while prefixSlots.count > prefixMaxSlots {
+            var mi = 1, mgap = Int.max
+            for i in 1 ..< prefixSlots.count {
+                let g = prefixSlots[i].len - prefixSlots[i - 1].len
+                if g < mgap { mgap = g; mi = i }
+            }
+            prefixSlots.remove(at: mi)
         }
     }
 
