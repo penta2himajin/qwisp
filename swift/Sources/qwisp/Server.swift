@@ -72,7 +72,7 @@ final class QwispEngine: @unchecked Sendable {
     private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int]) {
         let msgs = req.messages.map { ["role": $0.role, "content": $0.content] }
         let ids = try tokenizer.render(messages: msgs)
-        return (ids, req.max_tokens ?? 512, tokenizer.stopTokenIds)
+        return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds)   // omitted → until EOS/context
     }
 
     /// Non-streaming completion.
@@ -126,7 +126,7 @@ final class QwispEngine: @unchecked Sendable {
             let d = full.hasPrefix(emitted) ? String(full[emitted.endIndex...]) : full
             emitted = full
             if !d.isEmpty { try await send(Delta(role: nil, content: d), nil) }
-            if outIds.count >= p.maxTokens { finish = "length"; break }
+            if p.maxTokens >= 0 && outIds.count >= p.maxTokens { finish = "length"; break }  // <0 = until EOS/context
         }
         try await send(Delta(role: nil, content: nil), finish)
         try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
