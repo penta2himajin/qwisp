@@ -326,9 +326,13 @@ extension Tell {
     /// Returns out[0..<N] token ids.
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
+                             prefillTokens: [Int32]? = nil,
                              isCancelled: (() -> Bool)? = nil,
                              onToken: ((Int) -> Void)? = nil) -> [Int]? {
-        guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
+        // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
+        // remaining suffix as prefillTokens (forward appends it at the cache's current position).
+        // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
+        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)

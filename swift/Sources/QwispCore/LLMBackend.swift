@@ -32,12 +32,17 @@ public struct GenerateOptions {
     public var frequencyPenalty: Double
     public var presencePenalty: Double
     public var logitBias: [Int: Double]
+    /// Prefix-cache boundary: number of leading prompt tokens that are stable "content" (i.e. the
+    /// prompt WITHOUT the trailing generation-prompt suffix). The cross-request cache snapshots at
+    /// this position so the next request re-prefills only the new content. nil → no caching.
+    public var promptContentLen: Int? = nil
     public var sampling: Bool {
         temperature > 0 || topP < 1.0 || frequencyPenalty != 0 || presencePenalty != 0 || !logitBias.isEmpty
     }
     public init(maxTokens: Int = 128, stopTokens: [Int] = [],
                 temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
-                frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:]) {
+                frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:],
+                promptContentLen: Int? = nil) {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
         self.temperature = temperature
@@ -46,6 +51,7 @@ public struct GenerateOptions {
         self.frequencyPenalty = frequencyPenalty
         self.presencePenalty = presencePenalty
         self.logitBias = logitBias
+        self.promptContentLen = promptContentLen
     }
 }
 
@@ -95,6 +101,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
 
+    // ── Cross-request prefix cache (opt-in via QWISP_PREFIX_CACHE=1) ──────────
+    // Persistent per-instance fused backend + a content-boundary fullSnapshot, so consecutive
+    // requests (agentic loops) re-prefill only the new suffix. Serialized by the server lock.
+    let prefixCacheEnabled = Tell.envFlag("QWISP_PREFIX_CACHE")
+    var prefixCacheCap: Int { Swift.min(contextLen, Swift.max(2048, Tell.envInt("QWISP_PREFIX_CAP", 16384))) }
+    private var prefixBackend: Tell.SpecBackend?
+    private var prefixEmptySnap: Any?          // fullSnapshot of the fresh cache, for reset
+    private var cachedContent: [Int32] = []    // content tokens currently represented in the cache
+    private var boundarySnap: Any?             // fullSnapshot taken at the last content boundary
+
     /// Read `text_config.max_position_embeddings` from the checkpoint's config.json.
     /// Falls back to 32768 if absent — a sane bound that still lets any real chat reach EOS.
     static func readContextLen(_ modelDir: String) -> Int {
@@ -129,6 +145,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         // context; else the caller's cap. Both clamped to the context headroom.
         let headroom = Swift.max(0, contextLen - prompt.count)
         let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
+        // Prefix cache path: resident/fused, greedy, gen-prompt present, prompt fits the persistent
+        // cap with room to decode. Everything else falls through to the segmented-growth path below.
+        if prefixCacheEnabled, !cfg.isStreaming, !options.sampling,
+           let cl = options.promptContentLen, cl < prompt.count, prompt.count + 256 <= prefixCacheCap {
+            return generateCached(prompt: prompt, contentLen: cl, ceiling: ceiling, cfg: cfg)
+        }
         // First KV arena budget; grows geometrically to `ceiling` only if generation needs it.
         let baseline = Swift.max(1, Tell.envInt("QWISP_CTX_BASELINE", 8192))
         let cancel = CancelFlag()
@@ -200,6 +222,59 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 continuation.finish()
             }
         }
+    }
+
+    // Prefix-cache generation: persistent fused backend, restore the content-boundary snapshot when
+    // the new content extends the cached content, and re-prefill only the delta. Greedy only;
+    // provably lossless — SuffixSpec verifies every drafted token (see prefix-cache-poc).
+    private func generateCached(prompt: [Int], contentLen: Int, ceiling: Int, cfg: Config) -> AsyncStream<Int> {
+        let cancel = CancelFlag()
+        return AsyncStream { continuation in
+            continuation.onTermination = { _ in cancel.cancel() }
+            Thread.detachNewThread {
+                if self.prefixBackend == nil {
+                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: self.prefixCacheCap) else {
+                        continuation.finish(); return
+                    }
+                    self.prefixBackend = b
+                    self.prefixEmptySnap = b.fullSnapshot?()
+                }
+                let backend = self.prefixBackend!
+                let full = prompt.map { Int32($0) }
+                let content = Array(full[0 ..< contentLen])
+
+                // Reuse the content-boundary snapshot iff the new content extends the cached content;
+                // otherwise reset to empty and prefill all of content.
+                let lcp = SeedlessBackend.commonPrefixLen(content, self.cachedContent)
+                if let snap = self.boundarySnap, lcp == self.cachedContent.count {
+                    backend.fullRestore?(snap)
+                    if lcp < content.count { _ = Tell.prefill(promptIds: Array(content[lcp...]), backend: backend) }
+                } else {
+                    if let e = self.prefixEmptySnap { backend.fullRestore?(e) }
+                    _ = Tell.prefill(promptIds: content, backend: backend)
+                }
+                // Snapshot at the content boundary (for the NEXT request); record what's cached.
+                self.boundarySnap = backend.fullSnapshot?()
+                self.cachedContent = content
+
+                // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (cache already
+                // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
+                let genSuffix = Array(full[contentLen...])
+                let N = Swift.max(1, Swift.min(ceiling, self.prefixCacheCap - prompt.count))
+                _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
+                                     N: N, maxK: cfg.maxK, prefillTokens: genSuffix,
+                                     isCancelled: { cancel.isCancelled },
+                                     onToken: { continuation.yield($0) })
+                continuation.finish()
+            }
+        }
+    }
+
+    static func commonPrefixLen(_ a: [Int32], _ b: [Int32]) -> Int {
+        let n = Swift.min(a.count, b.count)
+        var i = 0
+        while i < n && a[i] == b[i] { i += 1 }
+        return i
     }
 }
 

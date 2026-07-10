@@ -69,10 +69,13 @@ final class QwispEngine: @unchecked Sendable {
                               presencePenalty: req.presence_penalty ?? 0, logitBias: bias)
     }
 
-    private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int]) {
+    private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int], contentLen: Int) {
         let msgs = req.messages.map { $0.renderDict }
-        let ids = try tokenizer.render(messages: msgs, tools: req.tools?.map { $0.spec })
-        return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds)   // omitted → until EOS/context
+        let tools = req.tools?.map { $0.spec }
+        let ids = try tokenizer.render(messages: msgs, tools: tools)
+        // Content boundary (prompt WITHOUT the generation-prompt suffix) → the prefix-cache reuse point.
+        let contentLen = (try? tokenizer.render(messages: msgs, tools: tools, addGenerationPrompt: false).count) ?? ids.count
+        return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds, contentLen)   // omitted → until EOS/context
     }
 
     // One concise throughput line per request → the service log. prefix TTFT (prefill + first
@@ -96,7 +99,7 @@ final class QwispEngine: @unchecked Sendable {
                                     decode: { tokenizer.decode($0) }, backend: backend,
                                     temperature: s.temperature, topP: s.topP, seed: s.seed,
                                     frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
-                                    logitBias: s.logitBias) { _ in if tFirst == nil { tFirst = Date() } }
+                                    logitBias: s.logitBias, promptContentLen: p.contentLen) { _ in if tFirst == nil { tFirst = Date() } }
         await lock.release()
         logPerf("complete", prompt: p.ids.count, gen: r.completionTokens, t0: t0, tFirst: tFirst)
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
@@ -136,7 +139,7 @@ final class QwispEngine: @unchecked Sendable {
         let opts = GenerateOptions(maxTokens: p.maxTokens, stopTokens: p.stop,
                                    temperature: s.temperature, topP: s.topP, seed: s.seed,
                                    frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
-                                   logitBias: s.logitBias)
+                                   logitBias: s.logitBias, promptContentLen: p.contentLen)
         let t0 = Date(); var tFirst: Date? = nil
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
