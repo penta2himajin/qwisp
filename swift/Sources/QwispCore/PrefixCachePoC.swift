@@ -387,6 +387,92 @@ extension Tell {
         return out.joined(separator: "\n")
     }
 
+    // Stage-1 gate for the steel-prefill hybrid: (a) model-math sanity — hybrid final normed must be
+    // CLOSE to raw (different rounding, tiny rel err; catches mis-wired buffers/slices), (b)
+    // determinism — two hybrid runs byte-identical, (c) split-invariance — chunk 512 vs 1024 byte-
+    // identical (steel padding pins every M into one kernel class), (d) speed — hybrid vs raw prefill.
+    public static func hybridPrefillBench(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[hybrid-bench] load fail\nHYBRIDBENCH FAIL" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let prompt = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+
+        func mkBackend(_ hybrid: Bool) -> Tell.SpecBackend? {
+            setenv("QWISP_HYBRID_PREFILL", hybrid ? "1" : "0", 1)
+            return Tell.fusedBackend(engine: engine, maxM: 1032, maxSeqLen: promptLen + 128)
+        }
+        // prefill via Tell.prefill (uses hybrid closure + chunk automatically); returns final normed row.
+        func run(_ b: Tell.SpecBackend, chunk: Int? = nil) -> [Float16]? {
+            var bb = b
+            if let c = chunk { bb.hybridChunk = c }
+            guard let n = Tell.prefill(promptIds: prompt, backend: bb) else { return nil }
+            n.eval()
+            return n.reshaped([-1]).asArray(Float16.self)
+        }
+        var out = ["[hybrid-bench] promptLen=\(promptLen) resident, maxM=1032"]
+
+        guard let rawB = mkBackend(false) else { return "[hybrid-bench] raw backend nil\nHYBRIDBENCH FAIL" }
+        let tR0 = Date(); guard let rawOut = run(rawB) else { return "[hybrid-bench] raw run nil\nHYBRIDBENCH FAIL" }
+        let tRaw = Date().timeIntervalSince(tR0)
+
+        guard let hyB = mkBackend(true), hyB.forwardHybrid != nil else { return "[hybrid-bench] hybrid backend nil\nHYBRIDBENCH FAIL" }
+        let tH0 = Date(); guard let hy1 = run(hyB) else { return "[hybrid-bench] hybrid run nil\nHYBRIDBENCH FAIL" }
+        let tHy = Date().timeIntervalSince(tH0)
+
+        // (a) model-math sanity: rel err of final normed row
+        var num = 0.0, den = 0.0
+        for i in 0..<rawOut.count { num += abs(Double(hy1[i]) - Double(rawOut[i])); den += abs(Double(rawOut[i])) }
+        let rel = num / Swift.max(den, 1e-9)
+        // (b) determinism: fresh hybrid backend, same run
+        guard let hyB2 = mkBackend(true), let hy2 = run(hyB2) else { return "[hybrid-bench] hy2 nil\nHYBRIDBENCH FAIL" }
+        let det = hy1 == hy2
+        // (c) split-invariance: chunk 512 on a fresh hybrid backend
+        guard let hyB3 = mkBackend(true), let hy3 = run(hyB3, chunk: 512) else { return "[hybrid-bench] hy3 nil\nHYBRIDBENCH FAIL" }
+        let splitInv = hy1 == hy3
+
+        out.append(String(format: "  raw    prefill %5.2fs (%.0f tok/s)  [chunk 64]", tRaw, Double(promptLen) / tRaw))
+        out.append(String(format: "  hybrid prefill %5.2fs (%.0f tok/s)  [chunk 1024]  → %.2fx", tHy, Double(promptLen) / tHy, tRaw / tHy))
+        // (a2) single-op wiring sanity: steel qkv on layer-0 weights vs f32-x reference (~1e-3 = correct)
+        var relOp = -1.0
+        if let g0 = engine.layers.first(where: { $0.gdn != nil })?.gdn {
+            let xt = MLXRandom.normal([64, 2048]).asType(.float16)
+            let ys = MLX.quantizedMatmul(xt, g0.qkvWq, scales: g0.qkvSc, biases: g0.qkvBi, transpose: true, groupSize: 64, bits: 4)
+            let yr = MLX.quantizedMatmul(xt.asType(.float32), g0.qkvWq, scales: g0.qkvSc.asType(.float32), biases: g0.qkvBi.asType(.float32), transpose: true, groupSize: 64, bits: 4)
+            MLX.eval([ys, yr])
+            let a = ys.asType(.float32).reshaped([-1]).asArray(Float.self)
+            let b = yr.reshaped([-1]).asArray(Float.self)
+            var n2 = 0.0, d2 = 0.0
+            for i in 0..<a.count { n2 += Double(abs(a[i] - b[i])); d2 += Double(abs(b[i])) }
+            relOp = n2 / Swift.max(d2, 1e-9)
+        }
+        // (a3) fidelity-family baseline: full-MLX (QwispModel) prefill final hidden vs raw
+        let model = QwispModel(store: store)
+        let caches = model.makeCaches()
+        var mlxLast: [Float16] = []
+        var pos = 0
+        while pos < promptLen {
+            let end = Swift.min(pos + 64, promptLen)
+            let ids = prompt[pos ..< end].map { Int32($0) }
+            let (hidden, _) = model.forwardHidden(MLXArray(ids).reshaped([1, end - pos]), caches: caches)
+            hidden.eval()
+            if end == promptLen { mlxLast = hidden[0, end - pos - 1].asType(.float16).reshaped([-1]).asArray(Float16.self) }
+            pos = end
+        }
+        var nM = 0.0, dM = 0.0
+        for i in 0..<Swift.min(mlxLast.count, rawOut.count) { nM += abs(Double(mlxLast[i]) - Double(rawOut[i])); dM += abs(Double(rawOut[i])) }
+        let relMLX = nM / Swift.max(dM, 1e-9)
+        out.append(String(format: "  (a) rel err vs raw      : %.2e   [single-op steel vs f32-ref: %.2e; full-MLX vs raw baseline: %.2e]", rel, relOp, relMLX))
+        let sane = relOp < 5e-3 && rel < Swift.max(2 * relMLX, 1e-2)
+        out.append("      wiring \(relOp < 5e-3 ? "OK ✅" : "MISWIRED ❌"), fidelity \(rel < Swift.max(2 * relMLX, 1e-2) ? "IN-FAMILY ✅ (≤2x full-MLX baseline)" : "OUT ❌")")
+        out.append("  (b) determinism         : \(det ? "IDENTICAL ✅" : "DIVERGE ❌")")
+        out.append("  (c) split-inv (512 vs 1024): \(splitInv ? "IDENTICAL ✅" : "DIVERGE ❌")")
+        let pass = sane && det && splitInv
+        out.append("HYBRIDBENCH \(pass ? "PASS" : "FAIL")")
+        setenv("QWISP_HYBRID_PREFILL", "0", 1)
+        return out.joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()

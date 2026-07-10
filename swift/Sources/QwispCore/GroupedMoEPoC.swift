@@ -692,9 +692,59 @@ public enum GroupedMoEPoC {
             let teArr = MLXArray(tileExpert, [Gt])
             _ = timeEval(3) { MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true) }
             let tSteel = timeEval(10) { MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true) }
+            // VALUE correctness: steel-CSR re-scattered vs production-shape gather (different kernels
+            // → not bit-equal; rel err ~1e-3 = same semantics, large = wrong rhsIndices broadcast)
+            var relV = -1.0
+            do {
+                let yP = MLX.gatherQuantizedMatmul(xe, wq, scales: sc, biases: bi, rhsIndices: indsArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false)
+                let yS = MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+                MLX.eval([yP, yS])
+                let ap = yP.reshaped([-1]).asArray(Float16.self)          // [T,Ktop,1,N] flat = mk-major
+                let as_ = yS.reshaped([-1]).asArray(Float16.self)         // [Gt,R,N] flat = tile-major
+                var pos = [Int: Int]()
+                for (ti, rows) in tileRows.enumerated() { for (ri, mk) in rows.enumerated() { pos[Int(mk)] = ti * R + ri } }
+                var nv = 0.0, dv = 0.0
+                for mk in 0..<(T * Ktop) {
+                    let o1 = mk * N, o2 = pos[mk]! * N
+                    for j in 0..<N { nv += abs(Double(ap[o1+j]) - Double(as_[o2+j])); dv += abs(Double(ap[o1+j])) }
+                }
+                relV = nv / Swift.max(dv, 1e-9)
+            }
+            // FULL-CHAIN value check: g→u→swiglu→d in steel-CSR tile space vs production per-pair shapes.
+            // Isolates the d-shape (K=512→N=2048) steel gather semantics, never value-verified before.
+            var relChain = -1.0
+            do {
+                let wf2 = MLXRandom.normal([E, K, N]).asType(.float16)     // "down": [E, H=K? no: E, out=K(2048), in=N(512)]
+                let (dq, ds, dbO) = MLX.quantized(wf2, groupSize: 64, bits: 4, mode: .affine)
+                let db = dbO!
+                // production: per-pair
+                let gP = MLX.gatherQuantizedMatmul(xe, wq, scales: sc, biases: bi, rhsIndices: indsArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false)
+                let gPs = gP * Float16(0.01)   // scale down: synthetic weights overflow f16 in silu(g)*g
+                let hP = (gPs * MLX.sigmoid(gPs)) * gPs                     // [T,Ktop,1,N]
+                let hPr = hP.reshaped([T * Ktop, 1, 1, N])
+                let indsFlat = indsArr.reshaped([T * Ktop, 1])
+                let dP = MLX.gatherQuantizedMatmul(hPr, dq, scales: ds, biases: db, rhsIndices: indsFlat, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: false)
+                // steel-CSR: tile space
+                let gS = MLX.gatherQuantizedMatmul(xgArr, wq, scales: sc, biases: bi, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+                let gSs = gS * Float16(0.01)
+                let hS = (gSs * MLX.sigmoid(gSs)) * gSs                     // matches hP transform
+                let dS = MLX.gatherQuantizedMatmul(hS, dq, scales: ds, biases: db, rhsIndices: teArr, transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+                MLX.eval([dP, dS])
+                let a = dP.reshaped([-1]).asArray(Float16.self)             // mk-major [T*Ktop, K]
+                let b = dS.reshaped([-1]).asArray(Float16.self)             // tile-major [Gt,R,K]
+                var pos = [Int: Int]()
+                for (ti, rows) in tileRows.enumerated() { for (ri, mk) in rows.enumerated() { pos[Int(mk)] = ti * R + ri } }
+                var nv = 0.0, dv = 0.0
+                let NN = K   // down output dim = K (2048) in this synthetic setup
+                for mk in 0..<(T * Ktop) {
+                    let o1 = mk * NN, o2 = pos[mk]! * NN
+                    for j in 0..<NN { nv += abs(Double(a[o1+j]) - Double(b[o2+j])); dv += abs(Double(a[o1+j])) }
+                }
+                relChain = nv / Swift.max(dv, 1e-9)
+            }
             let padFactor = Double(Gt * R) / Double(T * Ktop)
-            out.append(String(format: "  T=%4d  prod(qmv) %7.3fms | steel-CSR %7.3fms  %5.2fx  (tiles=%d pad=%.2fx)",
-                              T, tProd, tSteel, tProd / tSteel, Gt, padFactor))
+            out.append(String(format: "  T=%4d  prod(qmv) %7.3fms | steel-CSR %7.3fms  %5.2fx  (tiles=%d pad=%.2fx)  valErr %.2e %@  chainErr %.2e %@",
+                              T, tProd, tSteel, tProd / tSteel, Gt, padFactor, relV, relV < 5e-3 ? "✅" : "SEMANTICS❌", relChain, relChain < 5e-3 ? "✅" : "CHAIN❌"))
             // (3) tile-composition invariance at this T: recompute with a DIFFERENT composition
             // (shuffle rows into tiles of the same expert differently: reverse order within expert)
             if T == 256 {
