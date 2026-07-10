@@ -23,6 +23,7 @@ if CommandLine.arguments.contains("stream") {
         ("raw-tests", { _, _ in SeedlessVerifyTests.runAll() }),
         ("raw-spec",  { try Tell.run(modelDir: $0, refPath: $1) }),
         ("prefix-cache-poc", { md, _ in Tell.prefixCachePoC(modelDir: md) }),
+        ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {

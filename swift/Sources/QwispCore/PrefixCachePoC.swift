@@ -12,6 +12,33 @@ import MLX
 // tail = the generation prompt + generated tokens that the next request rewinds past, B = the new
 // content appended in the next request.
 extension Tell {
+    // Prefill throughput probe: measures tok/s prefilling a fixed prompt at several chunk sizes.
+    // If larger chunks are much faster → per-forward overhead dominates (raise the chunk).
+    // If flat → per-token compute is the limit (kernel-level work). Measure-before-implement.
+    public static func prefillThroughputProbe(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefill-probe] load fail" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = 4096
+        let prompt = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+        var lines = ["[prefill-probe] promptLen=\(promptLen), resident"]
+        for chunk in [64, 128, 256, 512] {
+            guard let b = Tell.fusedBackend(engine: engine, maxM: chunk + 8, maxSeqLen: promptLen + 128) else {
+                lines.append("  chunk=\(chunk): backend nil"); continue
+            }
+            let t0 = Date()
+            var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + chunk, promptLen)
+                _ = b.forward(Array(prompt[pos ..< end]))
+                pos = end
+            }
+            let dt = Date().timeIntervalSince(t0)
+            lines.append(String(format: "  chunk=%4d: %.3fs  %.0f tok/s", chunk, dt, Double(promptLen) / dt))
+        }
+        return lines.joined(separator: "\n") + "\nPREFILLPROBE done"
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()
