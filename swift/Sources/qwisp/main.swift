@@ -8,14 +8,17 @@ import QwispCore
 // Scaffold: proves the dependency graph (Hummingbird + swift-transformers) resolves
 // and links. `serve` / `chat` are wired in follow-up sub-steps.
 
-let defaultModel = "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
 let qwispConfig = Config.load(path: Config.defaultPath)
-let model = Config.resolveModel(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: defaultModel)
+let model = Config.resolveModel(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: Config.defaultModel)
 
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "serve":
-    let port = Config.resolvePort(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: 8080)
+    let port = Config.resolvePort(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: Config.defaultPort)
+    // A daemon has no TTY — never prompt. Missing model → fail fast with the hint.
+    if ProcessInfo.processInfo.environment["QWISP_FAKE"] != "1" && !ModelStore.isModel(model) {
+        FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
+    }
     let modelID = URL(fileURLWithPath: model).lastPathComponent
     let tok = try await QwispTokenizer(modelDir: model)
     let backend: any LLMBackend
@@ -50,16 +53,25 @@ case "chat":
     if prompt.isEmpty {
         print("usage: qwisp chat [--max-tokens N] <prompt>   (or pipe text via stdin)")
     } else {
-        let tok = try await QwispTokenizer(modelDir: model)
+        let env = ProcessInfo.processInfo.environment
+        // Ensure a model is present; interactively offer to pull one if not (TTY only).
+        let effModel: String
+        if env["QWISP_FAKE"] == "1" {
+            effModel = model
+        } else if let m = await ModelStore.ensureModel(model, allowPrompt: true) {
+            effModel = m
+        } else {
+            FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
+        }
+        let tok = try await QwispTokenizer(modelDir: effModel)
         let backend: any LLMBackend
-        if ProcessInfo.processInfo.environment["QWISP_FAKE"] == "1" {
+        if env["QWISP_FAKE"] == "1" {
             backend = FakeBackend(script: tok.encode("(fake backend) hello from qwisp chat."))
         } else {
-            backend = try SeedlessBackend(modelDir: model)
+            backend = try SeedlessBackend(modelDir: effModel)
         }
         // Option B sampling knobs (the server uses the OpenAI API params instead).
         // maxTokens comes from the --max-tokens flag above (default -1 = until EOS/context).
-        let env = ProcessInfo.processInfo.environment
         let temp = Double(env["QWISP_TEMP"] ?? "0") ?? 0
         let topP = Double(env["QWISP_TOPP"] ?? "1") ?? 1
         let seed = UInt64(env["QWISP_SEED"] ?? "0") ?? 0
@@ -89,6 +101,19 @@ case "configtest":
     let (passed, total, log) = Config.selfCheck()   // model/port resolution + config load (no GPU, no model)
     print(log.joined(separator: "\n") + "\nCONFIGTEST \(passed)/\(total)")
     if passed != total { exit(1) }
+case "pull":
+    // qwisp pull [hf-repo-id] — download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) and
+    // point ~/.config/qwisp/config.json at it.
+    let repo = args.dropFirst().first ?? ModelStore.defaultRepo
+    _ = try await ModelStore.pull(repo: repo)
+case "config":
+    // qwisp config           — effective config with per-key provenance
+    // qwisp config --defaults — full default set as JSON (for pinning explicitly)
+    if args.dropFirst().first == "--defaults" {
+        print(Config.defaultsJSON())
+    } else {
+        print(Config.effectiveReport(env: ProcessInfo.processInfo.environment, config: qwispConfig, path: Config.defaultPath))
+    }
 default:
-    print("usage: qwisp [serve|chat|selftest|comptest|sampletest|configtest]")
+    print("usage: qwisp [serve|chat|pull|config|selftest|comptest|sampletest|configtest]")
 }

@@ -6,12 +6,22 @@ import Foundation
 //   1. QWISP_MODEL / QWISP_PORT env      (dev + scripts override)
 //   2. ~/.config/qwisp/config.json       {"model": "...", "port": 8080}   (the resident source)
 //   3. built-in default                  (drop the model at ~/.mtplx/… and it just works)
-struct QwispConfig: Decodable {
+//
+// Defaults live in code (below), NOT materialized into the user's file — the file stays a sparse
+// override, so a new qwisp version's improved defaults aren't frozen out by a stale on-disk copy.
+// `qwisp config` prints the effective values; `qwisp config --defaults` emits the full default set
+// (generated here, never stale) for anyone who wants to pin one explicitly.
+struct QwispConfig: Codable {
     var model: String?
     var port: Int?
 }
 
 enum Config {
+    // ── defaults (the SSoT) ──────────────────────────────────────────────
+    static let defaultModel = FileManager.default.homeDirectoryForCurrentUser.path
+        + "/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
+    static let defaultPort = 8080
+
     static var defaultPath: String {
         FileManager.default.homeDirectoryForCurrentUser.path + "/.config/qwisp/config.json"
     }
@@ -33,6 +43,44 @@ enum Config {
         return config.port ?? def
     }
 
+    // Where each effective value came from — for `qwisp config` transparency.
+    static func sourceOfModel(env: [String: String], config: QwispConfig) -> String {
+        env["QWISP_MODEL"] != nil ? "env" : (config.model != nil ? "config" : "default")
+    }
+    static func sourceOfPort(env: [String: String], config: QwispConfig) -> String {
+        if let e = env["QWISP_PORT"], Int(e) != nil { return "env" }
+        return config.port != nil ? "config" : "default"
+    }
+
+    // Write ONLY the model key, preserving any other keys already in the file (sparse override).
+    static func writeModel(_ path: String, to cfgPath: String = defaultPath) throws {
+        var cfg = load(path: cfgPath)
+        cfg.model = path
+        let dir = (cfgPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try enc.encode(cfg).write(to: URL(fileURLWithPath: cfgPath))
+    }
+
+    // Full default set as JSON — generated from the defaults above, so it can never be stale
+    // relative to this binary. `qwisp config --defaults`.
+    static func defaultsJSON() -> String {
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let full = QwispConfig(model: defaultModel, port: defaultPort)
+        return (try? enc.encode(full)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    // Human-readable effective config with per-key provenance. `qwisp config`.
+    static func effectiveReport(env: [String: String], config: QwispConfig, path: String) -> String {
+        let m = resolveModel(env: env, config: config, default: defaultModel)
+        let p = resolvePort(env: env, config: config, default: defaultPort)
+        return """
+        config file: \(path)\(FileManager.default.fileExists(atPath: path) ? "" : "  (not present)")
+          model = \(m)  [\(sourceOfModel(env: env, config: config))]
+          port  = \(p)  [\(sourceOfPort(env: env, config: config))]
+        """
+    }
+
     // GPU-free, model-free self-check — the CONFIGTEST gate.
     static func selfCheck() -> (Int, Int, [String]) {
         var passed = 0, total = 0, log: [String] = []
@@ -50,6 +98,17 @@ enum Config {
         check("default port",      resolvePort(env: [:], config: empty, default: 8080) == 8080)
         check("bad env port → config", resolvePort(env: ["QWISP_PORT": "nope"], config: cfg, default: 8080) == 9)
 
+        // source attribution
+        check("source model env",     sourceOfModel(env: ["QWISP_MODEL": "/m"], config: cfg) == "env")
+        check("source model config",  sourceOfModel(env: [:], config: cfg) == "config")
+        check("source model default", sourceOfModel(env: [:], config: empty) == "default")
+        check("source port default",  sourceOfPort(env: [:], config: empty) == "default")
+        check("source port env",      sourceOfPort(env: ["QWISP_PORT": "1"], config: empty) == "env")
+
+        // defaultsJSON carries both keys
+        let dj = defaultsJSON()
+        check("defaults json has model+port", dj.contains("\"model\"") && dj.contains("\"port\"") && dj.contains("8080"))
+
         // load(): missing file and malformed JSON both yield empty config, no throw.
         let tmp = NSTemporaryDirectory() + "qwisp-configtest-\(getpid())"
         check("missing file → empty", load(path: tmp + "/nope.json").model == nil)
@@ -58,7 +117,16 @@ enum Config {
         try? #"{"model":"/x","port":7}"#.write(toFile: tmp + ".json", atomically: true, encoding: .utf8)
         let good = load(path: tmp + ".json")
         check("valid json parsed", good.model == "/x" && good.port == 7)
+
+        // writeModel: sets model, preserves the existing port, round-trips.
+        let wpath = tmp + "-write.json"
+        try? #"{"port":1234}"#.write(toFile: wpath, atomically: true, encoding: .utf8)
+        try? writeModel("/new/model", to: wpath)
+        let after = load(path: wpath)
+        check("writeModel sets model", after.model == "/new/model")
+        check("writeModel keeps port", after.port == 1234)
         try? FileManager.default.removeItem(atPath: tmp + ".json")
+        try? FileManager.default.removeItem(atPath: wpath)
 
         return (passed, total, log)
     }

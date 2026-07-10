@@ -15,39 +15,38 @@ can stream from flash on RAM-constrained machines, so a 35B model reaches smalle
 
 ## Requirements
 
-- **Apple Silicon Mac**, macOS 14+.
-- **Xcode with the Metal Toolchain** (the engine ships hand-written Metal kernels).
-- **The model** on disk — a Qwen3.6-35B-A3B MTPLX checkpoint (~20 GB), e.g.
-  [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16):
-
-  ```bash
-  hf download Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 --local-dir ~/models/qwen3.6-a3b
-  ```
-
-  The directory must contain `config.json`, the `*.safetensors` shards, and `tokenizer.json` +
-  `chat_template.jinja`. Point qwisp at it three ways (most explicit wins): `QWISP_MODEL` env,
-  `~/.config/qwisp/config.json` (`{"model": "...", "port": 8080}`), or drop it at the default path
-  `~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16` for zero config.
+- **Apple Silicon Mac**, macOS 14+. The Homebrew binary is self-contained; **Xcode 26 / Swift 6.3**
+  is needed only to build from source.
+- **A model** (~20 GB) — a Qwen3.6-35B-A3B MTPLX checkpoint. `qwisp pull` downloads the default
+  ([`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16))
+  and writes the config for you (see Quickstart). You can also point qwisp at an existing checkpoint
+  via `QWISP_MODEL` or `~/.config/qwisp/config.json`.
 - RAM sets the tier automatically: `<32 GB` streams experts from flash; `≥32 GB` keeps everything
   resident (fastest decode). 16 GB is the practical floor for interactive use.
 
 ## Quickstart
 
 ```bash
-# Build (Release; Metal Toolchain required; ~minutes on first build)
+brew install penta2himajin/qwisp/qwisp     # Apple Silicon, macOS 14+
+
+qwisp pull                                 # download the default model (~20 GB) + write config
+                                           #   …or: qwisp pull <hf-repo-id>
+
+qwisp chat "Explain MoE routing in two sentences."
+qwisp chat --max-tokens 256 "…"            # cap length (default: until EOS / context)
+
+qwisp serve                                # OpenAI-compatible server on :8080 (QWISP_PORT to change)
+brew services start qwisp                  #   …or run it as a resident background service
+
+qwisp config                               # show effective settings + where each value came from
+```
+
+Build from source instead (needs Xcode 26 / Swift 6.3):
+
+```bash
 cd swift && xcodebuild build -scheme qwisp -configuration Release \
   -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation
-BIN=swift/.xcode-build-rel/Build/Products/Release/qwisp
-
-export QWISP_MODEL=~/models/qwen3.6-a3b    # the model dir (or set it in ~/.config/qwisp/config.json)
-
-# OpenAI-compatible server (QWISP_PORT, default 8080)
-"$BIN" serve
-
-# CLI (in-process, streams to stdout). By default it generates until EOS / context;
-# --max-tokens N caps the length (like mlx-lm; -1 = unlimited, the default).
-"$BIN" chat "Explain MoE routing in two sentences."
-"$BIN" chat --max-tokens 256 "Explain MoE routing in two sentences."
+# binary at swift/.xcode-build-rel/Build/Products/Release/qwisp
 ```
 
 Talk to the server with any OpenAI client:
