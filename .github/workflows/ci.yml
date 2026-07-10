@@ -5,46 +5,40 @@ on:
   push:
     branches: [main]
 
-# GPU-free gates only. The Metal-GPU gates (RAWTESTS, GPUSAMPLETEST) and the model gates
-# (TOKTEST, COMPTEST) can't run on GitHub-hosted runners: no usable Metal GPU, and the model
-# is a ~20 GB download per run.
+# What can and cannot run on GitHub-hosted runners:
 #
-# ponytail: TODO — when a self-hosted Apple Silicon runner is available, add a second job
-#   heavy-gates:
-#     runs-on: [self-hosted, macOS, ARM64]
-#   that runs `scripts/test_raw.sh` (RAWTESTS 79/79), `qwisp gpusampletest`, and — with
-#   QWISP_MODEL pre-set on the runner — `scripts/test_tokenizer.sh` + `scripts/test_completion.sh`.
-#   Mind the GPU-exclusivity rule (one qwisp-poc at a time): give it concurrency: group so runs
-#   serialize. Until then, those gates stay a local pre-commit step.
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+#   This project builds only on Xcode 26 / Swift 6.3 (developed there; a raw-Metal engine that
+#   relies on that compiler's overload resolution — see e.g. SeedlessMetalForward.swift:2559,
+#   `Float * MLXArray`). GitHub-hosted runners cap at Xcode 16 / Swift 6.0 and CANNOT build qwisp.
+#   So everything that needs the build — the binary gates (CONFIGTEST, SAMPLETEST), the Metal-GPU
+#   gates (RAWTESTS, GPUSAMPLETEST), and the model gates (TOKTEST, COMPTEST) — needs a machine with
+#   Xcode 26 (+ a Metal GPU, + the ~20 GB model). Those stay a LOCAL pre-commit step for now.
+#
+#   The only gate that needs no build is BENCHBATCHTEST — a pure-bash fixture (it stubs the binary
+#   itself). It runs here on Linux, cheaply, and guards the bench_batch.sh routing logic.
+#
+# ponytail: TODO — when a self-hosted Apple Silicon runner (Xcode 26, Metal GPU, QWISP_MODEL set)
+#   is available, add a job to run the real gates:
+#     heavy-gates:
+#       runs-on: [self-hosted, macOS, ARM64]
+#       concurrency: { group: gpu-exclusive, cancel-in-progress: false }  # GPU is exclusive: serialize
+#       steps:
+#         - uses: actions/checkout@v4
+#         - working-directory: swift
+#           run: |
+#             for s in qwisp qwisp-poc; do xcodebuild build -scheme "$s" -configuration Release \
+#               -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation; done
+#             BIN=./.xcode-build-rel/Build/Products/Release/qwisp
+#             "$BIN" configtest && "$BIN" sampletest && "$BIN" gpusampletest
+#         - run: scripts/test_raw.sh                      # RAWTESTS 79/79
+#         - run: scripts/test_tokenizer.sh                # TOKTEST 3/3  (QWISP_MODEL preset on runner)
+#         - run: scripts/test_completion.sh               # COMPTEST 4/4
+#   Until then those are run locally before each commit.
 
 jobs:
-  build-and-gpu-free-gates:
-    runs-on: macos-15   # Package.swift is swift-tools 6.0 → needs Xcode 16 (macos-14 defaults to 15.4 / Swift 5.10)
+  bench-batch-fixture:
+    runs-on: ubuntu-latest   # pure-bash fixture; no build/GPU/model → no need for a costly macOS runner
     steps:
       - uses: actions/checkout@v4
-
-      - name: Toolchain
-        run: xcodebuild -version
-
-      - name: Build (Release, both schemes; shared derived data → 2nd build is incremental)
-        working-directory: swift
-        run: |
-          for scheme in qwisp qwisp-poc; do
-            xcodebuild build -scheme "$scheme" -configuration Release \
-              -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel \
-              -skipPackagePluginValidation
-          done
-
-      - name: GPU-free binary gates (CONFIGTEST, SAMPLETEST)
-        working-directory: swift
-        run: |
-          BIN=./.xcode-build-rel/Build/Products/Release/qwisp
-          "$BIN" configtest
-          "$BIN" sampletest
-
-      - name: Bench-batch fixture gate (BENCHBATCHTEST)
+      - name: BENCHBATCHTEST (bench_batch.sh routing fixture)
         run: scripts/test_bench_batch.sh
