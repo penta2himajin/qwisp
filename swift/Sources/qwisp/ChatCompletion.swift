@@ -113,12 +113,12 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
                    decode: ([Int]) -> String, backend: any LLMBackend,
                    temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
                    frequencyPenalty: Double = 0, presencePenalty: Double = 0,
-                   logitBias: [Int: Double] = [:],
+                   logitBias: [Int: Double] = [:], promptContentLen: Int? = nil,
                    onDelta: (String) -> Void) async -> CompletionResult {
     let opts = GenerateOptions(maxTokens: maxTokens, stopTokens: stopIds,
                                temperature: temperature, topP: topP, seed: seed,
                                frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
-                               logitBias: logitBias)
+                               logitBias: logitBias, promptContentLen: promptContentLen)
     var outIds: [Int] = []
     var emitted = ""
     var finish = "stop"
