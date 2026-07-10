@@ -324,6 +324,69 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // Hybrid-prefill estimate: measures the steel-replaceable sub-stage costs (GDN matmuls, GDN
+    // recurrence, MoE routed gather, MoE shared) by warm-buffer skip differentials (KV/GDN state
+    // reset via fullRestore between runs; buffers stay numerically sane after a warm pass, avoiding
+    // the cold-garbage artifact that invalidated v1), then folds in the MEASURED steel ratios
+    // (steel-route-bench @1a41c38) + sync/copy overheads to print the projected hybrid speedup.
+    // Additivity of the differentials is reported as a sanity check.
+    public static func hybridEstimate(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[hybrid-est] load fail\nHYBRIDEST done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let prompt = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+        func allOff() {
+            SeedlessMetalForward.profSkipGDNMatmul = false
+            SeedlessMetalForward.profSkipGDNRecur = false
+            SeedlessMetalForward.profSkipMoERouted = false
+            SeedlessMetalForward.profSkipMoEShared = false
+        }
+        var out = ["[hybrid-est] promptLen=\(promptLen) resident — sub-stage differentials (warm) + steel fold-in"]
+        // measured steel speedups (steel-route-bench): [chunk: (gdnMatmul, moeRouted, moeShared)]
+        // gdnMatmul = blend of inproj (3.8x@256, 4.3x@1024) and outproj (~1.4x@256, ~3.3x@1024) → ~3.0/4.0
+        let steel: [Int: (gdnMat: Double, moeR: Double, moeS: Double)] = [
+            256:  (3.0, 1.40, 1.0),
+            1024: (4.0, 2.24, 2.3)]
+        for chunk in [256, 1024] {
+            guard let b = Tell.fusedBackend(engine: engine, maxM: chunk + 8, maxSeqLen: promptLen + 128) else { continue }
+            guard let empty = b.fullSnapshot?() else { continue }
+            func prefill() -> Double {
+                b.fullRestore?(empty)
+                let t0 = Date(); var pos = 0
+                while pos < promptLen {
+                    let e = Swift.min(pos + chunk, promptLen)
+                    _ = b.forward(Array(prompt[pos ..< e])); pos = e
+                }
+                return Date().timeIntervalSince(t0)
+            }
+            allOff(); _ = prefill()                                  // warm: sane buffers + pipelines
+            func timed(_ set: () -> Void) -> Double {
+                allOff(); set()
+                let a = prefill(), c = prefill()
+                allOff(); return Swift.min(a, c)
+            }
+            let full  = timed {}
+            let dGMat = full - timed { SeedlessMetalForward.profSkipGDNMatmul = true }
+            let dGRec = full - timed { SeedlessMetalForward.profSkipGDNRecur = true }
+            let dMoER = full - timed { SeedlessMetalForward.profSkipMoERouted = true }
+            let dMoES = full - timed { SeedlessMetalForward.profSkipMoEShared = true }
+            let parts = dGMat + dGRec + dMoER + dMoES
+            let r = steel[chunk]!
+            let boundaries = Double(promptLen / chunk) * (30.0 * 2 + 40.0 * 2)   // per chunk: GDN 2/layer + MoE 2/layer
+            let sync = boundaries * 0.263e-3
+            let copies = Double(promptLen / chunk) * 0.015 * Double(chunk) / 1024.0   // ~15ms/chunk@1024 measured-class memcpy
+            let hybrid = full - dGMat * (1 - 1 / r.gdnMat) - dMoER * (1 - 1 / r.moeR) - dMoES * (1 - 1 / r.moeS) + sync + copies
+            out.append(String(format: "  chunk=%4d  full %5.2fs (%.0f tok/s)", chunk, full, Double(promptLen) / full))
+            out.append(String(format: "    sub-stage: GDNmat %5.2fs  GDNrec %5.2fs  MoErouted %5.2fs  MoEshared %5.2fs  (sum %.2fs = %.0f%% of full — additivity check)",
+                              dGMat, dGRec, dMoER, dMoES, parts, 100 * parts / full))
+            out.append(String(format: "    HYBRID est: %5.2fs (%.0f tok/s)  → %.2fx   [steel %0.1f/%0.2f/%0.1fx, sync %.2fs, copies %.2fs]",
+                              hybrid, Double(promptLen) / hybrid, full / hybrid, r.gdnMat, r.moeR, r.moeS, sync, copies))
+        }
+        out.append("HYBRIDEST done")
+        return out.joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()
