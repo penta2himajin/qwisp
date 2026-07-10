@@ -67,7 +67,7 @@ red strict cell.
 - **Lossless is defined at L1: bit-exact reproduction of the quantised greedy token stream.** The
   strict path is the reference; `bolt`/near-lossless is an opt-in speed tier. Never weaken the
   lossless definition to make a number look better.
-- **RAWTESTS 78/78 is the campaign-wide safety gate.** It must stay green through every
+- **RAWTESTS 79/79 is the campaign-wide safety gate.** It must stay green through every
   delete/rename/refactor commit. A red gate blocks the commit, not the other way around.
 - **Predictive levers lose to mechanical levers on the same slack** (engine doctrine, measured
   repeatedly). Don't re-propose prediction/prefetch schemes as speedups without new measurement.
@@ -86,12 +86,11 @@ red strict cell.
 ## Prohibitions
 
 1. Do not regenerate `refs/*.safetensors` from MLX or any non-raw-greedy source.
-2. Do not weaken, skip, or delete the locked tests (`swift/Sources/QwispCore/RawVerifyTests.swift`
-   57–78, `.locks/`). They are the lossless safety net.
-3. Do not rewrite the shipped forward path (RawSpecRunner / RawFusedVerify / RawMetalForward /
-   RawEngine / ExpertArena / ExpertSource + model layers). The productization pass **renames** it,
-   never rewrites it.
-4. Do not commit on `main` — it is the frozen pre-deletion snapshot. All work is on `feat/productize`.
+2. Do not weaken, skip, or delete the `WRITE-LOCKED` tests in
+   `swift/Sources/QwispCore/SeedlessVerifyTests.swift` (guarded by `total = 79`). They are the lossless safety net.
+3. Do not rewrite the shipped forward path (SeedlessEngine / SeedlessMetalForward / SeedlessFusedVerify /
+   Tell / ExpertArena / ExpertSource + model layers). It is frozen — refactor/rename only, never rewrite.
+4. Do not rewrite `main`'s history. Work on a topic branch (`claude/<topic>`, etc.) and open a PR to `main`.
 5. Do not run two `qwisp-poc` processes at once — the GPU is exclusive; heavy runs must be standalone.
 
 ## Git Conventions
