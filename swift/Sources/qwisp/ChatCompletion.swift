@@ -84,7 +84,7 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
         let delta = full.hasPrefix(emitted) ? String(full[emitted.endIndex...]) : full
         emitted = full
         if !delta.isEmpty { onDelta(delta) }
-        if outIds.count >= maxTokens { finish = "length"; break }
+        if maxTokens >= 0 && outIds.count >= maxTokens { finish = "length"; break }  // <0 = until EOS/context
     }
     return CompletionResult(text: emitted, completionTokens: outIds.count, finishReason: finish)
 }

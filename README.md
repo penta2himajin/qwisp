@@ -36,7 +36,8 @@ export QWISP_MODEL=/path/to/Qwen3.6-35B-A3B-MTPLX-…    # the model directory
 # OpenAI-compatible server (QWISP_PORT, default 8080)
 "$BIN" serve
 
-# CLI (in-process, streams to stdout; --max-tokens caps generation, default 512)
+# CLI (in-process, streams to stdout). By default it generates until EOS / context;
+# --max-tokens N caps the length (like mlx-lm; -1 = unlimited, the default).
 "$BIN" chat "Explain MoE routing in two sentences."
 "$BIN" chat --max-tokens 256 "Explain MoE routing in two sentences."
 ```
@@ -54,7 +55,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 | Endpoint | Notes |
 |---|---|
 | `GET /v1/models` | Lists the loaded model (id = model folder name). |
-| `POST /v1/chat/completions` | `stream:true` → SSE (`chat.completion.chunk`); otherwise a `chat.completion` JSON with `usage`. |
+| `POST /v1/chat/completions` | `stream:true` → SSE (`chat.completion.chunk`); otherwise a `chat.completion` JSON with `usage`. Omit `max_tokens` (or send a negative value) to generate until EOS / context; the KV arena grows on demand from an 8K baseline. |
 
 **Sampling is ignored — the engine is lossless greedy.** `temperature` / `top_p` / `n` are
 accepted but have no effect (output is deterministic). When any are supplied, the response carries

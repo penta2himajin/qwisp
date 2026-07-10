@@ -29,8 +29,9 @@ case "serve":
     try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
     // `--max-tokens N` | `--max-tokens=N` (matches mlx-lm); the rest of the args are the prompt.
+    // Default -1 = generate until EOS / context (mlx-lm / llama.cpp semantics); N caps it.
     var rest = Array(args.dropFirst())
-    var maxTokens = 512
+    var maxTokens = -1
     if let i = rest.firstIndex(where: { $0 == "--max-tokens" || $0.hasPrefix("--max-tokens=") }) {
         let flag = rest[i]
         if let eq = flag.firstIndex(of: "=") {
