@@ -54,18 +54,27 @@ public enum Sampler {
     }
 
     /// Zero everything outside the smallest set whose cumulative prob ≥ topP, then renormalize.
+    /// Sorting all V indices with a closure comparator is the dominant sampling cost, so sort only
+    /// the non-negligible candidates (a peaked softmax → a few hundred); fall back to the full sort
+    /// only when those don't cover topP (near-uniform dist) so the result stays exact.
     static func nucleusTruncate(_ p: inout [Float], topP: Double) {
-        let order = (0..<p.count).sorted { p[$0] > p[$1] }
+        let pm = p.max() ?? 0
+        let thr = pm * 1e-4                          // tokens below this cannot matter for a peaked dist
+        var cand: [Int] = []; var candMass: Double = 0
+        for i in 0..<p.count where p[i] >= thr { cand.append(i); candMass += Double(p[i]) }
+        let order = candMass >= topP ? cand.sorted { p[$0] > p[$1] }
+                                     : (0..<p.count).sorted { p[$0] > p[$1] }
         var cum: Double = 0
-        var keep = Set<Int>()
+        var kept: [(Int, Float)] = []
         for i in order {
-            keep.insert(i)
+            kept.append((i, p[i]))
             cum += Double(p[i])
-            if cum >= topP { break }               // include the token that crosses the threshold
+            if cum >= topP { break }                 // include the token that crosses the threshold
         }
+        for i in 0..<p.count { p[i] = 0 }            // zero-out then restore the nucleus (no per-elem Set lookup)
         var sum: Float = 0
-        for i in 0..<p.count { if !keep.contains(i) { p[i] = 0 } else { sum += p[i] } }
-        if sum > 0 { let inv = 1 / sum; for i in 0..<p.count { p[i] *= inv } }
+        for (i, v) in kept { p[i] = v; sum += v }
+        if sum > 0 { let inv = 1 / sum; for (i, _) in kept { p[i] *= inv } }
     }
 
     /// Categorical draw from a (already normalized) probability vector.
