@@ -43,10 +43,14 @@ else
     log="$DIR/qwisp-fm-$tag.log"
     echo "== $tag (C=$c thr=$thr) -> $log =="
     # DEFER only for slow configs' strict batch (bench_batch strips it for raw bolt calls).
+    # Tier-split canonical refs: resident (C=256) compares against refs/resident (steel-prefill
+    # hybrid canonical); streaming tiers keep refs/ (pre-hybrid canonical — hybrid is resident-only,
+    # streaming streams are unchanged by construction).
+    refsdir="$REPO/refs"; [ "$c" = 256 ] && refsdir="$REPO/refs/resident"
     if [ "$thr" != 0 ]; then
-      QWISP_THROTTLE_DEFER=1 "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
+      QWISP_BENCH_REFS="$refsdir" QWISP_THROTTLE_DEFER=1 "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
     else
-      "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
+      QWISP_BENCH_REFS="$refsdir" "$REPO/scripts/bench_batch.sh" "$c" "$GEN" "$thr" "$methods" > "$log" 2>&1
     fi
     echo "EXIT=$?" >> "$log"
     tail -n +2 "$log" | grep -E '^  (suffix-spec|bolt) +(code|agentic|longctx|shortnl) ' || true

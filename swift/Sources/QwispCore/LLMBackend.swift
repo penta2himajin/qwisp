@@ -193,7 +193,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
                         : Tell.fusedBackend(engine: self.engine,
-                                            maxM: Tell.envFlag("QWISP_HYBRID_PREFILL") ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
+                                            maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                                             maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
                     let onTok: (Int) -> Void = { continuation.yield($0) }
@@ -257,7 +257,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
                     // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
-                    let mm = Tell.envFlag("QWISP_HYBRID_PREFILL") ? Swift.max(cfg.maxM, 1032) : cfg.maxM
+                    let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
                     guard let b = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen) else {
                         continuation.finish(); return
                     }

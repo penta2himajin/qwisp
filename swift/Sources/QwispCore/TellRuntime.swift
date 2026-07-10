@@ -177,7 +177,9 @@ extension Tell {
         }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
-        if Tell.envFlag("QWISP_HYBRID_PREFILL") {
+        // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
+        // QWISP_HYBRID_PREFILL=0 opts out (pre-hybrid canonical stream).
+        if ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" {
             var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
             for (i, spec) in engine.layers.enumerated() {
                 guard let g = spec.gdn else { continue }
@@ -251,7 +253,9 @@ extension Tell {
         }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
-        if Tell.envFlag("QWISP_HYBRID_PREFILL") {
+        // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
+        // QWISP_HYBRID_PREFILL=0 opts out (pre-hybrid canonical stream).
+        if ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" {
             var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
             for (i, spec) in engine.layers.enumerated() {
                 guard let g = spec.gdn else { continue }
