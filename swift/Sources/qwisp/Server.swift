@@ -49,9 +49,24 @@ final class QwispEngine: @unchecked Sendable {
         self.modelID = modelID
     }
 
-    /// True when the client sent sampling params the greedy engine ignores.
+    /// True when the client sent a param that is still unsupported (n > 1 only —
+    /// temperature/top_p/seed are now honored via speculative sampling).
     func samplingRequested(_ req: ChatCompletionRequest) -> Bool {
-        req.temperature != nil || req.top_p != nil || (req.n ?? 1) > 1
+        (req.n ?? 1) > 1
+    }
+
+    struct SamplingParams {
+        var temperature: Double, topP: Double, seed: UInt64
+        var frequencyPenalty: Double, presencePenalty: Double, logitBias: [Int: Double]
+    }
+    /// Resolve sampling from the request. temperature default 0 = greedy/lossless.
+    func sampling(_ req: ChatCompletionRequest) -> SamplingParams {
+        var bias: [Int: Double] = [:]
+        for (k, v) in req.logit_bias ?? [:] { if let t = Int(k) { bias[t] = v } }
+        return SamplingParams(temperature: req.temperature ?? 0, topP: req.top_p ?? 1.0,
+                              seed: UInt64(bitPattern: Int64(req.seed ?? 0)),
+                              frequencyPenalty: req.frequency_penalty ?? 0,
+                              presencePenalty: req.presence_penalty ?? 0, logitBias: bias)
     }
 
     private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int]) {
@@ -63,9 +78,13 @@ final class QwispEngine: @unchecked Sendable {
     /// Non-streaming completion.
     func complete(_ req: ChatCompletionRequest) async throws -> ChatCompletionResponse {
         let p = try prompt(req)
+        let s = sampling(req)
         await lock.acquire()
         let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
-                                    decode: { tokenizer.decode($0) }, backend: backend) { _ in }
+                                    decode: { tokenizer.decode($0) }, backend: backend,
+                                    temperature: s.temperature, topP: s.topP, seed: s.seed,
+                                    frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
+                                    logitBias: s.logitBias) { _ in }
         await lock.release()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         return ChatCompletionResponse(
@@ -95,7 +114,11 @@ final class QwispEngine: @unchecked Sendable {
 
         try await send(Delta(role: "assistant", content: nil), nil)
         var outIds: [Int] = [], emitted = "", finish = "stop"
-        let opts = GenerateOptions(maxTokens: p.maxTokens, stopTokens: p.stop)
+        let s = sampling(req)
+        let opts = GenerateOptions(maxTokens: p.maxTokens, stopTokens: p.stop,
+                                   temperature: s.temperature, topP: s.topP, seed: s.seed,
+                                   frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
+                                   logitBias: s.logitBias)
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
@@ -124,7 +147,7 @@ func makeRouter(engine: QwispEngine, modelID: String) -> Router<BasicRequestCont
         let req = try await request.decode(as: ChatCompletionRequest.self, context: context)
         var headers = HTTPFields()
         if engine.samplingRequested(req) {
-            headers[warnHeader] = "sampling params ignored (greedy/lossless engine)"
+            headers[warnHeader] = "n > 1 ignored (single completion); temperature/top_p/seed are honored"
         }
         if req.stream == true {
             headers[.contentType] = "text/event-stream"
@@ -151,6 +174,6 @@ func runServe(engine: QwispEngine, modelID: String, port: Int) async throws {
         configuration: .init(address: .hostname("127.0.0.1", port: port))
     )
     print("qwisp serve → http://127.0.0.1:\(port)  (model: \(modelID))")
-    print("[qwisp serve] NOTE: sampling params (temperature/top_p/n) are ignored — greedy/lossless engine.")
+    print("[qwisp serve] NOTE: temperature/top_p/seed honored via speculative sampling (Option B); n>1 ignored. Default temperature 0 = greedy/lossless.")
     try await app.runService()
 }

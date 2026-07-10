@@ -56,12 +56,34 @@ case "chat":
         } else {
             backend = try SeedlessBackend(modelDir: model)
         }
-        await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens)
+        // Option B sampling knobs (the server uses the OpenAI API params instead).
+        // maxTokens comes from the --max-tokens flag above (default -1 = until EOS/context).
+        let env = ProcessInfo.processInfo.environment
+        let temp = Double(env["QWISP_TEMP"] ?? "0") ?? 0
+        let topP = Double(env["QWISP_TOPP"] ?? "1") ?? 1
+        let seed = UInt64(env["QWISP_SEED"] ?? "0") ?? 0
+        let freqPen = Double(env["QWISP_FREQPEN"] ?? "0") ?? 0
+        let presPen = Double(env["QWISP_PRESPEN"] ?? "0") ?? 0
+        var bias: [Int: Double] = [:]   // QWISP_LOGIT_BIAS="tok:bias,tok:bias"
+        for pair in (env["QWISP_LOGIT_BIAS"] ?? "").split(separator: ",") {
+            let kv = pair.split(separator: ":"); if kv.count == 2, let t = Int(kv[0]), let b = Double(kv[1]) { bias[t] = b }
+        }
+        await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens,
+                      temperature: temp, topP: topP, seed: seed,
+                      frequencyPenalty: freqPen, presencePenalty: presPen, logitBias: bias)
     }
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":
     print(await runCompletionSelftest(modelDir: model))
+case "sampletest":
+    let (passed, total, log) = Sampler.selfCheck()   // GPU-free sampling-math check
+    print(log.joined(separator: "\n") + "\nSAMPLETEST \(passed)/\(total)")
+    if passed != total { exit(1) }
+case "gpusampletest":
+    let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
+    print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
+    if passed != total { exit(1) }
 default:
-    print("usage: qwisp [serve|chat|selftest]")
+    print("usage: qwisp [serve|chat|selftest|comptest|sampletest]")
 }

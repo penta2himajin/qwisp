@@ -23,9 +23,29 @@ public struct GenerateOptions {
     /// Token ids that halt decoding (EOS / chat turn-end). Empty = run to maxTokens.
     /// A stop token is NOT emitted; the runtime stops before yielding it.
     public var stopTokens: [Int]
-    public init(maxTokens: Int = 128, stopTokens: [Int] = []) {
+    /// Sampling (Option B prototype). temperature 0 → greedy/lossless (default); >0 → sample.
+    /// topP < 1 → nucleus truncation. Penalties + logitBias reshape the logits before sampling.
+    /// `sampling` is true when any of these shape the distribution (so it leaves the greedy path).
+    public var temperature: Double
+    public var topP: Double
+    public var seed: UInt64
+    public var frequencyPenalty: Double
+    public var presencePenalty: Double
+    public var logitBias: [Int: Double]
+    public var sampling: Bool {
+        temperature > 0 || topP < 1.0 || frequencyPenalty != 0 || presencePenalty != 0 || !logitBias.isEmpty
+    }
+    public init(maxTokens: Int = 128, stopTokens: [Int] = [],
+                temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
+                frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:]) {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.seed = seed
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.logitBias = logitBias
     }
 }
 
@@ -127,6 +147,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // grow costs ~2× prefill on the tail; growing the KV buffer in place would need engine
             // changes (frozen forward path). The spec backend is also rebuilt per segment — fine for
             // a single-user server; a persistent per-instance backend is the throughput lever.
+            // QWISP_FORCE_SAMPLE=1 forces the sampling loop even at temperature 0 (T=0-equivalence gate).
+            let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
+            let wantSample = options.sampling || forceSample
             Thread.detachNewThread {
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
@@ -139,10 +162,34 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
                         : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
-                    let seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
-                                               N: segN, maxK: cfg.maxK,
-                                               isCancelled: { cancel.isCancelled }) { tok in
-                        continuation.yield(tok)
+                    let onTok: (Int) -> Void = { continuation.yield($0) }
+                    // Each segment dispatches to greedy or sampling. Sampling keeps its own state
+                    // per segment (RNG restarts, so vary the seed by `produced` to avoid reusing the
+                    // same stream across segment boundaries). ponytail: penalty counts reset per
+                    // segment — only bites penalized generation past the 8K baseline, which is rare.
+                    let seg: [Int]?
+                    let gpuSample = wantSample && backend.stepSampleRows != nil && !Tell.envFlag("QWISP_SAMPLE_CPU")
+                    if gpuSample {
+                        // GPU sampler: temperature/top_p/penalties/logit_bias on-GPU, tiny readback.
+                        // top_p lowers acceptance → narrower draft cuts forward + per-row work.
+                        let sampMaxK = options.topP < 1.0 ? Swift.min(cfg.maxK, 24) : cfg.maxK
+                        seg = Tell.runSpecSampleLoopGPU(promptIds: seq, backend: backend, engine: self.engine,
+                                                        N: segN, maxK: sampMaxK, temperature: options.temperature,
+                                                        topP: options.topP, seed: options.seed &+ UInt64(produced),
+                                                        frequencyPenalty: options.frequencyPenalty,
+                                                        presencePenalty: options.presencePenalty, logitBias: options.logitBias,
+                                                        isCancelled: { cancel.isCancelled }, onToken: onTok)
+                    } else if wantSample {
+                        // CPU sampling fallback (QWISP_SAMPLE_CPU / no head): logits readback, maxK ≤ 8.
+                        seg = Tell.runSpecSampleLoop(promptIds: seq, backend: backend, engine: self.engine,
+                                                     N: segN, maxK: Swift.min(cfg.maxK, 8), temperature: options.temperature,
+                                                     topP: options.topP, seed: options.seed &+ UInt64(produced),
+                                                     frequencyPenalty: options.frequencyPenalty,
+                                                     presencePenalty: options.presencePenalty, logitBias: options.logitBias,
+                                                     isCancelled: { cancel.isCancelled }, onToken: onTok)
+                    } else {
+                        seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
+                                               N: segN, maxK: cfg.maxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
                     }
                     guard let seg, !seg.isEmpty else { break }
                     seq += seg.map { Int32($0) }

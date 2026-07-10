@@ -16,10 +16,15 @@ struct ChatCompletionRequest: Codable {
     let messages: [ChatMessage]
     let stream: Bool?
     let max_tokens: Int?
-    // Accepted but IGNORED — the engine is lossless greedy (see runGeneration / server header).
+    // temperature / top_p / seed / penalties / logit_bias are HONORED via speculative sampling
+    // (Option B). n > 1 is still ignored (single completion).
     let temperature: Double?
     let top_p: Double?
     let n: Int?
+    let seed: Int?
+    let frequency_penalty: Double?
+    let presence_penalty: Double?
+    let logit_bias: [String: Double]?   // OpenAI: token-id string → bias
 }
 
 // ── Response (non-streaming) ─────────────────────────────────────────────────
@@ -47,12 +52,17 @@ struct ChatCompletionChunk: Codable {
 }
 
 // ── CLI (`qwisp chat`) — thin in-process wrapper over the same core ──────────
-func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend, maxTokens: Int) async {
+func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend, maxTokens: Int,
+             temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
+             frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:]) async {
     let promptIds: [Int]
     do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]]) }
     catch { fputs("chat: render error: \(error)\n", stderr); return }
     _ = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
-                            decode: { tokenizer.decode($0) }, backend: backend) { delta in
+                            decode: { tokenizer.decode($0) }, backend: backend,
+                            temperature: temperature, topP: topP, seed: seed,
+                            frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
+                            logitBias: logitBias) { delta in
         fputs(delta, stdout); fflush(stdout)   // real-time token output
     }
     fputs("\n", stdout)
@@ -70,8 +80,14 @@ struct CompletionResult {
 /// maxTokens (finish_reason "length"). Transport-agnostic; GPU-free with a fake backend.
 func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
                    decode: ([Int]) -> String, backend: any LLMBackend,
+                   temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
+                   frequencyPenalty: Double = 0, presencePenalty: Double = 0,
+                   logitBias: [Int: Double] = [:],
                    onDelta: (String) -> Void) async -> CompletionResult {
-    let opts = GenerateOptions(maxTokens: maxTokens, stopTokens: stopIds)
+    let opts = GenerateOptions(maxTokens: maxTokens, stopTokens: stopIds,
+                               temperature: temperature, topP: topP, seed: seed,
+                               frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
+                               logitBias: logitBias)
     var outIds: [Int] = []
     var emitted = ""
     var finish = "stop"
