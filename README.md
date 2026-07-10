@@ -17,9 +17,17 @@ can stream from flash on RAM-constrained machines, so a 35B model reaches smalle
 
 - **Apple Silicon Mac**, macOS 14+.
 - **Xcode with the Metal Toolchain** (the engine ships hand-written Metal kernels).
-- **The model** on disk — a Qwen3.6-35B-A3B MTPLX checkpoint (~20 GB). Point `QWISP_MODEL` at
-  its directory (must contain `config.json`, the `*.safetensors` shards, and `tokenizer.json` +
-  `chat_template.jinja`).
+- **The model** on disk — a Qwen3.6-35B-A3B MTPLX checkpoint (~20 GB), e.g.
+  [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16):
+
+  ```bash
+  hf download Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 --local-dir ~/models/qwen3.6-a3b
+  ```
+
+  The directory must contain `config.json`, the `*.safetensors` shards, and `tokenizer.json` +
+  `chat_template.jinja`. Point qwisp at it three ways (most explicit wins): `QWISP_MODEL` env,
+  `~/.config/qwisp/config.json` (`{"model": "...", "port": 8080}`), or drop it at the default path
+  `~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16` for zero config.
 - RAM sets the tier automatically: `<32 GB` streams experts from flash; `≥32 GB` keeps everything
   resident (fastest decode). 16 GB is the practical floor for interactive use.
 
@@ -31,7 +39,7 @@ cd swift && xcodebuild build -scheme qwisp -configuration Release \
   -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation
 BIN=swift/.xcode-build-rel/Build/Products/Release/qwisp
 
-export QWISP_MODEL=/path/to/Qwen3.6-35B-A3B-MTPLX-…    # the model directory
+export QWISP_MODEL=~/models/qwen3.6-a3b    # the model dir (or set it in ~/.config/qwisp/config.json)
 
 # OpenAI-compatible server (QWISP_PORT, default 8080)
 "$BIN" serve
@@ -57,10 +65,11 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 | `GET /v1/models` | Lists the loaded model (id = model folder name). |
 | `POST /v1/chat/completions` | `stream:true` → SSE (`chat.completion.chunk`); otherwise a `chat.completion` JSON with `usage`. Omit `max_tokens` (or send a negative value) to generate until EOS / context; the KV arena grows on demand from an 8K baseline. |
 
-**Sampling is ignored — the engine is lossless greedy.** `temperature` / `top_p` / `n` are
-accepted but have no effect (output is deterministic). When any are supplied, the response carries
-an `x-qwisp-warning: sampling params ignored (greedy/lossless engine)` header, and `serve` logs the
-same at startup. `tools`, `logprobs`, and `n > 1` are not supported.
+**Sampling is honored.** `temperature` (default `0` = greedy/lossless), `top_p`, `seed`,
+`frequency_penalty`, `presence_penalty`, and `logit_bias` all take effect — via speculative
+sampling on the GPU, at near-greedy speed. `temperature: 0` (the default) stays deterministic and
+bit-exact to the strict greedy path. `n > 1` is ignored (single completion) and sets an
+`x-qwisp-warning` header; `tools` and `logprobs` are not supported.
 
 ## Architecture
 
@@ -107,6 +116,16 @@ oracle/           # Python reference oracle (bit-compare; needs MLX python + mod
 notes/            # engine design rationale (referenced from source comments)
 docs/             # process docs (handoff protocol, i18n policy)
 ```
+
+## Acknowledgements
+
+Qwisp stands on:
+
+- **[Qwen](https://github.com/QwenLM/Qwen)** (Alibaba) — the Qwen3.6-35B-A3B model this engine specialises in.
+- **[Youssofal](https://huggingface.co/Youssofal)** — the MTPLX checkpoint qwisp loads by default.
+- **[MLX](https://github.com/ml-explore/mlx)** / **[mlx-swift](https://github.com/ml-explore/mlx-swift)** (Apple) — the numeric substrate (tensors, quantization, mmap loader).
+- **[Hummingbird](https://github.com/hummingbird-project/hummingbird)** — the async HTTP server.
+- **[swift-transformers](https://github.com/huggingface/swift-transformers)** (Hugging Face) — tokenizer + Qwen chat template.
 
 ## License
 
