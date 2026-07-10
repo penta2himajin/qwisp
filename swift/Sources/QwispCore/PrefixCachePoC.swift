@@ -76,51 +76,48 @@ extension Tell {
             return Date().timeIntervalSince(t0)
         }
 
-        // min-of-2 to damp run-to-run variance (single-run differentials were non-additive/noisy).
-        func best(_ set: () -> Void) -> Double {
-            allOff(); set(); let a = runPrefill(); let b = runPrefill(); allOff(); return Swift.min(a, b)
+        // v2: split WALL vs GPU-busy (profLastGPUMs per CB) per config. The decisive question:
+        // is prefill time GPU execution (kernel-level, capped ~22% by the skip test) or CPU-side
+        // gap (MLX embed eval + hBuf upload + normed readback + commit/wait per chunk) — the
+        // latter is a scheduling prize, lossless by construction (no math change).
+        func runAt(_ c: Int) -> (wall: Double, gpu: Double) {
+            guard let bk = Tell.fusedBackend(engine: engine, maxM: c + 8, maxSeqLen: promptLen + 128) else { return (-1, 0) }
+            var gpu = 0.0
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let e = Swift.min(pos + c, promptLen)
+                _ = bk.forward(Array(prompt[pos ..< e]))
+                gpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs / 1000.0
+                pos = e
+            }
+            return (Date().timeIntervalSince(t0), gpu)
         }
         func floorSet() {   // skip ALL heavy GPU compute → what remains is the irreducible floor
             SeedlessMetalForward.profSkipMixer = true          // GDN body + attention body
             SeedlessMetalForward.profSkipMoEExperts = true     // routed+shared+combine gather
             SeedlessMetalForward.profSkipSingleThread = true   // route_top8/shared_gate8
         }
-        allOff(); _ = runPrefill()                             // warmup: compile all pipelines
+        allOff(); _ = runAt(chunk)                             // warmup: compile all pipelines
+        _ = runPrefill                                          // (kept for API symmetry)
 
-        let tFull = best {}
-        // Floor swept over chunk size: if floor DROPS with bigger chunk → per-chunk dispatch/encode
-        // overhead (amortizable by larger chunk). If FLAT → per-token ops (norms/gate/KV, not amortizable).
-        var floorLines: [String] = []
-        for fc in [chunk, 256, 1024] {
-            let savedChunk = chunk
-            _ = savedChunk
-            // re-run floor at this chunk by temporarily overriding the closure's chunk via a local loop
-            func runAt(_ c: Int) -> Double {
-                guard let bk = Tell.fusedBackend(engine: engine, maxM: c + 8, maxSeqLen: promptLen + 128) else { return -1 }
-                let t0 = Date(); var pos = 0
-                while pos < promptLen { let e = Swift.min(pos + c, promptLen); _ = bk.forward(Array(prompt[pos ..< e])); pos = e }
-                return Date().timeIntervalSince(t0)
-            }
-            allOff(); floorSet(); let a = runAt(fc); let b = runAt(fc); allOff()
-            let f = Swift.min(a, b)
-            floorLines.append(String(format: "  floor @chunk=%4d        %6.1fs  %5.1f%% of full   (%d chunks)",
-                                     fc, f, 100 * f / tFull, (promptLen + fc - 1) / fc))
+        var lines = ["[prefill-bd] promptLen=\(promptLen) resident  — wall vs GPU-busy per config"]
+        func row(_ label: String, _ c: Int, floored: Bool) -> Double {
+            allOff(); if floored { floorSet() }
+            let a = runAt(c), b = runAt(c)
+            allOff()
+            let r = a.wall < b.wall ? a : b
+            lines.append(String(format: "  %@ chunk=%4d   wall %6.1fs   gpu %6.1fs   cpu-gap %6.1fs (%4.1f%%)   %.0f tok/s",
+                                label, c, r.wall, r.gpu, r.wall - r.gpu, 100 * (r.wall - r.gpu) / r.wall,
+                                Double(promptLen) / r.wall))
+            return r.wall
         }
-        // rough single-component split at the production chunk (noisy — min-of-2, may not be additive).
-        let tMixer = best { SeedlessMetalForward.profSkipMixer = true }
-        let tMoE   = best { SeedlessMetalForward.profSkipMoEExperts = true }
-        let tRoute = best { SeedlessMetalForward.profSkipSingleThread = true }
-        func pct(_ c: Double) -> String { String(format: "%6.1fs  %5.1f%%", c, 100 * c / tFull) }
-        var out = ["[prefill-bd] promptLen=\(promptLen) chunk=\(chunk) resident  (min-of-2)",
-                   String(format: "  FULL prefill            %6.1fs  (%.0f tok/s)", tFull, Double(promptLen) / tFull),
-                   "  ── rough component (t_full − t_skip, noisy) ──",
-                   "  all mixers (GDN+attn)   \(pct(tFull - tMixer))",
-                   "  MoE experts (all)       \(pct(tFull - tMoE))",
-                   "  routing single-thread   \(pct(tFull - tRoute))",
-                   "  ── FLOOR (all heavy compute skipped), swept over chunk ──"]
-        out += floorLines
-        out.append("PREFILLBD done")
-        return out.joined(separator: "\n")
+        _ = row("FULL ", chunk, floored: false)
+        _ = row("FULL ", 256, floored: false)
+        _ = row("floor", chunk, floored: true)
+        _ = row("floor", 256, floored: true)
+        _ = row("floor", 1024, floored: true)
+        lines.append("PREFILLBD done")
+        return lines.joined(separator: "\n")
     }
 
     // End-to-end lossless gate for the Design-B + multi-slot prefix cache: drives SeedlessBackend.generate
