@@ -290,6 +290,7 @@ extension Tell {
     /// Returns out[0..<N] token ids.
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
+                             isCancelled: (() -> Bool)? = nil,
                              onToken: ((Int) -> Void)? = nil) -> [Int]? {
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
@@ -304,7 +305,11 @@ extension Tell {
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
 
-        while out.count < N {
+        // isCancelled nil → `?? false` → loop condition byte-identical (RAWTESTS 79/79).
+        // Set by the streaming backend when the consumer drops the stream, so an
+        // aborted request stops at the next spec-step boundary instead of running
+        // to N and orphaning the GPU (see SeedlessBackend.generate).
+        while out.count < N && !(isCancelled?() ?? false) {
             flush()
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
