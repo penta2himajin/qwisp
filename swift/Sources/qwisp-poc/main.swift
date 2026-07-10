@@ -25,6 +25,7 @@ if CommandLine.arguments.contains("stream") {
         ("prefix-cache-poc", { md, _ in Tell.prefixCachePoC(modelDir: md) }),
         ("prefill-breakdown", { md, _ in Tell.prefillBreakdownProbe(modelDir: md) }),
         ("prefix-cache-e2e", { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
+        ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
     ]
     if let name = env["QWISP_RUN"] {

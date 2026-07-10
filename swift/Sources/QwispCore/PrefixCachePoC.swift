@@ -174,6 +174,42 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // Speed probe for the multi-slot cache: TTFT (time-to-first-token) for a cold request vs a
+    // cross-conversation request that shares a large prefix vs an intra-conversation extend.
+    // Shows the multi-slot win = skipping re-prefill of the shared system+tools prefix on a NEW convo.
+    // Env: QWISP_PREFIX_SHARED (shared prefix length, default 4096).
+    public static func prefixCacheSpeedProbe(modelDir: String) -> String {
+        guard let backend = try? SeedlessBackend(modelDir: modelDir) else { return "[prefix-speed] load fail\nPREFIXSPEED done" }
+        setenv("QWISP_PREFIX_SNAP_STRIDE", "2048", 1)
+        let P = Tell.envInt("QWISP_PREFIX_SHARED", 4096)
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let shared = toks(P, 13)
+        func req(_ content: [Int]) -> (p: [Int], cl: Int) { (content + toks(8, 777), content.count) }
+        let r1 = req(shared + toks(64, 1))                       // cold: cache empty
+        let r2 = req(shared + toks(64, 2))                       // cross-conversation: shares `shared`
+        let r3 = req(shared + toks(64, 2) + toks(80, 3))         // intra-conversation: extends r2
+
+        final class Box: @unchecked Sendable { var v: [Int] = []; var ttft = 0.0 }
+        func ttft(_ p: [Int], _ cl: Int) -> Double {
+            let box = Box(); let sem = DispatchSemaphore(value: 0); let t0 = Date()
+            let stream = backend.generate(p, options: GenerateOptions(maxTokens: 4, promptContentLen: cl))
+            Task { for await t in stream { if box.v.isEmpty { box.ttft = Date().timeIntervalSince(t0) }; box.v.append(t) }; sem.signal() }
+            sem.wait(); return box.ttft
+        }
+
+        backend.prefixCacheForced = true
+        backend.resetPrefixCache()
+        let cold  = ttft(r1.p, r1.cl)     // cache empty → full prefill of `shared`+tail
+        let cross = ttft(r2.p, r2.cl)     // multi-slot restores a boundary inside `shared`
+        let intra = ttft(r3.p, r3.cl)     // extends r2 → restores the top boundary
+        func fmt(_ s: Double) -> String { String(format: "%.2fs", s) }
+        return ["[prefix-speed] shared prefix=\(P) tok, resident/fused, greedy",
+                "  R1 cold (cache empty)      TTFT \(fmt(cold))",
+                String(format: "  R2 cross-conversation      TTFT %@   (%.1fx vs cold)", fmt(cross), cold / max(cross, 1e-3)),
+                String(format: "  R3 intra-conversation      TTFT %@   (%.1fx vs cold)", fmt(intra), cold / max(intra, 1e-3)),
+                "PREFIXSPEED done"].joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()
