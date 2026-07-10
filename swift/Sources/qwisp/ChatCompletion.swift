@@ -8,7 +8,10 @@ import QwispCore
 // ── Request ────────────────────────────────────────────────────────────────
 struct ChatMessage: Codable {
     let role: String
-    let content: String
+    let content: String?                // nil for assistant messages that are only tool_calls
+    var tool_calls: [ReqToolCall]? = nil // assistant → previous function calls (history)
+    var tool_call_id: String? = nil      // role:"tool" → which call this result answers
+    var name: String? = nil
 }
 
 struct ChatCompletionRequest: Codable {
@@ -25,6 +28,8 @@ struct ChatCompletionRequest: Codable {
     let frequency_penalty: Double?
     let presence_penalty: Double?
     let logit_bias: [String: Double]?   // OpenAI: token-id string → bias
+    var tools: [Tool]? = nil            // function-calling tool specs
+    var tool_choice: JSONValue? = nil   // accepted; the model decides (auto)
 }
 
 // Qwen3.6 is a reasoning model: the chat template injects `<think>` into the generation prompt,
@@ -39,7 +44,12 @@ func splitThink(_ s: String) -> (reasoning: String, content: String) {
 }
 
 // ── Response (non-streaming) ─────────────────────────────────────────────────
-struct ResponseMessage: Codable { let role: String; let content: String; var reasoning_content: String? = nil }
+struct ResponseMessage: Codable {
+    let role: String
+    var content: String? = nil          // nil when the turn is only tool_calls
+    var reasoning_content: String? = nil
+    var tool_calls: [ToolCall]? = nil
+}
 struct Choice: Codable { let index: Int; let message: ResponseMessage; let finish_reason: String }
 struct Usage: Codable { let prompt_tokens: Int; let completion_tokens: Int; let total_tokens: Int }
 struct ChatCompletionResponse: Codable {
@@ -52,7 +62,7 @@ struct ChatCompletionResponse: Codable {
 }
 
 // ── Response (streaming chunk) ───────────────────────────────────────────────
-struct Delta: Codable { var role: String? = nil; var content: String? = nil; var reasoning_content: String? = nil }
+struct Delta: Codable { var role: String? = nil; var content: String? = nil; var reasoning_content: String? = nil; var tool_calls: [ToolCallDelta]? = nil }
 struct ChunkChoice: Codable { let index: Int; let delta: Delta; let finish_reason: String? }
 struct ChatCompletionChunk: Codable {
     let id: String
