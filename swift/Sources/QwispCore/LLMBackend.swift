@@ -101,7 +101,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
 
-    // ── Cross-request prefix cache (opt-in via QWISP_PREFIX_CACHE=1) ──────────
+    // ── Cross-request prefix cache (default ON; QWISP_PREFIX_CACHE=0 opts out) ──────────
     // Persistent per-instance fused backend + a content-boundary fullSnapshot, so consecutive
     // requests (agentic loops) re-prefill only the new suffix. Serialized by the server lock.
     // Design B: the arena grows monotonically to fit each request (prompt+generation) instead of a
@@ -110,7 +110,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // reuse a shared prefix (system+tools) instead of re-prefilling it. Lossless — SuffixSpec verifies
     // every drafted token; snapshot/restore is byte-identical (PrefixCachePoC). ~60MB / slot (GDN state).
     public var prefixCacheForced: Bool? = nil      // test/override hook; nil → env flag
-    var prefixCacheEnabled: Bool { prefixCacheForced ?? Tell.envFlag("QWISP_PREFIX_CACHE") }
+    // Default ON (lossless: PREFIXE2E gate; growth removed the truncation risk). QWISP_PREFIX_CACHE=0 opts out.
+    var prefixCacheEnabled: Bool { prefixCacheForced ?? (ProcessInfo.processInfo.environment["QWISP_PREFIX_CACHE"] != "0") }
     var prefixArenaMax: Int { Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", 65536))) }
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
