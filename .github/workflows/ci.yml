@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build-and-gpu-free-gates:
-    runs-on: macos-14
+    runs-on: macos-15   # Package.swift is swift-tools 6.0 → needs Xcode 16 (macos-14 defaults to 15.4 / Swift 5.10)
     steps:
       - uses: actions/checkout@v4
 
