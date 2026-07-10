@@ -22,6 +22,7 @@ if CommandLine.arguments.contains("stream") {
     let runners: [(String, (String, String) throws -> String)] = [
         ("raw-tests", { _, _ in SeedlessVerifyTests.runAll() }),
         ("raw-spec",  { try Tell.run(modelDir: $0, refPath: $1) }),
+        ("prefix-cache-poc", { md, _ in Tell.prefixCachePoC(modelDir: md) }),
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {
