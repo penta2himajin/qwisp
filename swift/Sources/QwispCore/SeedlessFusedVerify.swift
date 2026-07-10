@@ -2159,11 +2159,14 @@ public enum SeedlessFusedVerify {
 
     /// attention 層 × M 行の全段を既存 encoder に encode。演算列は attnLayerRows と 1:1。
     /// kv.len は encode 時点の baseLen として読み、呼び出し側が encode 後に kv.len += M する。
+    // hybridDense: q/k/v arrive via MLX steel into sc.qOut/kOut/vOut; o_proj computed via MLX
+    // steel from sc.gated afterwards. Default false = existing path, untouched.
     static func encodeAttnLayerRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer,
                                     w: AttnLayerBufs, sc: AttnScratch, kv: KVCacheBufs,
                                     M: Int, H: Int,
                                     numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
-                                    ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6) {
+                                    ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6,
+                                    hybridDense: Bool = false) {
         let baseLen = kv.len
         let qd2 = 2 * headDim
         let scale = Float(pow(Double(headDim), -0.5))
@@ -2171,7 +2174,9 @@ public enum SeedlessFusedVerify {
         // A1(fuseATTN): 3 separate qmm4 dispatches → 1 demux dispatch(−2 per attn layer).
         // Cat weights built at prepare time; bit-exact by qmm4_inproj_demux_rows construction.
         // 原子別 kill-switch(bisect/構成用): QWISP_FUSE_A1=0 で A1 のみ無効。
-        if SeedlessFusedForward.fuseATTN,
+        if hybridDense {
+            // q/k/v computed via MLX steel into sc.qOut/kOut/vOut before this encode.
+        } else if SeedlessFusedForward.fuseATTN,
            SeedlessFusedForward.fuseA1Enabled,
            let cw = w.catQkvW, let cs = w.catQkvS, let cb = w.catQkvB, let dummy = w.catQkvDummy {
             let Nq = numHeads * qd2, Nk = numKV * headDim, Nv = numKV * headDim
@@ -2214,7 +2219,9 @@ public enum SeedlessFusedVerify {
         // ⑥ sigmoid gate → o_proj
         encodeSigmoidMul(enc, attnOut: sc.attnOut, qOut: sc.qOut, gated: sc.gated,
                          headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
-        encodeQmmRows(enc, w: w.oW, scales: w.oS, biases: w.oB, x: sc.gated, out: out, M: M, K: numHeads * headDim, N: H)
+        if !hybridDense {
+            encodeQmmRows(enc, w: w.oW, scales: w.oS, biases: w.oB, x: sc.gated, out: out, M: M, K: numHeads * headDim, N: H)
+        }
     }
 
     /// Stage B の pipeline warm。
@@ -3722,6 +3729,9 @@ public enum SeedlessFusedVerify {
         public var hybridGdnW: [Int: (qkv: (MLXArray, MLXArray, MLXArray),
                                       z: (MLXArray, MLXArray, MLXArray),
                                       out: (MLXArray, MLXArray, MLXArray))] = [:]
+        // Per-layer attn q/k/v/o triples for the steel dense swap.
+        public var hybridAttnW: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray),
+                                       v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
         // Per-layer MoE expert weights (gate/up/down triples) for the steel-CSR routed gather.
         public var hybridMoEW: [Int: (g: (MLXArray, MLXArray, MLXArray),
                                       u: (MLXArray, MLXArray, MLXArray),
@@ -3786,9 +3796,16 @@ public enum SeedlessFusedVerify {
             return MLXArray(Array(UnsafeBufferPointer(start: p, count: rows * cols)), [rows, cols])
         }
         private func arrToBuf(_ a: MLXArray, _ b: MTLBuffer, _ count: Int) {
-            let v = a.asType(.float16).reshaped([-1]); v.eval()
-            let arr = v.asArray(Float16.self)
-            b.contents().bindMemory(to: Float16.self, capacity: count).update(from: arr, count: count)
+            let v = a.asType(.float16)
+            v.eval()
+            // single memcpy via noCopy MTLBuffer wrap when contiguous; Array-copy fallback otherwise
+            if let (device, _) = SeedlessMetalForward.ensure(),
+               let src = v.asMTLBuffer(device: device, noCopy: true) {
+                memcpy(b.contents(), src.contents(), count * 2)
+            } else {
+                let arr = v.reshaped([-1]).asArray(Float16.self)
+                b.contents().bindMemory(to: Float16.self, capacity: count).update(from: arr, count: count)
+            }
         }
 
         /// Hybrid prefill forward: raw skeleton (norms/conv/recurrence/attention/MoE — all
@@ -3824,8 +3841,10 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
                     flush()
                     let xa = bufToArr(normed, M, H)
-                    arrToBuf(steelQmm(xa, hw.qkv, M: M), gdnSc.qkv, M * convDim)
-                    arrToBuf(steelQmm(xa, hw.z, M: M), gdnSc.z, M * valueDim)
+                    let yQkv = steelQmm(xa, hw.qkv, M: M), yZ = steelQmm(xa, hw.z, M: M)
+                    MLX.eval([yQkv, yZ])
+                    arrToBuf(yQkv, gdnSc.qkv, M * convDim)
+                    arrToBuf(yZ, gdnSc.z, M * valueDim)
                     SeedlessFusedVerify.encodeGdnLayerRows(enc(), x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
                                                       M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                       headKDim: headKDim, headVDim: headVDim,
@@ -3840,8 +3859,30 @@ public enum SeedlessFusedVerify {
                         SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: mixerOut, total: M * H)
                         SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
                     }
+                } else if !L.isLinear, let aw = L.attn, let kv = L.kvCache, let hwA = hybridAttnW[li] {
+                    SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
+                    flush()
+                    let xa = bufToArr(normed, M, H)
+                    let yQ = steelQmm(xa, hwA.q, M: M), yK = steelQmm(xa, hwA.k, M: M), yV = steelQmm(xa, hwA.v, M: M)
+                    MLX.eval([yQ, yK, yV])
+                    arrToBuf(yQ, attnSc.qOut, M * numHeads * headDim * 2)
+                    arrToBuf(yK, attnSc.kOut, M * numKV * headDim)
+                    arrToBuf(yV, attnSc.vOut, M * numKV * headDim)
+                    SeedlessFusedVerify.encodeAttnLayerRows(enc(), x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
+                                                       M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+                                                       ropeDim: ropeDim, ropeBase: ropeBase, eps: eps, hybridDense: true)
+                    kv.len += M
+                    flush()
+                    arrToBuf(steelQmm(bufToArr(attnSc.gated, M, numHeads * headDim), hwA.o, M: M), mixerOut, M * H)
+                    if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
+                        SeedlessFusedVerify.encodeGdnResidPostNormRows(enc(), h: hBuf, r: mixerOut,
+                                                                  w: L.postLN, postNorm: postNorm, M: M, H: H, eps: eps)
+                    } else {
+                        SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: mixerOut, total: M * H)
+                        SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.postLN, out: postNorm, rows: M, D: H, eps: eps)
+                    }
                 } else {
-                    encodePreMoE(enc(), L, M: M)   // raw mixer (attn layers etc.), incl. resid+postnorm
+                    encodePreMoE(enc(), L, M: M)   // raw mixer fallback, incl. resid+postnorm
                 }
                 // ── MoE ──
                 if let mw = hybridMoEW[li] {

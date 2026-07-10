@@ -184,6 +184,12 @@ extension Tell {
                 hw[i] = (qkv: (g.qkvWq, g.qkvSc, g.qkvBi), z: (g.zWq, g.zSc, g.zBi), out: (g.outWq, g.outSc, g.outBi))
             }
             fwd.hybridGdnW = hw
+            var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let a = spec.attn else { continue }
+                aw[i] = (q: (a.qWq, a.qSc, a.qBi), k: (a.kWq, a.kSc, a.kBi), v: (a.vWq, a.vSc, a.vBi), o: (a.oWq, a.oSc, a.oBi))
+            }
+            fwd.hybridAttnW = aw
             if Tell.envInt("QWISP_HYBRID_MOE", 1) == 1 {
                 var mwAll: [Int: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))] = [:]
                 for (i, spec) in engine.layers.enumerated() {
@@ -252,6 +258,12 @@ extension Tell {
                 hw[i] = (qkv: (g.qkvWq, g.qkvSc, g.qkvBi), z: (g.zWq, g.zSc, g.zBi), out: (g.outWq, g.outSc, g.outBi))
             }
             fwd.hybridGdnW = hw
+            var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let a = spec.attn else { continue }
+                aw[i] = (q: (a.qWq, a.qSc, a.qBi), k: (a.kWq, a.kSc, a.kBi), v: (a.vWq, a.vSc, a.vBi), o: (a.oWq, a.oSc, a.oBi))
+            }
+            fwd.hybridAttnW = aw
             if Tell.envInt("QWISP_HYBRID_MOE", 1) == 1 {
                 var mwAll: [Int: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))] = [:]
                 for (i, spec) in engine.layers.enumerated() {
