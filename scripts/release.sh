@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# scripts/release.sh vX.Y.Z [--dry-run]
+# scripts/release.sh vX.Y.Z [--notes-file PATH] [--dry-run]
+#
+# --notes-file PATH prepends your release notes (changelog) above the standard install/asset
+# footer in the GitHub release body.
 #
 # Build, package, and publish a qwisp release, then bump the Homebrew tap formula.
 #
@@ -16,10 +19,18 @@
 # side-effecting steps (GitHub release, tap push). Use it to validate the build/package half.
 set -euo pipefail
 
-VERSION="${1:-}"
-DRY=0
-[[ "${2:-}" == "--dry-run" || "${1:-}" == "--dry-run" ]] && DRY=1
-[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/release.sh vX.Y.Z [--dry-run]"; exit 1; }
+VERSION="" DRY=0 NOTES_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)        DRY=1; shift;;
+    --notes-file)     NOTES_FILE="${2:-}"; shift 2;;
+    --notes-file=*)   NOTES_FILE="${1#*=}"; shift;;
+    v*)               VERSION="$1"; shift;;
+    *)                echo "unknown arg: $1"; exit 1;;
+  esac
+done
+[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/release.sh vX.Y.Z [--notes-file PATH] [--dry-run]"; exit 1; }
+[[ -z "$NOTES_FILE" || -f "$NOTES_FILE" ]] || { echo "ERROR: --notes-file '$NOTES_FILE' not found"; exit 1; }
 BARE="${VERSION#v}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,7 +78,10 @@ fi
 
 # 5. GitHub release (admin token bypasses the v* tag ruleset)
 NOTES="$WORK/notes.md"
-cat > "$NOTES" <<'EOF'
+: > "$NOTES"
+# Prepend the caller's release notes (changelog etc.), then the standard install/asset footer.
+if [[ -n "$NOTES_FILE" ]]; then cat "$NOTES_FILE" >> "$NOTES"; printf '\n\n---\n\n' >> "$NOTES"; fi
+cat >> "$NOTES" <<'EOF'
 ```bash
 brew install penta2himajin/qwisp/qwisp
 qwisp pull            # download the default model (~20 GB) + write config
