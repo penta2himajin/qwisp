@@ -86,6 +86,19 @@ extension Tell {
         let snapshot: () -> Any
         let rollback: (Any) -> Void
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
+        // Option B (sampling): full logits per input row (readback), for speculative sampling.
+        // Additive — greedy stepArgmax path is untouched.
+        var stepLogitsRows: (([Int32]) -> [[Float]]?)? = nil
+    }
+
+    /// forward + lm_head logits, read back to CPU per row (for speculative sampling).
+    /// Mirrors makeStepArgmax but returns the full logits vector instead of the argmax index.
+    static func makeStepLogits(engine: SeedlessEngine, forward: @escaping ([Int32]) -> MLXArray?) -> ([Int32]) -> [[Float]]? {
+        return { tokens in
+            guard let n = forward(tokens), let l = engine.logits(n, M: tokens.count) else { return nil }
+            MLX.eval([l])
+            return (0 ..< tokens.count).map { l[$0].asArray(Float.self) }
+        }
     }
 
     /// forward+lm_head+MLX argMax による stepArgmax 合成(composed 用 fallback)。
@@ -151,6 +164,7 @@ extension Tell {
         if fwd.head != nil {
             backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
         }
+        backend.stepLogitsRows = makeStepLogits(engine: engine, forward: forward)   // Option B sampling
         return (backend, fwd)
     }
 
@@ -388,6 +402,73 @@ extension Tell {
                     guard let _ = backend.forward(rebuildTokens) else { return nil }
                     u = evals[p]
                 }
+            }
+        }
+        flush()
+        return Array(out.prefix(N))
+    }
+
+    /// Option B (prototype): speculative-sampling decode. Same suffix-draft + snapshot/rollback
+    /// structure as the greedy non-A3 runSpecLoop, but accepts drafts by the modified rejection
+    /// rule (Sampler.acceptOrResample) so the emitted stream is distributed as the tempered/top_p
+    /// TARGET. Reduces EXACTLY to greedy at temperature 0 (byte-identical to runSpecLoop — the
+    /// small correctness gate). Requires backend.stepLogitsRows (logits readback).
+    static func runSpecSampleLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
+                                  N: Int, maxK: Int, temperature: Double, topP: Double, seed: UInt64,
+                                  isCancelled: (() -> Bool)? = nil,
+                                  onToken: ((Int) -> Void)? = nil) -> [Int]? {
+        guard let stepLogits = backend.stepLogitsRows else { return nil }
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend) else { return nil }
+        guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
+        MLX.eval([lg0])
+        var rng = SplitMix64(seed: seed)
+        func draw(_ logits: [Float]) -> Int {
+            Sampler.categorical(Sampler.probs(logits: logits, temperature: temperature, topP: topP), rng: &rng)
+        }
+        var u = draw(lg0[0].asArray(Float.self))
+
+        var hist = promptIds.map { Int($0) }
+        var out: [Int] = []
+        var streamed = 0
+        func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
+
+        while out.count < N && !(isCancelled?() ?? false) {
+            flush()
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let D = drafts.count
+            let snap = backend.snapshot()
+
+            if D == 0 {
+                guard let rows = stepLogits([Int32(u)]) else { return nil }
+                out.append(u); hist.append(u)
+                u = draw(rows[0])
+                continue
+            }
+
+            let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+            guard let rows = stepLogits(verifyTokens) else { return nil }   // D+1 logits rows
+
+            // Accept the longest draft prefix under the rejection rule; on reject, `rejectTok`
+            // is the residual resample that replaces the first mismatched draft.
+            var p = 0
+            var rejectTok: Int? = nil
+            while p < D {
+                let pp = Sampler.probs(logits: rows[p], temperature: temperature, topP: topP)
+                let (accepted, resampled) = Sampler.acceptOrResample(p: pp, draft: drafts[p], rng: &rng)
+                if accepted { p += 1 } else { rejectTok = resampled; break }
+            }
+
+            if p == D {
+                out.append(u); hist.append(u)
+                for d in drafts { out.append(d); hist.append(d) }
+                u = draw(rows[D])                                    // bonus token
+            } else {
+                backend.rollback(snap)                              // undo the D+1 verify advance
+                out.append(u); hist.append(u)
+                for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                guard let _ = backend.forward(rebuildTokens) else { return nil }   // realize accepted prefix
+                u = rejectTok!
             }
         }
         flush()

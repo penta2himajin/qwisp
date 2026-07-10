@@ -41,12 +41,22 @@ case "chat":
             backend = try SeedlessBackend(modelDir: model)
         }
         let maxTokens = Int(ProcessInfo.processInfo.environment["QWISP_GEN"] ?? "512") ?? 512
-        await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens)
+        // Option B prototype knobs (the server uses the OpenAI API params instead).
+        let env = ProcessInfo.processInfo.environment
+        let temp = Double(env["QWISP_TEMP"] ?? "0") ?? 0
+        let topP = Double(env["QWISP_TOPP"] ?? "1") ?? 1
+        let seed = UInt64(env["QWISP_SEED"] ?? "0") ?? 0
+        await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens,
+                      temperature: temp, topP: topP, seed: seed)
     }
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":
     print(await runCompletionSelftest(modelDir: model))
+case "sampletest":
+    let (passed, total, log) = Sampler.selfCheck()   // GPU-free sampling-math check
+    print(log.joined(separator: "\n") + "\nSAMPLETEST \(passed)/\(total)")
+    if passed != total { exit(1) }
 default:
-    print("usage: qwisp [serve|chat|selftest]")
+    print("usage: qwisp [serve|chat|selftest|comptest|sampletest]")
 }

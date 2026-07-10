@@ -23,9 +23,19 @@ public struct GenerateOptions {
     /// Token ids that halt decoding (EOS / chat turn-end). Empty = run to maxTokens.
     /// A stop token is NOT emitted; the runtime stops before yielding it.
     public var stopTokens: [Int]
-    public init(maxTokens: Int = 128, stopTokens: [Int] = []) {
+    /// Sampling (Option B prototype). temperature 0 → greedy/lossless (default); >0 → sample.
+    /// topP < 1 → nucleus truncation. `sampling` is true when any of these shape the distribution.
+    public var temperature: Double
+    public var topP: Double
+    public var seed: UInt64
+    public var sampling: Bool { temperature > 0 || topP < 1.0 }
+    public init(maxTokens: Int = 128, stopTokens: [Int] = [],
+                temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0) {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.seed = seed
     }
 }
 
@@ -110,10 +120,26 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                             maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen, C: cfg.c).map { $0.0 }
                     : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
                 guard let sb = specBackend else { continuation.finish(); return }
-                _ = Tell.runSpecLoop(promptIds: promptIds, backend: sb, engine: self.engine,
-                                     N: options.maxTokens, maxK: cfg.maxK,
-                                     isCancelled: { cancel.isCancelled }) { tok in
-                    continuation.yield(tok)
+                // QWISP_FORCE_SAMPLE=1 forces the sampling loop even at temperature 0, so the
+                // T=0-equivalence gate can exercise runSpecSampleLoop against greedy.
+                let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
+                if options.sampling || forceSample {
+                    // Option B: speculative sampling. maxK capped (per-position logits readback is
+                    // the prototype cost; a GPU sampler kernel would lift the cap). Greedy path
+                    // (below) is untouched.
+                    _ = Tell.runSpecSampleLoop(promptIds: promptIds, backend: sb, engine: self.engine,
+                                               N: options.maxTokens, maxK: Swift.min(cfg.maxK, 8),
+                                               temperature: options.temperature, topP: options.topP,
+                                               seed: options.seed,
+                                               isCancelled: { cancel.isCancelled }) { tok in
+                        continuation.yield(tok)
+                    }
+                } else {
+                    _ = Tell.runSpecLoop(promptIds: promptIds, backend: sb, engine: self.engine,
+                                         N: options.maxTokens, maxK: cfg.maxK,
+                                         isCancelled: { cancel.isCancelled }) { tok in
+                        continuation.yield(tok)
+                    }
                 }
                 continuation.finish()
             }
