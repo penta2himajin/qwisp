@@ -70,6 +70,11 @@ sampling on the GPU, at near-greedy speed. `temperature: 0` (the default) stays 
 bit-exact to the strict greedy path. `n > 1` is ignored (single completion) and sets an
 `x-qwisp-warning` header; `tools` and `logprobs` are not supported.
 
+**Reasoning is separated.** Qwen3.6 thinks before answering; qwisp splits that out so `content`
+is the clean answer and the thinking goes to `reasoning_content` (`delta.reasoning_content` when
+streaming) — it never leaks into `content`. Give reasoning models a generous `max_tokens`: a small
+cap can be spent entirely on thinking, leaving `content` empty.
+
 ## Architecture
 
 ```
