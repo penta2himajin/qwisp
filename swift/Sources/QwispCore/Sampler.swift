@@ -91,6 +91,23 @@ public enum Sampler {
         return (false, categorical(resid, rng: &rng))
     }
 
+    /// Apply OpenAI penalties + logit_bias to raw logits before softmax.
+    /// `counts` maps token id → occurrences so far (only present tokens). frequency_penalty scales
+    /// with count; presence_penalty is applied once per present token; logit_bias is additive.
+    public static func adjustLogits(_ logits: inout [Float], counts: [Int: Int],
+                                    frequencyPenalty: Double = 0, presencePenalty: Double = 0,
+                                    logitBias: [Int: Double] = [:]) {
+        if frequencyPenalty != 0 || presencePenalty != 0 {
+            let fp = Float(frequencyPenalty), pp = Float(presencePenalty)
+            for (tok, c) in counts where tok >= 0 && tok < logits.count {
+                logits[tok] -= fp * Float(c) + pp
+            }
+        }
+        for (tok, b) in logitBias where tok >= 0 && tok < logits.count {
+            logits[tok] += Float(b)
+        }
+    }
+
     /// GPU-free self-check of the sampling math (run via `qwisp sampletest`).
     public static func selfCheck() -> (passed: Int, total: Int, log: [String]) {
         var passed = 0, total = 0; var log: [String] = []
@@ -132,6 +149,18 @@ public enum Sampler {
         let empiricalMode = counts.firstIndex(of: counts.max()!)!
         let trueMode = p1.firstIndex(of: p1.max()!)!
         ok("empirical_mode_matches", empiricalMode == trueMode)
+
+        // 7. logit_bias: -inf-ish bias bans a token; large positive forces it.
+        var lb = [Float]([1, 2, 3, 0])
+        adjustLogits(&lb, counts: [:], frequencyPenalty: 0, presencePenalty: 0, logitBias: [2: -100, 0: 100])
+        ok("logit_bias_applied", lb[2] == -97 && lb[0] == 101)
+        let pBias = probs(logits: lb, temperature: 1.0, topP: 1)
+        ok("logit_bias_shifts_argmax", pBias.firstIndex(of: pBias.max()!) == 0)   // token 0 now dominates
+
+        // 8. frequency/presence penalty lowers a repeated token's logit by count*fp + pp.
+        var lp = [Float]([5, 5, 5, 5])
+        adjustLogits(&lp, counts: [1: 3], frequencyPenalty: 0.5, presencePenalty: 1.0)
+        ok("freq_presence_penalty", abs(lp[1] - (5 - 0.5*3 - 1.0)) < 1e-5 && lp[0] == 5)
 
         return (passed, total, log)
     }

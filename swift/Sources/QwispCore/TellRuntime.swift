@@ -415,6 +415,8 @@ extension Tell {
     /// small correctness gate). Requires backend.stepLogitsRows (logits readback).
     static func runSpecSampleLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                                   N: Int, maxK: Int, temperature: Double, topP: Double, seed: UInt64,
+                                  frequencyPenalty: Double = 0, presencePenalty: Double = 0,
+                                  logitBias: [Int: Double] = [:],
                                   isCancelled: (() -> Bool)? = nil,
                                   onToken: ((Int) -> Void)? = nil) -> [Int]? {
         guard let stepLogits = backend.stepLogitsRows else { return nil }
@@ -422,15 +424,27 @@ extension Tell {
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var rng = SplitMix64(seed: seed)
-        func draw(_ logits: [Float]) -> Int {
-            Sampler.categorical(Sampler.probs(logits: logits, temperature: temperature, topP: topP), rng: &rng)
-        }
-        var u = draw(lg0[0].asArray(Float.self))
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
+        var counts: [Int: Int] = [:]   // generated-token occurrences, for penalties
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
+        func commit(_ t: Int) { out.append(t); hist.append(t); counts[t, default: 0] += 1 }
+        // Penalties/bias reshape logits before softmax. Penalty context = generated tokens as of the
+        // step start (within-window granularity is approximate — standard for spec decoding).
+        func adjusted(_ logits: [Float]) -> [Float] {
+            var l = logits
+            Sampler.adjustLogits(&l, counts: counts, frequencyPenalty: frequencyPenalty,
+                                 presencePenalty: presencePenalty, logitBias: logitBias)
+            return l
+        }
+        func probs(_ logits: [Float]) -> [Float] {
+            Sampler.probs(logits: adjusted(logits), temperature: temperature, topP: topP)
+        }
+        func draw(_ logits: [Float]) -> Int { Sampler.categorical(probs(logits), rng: &rng) }
+
+        var u = draw(lg0[0].asArray(Float.self))
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
@@ -440,7 +454,7 @@ extension Tell {
 
             if D == 0 {
                 guard let rows = stepLogits([Int32(u)]) else { return nil }
-                out.append(u); hist.append(u)
+                commit(u)
                 u = draw(rows[0])
                 continue
             }
@@ -453,19 +467,18 @@ extension Tell {
             var p = 0
             var rejectTok: Int? = nil
             while p < D {
-                let pp = Sampler.probs(logits: rows[p], temperature: temperature, topP: topP)
-                let (accepted, resampled) = Sampler.acceptOrResample(p: pp, draft: drafts[p], rng: &rng)
+                let (accepted, resampled) = Sampler.acceptOrResample(p: probs(rows[p]), draft: drafts[p], rng: &rng)
                 if accepted { p += 1 } else { rejectTok = resampled; break }
             }
 
             if p == D {
-                out.append(u); hist.append(u)
-                for d in drafts { out.append(d); hist.append(d) }
+                commit(u)
+                for d in drafts { commit(d) }
                 u = draw(rows[D])                                    // bonus token
             } else {
                 backend.rollback(snap)                              // undo the D+1 verify advance
-                out.append(u); hist.append(u)
-                for d in drafts.prefix(p) { out.append(d); hist.append(d) }
+                commit(u)
+                for d in drafts.prefix(p) { commit(d) }
                 let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
                 guard let _ = backend.forward(rebuildTokens) else { return nil }   // realize accepted prefix
                 u = rejectTok!

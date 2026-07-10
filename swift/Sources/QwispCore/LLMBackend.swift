@@ -24,18 +24,28 @@ public struct GenerateOptions {
     /// A stop token is NOT emitted; the runtime stops before yielding it.
     public var stopTokens: [Int]
     /// Sampling (Option B prototype). temperature 0 → greedy/lossless (default); >0 → sample.
-    /// topP < 1 → nucleus truncation. `sampling` is true when any of these shape the distribution.
+    /// topP < 1 → nucleus truncation. Penalties + logitBias reshape the logits before sampling.
+    /// `sampling` is true when any of these shape the distribution (so it leaves the greedy path).
     public var temperature: Double
     public var topP: Double
     public var seed: UInt64
-    public var sampling: Bool { temperature > 0 || topP < 1.0 }
+    public var frequencyPenalty: Double
+    public var presencePenalty: Double
+    public var logitBias: [Int: Double]
+    public var sampling: Bool {
+        temperature > 0 || topP < 1.0 || frequencyPenalty != 0 || presencePenalty != 0 || !logitBias.isEmpty
+    }
     public init(maxTokens: Int = 128, stopTokens: [Int] = [],
-                temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0) {
+                temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
+                frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:]) {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
         self.temperature = temperature
         self.topP = topP
         self.seed = seed
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.logitBias = logitBias
     }
 }
 
@@ -131,6 +141,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                N: options.maxTokens, maxK: Swift.min(cfg.maxK, 8),
                                                temperature: options.temperature, topP: options.topP,
                                                seed: options.seed,
+                                               frequencyPenalty: options.frequencyPenalty,
+                                               presencePenalty: options.presencePenalty,
+                                               logitBias: options.logitBias,
                                                isCancelled: { cancel.isCancelled }) { tok in
                         continuation.yield(tok)
                     }

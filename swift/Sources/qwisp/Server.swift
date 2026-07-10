@@ -55,9 +55,18 @@ final class QwispEngine: @unchecked Sendable {
         (req.n ?? 1) > 1
     }
 
+    struct SamplingParams {
+        var temperature: Double, topP: Double, seed: UInt64
+        var frequencyPenalty: Double, presencePenalty: Double, logitBias: [Int: Double]
+    }
     /// Resolve sampling from the request. temperature default 0 = greedy/lossless.
-    func sampling(_ req: ChatCompletionRequest) -> (temperature: Double, topP: Double, seed: UInt64) {
-        (req.temperature ?? 0, req.top_p ?? 1.0, UInt64(bitPattern: Int64(req.seed ?? 0)))
+    func sampling(_ req: ChatCompletionRequest) -> SamplingParams {
+        var bias: [Int: Double] = [:]
+        for (k, v) in req.logit_bias ?? [:] { if let t = Int(k) { bias[t] = v } }
+        return SamplingParams(temperature: req.temperature ?? 0, topP: req.top_p ?? 1.0,
+                              seed: UInt64(bitPattern: Int64(req.seed ?? 0)),
+                              frequencyPenalty: req.frequency_penalty ?? 0,
+                              presencePenalty: req.presence_penalty ?? 0, logitBias: bias)
     }
 
     private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int]) {
@@ -73,7 +82,9 @@ final class QwispEngine: @unchecked Sendable {
         await lock.acquire()
         let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
                                     decode: { tokenizer.decode($0) }, backend: backend,
-                                    temperature: s.temperature, topP: s.topP, seed: s.seed) { _ in }
+                                    temperature: s.temperature, topP: s.topP, seed: s.seed,
+                                    frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
+                                    logitBias: s.logitBias) { _ in }
         await lock.release()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         return ChatCompletionResponse(
@@ -105,7 +116,9 @@ final class QwispEngine: @unchecked Sendable {
         var outIds: [Int] = [], emitted = "", finish = "stop"
         let s = sampling(req)
         let opts = GenerateOptions(maxTokens: p.maxTokens, stopTokens: p.stop,
-                                   temperature: s.temperature, topP: s.topP, seed: s.seed)
+                                   temperature: s.temperature, topP: s.topP, seed: s.seed,
+                                   frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
+                                   logitBias: s.logitBias)
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
