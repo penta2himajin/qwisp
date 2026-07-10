@@ -80,6 +80,11 @@ is the clean answer and the thinking goes to `reasoning_content` (`delta.reasoni
 streaming) — it never leaks into `content`. Give reasoning models a generous `max_tokens`: a small
 cap can be spent entirely on thinking, leaving `content` empty.
 
+**Throughput logging.** Each request logs one line to the server log —
+`[qwisp] stream prompt=… gen=… ttft=…ms decode=… tok/s` — separating time-to-first-token (prefill)
+from the decode rate. `tail -f "$(brew --prefix)/var/log/qwisp.log"` while a client drives qwisp to
+measure real, in-harness performance.
+
 ## Architecture
 
 ```

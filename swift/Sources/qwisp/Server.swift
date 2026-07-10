@@ -75,17 +75,30 @@ final class QwispEngine: @unchecked Sendable {
         return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds)   // omitted → until EOS/context
     }
 
+    // One concise throughput line per request → the service log. prefix TTFT (prefill + first
+    // token) is separated from the decode rate (tokens after the first / time after the first).
+    private func logPerf(_ tag: String, prompt: Int, gen: Int, t0: Date, tFirst: Date?) {
+        let now = Date()
+        let ttft = tFirst.map { String(format: "%.0fms", $0.timeIntervalSince(t0) * 1000) } ?? "-"
+        let dt = now.timeIntervalSince(tFirst ?? t0)
+        let rate = dt > 0 ? Double(max(0, gen - 1)) / dt : 0
+        fputs(String(format: "[qwisp] %@ prompt=%d gen=%d ttft=%@ decode=%.1f tok/s (%.2fs)\n",
+                     tag, prompt, gen, ttft, rate, now.timeIntervalSince(t0)), stderr)
+    }
+
     /// Non-streaming completion.
     func complete(_ req: ChatCompletionRequest) async throws -> ChatCompletionResponse {
         let p = try prompt(req)
         let s = sampling(req)
         await lock.acquire()
+        let t0 = Date(); var tFirst: Date? = nil
         let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
                                     decode: { tokenizer.decode($0) }, backend: backend,
                                     temperature: s.temperature, topP: s.topP, seed: s.seed,
                                     frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
-                                    logitBias: s.logitBias) { _ in }
+                                    logitBias: s.logitBias) { _ in if tFirst == nil { tFirst = Date() } }
         await lock.release()
+        logPerf("complete", prompt: p.ids.count, gen: r.completionTokens, t0: t0, tFirst: tFirst)
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let (reasoning, afterThink) = splitThink(r.text)
         let (content, toolCalls) = ToolParse.parse(afterThink)
@@ -124,9 +137,11 @@ final class QwispEngine: @unchecked Sendable {
                                    temperature: s.temperature, topP: s.topP, seed: s.seed,
                                    frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
                                    logitBias: s.logitBias)
+        let t0 = Date(); var tFirst: Date? = nil
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
+            if tFirst == nil { tFirst = Date() }
             // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
             let (r, afterThink) = splitThink(tokenizer.decode(outIds))
             if r.count > sentR.count, r.hasPrefix(sentR) {
@@ -147,6 +162,7 @@ final class QwispEngine: @unchecked Sendable {
         if !toolCalls.isEmpty { finish = "tool_calls" }
         try await send(Delta(), finish)
         try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
+        logPerf("stream", prompt: p.ids.count, gen: outIds.count, t0: t0, tFirst: tFirst)
     }
 }
 
