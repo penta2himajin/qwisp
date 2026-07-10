@@ -45,6 +45,7 @@ public enum SamplerGPU {
         constant uint&      seedHi    [[buffer(9)]],
         constant uint&      basePos   [[buffer(10)]],
         constant uint&      useAdj    [[buffer(11)]],
+        constant float&     topP      [[buffer(12)]],   // < 1 → nucleus truncation on GPU
         uint m   [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]],
         uint tgs [[threads_per_threadgroup]])
@@ -58,43 +59,66 @@ public enum SamplerGPU {
         int d = draftToks[m];
         bool greedy = invT <= 0.0f;
         uint posSalt = seedHi ^ (basePos + m);
+        #define LADJ(v) ((float)row[v] + (useAdj ? logitAdj[v] : 0.0f))
 
+        // pass 1: max adjusted logit (stable softmax reference).
         float locMax = -INFINITY;
-        float locFS = -INFINITY; int locFI = 0x7fffffff;   // Gumbel argmax (full)
-        float locRS = -INFINITY; int locRI = 0x7fffffff;   // Gumbel argmax (excl draft)
+        for (uint v = tid; v < V; v += tgs) locMax = max(locMax, LADJ(v));
+        rMax[tid] = locMax; threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rMax[tid] = max(rMax[tid], rMax[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+        float gmax = rMax[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool doTopP = (!greedy) && (topP < 0.999f);
+        float Lthr = -INFINITY;   // nucleus membership: LADJ(v) >= Lthr
+        float Znuc = 0.0f;        // sum of weights w=exp((L-gmax)*invT) over the nucleus
+
+        if (!greedy) {
+            // pass 2: full normalizer Zfull.
+            float locZ = 0.0f;
+            for (uint v = tid; v < V; v += tgs) locZ += exp((LADJ(v) - gmax) * invT);
+            rZ[tid] = locZ; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            float Zfull = rZ[0]; Znuc = Zfull; threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (doTopP) {
+                // Bisect the weight threshold thr∈[0,1] (w=1 at argmax): largest thr whose kept mass
+                // still covers topP → the smallest nucleus. ~22 full-vocab reductions.
+                float lo = 0.0f, hi = 1.0f;
+                float target = topP * Zfull;
+                for (int it = 0; it < 22; it++) {
+                    float mid = (lo + hi) * 0.5f;
+                    float locS = 0.0f;
+                    for (uint v = tid; v < V; v += tgs) { float w = exp((LADJ(v) - gmax) * invT); if (w >= mid) locS += w; }
+                    rZ[tid] = locS; threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                    float S = rZ[0];
+                    if (S >= target) { lo = mid; Znuc = S; } else { hi = mid; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                Lthr = (lo > 0.0f) ? (gmax + log(lo) / invT) : -INFINITY;   // w>=lo ⟺ L>=gmax+log(lo)/invT
+            }
+        }
+
+        // Gumbel-max categorical over the nucleus (full + excluding the draft).
+        float locFS = -INFINITY; int locFI = 0x7fffffff;
+        float locRS = -INFINITY; int locRI = 0x7fffffff;
         for (uint v = tid; v < V; v += tgs) {
-            float L = (float)row[v] + (useAdj ? logitAdj[v] : 0.0f);
-            if (L > locMax) locMax = L;
-            float score;
-            if (greedy) { score = L; }
-            else { score = L * invT + (-log(-log(u01(qhash(seedLo, posSalt, v))))); }
+            float L = LADJ(v);
+            if (doTopP && L < Lthr) continue;                     // outside nucleus
+            float score = greedy ? L : (L * invT + (-log(-log(u01(qhash(seedLo, posSalt, v))))));
             if (score > locFS || (score == locFS && (int)v < locFI)) { locFS = score; locFI = (int)v; }
             if ((int)v != d && (score > locRS || (score == locRS && (int)v < locRI))) { locRS = score; locRI = (int)v; }
         }
-        rMax[tid] = locMax; rFS[tid] = locFS; rFI[tid] = locFI; rRS[tid] = locRS; rRI[tid] = locRI;
+        rFS[tid] = locFS; rFI[tid] = locFI; rRS[tid] = locRS; rRI[tid] = locRI;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tgs / 2; s > 0; s >>= 1) {
+        for (uint s = tgs/2; s > 0; s >>= 1) {
             if (tid < s) {
-                if (rMax[tid+s] > rMax[tid]) rMax[tid] = rMax[tid+s];
                 if (rFS[tid+s] > rFS[tid] || (rFS[tid+s]==rFS[tid] && rFI[tid+s]<rFI[tid])) { rFS[tid]=rFS[tid+s]; rFI[tid]=rFI[tid+s]; }
                 if (rRS[tid+s] > rRS[tid] || (rRS[tid+s]==rRS[tid] && rRI[tid+s]<rRI[tid])) { rRS[tid]=rRS[tid+s]; rRI[tid]=rRI[tid+s]; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        float gmax = rMax[0];
         int fullIdx = rFI[0], residIdx = rRI[0];
-
-        // pass 2: softmax normalizer Z (only needed for the accept probability at T>0).
-        float locZ = 0.0f;
-        if (!greedy) {
-            for (uint v = tid; v < V; v += tgs) {
-                float L = (float)row[v] + (useAdj ? logitAdj[v] : 0.0f);
-                locZ += exp((L - gmax) * invT);
-            }
-        }
-        rZ[tid] = locZ;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tgs / 2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
 
         if (tid == 0) {
             sampFull[m]  = fullIdx;
@@ -102,10 +126,15 @@ public enum SamplerGPU {
             float pDraft;
             if (d < 0) pDraft = 0.0f;
             else if (greedy) pDraft = (d == fullIdx) ? 1.0f : 0.0f;
-            else { float Ld = (float)row[d] + (useAdj ? logitAdj[d] : 0.0f); pDraft = exp((Ld - gmax) * invT) / rZ[0]; }
+            else {
+                float Ld = LADJ(d);
+                bool inNuc = !doTopP || (Ld >= Lthr);
+                pDraft = inNuc ? (exp((Ld - gmax) * invT) / Znuc) : 0.0f;
+            }
             float coin = u01(qhash(seedLo, posSalt, 0x9999AAAAu));
             acceptOut[m] = (coin < pDraft) ? 1 : 0;
         }
+        #undef LADJ
     }
     """
 
@@ -123,7 +152,8 @@ public enum SamplerGPU {
     /// Returns (full, resid, accept) per row.
     public static func sampleRows(device: MTLDevice, queue: MTLCommandQueue,
                                   logits: [[Float]], drafts: [Int], invT: Float,
-                                  seed: UInt64, basePos: Int) -> (full: [Int], resid: [Int], accept: [Bool])? {
+                                  seed: UInt64, basePos: Int, topP: Float = 1.0,
+                                  logitAdj: [Float]? = nil) -> (full: [Int], resid: [Int], accept: [Bool])? {
         guard ensurePipeline(device), let pipe = _pipeline, let first = logits.first else { return nil }
         let M = logits.count, V = first.count
         var flat = [UInt16](repeating: 0, count: M * V)   // f16
@@ -137,6 +167,8 @@ public enum SamplerGPU {
         flat.withUnsafeBytes { lgBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: M*V*2) }
         let dp = dBuf.contents().bindMemory(to: Int32.self, capacity: M)
         for m in 0..<M { dp[m] = Int32(m < drafts.count ? drafts[m] : -1) }
+        var useAdj: UInt32 = 0
+        if let adj = logitAdj { useAdj = 1; adj.withUnsafeBytes { adjBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: V*4) } }
 
         let cb = queue.makeCommandBuffer()!, enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipe)
@@ -144,10 +176,11 @@ public enum SamplerGPU {
         enc.setBuffer(dBuf, offset: 0, index: 2); enc.setBuffer(fBuf, offset: 0, index: 3)
         enc.setBuffer(rBuf, offset: 0, index: 4); enc.setBuffer(aBuf, offset: 0, index: 5)
         var it = invT, vv = UInt32(V), sl = UInt32(truncatingIfNeeded: seed), sh = UInt32(truncatingIfNeeded: seed >> 32)
-        var bp = UInt32(basePos), ua = UInt32(0)
+        var bp = UInt32(basePos), ua = useAdj, tp = topP
         enc.setBytes(&it, length: 4, index: 6); enc.setBytes(&vv, length: 4, index: 7)
         enc.setBytes(&sl, length: 4, index: 8); enc.setBytes(&sh, length: 4, index: 9)
         enc.setBytes(&bp, length: 4, index: 10); enc.setBytes(&ua, length: 4, index: 11)
+        enc.setBytes(&tp, length: 4, index: 12)
         enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -216,6 +249,39 @@ public enum SamplerGPU {
         let accRate = Double(acc) / Double(N)
         ok("accept_rate_matches_p", abs(accRate - Double(analytic[draft])) < 0.02,
            String(format: "acc=%.3f p=%.3f", accRate, analytic[draft]))
+
+        // top_p on GPU: empirical dist must match the CPU nucleus-truncated dist.
+        let topPv: Float = 0.9
+        let truncCPU = Sampler.probs(logits: logits, temperature: Double(T), topP: Double(topPv))
+        var histTP = [Int](repeating: 0, count: logits.count)
+        for i in 0..<N {
+            if let r = sampleRows(device: device, queue: queue, logits: [logits], drafts: [-1],
+                                  invT: 1.0/T, seed: UInt64(i) &* 0x2545F4914F6CDD1D, basePos: i, topP: topPv) {
+                histTP[r.full[0]] += 1
+            }
+        }
+        var tvTP = 0.0
+        for i in 0..<logits.count { tvTP += abs(Double(histTP[i])/Double(N) - Double(truncCPU[i])) }
+        tvTP *= 0.5
+        ok("gpu_topp_matches_cpu", tvTP < 0.02, String(format: "TV=%.4f", tvTP))
+        // truncation actually happened: the -4.0 tail token must be excluded at top_p 0.9.
+        ok("gpu_topp_truncates_tail", histTP[logits.count - 1] == 0)
+
+        // penalties/logit_bias via logitAdj: GPU dist must match softmax(logits + adj).
+        let adj: [Float] = [0, -3, 0, 0, +2, 0, 0, 0]
+        let adjusted = zip(logits, adj).map { $0 + $1 }
+        let adjCPU = Sampler.probs(logits: adjusted, temperature: Double(T), topP: 1.0)
+        var histAdj = [Int](repeating: 0, count: logits.count)
+        for i in 0..<N {
+            if let r = sampleRows(device: device, queue: queue, logits: [logits], drafts: [-1],
+                                  invT: 1.0/T, seed: UInt64(i) &* 0x9E6C63D0676A9A99, basePos: i, logitAdj: adj) {
+                histAdj[r.full[0]] += 1
+            }
+        }
+        var tvAdj = 0.0
+        for i in 0..<logits.count { tvAdj += abs(Double(histAdj[i])/Double(N) - Double(adjCPU[i])) }
+        tvAdj *= 0.5
+        ok("gpu_logitadj_matches_cpu", tvAdj < 0.02, String(format: "TV=%.4f", tvAdj))
 
         return (passed, total, log)
     }

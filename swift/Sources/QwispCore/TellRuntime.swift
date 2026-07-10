@@ -91,7 +91,7 @@ extension Tell {
         var stepLogitsRows: (([Int32]) -> [[Float]]?)? = nil
         // Option B GPU sampler: (tokens, draftPerRow, invT, seed, basePos) → per-row
         // (full sample, residual sample, accept). Returns the decision on-GPU, tiny readback.
-        var stepSampleRows: (([Int32], [Int], Float, UInt64, Int) -> (full: [Int], resid: [Int], accept: [Bool])?)? = nil
+        var stepSampleRows: (([Int32], [Int], Float, UInt64, Int, [Float]?, Float) -> (full: [Int], resid: [Int], accept: [Bool])?)? = nil
     }
 
     /// forward + lm_head logits, read back to CPU per row (for speculative sampling).
@@ -169,8 +169,8 @@ extension Tell {
         }
         backend.stepLogitsRows = makeStepLogits(engine: engine, forward: forward)   // Option B sampling (CPU)
         if fwd.head != nil {                                                        // Option B GPU sampler
-            backend.stepSampleRows = { toks, drafts, invT, seed, base in
-                fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base)
+            backend.stepSampleRows = { toks, drafts, invT, seed, base, adj, topP in
+                fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
         }
         return (backend, fwd)
@@ -501,7 +501,9 @@ extension Tell {
     /// work — the maxK cap is lifted. Temperature only (top_p/penalties/logit_bias use the CPU loop).
     /// T=0 (temperature 0) degenerates to argmax → byte-identical to greedy.
     static func runSpecSampleLoopGPU(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
-                                     N: Int, maxK: Int, temperature: Double, seed: UInt64,
+                                     N: Int, maxK: Int, temperature: Double, topP: Double, seed: UInt64,
+                                     frequencyPenalty: Double = 0, presencePenalty: Double = 0,
+                                     logitBias: [Int: Double] = [:],
                                      isCancelled: (() -> Bool)? = nil,
                                      onToken: ((Int) -> Void)? = nil) -> [Int]? {
         guard let stepSample = backend.stepSampleRows else { return nil }
@@ -509,15 +511,36 @@ extension Tell {
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         let invT: Float = temperature > 0 ? Float(1.0 / temperature) : -1
+        let tpF = Float(topP)
         var rng = SplitMix64(seed: seed)
-        // First token from the prefill logits (one-time CPU sample; degenerates to argmax at T=0).
-        var u = Sampler.categorical(Sampler.probs(logits: lg0[0].asArray(Float.self),
-                                                  temperature: temperature, topP: 1.0), rng: &rng)
+
+        // Penalties/logit_bias fold into a persistent per-vocab adjustment buffer (`adj`, kept in
+        // sync as tokens commit) that the kernel adds before softmax. nil = temperature-only fast path.
+        let useAdj = frequencyPenalty != 0 || presencePenalty != 0 || !logitBias.isEmpty
+        var lg0arr = lg0[0].asArray(Float.self)
+        let V = lg0arr.count
+        var adj: [Float]? = nil
+        var counts: [Int: Int] = [:]
+        if useAdj {
+            var a = [Float](repeating: 0, count: V)
+            for (t, b) in logitBias where t >= 0 && t < V { a[t] += Float(b) }
+            adj = a
+            Sampler.adjustLogits(&lg0arr, counts: [:], logitBias: logitBias)   // first token: bias only
+        }
+        var u = Sampler.categorical(Sampler.probs(logits: lg0arr, temperature: temperature, topP: topP), rng: &rng)
+
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
-        func commit(_ t: Int) { out.append(t); hist.append(t) }
+        func commit(_ t: Int) {
+            out.append(t); hist.append(t)
+            if useAdj, t >= 0, t < V {
+                let c = (counts[t] ?? 0) + 1; counts[t] = c
+                adj![t] -= Float(frequencyPenalty)
+                if c == 1 { adj![t] -= Float(presencePenalty) }
+            }
+        }
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
@@ -527,7 +550,7 @@ extension Tell {
             let basePos = out.count   // monotonic absolute position → reproducible per-position RNG
 
             if D == 0 {
-                guard let r = stepSample([Int32(u)], [-1], invT, seed, basePos) else { return nil }
+                guard let r = stepSample([Int32(u)], [-1], invT, seed, basePos, adj, tpF) else { return nil }
                 commit(u)
                 u = r.full[0]
                 continue
@@ -535,7 +558,7 @@ extension Tell {
 
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
             let draftRows = drafts + [-1]                       // row D is the bonus (no draft)
-            guard let r = stepSample(verifyTokens, draftRows, invT, seed, basePos) else { return nil }
+            guard let r = stepSample(verifyTokens, draftRows, invT, seed, basePos, adj, tpF) else { return nil }
 
             var p = 0
             while p < D && r.accept[p] { p += 1 }

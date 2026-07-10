@@ -134,23 +134,25 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // T=0-equivalence gate can exercise runSpecSampleLoop against greedy.
                 let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
                 let wantSample = options.sampling || forceSample
-                // GPU sampler is eligible only for the temperature-only shape (no top_p / penalties /
-                // logit_bias, which still use the optimized CPU loop). QWISP_SAMPLE_CPU forces CPU.
-                let gpuEligible = wantSample && options.topP >= 1.0
-                    && options.frequencyPenalty == 0 && options.presencePenalty == 0 && options.logitBias.isEmpty
-                    && sb.stepSampleRows != nil && !Tell.envFlag("QWISP_SAMPLE_CPU")
+                // GPU sampler now handles the full shape (temperature + top_p + penalties + logit_bias),
+                // all on-GPU with tiny readback + uncapped maxK. QWISP_SAMPLE_CPU forces the CPU loop.
+                let gpuEligible = wantSample && sb.stepSampleRows != nil && !Tell.envFlag("QWISP_SAMPLE_CPU")
                 if gpuEligible {
-                    // Option B "本速度化": softmax + categorical + accept on the GPU, tiny readback,
-                    // maxK uncapped. T=0 degenerates to argmax → byte-identical to greedy.
+                    // Option B "本速度化": softmax + top_p nucleus + penalties/bias + categorical +
+                    // accept on the GPU. T=0 degenerates to argmax → byte-identical to greedy.
                     _ = Tell.runSpecSampleLoopGPU(promptIds: promptIds, backend: sb, engine: self.engine,
                                                   N: options.maxTokens, maxK: cfg.maxK,
-                                                  temperature: options.temperature, seed: options.seed,
+                                                  temperature: options.temperature, topP: options.topP,
+                                                  seed: options.seed,
+                                                  frequencyPenalty: options.frequencyPenalty,
+                                                  presencePenalty: options.presencePenalty,
+                                                  logitBias: options.logitBias,
                                                   isCancelled: { cancel.isCancelled }) { tok in
                         continuation.yield(tok)
                     }
                 } else if wantSample {
-                    // CPU speculative sampling: handles top_p / penalties / logit_bias (per-position
-                    // logits readback → maxK capped at 8). Greedy path (below) is untouched.
+                    // CPU speculative sampling fallback (QWISP_SAMPLE_CPU / no head): per-position
+                    // logits readback → maxK capped at 8. Greedy path (below) is untouched.
                     _ = Tell.runSpecSampleLoop(promptIds: promptIds, backend: sb, engine: self.engine,
                                                N: options.maxTokens, maxK: Swift.min(cfg.maxK, 8),
                                                temperature: options.temperature, topP: options.topP,

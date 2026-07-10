@@ -3576,7 +3576,8 @@ public enum SeedlessFusedVerify {
         /// Option B GPU sampler: same 1-CB forward as stepArgmax, but the final op is spec_sample_rows
         /// (Gumbel-max categorical + accept) instead of argmax. Returns per-row (full sample, residual
         /// sample excluding the draft, accept flag). readback = 3·M ints (no full-logits transfer).
-        public func stepSampleRows(_ tokens: [Int32], drafts: [Int], invT: Float, seed: UInt64, basePos: Int)
+        public func stepSampleRows(_ tokens: [Int32], drafts: [Int], invT: Float, seed: UInt64, basePos: Int,
+                                   logitAdj: [Float]? = nil, topP: Float = 1.0)
             -> (full: [Int], resid: [Int], accept: [Bool])? {
             guard let hd = head, tokens.count <= maxM else { return nil }
             guard SamplerGPU.ensurePipeline(device), let samp = SamplerGPU._pipeline else { return nil }
@@ -3593,6 +3594,11 @@ public enum SeedlessFusedVerify {
                   let sD = sSampDraft, let sAdj = sSampAdj else { return nil }
             let dp = sD.contents().bindMemory(to: Int32.self, capacity: maxM)
             for i in 0 ..< M { dp[i] = Int32(i < drafts.count ? drafts[i] : -1) }
+            var useAdj: UInt32 = 0
+            if let adj = logitAdj, adj.count == hd.vocab {
+                useAdj = 1
+                adj.withUnsafeBytes { sAdj.contents().copyMemory(from: $0.baseAddress!, byteCount: hd.vocab * 4) }
+            }
 
             func encodeEmbed(_ enc: MTLComputeCommandEncoder) {
                 let ep = SeedlessFusedVerify._embedRowsPipeline!
@@ -3626,10 +3632,12 @@ public enum SeedlessFusedVerify {
                 enc.setBuffer(sD, offset: 0, index: 2); enc.setBuffer(sF, offset: 0, index: 3)
                 enc.setBuffer(sR, offset: 0, index: 4); enc.setBuffer(sA, offset: 0, index: 5)
                 var it = invT, vv = UInt32(hd.vocab), sl = UInt32(truncatingIfNeeded: seed)
-                var sh = UInt32(truncatingIfNeeded: seed >> 32), bp = UInt32(truncatingIfNeeded: basePos), ua = UInt32(0)
+                var sh = UInt32(truncatingIfNeeded: seed >> 32), bp = UInt32(truncatingIfNeeded: basePos)
+                var ua = useAdj, tp = topP
                 enc.setBytes(&it, length: 4, index: 6); enc.setBytes(&vv, length: 4, index: 7)
                 enc.setBytes(&sl, length: 4, index: 8); enc.setBytes(&sh, length: 4, index: 9)
                 enc.setBytes(&bp, length: 4, index: 10); enc.setBytes(&ua, length: 4, index: 11)
+                enc.setBytes(&tp, length: 4, index: 12)
                 enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
