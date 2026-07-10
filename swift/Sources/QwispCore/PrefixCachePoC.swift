@@ -259,6 +259,29 @@ extension Tell {
             let wall = Date().timeIntervalSince(t0)
             lines.append(String(format: "  chunk=%4d  wall %5.1fs  %.0f tok/s", chunk, wall, Double(promptLen)/wall))
         }
+        // MLX GDN stage attribution (GatedDeltaNetLayer prof counters; eval barriers inflate wall,
+        // stage sums still attribute where MLX spends its GDN time vs our sequential T-loop kernel).
+        StreamingMoEBlock.profileLayers = true
+        StreamingMoEBlock.tGdnInproj = 0; StreamingMoEBlock.tGdnConv = 0
+        StreamingMoEBlock.tGdnKernel = 0; StreamingMoEBlock.tGdnOut = 0
+        do {
+            let caches = model.makeCaches()
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + 64, promptLen)
+                let (hidden, _) = model.forwardHidden(MLXArray(ids[pos ..< end].map { Int32($0) }).reshaped([1, end - pos]),
+                                                      caches: caches)
+                MLX.eval(hidden)
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            func s(_ ns: UInt64) -> Double { Double(ns) / 1e9 }
+            lines.append(String(format: "  MLX GDN stages (c64, barriered wall %.1fs): inproj %.2fs  conv %.2fs  recur-kernel %.2fs  out %.2fs  | GDN total %.2fs",
+                                wall, s(StreamingMoEBlock.tGdnInproj), s(StreamingMoEBlock.tGdnConv),
+                                s(StreamingMoEBlock.tGdnKernel), s(StreamingMoEBlock.tGdnOut),
+                                s(StreamingMoEBlock.tGdnInproj + StreamingMoEBlock.tGdnConv + StreamingMoEBlock.tGdnKernel + StreamingMoEBlock.tGdnOut)))
+        }
+        StreamingMoEBlock.profileLayers = false
         lines.append("STAGEPROF done")
         return lines.joined(separator: "\n")
     }
