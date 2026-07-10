@@ -441,14 +441,13 @@ extension Tell {
         func commit(_ t: Int) { out.append(t); hist.append(t); counts[t, default: 0] += 1 }
         // Penalties/bias reshape logits before softmax. Penalty context = generated tokens as of the
         // step start (within-window granularity is approximate — standard for spec decoding).
-        func adjusted(_ logits: [Float]) -> [Float] {
-            var l = logits
+        let hasAdj = frequencyPenalty != 0 || presencePenalty != 0 || !logitBias.isEmpty
+        func probs(_ logits: [Float]) -> [Float] {
+            guard hasAdj else { return Sampler.probs(logits: logits, temperature: temperature, topP: topP) }
+            var l = logits   // copy only when penalties/bias actually change the logits
             Sampler.adjustLogits(&l, counts: counts, frequencyPenalty: frequencyPenalty,
                                  presencePenalty: presencePenalty, logitBias: logitBias)
-            return l
-        }
-        func probs(_ logits: [Float]) -> [Float] {
-            Sampler.probs(logits: adjusted(logits), temperature: temperature, topP: topP)
+            return Sampler.probs(logits: l, temperature: temperature, topP: topP)
         }
         func draw(_ logits: [Float]) -> Int { Sampler.categorical(probs(logits), rng: &rng) }
 

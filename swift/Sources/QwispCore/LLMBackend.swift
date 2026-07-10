@@ -140,8 +140,11 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 if gpuEligible {
                     // Option B "本速度化": softmax + top_p nucleus + penalties/bias + categorical +
                     // accept on the GPU. T=0 degenerates to argmax → byte-identical to greedy.
+                    // top_p lowers acceptance → a narrower draft cuts both the forward (M rows) and
+                    // the per-row bisection with little accept-rate loss; temperature-only keeps 96.
+                    let sampMaxK = options.topP < 1.0 ? Swift.min(cfg.maxK, 24) : cfg.maxK
                     _ = Tell.runSpecSampleLoopGPU(promptIds: promptIds, backend: sb, engine: self.engine,
-                                                  N: options.maxTokens, maxK: cfg.maxK,
+                                                  N: options.maxTokens, maxK: sampMaxK,
                                                   temperature: options.temperature, topP: options.topP,
                                                   seed: options.seed,
                                                   frequencyPenalty: options.frequencyPenalty,

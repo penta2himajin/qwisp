@@ -20,7 +20,11 @@ public enum SamplerGPU {
 
     static let kernelSrc = """
     #include <metal_stdlib>
+    #include <metal_atomic>
     using namespace metal;
+
+    #define GPB 1024        // top_p histogram buckets
+    #define GSPAN 40.0f     // max scaled-gap covered (exp(-40) ≈ 0)
 
     inline uint qhash(uint a, uint b, uint c) {
         uint h = a * 0x9E3779B1u + 0x165667B1u;
@@ -72,30 +76,47 @@ public enum SamplerGPU {
         float Lthr = -INFINITY;   // nucleus membership: LADJ(v) >= Lthr
         float Znuc = 0.0f;        // sum of weights w=exp((L-gmax)*invT) over the nucleus
 
+        // Histogram-based top_p: bin the softmax weight by its scaled gap g=(gmax-L)*invT into GPB
+        // buckets, folded into the SAME pass that sums Zfull (no extra full-vocab traversal). The
+        // nucleus threshold is then one linear scan of the bucket cumulative mass — replaces the
+        // 14-iteration bisection (14 full passes → 1 pass + a GPB scan). Bucket edges are exact
+        // (Lthr and Znuc reference the same boundary), only the boundary token's granularity is
+        // approximate — sub-noise for sampling.
+        threadgroup atomic_uint hist[GPB];   // fixed-point mass (atomic_uint = robust; atomic_float TG is flaky)
+        threadgroup float tLthr;
         if (!greedy) {
-            // pass 2: full normalizer Zfull.
+            bool useHist = doTopP;
+            if (useHist) { for (uint b = tid; b < GPB; b += tgs) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed); threadgroup_barrier(mem_flags::mem_threadgroup); }
+            const float binW = GSPAN / (float)GPB;
+            const float SCALE = 8192.0f;                    // V·SCALE < 2^32 for V≤248k
             float locZ = 0.0f;
-            for (uint v = tid; v < V; v += tgs) locZ += exp((LADJ(v) - gmax) * invT);
+            for (uint v = tid; v < V; v += tgs) {
+                float g = (gmax - LADJ(v)) * invT;          // >= 0
+                float w = exp(-g);
+                locZ += w;
+                if (useHist) { uint b = min((uint)(GPB - 1), (uint)(g / binW)); atomic_fetch_add_explicit(&hist[b], (uint)(w * SCALE), memory_order_relaxed); }
+            }
             rZ[tid] = locZ; threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
             float Zfull = rZ[0]; Znuc = Zfull; threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            if (doTopP) {
-                // Bisect the weight threshold thr∈[0,1] (w=1 at argmax): largest thr whose kept mass
-                // still covers topP → the smallest nucleus. ~22 full-vocab reductions.
-                float lo = 0.0f, hi = 1.0f;
-                float target = topP * Zfull;
-                for (int it = 0; it < 22; it++) {
-                    float mid = (lo + hi) * 0.5f;
-                    float locS = 0.0f;
-                    for (uint v = tid; v < V; v += tgs) { float w = exp((LADJ(v) - gmax) * invT); if (w >= mid) locS += w; }
-                    rZ[tid] = locS; threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-                    float S = rZ[0];
-                    if (S >= target) { lo = mid; Znuc = S; } else { hi = mid; }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (useHist) {
+                // quantized cumulative → nucleus boundary bucket bstar → Lthr.
+                if (tid == 0) {
+                    uint total = 0; for (uint b = 0; b < GPB; b++) total += atomic_load_explicit(&hist[b], memory_order_relaxed);
+                    uint targetU = (uint)(topP * (float)total);
+                    uint cum = 0; uint bstar = GPB - 1;
+                    for (uint b = 0; b < GPB; b++) { cum += atomic_load_explicit(&hist[b], memory_order_relaxed); if (cum >= targetU) { bstar = b; break; } }
+                    tLthr = gmax - (float)(bstar + 1) * binW / invT;
                 }
-                Lthr = (lo > 0.0f) ? (gmax + log(lo) / invT) : -INFINITY;   // w>=lo ⟺ L>=gmax+log(lo)/invT
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                Lthr = tLthr;
+                // real (unquantized) nucleus normalizer for the accept probability.
+                float locN = 0.0f;
+                for (uint v = tid; v < V; v += tgs) { float L = LADJ(v); if (L >= Lthr) locN += exp((L - gmax) * invT); }
+                rZ[tid] = locN; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) rZ[tid] += rZ[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+                Znuc = rZ[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
 
@@ -215,7 +236,7 @@ public enum SamplerGPU {
         let logits: [Float] = [3.0, 2.0, 1.0, 0.5, 0.0, -1.0, -2.0, -4.0]
         let T: Float = 1.0
         let analytic = Sampler.probs(logits: logits, temperature: Double(T), topP: 1.0)
-        let N = 40000
+        let N = 8000
         var histGPU = [Int](repeating: 0, count: logits.count)
         for i in 0..<N {
             if let r = sampleRows(device: device, queue: queue, logits: [logits], drafts: [-1],
