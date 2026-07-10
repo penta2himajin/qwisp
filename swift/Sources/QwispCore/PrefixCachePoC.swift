@@ -286,6 +286,44 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // Verification ① for the MLX-dense-prefill route: per-element M-invariance of MLX
+    // quantizedMatmul. Row r's output must be bit-identical no matter how many other rows share
+    // the call (and under zero-padding), or split-point-invariant prefill via MLX dense is dead.
+    // MLX dispatches qmv (M<14, scalar) vs steel qmm (M>=14, matrix units) — the padding variant
+    // tests whether pinning ALL prefill matmuls to the steel class (pad M up to >=14) is coherent.
+    public static func mlxQmmInvariance(modelDir: String) -> String {
+        var lines = ["[mlx-qmm-minv] MLX quantizedMatmul per-element M-invariance (value-equality per row)"]
+        for (label, K, N) in [("2048→512", 2048, 512), ("2048→12352", 2048, 12352)] {
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return "[mlx-qmm-minv] biases nil" }
+            let xAll = MLXRandom.normal([1024, K]).asType(.float16)
+            MLX.eval([wq, sc, bi, xAll])
+            func qmm(_ x: MLXArray) -> MLXArray {
+                let y = MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4)
+                y.eval(); return y
+            }
+            let full = qmm(xAll)                                   // M=1024 reference
+            func rowsEqual(_ a: MLXArray, _ b: MLXArray) -> Bool {
+                let d = MLX.all(a .== b)
+                d.eval(); return d.item(Bool.self)
+            }
+            lines.append("  ── \(label) ──")
+            for M in [1, 8, 13, 14, 16, 64, 256] {
+                let out = qmm(xAll[0..<M])
+                let ok = rowsEqual(out, full[0..<M])
+                lines.append("    M=\(M)\tvs M=1024 rows[0..<\(M)]: \(ok ? "IDENTICAL ✅" : "DIFFER ❌")")
+            }
+            // zero-pad variant: 3 real rows + 13 zero rows = M=16 call; real rows vs full
+            let pad = MLX.concatenated([xAll[0..<3], MLXArray.zeros([13, K]).asType(.float16)], axis: 0)
+            let outPad = qmm(pad)
+            let okPad = rowsEqual(outPad[0..<3], full[0..<3])
+            lines.append("    M=3+13pad(=16)\tvs M=1024 rows[0..<3]: \(okPad ? "IDENTICAL ✅" : "DIFFER ❌")")
+        }
+        lines.append("MLXQMMMINV done")
+        return lines.joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()

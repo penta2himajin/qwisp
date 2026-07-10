@@ -26,6 +26,8 @@ if CommandLine.arguments.contains("stream") {
         ("prefill-breakdown", { md, _ in Tell.prefillBreakdownProbe(modelDir: md) }),
         ("prefill-stage-profile", { md, _ in Tell.prefillStageProfile(modelDir: md) }),
         ("grouped-moe-bench", { _, _ in GroupedMoEPoC.bench() }),
+        ("dense-tiled-bench", { _, _ in GroupedMoEPoC.denseBench() }),
+        ("mlx-qmm-minv", { md, _ in Tell.mlxQmmInvariance(modelDir: md) }),
         ("prefix-cache-e2e", { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
         ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),

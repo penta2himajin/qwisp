@@ -454,4 +454,160 @@ public enum GroupedMoEPoC {
         out.append("GROUPEDMOE done")
         return out.joined(separator: "\n")
     }
+
+    // Probe B (matrix-unit-canonical route): DENSE qmm — production scalar qmv structure vs the
+    // production qmm4_tiled structure (TG-shared dequant, M-invariant per locked test 10) at
+    // PREFILL M on real dense shapes. Decides whether tiled-for-prefill buys the dense share.
+    nonisolated(unsafe) static var pipeDenseRef: MTLComputePipelineState?
+    nonisolated(unsafe) static var pipeDenseTiled: MTLComputePipelineState?
+    static let denseSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+    inline float ld16(const device half* x, thread float* xt) {
+        float sum = 0.0f;
+        for (int i = 0; i < 16; i += 4) {
+            sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+            xt[i] = x[i]; xt[i+1] = x[i+1]/16.0f; xt[i+2] = x[i+2]/256.0f; xt[i+3] = x[i+3]/4096.0f;
+        }
+        return sum;
+    }
+    inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+        float accum = 0.0f;
+        const device uint16_t* ws = (const device uint16_t*)w;
+        for (int i = 0; i < 4; i++) {
+            accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                      xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                      xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                      xt[4*i+3] * (float)(ws[i] & 0xf000));
+        }
+        return scale * accum + sum * bias;
+    }
+    // production qmm4 structure batched over M rows: grid (1, N/8, M), tg per (row, n-tile)
+    kernel void dq_ref(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                       device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                       device half* y [[buffer(4)]],
+                       constant int& in_vec_size [[buffer(5)]], constant int& out_vec_size [[buffer(6)]],
+                       uint3 tid [[threadgroup_position_in_grid]],
+                       uint simd_gid [[simdgroup_index_in_threadgroup]],
+                       uint simd_lid [[thread_index_in_simdgroup]]) {
+        constexpr int packs_per_thread = 2, results_per_simdgroup = 4;
+        constexpr int bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512, scale_step_per_thread = 4;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        typedef float U;
+        thread U x_thread[16];
+        thread U result[4] = {0};
+        const int in_vec_size_w = in_vec_size / 2;
+        const int in_vec_size_g = in_vec_size / 64;
+        uint m = tid.z;
+        const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        x += (size_t)m * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)m * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = ld16(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                const device half* sl = scales + row * in_vec_size_g;
+                const device half* bl = biases + row * in_vec_size_g;
+                U s = sl[0]; U b = bl[0];
+                result[row] += qd4(wl, x_thread, s, b, sum);
+            }
+            ws += block_size / 2;
+            scales += block_size / 64; biases += block_size / 64; x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) y[row] = (half)result[row];
+        }
+    }
+    // production qmm4_tiled structure (verbatim): tg per output column, TG-shared dequant, M-loop
+    kernel void dq_tiled(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                         device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                         device half* y [[buffer(4)]], constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],
+                         constant int& M [[buffer(7)]],
+                         uint n [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                         uint tgs [[threads_per_threadgroup]]) {
+        threadgroup float wdq[2048];
+        threadgroup float red[256];
+        int Kg = K / 64;
+        for (int k = (int)lid; k < K; k += (int)tgs) {
+            uint pack = w[n * (K/8) + k/8];
+            uint nib = (pack >> (4*(k%8))) & 0xf;
+            int g = k/64;
+            wdq[k] = (float)scales[n*Kg+g] * (float)nib + (float)biases[n*Kg+g];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int m = 0; m < M; m++) {
+            float acc = 0.0f;
+            for (int k = (int)lid; k < K; k += (int)tgs) acc += (float)x[m*K+k] * wdq[k];
+            red[lid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs/2; s > 0; s >>= 1) { if (lid < s) red[lid] += red[lid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (lid == 0) y[m*N + n] = (half)red[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    """
+
+    public static func denseBench() -> String {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return "[dense-bench] no device\nDENSEBENCH done" }
+        if pipeDenseRef == nil {
+            do {
+                let lib = try device.makeLibrary(source: denseSrc, options: nil)
+                pipeDenseRef = try device.makeComputePipelineState(function: lib.makeFunction(name: "dq_ref")!)
+                pipeDenseTiled = try device.makeComputePipelineState(function: lib.makeFunction(name: "dq_tiled")!)
+            } catch { return "[dense-bench] compile: \(error)\nDENSEBENCH done" }
+        }
+        var out = ["[dense-bench] scalar qmv structure vs qmm4_tiled structure — dense prefill shapes (K<=2048)"]
+        var rng = LCG(s: 7)
+        // real dense shapes: GDN in_proj (2048->12352), attn qkv+gate (2048->~5120), MoE shared g/u (2048->512), d (512->2048)
+        for (label, K, N) in [("GDN inproj 2048→12352", 2048, 12352), ("attn qkv  2048→5120", 2048, 5120), ("shared g/u 2048→512", 2048, 512), ("d/out      512→2048", 512, 2048)] {
+            let wCount = N * K / 8
+            let wBuf = device.makeBuffer(length: wCount * 4, options: .storageModeShared)!
+            let wp = wBuf.contents().bindMemory(to: UInt32.self, capacity: wCount)
+            for i in 0..<wCount { wp[i] = UInt32(truncatingIfNeeded: rng.next()) }
+            let sCount = N * K / 64
+            let sBuf = device.makeBuffer(length: sCount * 2, options: .storageModeShared)!
+            let bBuf = device.makeBuffer(length: sCount * 2, options: .storageModeShared)!
+            let sp = sBuf.contents().bindMemory(to: Float16.self, capacity: sCount)
+            let bp = bBuf.contents().bindMemory(to: Float16.self, capacity: sCount)
+            for i in 0..<sCount { sp[i] = Float16(Double(rng.next() % 1000) / 50000.0 + 0.001); bp[i] = Float16(Double(rng.next() % 1000) / 100000.0) }
+            var line = "  \(label): "
+            for M in [64, 256, 1024] {
+                let xBuf = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
+                let xp = xBuf.contents().bindMemory(to: Float16.self, capacity: M * K)
+                for i in 0..<(M * K) { xp[i] = Float16(Double(rng.next() % 2000) / 1000.0 - 1.0) }
+                let yBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
+                var kk = Int32(K), nn = Int32(N), mm = Int32(M)
+                func encR(_ enc: MTLComputeCommandEncoder) {
+                    enc.setComputePipelineState(pipeDenseRef!)
+                    enc.setBuffer(wBuf, offset: 0, index: 0); enc.setBuffer(sBuf, offset: 0, index: 1); enc.setBuffer(bBuf, offset: 0, index: 2)
+                    enc.setBuffer(xBuf, offset: 0, index: 3); enc.setBuffer(yBuf, offset: 0, index: 4)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+                    enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                }
+                func encT(_ enc: MTLComputeCommandEncoder) {
+                    enc.setComputePipelineState(pipeDenseTiled!)
+                    enc.setBuffer(wBuf, offset: 0, index: 0); enc.setBuffer(sBuf, offset: 0, index: 1); enc.setBuffer(bBuf, offset: 0, index: 2)
+                    enc.setBuffer(xBuf, offset: 0, index: 3); enc.setBuffer(yBuf, offset: 0, index: 4)
+                    enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+                    enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                }
+                func t(_ e: (MTLComputeCommandEncoder) -> Void) -> Double {
+                    let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                    for _ in 0..<8 { e(enc) }
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 / 8.0
+                }
+                _ = t(encR); _ = t(encT)
+                let tR = t(encR), tT = t(encT)
+                line += String(format: "M%d %.2f/%.2fms %.2fx  ", M, tR, tT, tR / tT)
+            }
+            out.append(line)
+        }
+        out.append("DENSEBENCH done")
+        return out.joined(separator: "\n")
+    }
 }
