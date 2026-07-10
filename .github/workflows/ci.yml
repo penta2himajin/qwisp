@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# GPU-free gates only. The Metal-GPU gates (RAWTESTS, GPUSAMPLETEST) and the model gates
+# (TOKTEST, COMPTEST) can't run on GitHub-hosted runners: no usable Metal GPU, and the model
+# is a ~20 GB download per run.
+#
+# ponytail: TODO — when a self-hosted Apple Silicon runner is available, add a second job
+#   heavy-gates:
+#     runs-on: [self-hosted, macOS, ARM64]
+#   that runs `scripts/test_raw.sh` (RAWTESTS 79/79), `qwisp gpusampletest`, and — with
+#   QWISP_MODEL pre-set on the runner — `scripts/test_tokenizer.sh` + `scripts/test_completion.sh`.
+#   Mind the GPU-exclusivity rule (one qwisp-poc at a time): give it concurrency: group so runs
+#   serialize. Until then, those gates stay a local pre-commit step.
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-gpu-free-gates:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: xcodebuild -version
+
+      - name: Build (Release, both schemes; shared derived data → 2nd build is incremental)
+        working-directory: swift
+        run: |
+          for scheme in qwisp qwisp-poc; do
+            xcodebuild build -scheme "$scheme" -configuration Release \
+              -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel \
+              -skipPackagePluginValidation
+          done
+
+      - name: GPU-free binary gates (CONFIGTEST, SAMPLETEST)
+        working-directory: swift
+        run: |
+          BIN=./.xcode-build-rel/Build/Products/Release/qwisp
+          "$BIN" configtest
+          "$BIN" sampletest
+
+      - name: Bench-batch fixture gate (BENCHBATCHTEST)
+        run: scripts/test_bench_batch.sh
