@@ -45,9 +45,10 @@ extension Tell {
             let seqBase = greedy(bBase, firstNormed: nBase)
 
             _ = Tell.prefill(promptIds: A, backend: bReuse)   // cache the stable content prefix
-            let snap = bReuse.snapshot()                       // content-boundary snapshot
+            // Full-state snapshot for arbitrary rewind; falls back to snapshot (composed's is already full).
+            let snap = (bReuse.fullSnapshot ?? bReuse.snapshot)()          // content-boundary snapshot
             _ = Tell.prefill(promptIds: tail, backend: bReuse) // gen prompt + generated (request-specific)
-            bReuse.rollback(snap)                              // next request rewinds past them
+            (bReuse.fullRestore ?? bReuse.rollback)(snap)      // next request rewinds past them
             let t1 = Date()
             guard let nReuse = Tell.prefill(promptIds: B, backend: bReuse) else { return "  \(label): prefill reuse nil" }
             let tSuffix = Date().timeIntervalSince(t1)
@@ -60,13 +61,13 @@ extension Tell {
         }
 
         let composed = trial("composed(full copyState)", { Tell.composedBackend(engine: engine) }, timed: false)
-        let fused = trial("fused(1-step rollback)", { Tell.fusedBackend(engine: engine, maxM: 96, maxSeqLen: maxSeqLen) }, timed: true)
-        let pass = composed.contains("byte-identical=YES")
+        let fused = trial("fused(full snapshot)", { Tell.fusedBackend(engine: engine, maxM: 96, maxSeqLen: maxSeqLen) }, timed: true)
+        let pass = composed.contains("byte-identical=YES") && fused.contains("byte-identical=YES")
         return """
         [prefix-poc] A=\(aLen) tail=\(tailLen) B=\(bLen) decodeN=\(decodeN)
         \(composed)
         \(fused)
-        PREFIXPOC \(pass ? "PASS" : "FAIL")   (composed = the full-state primitive; fused's 1-step rollback is expected to fail arbitrary rewind)
+        PREFIXPOC \(pass ? "PASS" : "FAIL")   (both paths must be byte-identical to full prefill)
         """
     }
 }

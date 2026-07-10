@@ -85,6 +85,10 @@ extension Tell {
         let stepArgmax: ([Int32]) -> [Int]?
         let snapshot: () -> Any
         let rollback: (Any) -> Void
+        // Full-state save/restore for arbitrary-length rewind (cross-request prefix caching).
+        // Distinct from snapshot/rollback (1-step spec). nil if the backend doesn't support it.
+        var fullSnapshot: (() -> Any)? = nil
+        var fullRestore: ((Any) -> Void)? = nil
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
         // Additive — greedy stepArgmax path is untouched.
@@ -162,6 +166,11 @@ extension Tell {
                 guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
+        // Full-state save/restore (prefix caching): deep-copies GDN state so arbitrary rewind is exact.
+        backend.fullSnapshot = { fwd.fullSnapshot() }
+        backend.fullRestore = { snap in
+            if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
+        }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
         if fwd.head != nil {
@@ -202,6 +211,11 @@ extension Tell {
                 guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return }
                 fwd.rollbackOneStep(s)
             })
+        // Full-state save/restore (prefix caching): deep-copies GDN state so arbitrary rewind is exact.
+        backend.fullSnapshot = { fwd.fullSnapshot() }
+        backend.fullRestore = { snap in
+            if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
+        }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         if fwd.head != nil {
             backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }

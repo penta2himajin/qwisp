@@ -2689,6 +2689,20 @@ public enum SeedlessFusedVerify {
                 MLXArray(Array(UnsafeBufferPointer(start: sp, count: c.Hv * c.Dv * c.Dk)), [1, c.Hv, c.Dv, c.Dk]))
     }
 
+    /// Write a saved (conv hist, rec state) back into the CURRENT (In) side of a GDN cache —
+    /// the inverse of readGdnCache, for full-state restore (prefix caching, notes/…). The next
+    /// encode reads convHist/state, so writing there restores the layer to the snapshot exactly.
+    static func writeGdnCache(_ c: GdnCacheBufs, conv: MLXArray, rec: MLXArray) {
+        let cf = conv.asType(.float16).reshaped([-1]); cf.eval()
+        let ca = cf.asArray(Float16.self)
+        c.convHist.contents().bindMemory(to: Float16.self, capacity: (c.K - 1) * c.C)
+            .update(from: ca, count: min(ca.count, (c.K - 1) * c.C))
+        let rf = rec.asType(.float32).reshaped([-1]); rf.eval()
+        let ra = rf.asArray(Float.self)
+        c.state.contents().bindMemory(to: Float.self, capacity: c.Hv * c.Dv * c.Dk)
+            .update(from: ra, count: min(ra.count, c.Hv * c.Dv * c.Dk))
+    }
+
     /// GDN 層の常駐 scratch。
     public struct GdnScratch {
         let qkv: MTLBuffer, z: MTLBuffer, bP: MTLBuffer, aP: MTLBuffer
@@ -3668,6 +3682,27 @@ public enum SeedlessFusedVerify {
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = s.kvLens[i] }
                 if let gc = L.gdnCache { gc.swapState() }
+            }
+        }
+
+        /// Full-state snapshot/restore for ARBITRARY-length rewind (cross-request prefix caching) —
+        /// additive; the 1-step spec path (snapshot/rollbackOneStep) is untouched. KV needs only its
+        /// length (forwardRows only appends, so positions 0..len stay intact and are re-prefilled
+        /// over on restore); GDN's ping-pong holds only 1 step, so its state is deep-copied.
+        public struct FullSnapshot { let kvLens: [Int]; let gdn: [(conv: MLXArray, rec: MLXArray)?] }
+        public func fullSnapshot() -> FullSnapshot {
+            let gdn = layers.map { L -> (conv: MLXArray, rec: MLXArray)? in
+                guard let gc = L.gdnCache else { return nil }
+                let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r)
+            }
+            return FullSnapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }, gdn: gdn)
+        }
+        public func fullRestore(_ s: FullSnapshot) {
+            for (i, L) in layers.enumerated() {
+                if let kv = L.kvCache { kv.len = s.kvLens[i] }
+                if let gc = L.gdnCache, let g = s.gdn[i] {
+                    SeedlessFusedVerify.writeGdnCache(gc, conv: g.conv, rec: g.rec)
+                }
             }
         }
 
