@@ -207,6 +207,62 @@ extension Tell {
                 "PREFIXSPEED done"].joined(separator: "\n")
     }
 
+    // Prefill stage profile (kernel-speedup recon): ① raw path — per-stage GPU time via
+    // forwardRowsProfiled (CB-split, exact math) bucketed into GDN/attn/MoE, swept over chunk size.
+    // ② MLX path — same prompt chunk-prefilled through QwispModel (MLX gather_qmm uses matrix-unit
+    // kernels at M>=14), as free evidence of what a GEMM-structured MoE kernel buys at prefill M.
+    // Env: QWISP_PREFILL_LEN (default 2048).
+    public static func prefillStageProfile(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[stage-prof] load fail\nSTAGEPROF done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let promptI32 = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+        var lines = ["[stage-prof] promptLen=\(promptLen) resident"]
+
+        // ① raw per-stage GPU time, chunk sweep
+        lines.append("  ── raw path: per-stage GPU ms (CB-split, exact) ──")
+        for chunk in [64, 256, 1024] {
+            guard let (fwd, _) = engine.makeFused(maxM: chunk + 8, maxSeqLen: promptLen + 128) else {
+                lines.append("  chunk=\(chunk): makeFused nil"); continue
+            }
+            var g = 0.0, a = 0.0, m = 0.0
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + chunk, promptLen)
+                let x = engine.embed(tokens: Array(promptI32[pos ..< end]))
+                guard let t = fwd.forwardRowsProfiled(x, M: end - pos) else { break }
+                g += t.gdn; a += t.attn; m += t.moe
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            let tot = g + a + m
+            lines.append(String(format: "  chunk=%4d  GDN %6.2fs (%4.1f%%)  attn %6.2fs (%4.1f%%)  MoE %6.2fs (%4.1f%%)  | stageSum %5.1fs  wall %5.1fs  %.0f tok/s",
+                                chunk, g/1000, 100*g/tot, a/1000, 100*a/tot, m/1000, 100*m/tot,
+                                tot/1000, wall, Double(promptLen)/wall))
+        }
+
+        // ② MLX path (matrix-unit gather_qmm at M>=14): same prompt, chunked cached prefill
+        lines.append("  ── MLX path (QwispModel, gather_qmm matrix-unit) ──")
+        let model = QwispModel(store: store)
+        let ids = promptI32.map { Int($0) }
+        for chunk in [64, 256] {
+            let caches = model.makeCaches()
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + chunk, promptLen)
+                let (hidden, _) = model.forwardHidden(MLXArray(ids[pos ..< end].map { Int32($0) }).reshaped([1, end - pos]),
+                                                      caches: caches)
+                MLX.eval(hidden)
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            lines.append(String(format: "  chunk=%4d  wall %5.1fs  %.0f tok/s", chunk, wall, Double(promptLen)/wall))
+        }
+        lines.append("STAGEPROF done")
+        return lines.joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()

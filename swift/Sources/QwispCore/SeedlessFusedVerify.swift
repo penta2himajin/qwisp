@@ -3706,6 +3706,36 @@ public enum SeedlessFusedVerify {
             }
         }
 
+        /// Measurement-only prefill profiler: resident forward with per-stage CB splits, bucketing
+        /// GPU time into (GDN mixer, attn mixer, MoE block). Encode order and kernels are identical
+        /// to forwardRows resident mode — only CB boundaries differ — so cache state advances
+        /// exactly the same and the token math is unchanged. Adds ~2 sync/layer of CPU overhead,
+        /// which inflates wall time but NOT the per-CB gpu times being reported.
+        public func forwardRowsProfiled(_ x: MLXArray, M: Int) -> (gdn: Double, attn: Double, moe: Double)? {
+            guard M <= maxM else { return nil }
+            let xf = x.asType(.float16).reshaped([-1]); xf.eval()
+            let arr = xf.asArray(Float16.self)
+            hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H).update(from: arr, count: M * H)
+            var tGdn = 0.0, tAttn = 0.0, tMoe = 0.0
+            func timed(_ body: (MTLComputeCommandEncoder) -> Void) -> Double {
+                let cb = queue.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                body(enc)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            }
+            for L in layers {
+                let t1 = timed { enc in self.encodePreMoE(enc, L, M: M) }
+                if L.isLinear { tGdn += t1 } else { tAttn += t1 }
+                tMoe += timed { enc in
+                    SeedlessFusedVerify.encodeMoEBlockRows(enc, x: self.postNorm, out: self.moeOut, w: L.moe, sc: self.moeSc,
+                                                      M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: self.H)
+                    SeedlessFusedVerify.encodeResidAdd(enc, h: self.hBuf, r: self.moeOut, total: M * self.H)
+                }
+            }
+            return (tGdn, tAttn, tMoe)
+        }
+
         /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
         public func readLayerCache(_ i: Int) -> (MLXArray?, MLXArray?) {
             let L = layers[i]
