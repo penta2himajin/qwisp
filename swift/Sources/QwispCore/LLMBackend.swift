@@ -73,10 +73,22 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let engine: SeedlessEngine
     let modelDir: String
     let tier: SeedlessTier
+    let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
+
+    /// Read `text_config.max_position_embeddings` from the checkpoint's config.json.
+    /// Falls back to 32768 if absent — a sane bound that still lets any real chat reach EOS.
+    static func readContextLen(_ modelDir: String) -> Int {
+        let url = URL(fileURLWithPath: modelDir).appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: url),
+              let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 32768 }
+        let tc = (top["text_config"] as? [String: Any]) ?? top
+        return (tc["max_position_embeddings"] as? Int) ?? 32768
+    }
 
     public init(modelDir: String, tier: SeedlessTier = .auto) throws {
         self.modelDir = modelDir
         self.tier = tier
+        self.contextLen = SeedlessBackend.readContextLen(modelDir)
         let store = try WeightStore(modelDir: modelDir)
         // residency by tier (mirrors run(): streaming keeps only non-experts resident).
         if SeedlessBackend.config(tier: tier, promptLen: 0, maxTokens: 0).isStreaming {
@@ -89,31 +101,54 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
-        let cfg = SeedlessBackend.config(tier: tier, promptLen: prompt.count, maxTokens: options.maxTokens)
-        let promptIds = prompt.map { Int32($0) }
+        // c / maxK / maxM / isStreaming are prompt-length independent; only maxSeqLen (per
+        // segment, below) tracks the growing sequence. Resolve those once.
+        let cfg = SeedlessBackend.config(tier: tier, promptLen: 0, maxTokens: 0)
+        let promptIds0 = prompt.map { Int32($0) }
+        // Hard ceiling on GENERATED tokens: <0 (unset / `--max-tokens -1`) → fill to the model
+        // context; else the caller's cap. Both clamped to the context headroom.
+        let headroom = Swift.max(0, contextLen - prompt.count)
+        let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
+        // First KV arena budget; grows geometrically to `ceiling` only if generation needs it.
+        let baseline = Swift.max(1, Tell.envInt("QWISP_CTX_BASELINE", 8192))
         let cancel = CancelFlag()
         return AsyncStream { continuation in
-            // Consumer dropped the stream (early stop token / maxTokens / client disconnect)
-            // → cancel the detached decode so it stops at the next spec-step boundary instead
-            // of running to maxTokens on the GPU. Without this the orphaned thread keeps the
-            // (exclusive) GPU busy and the next request's decode overlaps it.
+            // Consumer dropped the stream (EOS at the consumer / client disconnect) → cancel the
+            // detached decode so it stops at the next spec-step boundary instead of running to the
+            // ceiling on the (exclusive) GPU and overlapping the next request's decode.
             continuation.onTermination = { _ in cancel.cancel() }
-            // The decode loop is synchronous + GPU-bound. Run it off the caller's task and
-            // yield each accepted token as it lands (true incremental streaming). The spec
-            // backend is built INSIDE the thread so no non-Sendable state is captured;
-            // generation is serialized upstream (server AsyncLock) so touching engine is safe.
-            // ponytail: the spec backend is rebuilt per request — fine for a single-user
-            // server; make it a persistent per-instance backend if throughput matters.
+            // Decode is synchronous + GPU-bound → run off the caller's task, yielding each token as
+            // it lands. The spec backend is built INSIDE the thread so no non-Sendable state is
+            // captured; generation is serialized upstream (server AsyncLock).
+            //
+            // Segmented growth: start with an 8K-token KV arena and only enlarge it (rebuild +
+            // re-prefill prompt+generated-so-far) if a segment fills without stopping. The common
+            // case (answer < 8K, ends at EOS) never grows and pays nothing. ponytail: re-prefill on
+            // grow costs ~2× prefill on the tail; growing the KV buffer in place would need engine
+            // changes (frozen forward path). The spec backend is also rebuilt per segment — fine for
+            // a single-user server; a persistent per-instance backend is the throughput lever.
             Thread.detachNewThread {
-                let specBackend: Tell.SpecBackend? = cfg.isStreaming
-                    ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
-                                            maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen, C: cfg.c).map { $0.0 }
-                    : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: cfg.maxSeqLen)
-                guard let sb = specBackend else { continuation.finish(); return }
-                _ = Tell.runSpecLoop(promptIds: promptIds, backend: sb, engine: self.engine,
-                                     N: options.maxTokens, maxK: cfg.maxK,
-                                     isCancelled: { cancel.isCancelled }) { tok in
-                    continuation.yield(tok)
+                var seq = promptIds0          // prompt + all accepted tokens so far
+                var produced = 0
+                var budget = Swift.min(baseline, Swift.max(1, ceiling))
+                while produced < ceiling && !cancel.isCancelled {
+                    let segN = Swift.min(budget, ceiling - produced)
+                    let maxSeqLen = seq.count + segN + cfg.maxK + 64
+                    let sb: Tell.SpecBackend? = cfg.isStreaming
+                        ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
+                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
+                        : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: maxSeqLen)
+                    guard let backend = sb else { break }
+                    let seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
+                                               N: segN, maxK: cfg.maxK,
+                                               isCancelled: { cancel.isCancelled }) { tok in
+                        continuation.yield(tok)
+                    }
+                    guard let seg, !seg.isEmpty else { break }
+                    seq += seg.map { Int32($0) }
+                    produced += seg.count
+                    if seg.count < segN { break }   // stopped early (consumer cancel / EOS) → done
+                    budget = Swift.min(budget * 2, 65536)
                 }
                 continuation.finish()
             }

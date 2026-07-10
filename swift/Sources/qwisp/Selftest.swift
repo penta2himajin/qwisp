@@ -13,7 +13,7 @@ final class FakeBackend: LLMBackend {
             var n = 0
             for id in script {
                 if options.stopTokens.contains(id) { break }
-                if n >= options.maxTokens { break }
+                if options.maxTokens >= 0 && n >= options.maxTokens { break }  // <0 = until EOS/context
                 cont.yield(id); n += 1
             }
             cont.finish()
