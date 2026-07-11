@@ -27,7 +27,12 @@ case "serve":
         backend = FakeBackend(script: tok.encode("Hello! This is qwisp with a fake backend for wire-format testing."))
     } else {
         print("[qwisp serve] loading Seedless engine (loads the model) …")
-        backend = try SeedlessBackend(modelDir: model)
+        let sb = try SeedlessBackend(modelDir: model)
+        // --lossless > env QWISP_LOSSLESS > config "lossless" > false. Streaming tiers
+        // (<32GB) otherwise default to bolt (near-lossless).
+        sb.losslessForced = args.contains("--lossless")
+            || Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig)
+        backend = sb
     }
     let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID)
     try await runServe(engine: engine, modelID: modelID, port: port)
@@ -36,6 +41,8 @@ case "chat":
     // Default -1 = generate until EOS / context (mlx-lm / llama.cpp semantics); N caps it.
     var rest = Array(args.dropFirst())
     var maxTokens = -1
+    var chatLossless = Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig)
+    if let i = rest.firstIndex(of: "--lossless") { chatLossless = true; rest.remove(at: i) }
     if let i = rest.firstIndex(where: { $0 == "--max-tokens" || $0.hasPrefix("--max-tokens=") }) {
         let flag = rest[i]
         if let eq = flag.firstIndex(of: "=") {
@@ -51,7 +58,7 @@ case "chat":
     let promptText = rest.joined(separator: " ")
     let prompt = promptText.isEmpty ? (readLine(strippingNewline: true) ?? "") : promptText
     if prompt.isEmpty {
-        print("usage: qwisp chat [--max-tokens N] <prompt>   (or pipe text via stdin)")
+        print("usage: qwisp chat [--max-tokens N] [--lossless] <prompt>   (or pipe text via stdin)")
     } else {
         let env = ProcessInfo.processInfo.environment
         // Ensure a model is present; interactively offer to pull one if not (TTY only).
@@ -68,7 +75,9 @@ case "chat":
         if env["QWISP_FAKE"] == "1" {
             backend = FakeBackend(script: tok.encode("(fake backend) hello from qwisp chat."))
         } else {
-            backend = try SeedlessBackend(modelDir: effModel)
+            let sb = try SeedlessBackend(modelDir: effModel)
+            sb.losslessForced = chatLossless
+            backend = sb
         }
         // Option B sampling knobs (the server uses the OpenAI API params instead).
         // maxTokens comes from the --max-tokens flag above (default -1 = until EOS/context).

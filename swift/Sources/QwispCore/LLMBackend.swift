@@ -97,6 +97,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
 
     let store: WeightStore
     let engine: SeedlessEngine
+    /// --lossless / QWISP_LOSSLESS: force strict (bit-exact) on every tier. Streaming
+    /// tiers (<32GB) otherwise default to bolt (near-lossless L3) — productization
+    /// tier→mode decision. Set by the CLI after init (resolved flag > env > config).
+    public var losslessForced: Bool? = nil
+    var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
+    private var boltServe: BoltServe? = nil
     let modelDir: String
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
@@ -182,6 +188,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // QWISP_FORCE_SAMPLE=1 forces the sampling loop even at temperature 0 (T=0-equivalence gate).
             let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
             let wantSample = options.sampling || forceSample
+            // Productization tier→mode: streaming tiers (<32GB) decode with bolt (near-lossless
+            // L3, buddy remap) by default; --lossless / QWISP_LOSSLESS forces strict. Sampling
+            // requests fall back to strict streaming (the bolt loop is greedy-deterministic; v1).
+            let useBolt = cfg.isStreaming && !wantSample && !self.lossless
             Thread.detachNewThread {
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
@@ -189,6 +199,22 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 while produced < ceiling && !cancel.isCancelled {
                     let segN = Swift.min(budget, ceiling - produced)
                     let maxSeqLen = seq.count + segN + cfg.maxK + 64
+                    let onTok: (Int) -> Void = { continuation.yield($0) }
+                    if useBolt {
+                        if self.boltServe == nil {
+                            self.boltServe = BoltServe(engine: self.engine, modelDir: self.modelDir,
+                                                       C: cfg.c, maxK: cfg.maxK, maxM: cfg.maxM)
+                        }
+                        guard let seg = self.boltServe?.runSegment(
+                            promptIds: seq, N: segN, maxSeqLen: maxSeqLen,
+                            isCancelled: { cancel.isCancelled }, onToken: onTok),
+                            !seg.isEmpty else { break }
+                        seq += seg.map { Int32($0) }
+                        produced += seg.count
+                        if seg.count < segN { break }
+                        budget = Swift.min(budget * 2, 65536)
+                        continue
+                    }
                     let sb: Tell.SpecBackend? = cfg.isStreaming
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
@@ -196,7 +222,6 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                             maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                                             maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
-                    let onTok: (Int) -> Void = { continuation.yield($0) }
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
                     // per segment (RNG restarts, so vary the seed by `produced` to avoid reusing the
                     // same stream across segment boundaries). ponytail: penalty counts reset per

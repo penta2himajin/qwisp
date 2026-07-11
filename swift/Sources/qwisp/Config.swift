@@ -14,6 +14,7 @@ import Foundation
 struct QwispConfig: Codable {
     var model: String?
     var port: Int?
+    var lossless: Bool?
 }
 
 enum Config {
@@ -30,7 +31,7 @@ enum Config {
     static func load(path: String) -> QwispConfig {
         guard let data = FileManager.default.contents(atPath: path),
               let cfg = try? JSONDecoder().decode(QwispConfig.self, from: data)
-        else { return QwispConfig(model: nil, port: nil) }
+        else { return QwispConfig(model: nil, port: nil, lossless: nil) }
         return cfg
     }
 
@@ -41,6 +42,16 @@ enum Config {
     static func resolvePort(env: [String: String], config: QwispConfig, default def: Int) -> Int {
         if let e = env["QWISP_PORT"], let v = Int(e) { return v }
         return config.port ?? def
+    }
+
+    /// --lossless: force strict (bit-exact) on every tier. Streaming tiers (<32GB)
+    /// otherwise default to bolt (near-lossless). env QWISP_LOSSLESS=1 > config > false.
+    static func resolveLossless(env: [String: String], config: QwispConfig) -> Bool {
+        if let e = env["QWISP_LOSSLESS"] { return e == "1" }
+        return config.lossless ?? false
+    }
+    static func sourceOfLossless(env: [String: String], config: QwispConfig) -> String {
+        env["QWISP_LOSSLESS"] != nil ? "env" : (config.lossless != nil ? "config" : "default")
     }
 
     // Where each effective value came from — for `qwisp config` transparency.
@@ -66,7 +77,7 @@ enum Config {
     // relative to this binary. `qwisp config --defaults`.
     static func defaultsJSON() -> String {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let full = QwispConfig(model: defaultModel, port: defaultPort)
+        let full = QwispConfig(model: defaultModel, port: defaultPort, lossless: false)
         return (try? enc.encode(full)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
 
@@ -74,10 +85,12 @@ enum Config {
     static func effectiveReport(env: [String: String], config: QwispConfig, path: String) -> String {
         let m = resolveModel(env: env, config: config, default: defaultModel)
         let p = resolvePort(env: env, config: config, default: defaultPort)
+        let l = resolveLossless(env: env, config: config)
         return """
         config file: \(path)\(FileManager.default.fileExists(atPath: path) ? "" : "  (not present)")
-          model = \(m)  [\(sourceOfModel(env: env, config: config))]
-          port  = \(p)  [\(sourceOfPort(env: env, config: config))]
+          model    = \(m)  [\(sourceOfModel(env: env, config: config))]
+          port     = \(p)  [\(sourceOfPort(env: env, config: config))]
+          lossless = \(l)  [\(sourceOfLossless(env: env, config: config))]
         """
     }
 
@@ -87,8 +100,8 @@ enum Config {
         func check(_ name: String, _ ok: Bool) {
             total += 1; if ok { passed += 1 } else { log.append("FAIL: \(name)") }
         }
-        let cfg = QwispConfig(model: "/cfg/model", port: 9)
-        let empty = QwispConfig(model: nil, port: nil)
+        let cfg = QwispConfig(model: "/cfg/model", port: 9, lossless: true)
+        let empty = QwispConfig(model: nil, port: nil, lossless: nil)
 
         check("env wins model",   resolveModel(env: ["QWISP_MODEL": "/env/m"], config: cfg, default: "/def") == "/env/m")
         check("config wins model", resolveModel(env: [:], config: cfg, default: "/def") == "/cfg/model")
@@ -105,9 +118,18 @@ enum Config {
         check("source port default",  sourceOfPort(env: [:], config: empty) == "default")
         check("source port env",      sourceOfPort(env: ["QWISP_PORT": "1"], config: empty) == "env")
 
-        // defaultsJSON carries both keys
+        // lossless resolution (productization: <32GB defaults bolt; this forces strict)
+        check("env wins lossless",     resolveLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == true)
+        check("env 0 beats config",    resolveLossless(env: ["QWISP_LOSSLESS": "0"], config: cfg) == false)
+        check("config lossless",       resolveLossless(env: [:], config: cfg) == true)
+        check("default lossless off",  resolveLossless(env: [:], config: empty) == false)
+        check("source lossless env",   sourceOfLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == "env")
+        check("source lossless config", sourceOfLossless(env: [:], config: cfg) == "config")
+
+        // defaultsJSON carries the keys
         let dj = defaultsJSON()
-        check("defaults json has model+port", dj.contains("\"model\"") && dj.contains("\"port\"") && dj.contains("8080"))
+        check("defaults json has model+port+lossless",
+              dj.contains("\"model\"") && dj.contains("\"port\"") && dj.contains("8080") && dj.contains("\"lossless\""))
 
         // load(): missing file and malformed JSON both yield empty config, no throw.
         let tmp = NSTemporaryDirectory() + "qwisp-configtest-\(getpid())"
