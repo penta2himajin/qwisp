@@ -207,6 +207,272 @@ extension Tell {
                 "PREFIXSPEED done"].joined(separator: "\n")
     }
 
+    // Prefill stage profile (kernel-speedup recon): ① raw path — per-stage GPU time via
+    // forwardRowsProfiled (CB-split, exact math) bucketed into GDN/attn/MoE, swept over chunk size.
+    // ② MLX path — same prompt chunk-prefilled through QwispModel (MLX gather_qmm uses matrix-unit
+    // kernels at M>=14), as free evidence of what a GEMM-structured MoE kernel buys at prefill M.
+    // Env: QWISP_PREFILL_LEN (default 2048).
+    public static func prefillStageProfile(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[stage-prof] load fail\nSTAGEPROF done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let promptI32 = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+        var lines = ["[stage-prof] promptLen=\(promptLen) resident"]
+
+        // ① raw per-stage GPU time, chunk sweep
+        lines.append("  ── raw path: per-stage GPU ms (CB-split, exact) ──")
+        for chunk in [64, 256, 1024] {
+            guard let (fwd, _) = engine.makeFused(maxM: chunk + 8, maxSeqLen: promptLen + 128) else {
+                lines.append("  chunk=\(chunk): makeFused nil"); continue
+            }
+            var g = 0.0, a = 0.0, m = 0.0
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + chunk, promptLen)
+                let x = engine.embed(tokens: Array(promptI32[pos ..< end]))
+                guard let t = fwd.forwardRowsProfiled(x, M: end - pos) else { break }
+                g += t.gdn; a += t.attn; m += t.moe
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            let tot = g + a + m
+            lines.append(String(format: "  chunk=%4d  GDN %6.2fs (%4.1f%%)  attn %6.2fs (%4.1f%%)  MoE %6.2fs (%4.1f%%)  | stageSum %5.1fs  wall %5.1fs  %.0f tok/s",
+                                chunk, g/1000, 100*g/tot, a/1000, 100*a/tot, m/1000, 100*m/tot,
+                                tot/1000, wall, Double(promptLen)/wall))
+        }
+
+        // ② MLX path (matrix-unit gather_qmm at M>=14): same prompt, chunked cached prefill
+        lines.append("  ── MLX path (QwispModel, gather_qmm matrix-unit) ──")
+        let model = QwispModel(store: store)
+        let ids = promptI32.map { Int($0) }
+        for chunk in [64, 256] {
+            let caches = model.makeCaches()
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + chunk, promptLen)
+                let (hidden, _) = model.forwardHidden(MLXArray(ids[pos ..< end].map { Int32($0) }).reshaped([1, end - pos]),
+                                                      caches: caches)
+                MLX.eval(hidden)
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            lines.append(String(format: "  chunk=%4d  wall %5.1fs  %.0f tok/s", chunk, wall, Double(promptLen)/wall))
+        }
+        // MLX GDN stage attribution (GatedDeltaNetLayer prof counters; eval barriers inflate wall,
+        // stage sums still attribute where MLX spends its GDN time vs our sequential T-loop kernel).
+        StreamingMoEBlock.profileLayers = true
+        StreamingMoEBlock.tGdnInproj = 0; StreamingMoEBlock.tGdnConv = 0
+        StreamingMoEBlock.tGdnKernel = 0; StreamingMoEBlock.tGdnOut = 0
+        do {
+            let caches = model.makeCaches()
+            let t0 = Date(); var pos = 0
+            while pos < promptLen {
+                let end = Swift.min(pos + 64, promptLen)
+                let (hidden, _) = model.forwardHidden(MLXArray(ids[pos ..< end].map { Int32($0) }).reshaped([1, end - pos]),
+                                                      caches: caches)
+                MLX.eval(hidden)
+                pos = end
+            }
+            let wall = Date().timeIntervalSince(t0)
+            func s(_ ns: UInt64) -> Double { Double(ns) / 1e9 }
+            lines.append(String(format: "  MLX GDN stages (c64, barriered wall %.1fs): inproj %.2fs  conv %.2fs  recur-kernel %.2fs  out %.2fs  | GDN total %.2fs",
+                                wall, s(StreamingMoEBlock.tGdnInproj), s(StreamingMoEBlock.tGdnConv),
+                                s(StreamingMoEBlock.tGdnKernel), s(StreamingMoEBlock.tGdnOut),
+                                s(StreamingMoEBlock.tGdnInproj + StreamingMoEBlock.tGdnConv + StreamingMoEBlock.tGdnKernel + StreamingMoEBlock.tGdnOut)))
+        }
+        StreamingMoEBlock.profileLayers = false
+        lines.append("STAGEPROF done")
+        return lines.joined(separator: "\n")
+    }
+
+    // Verification ① for the MLX-dense-prefill route: per-element M-invariance of MLX
+    // quantizedMatmul. Row r's output must be bit-identical no matter how many other rows share
+    // the call (and under zero-padding), or split-point-invariant prefill via MLX dense is dead.
+    // MLX dispatches qmv (M<14, scalar) vs steel qmm (M>=14, matrix units) — the padding variant
+    // tests whether pinning ALL prefill matmuls to the steel class (pad M up to >=14) is coherent.
+    public static func mlxQmmInvariance(modelDir: String) -> String {
+        var lines = ["[mlx-qmm-minv] MLX quantizedMatmul per-element M-invariance (value-equality per row)"]
+        for (label, K, N) in [("2048→512", 2048, 512), ("2048→12352", 2048, 12352)] {
+            let wf = MLXRandom.normal([N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            guard let bi = biOpt else { return "[mlx-qmm-minv] biases nil" }
+            let xAll = MLXRandom.normal([1024, K]).asType(.float16)
+            MLX.eval([wq, sc, bi, xAll])
+            func qmm(_ x: MLXArray) -> MLXArray {
+                let y = MLX.quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4)
+                y.eval(); return y
+            }
+            let full = qmm(xAll)                                   // M=1024 reference
+            func rowsEqual(_ a: MLXArray, _ b: MLXArray) -> Bool {
+                let d = MLX.all(a .== b)
+                d.eval(); return d.item(Bool.self)
+            }
+            lines.append("  ── \(label) ──")
+            for M in [1, 8, 13, 14, 16, 64, 256] {
+                let out = qmm(xAll[0..<M])
+                let ok = rowsEqual(out, full[0..<M])
+                lines.append("    M=\(M)\tvs M=1024 rows[0..<\(M)]: \(ok ? "IDENTICAL ✅" : "DIFFER ❌")")
+            }
+            // zero-pad variant: 3 real rows + 13 zero rows = M=16 call; real rows vs full
+            let pad = MLX.concatenated([xAll[0..<3], MLXArray.zeros([13, K]).asType(.float16)], axis: 0)
+            let outPad = qmm(pad)
+            let okPad = rowsEqual(outPad[0..<3], full[0..<3])
+            lines.append("    M=3+13pad(=16)\tvs M=1024 rows[0..<3]: \(okPad ? "IDENTICAL ✅" : "DIFFER ❌")")
+        }
+        lines.append("MLXQMMMINV done")
+        return lines.joined(separator: "\n")
+    }
+
+    // Hybrid-prefill estimate: measures the steel-replaceable sub-stage costs (GDN matmuls, GDN
+    // recurrence, MoE routed gather, MoE shared) by warm-buffer skip differentials (KV/GDN state
+    // reset via fullRestore between runs; buffers stay numerically sane after a warm pass, avoiding
+    // the cold-garbage artifact that invalidated v1), then folds in the MEASURED steel ratios
+    // (steel-route-bench @1a41c38) + sync/copy overheads to print the projected hybrid speedup.
+    // Additivity of the differentials is reported as a sanity check.
+    public static func hybridEstimate(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[hybrid-est] load fail\nHYBRIDEST done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let prompt = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+        func allOff() {
+            SeedlessMetalForward.profSkipGDNMatmul = false
+            SeedlessMetalForward.profSkipGDNRecur = false
+            SeedlessMetalForward.profSkipMoERouted = false
+            SeedlessMetalForward.profSkipMoEShared = false
+        }
+        var out = ["[hybrid-est] promptLen=\(promptLen) resident — sub-stage differentials (warm) + steel fold-in"]
+        // measured steel speedups (steel-route-bench): [chunk: (gdnMatmul, moeRouted, moeShared)]
+        // gdnMatmul = blend of inproj (3.8x@256, 4.3x@1024) and outproj (~1.4x@256, ~3.3x@1024) → ~3.0/4.0
+        let steel: [Int: (gdnMat: Double, moeR: Double, moeS: Double)] = [
+            256:  (3.0, 1.40, 1.0),
+            1024: (4.0, 2.24, 2.3)]
+        for chunk in [256, 1024] {
+            guard let b = Tell.fusedBackend(engine: engine, maxM: chunk + 8, maxSeqLen: promptLen + 128) else { continue }
+            guard let empty = b.fullSnapshot?() else { continue }
+            func prefill() -> Double {
+                b.fullRestore?(empty)
+                let t0 = Date(); var pos = 0
+                while pos < promptLen {
+                    let e = Swift.min(pos + chunk, promptLen)
+                    _ = b.forward(Array(prompt[pos ..< e])); pos = e
+                }
+                return Date().timeIntervalSince(t0)
+            }
+            allOff(); _ = prefill()                                  // warm: sane buffers + pipelines
+            func timed(_ set: () -> Void) -> Double {
+                allOff(); set()
+                let a = prefill(), c = prefill()
+                allOff(); return Swift.min(a, c)
+            }
+            let full  = timed {}
+            let dGMat = full - timed { SeedlessMetalForward.profSkipGDNMatmul = true }
+            let dGRec = full - timed { SeedlessMetalForward.profSkipGDNRecur = true }
+            let dMoER = full - timed { SeedlessMetalForward.profSkipMoERouted = true }
+            let dMoES = full - timed { SeedlessMetalForward.profSkipMoEShared = true }
+            let parts = dGMat + dGRec + dMoER + dMoES
+            let r = steel[chunk]!
+            let boundaries = Double(promptLen / chunk) * (30.0 * 2 + 40.0 * 2)   // per chunk: GDN 2/layer + MoE 2/layer
+            let sync = boundaries * 0.263e-3
+            let copies = Double(promptLen / chunk) * 0.015 * Double(chunk) / 1024.0   // ~15ms/chunk@1024 measured-class memcpy
+            let hybrid = full - dGMat * (1 - 1 / r.gdnMat) - dMoER * (1 - 1 / r.moeR) - dMoES * (1 - 1 / r.moeS) + sync + copies
+            out.append(String(format: "  chunk=%4d  full %5.2fs (%.0f tok/s)", chunk, full, Double(promptLen) / full))
+            out.append(String(format: "    sub-stage: GDNmat %5.2fs  GDNrec %5.2fs  MoErouted %5.2fs  MoEshared %5.2fs  (sum %.2fs = %.0f%% of full — additivity check)",
+                              dGMat, dGRec, dMoER, dMoES, parts, 100 * parts / full))
+            out.append(String(format: "    HYBRID est: %5.2fs (%.0f tok/s)  → %.2fx   [steel %0.1f/%0.2f/%0.1fx, sync %.2fs, copies %.2fs]",
+                              hybrid, Double(promptLen) / hybrid, full / hybrid, r.gdnMat, r.moeR, r.moeS, sync, copies))
+        }
+        out.append("HYBRIDEST done")
+        return out.joined(separator: "\n")
+    }
+
+    // Stage-1 gate for the steel-prefill hybrid: (a) model-math sanity — hybrid final normed must be
+    // CLOSE to raw (different rounding, tiny rel err; catches mis-wired buffers/slices), (b)
+    // determinism — two hybrid runs byte-identical, (c) split-invariance — chunk 512 vs 1024 byte-
+    // identical (steel padding pins every M into one kernel class), (d) speed — hybrid vs raw prefill.
+    public static func hybridPrefillBench(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[hybrid-bench] load fail\nHYBRIDBENCH FAIL" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let promptLen = Tell.envInt("QWISP_PREFILL_LEN", 2048)
+        let prompt = (0..<promptLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
+
+        func mkBackend(_ hybrid: Bool) -> Tell.SpecBackend? {
+            setenv("QWISP_HYBRID_PREFILL", hybrid ? "1" : "0", 1)
+            return Tell.fusedBackend(engine: engine, maxM: 1032, maxSeqLen: promptLen + 128)
+        }
+        // prefill via Tell.prefill (uses hybrid closure + chunk automatically); returns final normed row.
+        func run(_ b: Tell.SpecBackend, chunk: Int? = nil) -> [Float16]? {
+            var bb = b
+            if let c = chunk { bb.hybridChunk = c }
+            guard let n = Tell.prefill(promptIds: prompt, backend: bb) else { return nil }
+            n.eval()
+            return n.reshaped([-1]).asArray(Float16.self)
+        }
+        var out = ["[hybrid-bench] promptLen=\(promptLen) resident, maxM=1032"]
+
+        guard let rawB = mkBackend(false) else { return "[hybrid-bench] raw backend nil\nHYBRIDBENCH FAIL" }
+        let tR0 = Date(); guard let rawOut = run(rawB) else { return "[hybrid-bench] raw run nil\nHYBRIDBENCH FAIL" }
+        let tRaw = Date().timeIntervalSince(tR0)
+
+        guard let hyB = mkBackend(true), hyB.forwardHybrid != nil else { return "[hybrid-bench] hybrid backend nil\nHYBRIDBENCH FAIL" }
+        let tH0 = Date(); guard let hy1 = run(hyB) else { return "[hybrid-bench] hybrid run nil\nHYBRIDBENCH FAIL" }
+        let tHy = Date().timeIntervalSince(tH0)
+
+        // (a) model-math sanity: rel err of final normed row
+        var num = 0.0, den = 0.0
+        for i in 0..<rawOut.count { num += abs(Double(hy1[i]) - Double(rawOut[i])); den += abs(Double(rawOut[i])) }
+        let rel = num / Swift.max(den, 1e-9)
+        // (b) determinism: fresh hybrid backend, same run
+        guard let hyB2 = mkBackend(true), let hy2 = run(hyB2) else { return "[hybrid-bench] hy2 nil\nHYBRIDBENCH FAIL" }
+        let det = hy1 == hy2
+        // (c) split-invariance: chunk 512 on a fresh hybrid backend
+        guard let hyB3 = mkBackend(true), let hy3 = run(hyB3, chunk: 512) else { return "[hybrid-bench] hy3 nil\nHYBRIDBENCH FAIL" }
+        let splitInv = hy1 == hy3
+
+        out.append(String(format: "  raw    prefill %5.2fs (%.0f tok/s)  [chunk 64]", tRaw, Double(promptLen) / tRaw))
+        out.append(String(format: "  hybrid prefill %5.2fs (%.0f tok/s)  [chunk 1024]  → %.2fx", tHy, Double(promptLen) / tHy, tRaw / tHy))
+        // (a2) single-op wiring sanity: steel qkv on layer-0 weights vs f32-x reference (~1e-3 = correct)
+        var relOp = -1.0
+        if let g0 = engine.layers.first(where: { $0.gdn != nil })?.gdn {
+            let xt = MLXRandom.normal([64, 2048]).asType(.float16)
+            let ys = MLX.quantizedMatmul(xt, g0.qkvWq, scales: g0.qkvSc, biases: g0.qkvBi, transpose: true, groupSize: 64, bits: 4)
+            let yr = MLX.quantizedMatmul(xt.asType(.float32), g0.qkvWq, scales: g0.qkvSc.asType(.float32), biases: g0.qkvBi.asType(.float32), transpose: true, groupSize: 64, bits: 4)
+            MLX.eval([ys, yr])
+            let a = ys.asType(.float32).reshaped([-1]).asArray(Float.self)
+            let b = yr.reshaped([-1]).asArray(Float.self)
+            var n2 = 0.0, d2 = 0.0
+            for i in 0..<a.count { n2 += Double(abs(a[i] - b[i])); d2 += Double(abs(b[i])) }
+            relOp = n2 / Swift.max(d2, 1e-9)
+        }
+        // (a3) fidelity-family baseline: full-MLX (QwispModel) prefill final hidden vs raw
+        let model = QwispModel(store: store)
+        let caches = model.makeCaches()
+        var mlxLast: [Float16] = []
+        var pos = 0
+        while pos < promptLen {
+            let end = Swift.min(pos + 64, promptLen)
+            let ids = prompt[pos ..< end].map { Int32($0) }
+            let (hidden, _) = model.forwardHidden(MLXArray(ids).reshaped([1, end - pos]), caches: caches)
+            hidden.eval()
+            if end == promptLen { mlxLast = hidden[0, end - pos - 1].asType(.float16).reshaped([-1]).asArray(Float16.self) }
+            pos = end
+        }
+        var nM = 0.0, dM = 0.0
+        for i in 0..<Swift.min(mlxLast.count, rawOut.count) { nM += abs(Double(mlxLast[i]) - Double(rawOut[i])); dM += abs(Double(rawOut[i])) }
+        let relMLX = nM / Swift.max(dM, 1e-9)
+        out.append(String(format: "  (a) rel err vs raw      : %.2e   [single-op steel vs f32-ref: %.2e; full-MLX vs raw baseline: %.2e]", rel, relOp, relMLX))
+        let sane = relOp < 5e-3 && rel < Swift.max(2 * relMLX, 1e-2)
+        out.append("      wiring \(relOp < 5e-3 ? "OK ✅" : "MISWIRED ❌"), fidelity \(rel < Swift.max(2 * relMLX, 1e-2) ? "IN-FAMILY ✅ (≤2x full-MLX baseline)" : "OUT ❌")")
+        out.append("  (b) determinism         : \(det ? "IDENTICAL ✅" : "DIVERGE ❌")")
+        out.append("  (c) split-inv (512 vs 1024): \(splitInv ? "IDENTICAL ✅" : "DIVERGE ❌")")
+        let pass = sane && det && splitInv
+        out.append("HYBRIDBENCH \(pass ? "PASS" : "FAIL")")
+        setenv("QWISP_HYBRID_PREFILL", "0", 1)
+        return out.joined(separator: "\n")
+    }
+
     public static func prefixCachePoC(modelDir: String) -> String {
         guard let store = try? WeightStore(modelDir: modelDir) else { return "[prefix-poc] load fail\nPREFIXPOC FAIL" }
         store.residentAll()

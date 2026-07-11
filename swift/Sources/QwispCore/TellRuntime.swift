@@ -89,6 +89,10 @@ extension Tell {
         // Distinct from snapshot/rollback (1-step spec). nil if the backend doesn't support it.
         var fullSnapshot: (() -> Any)? = nil
         var fullRestore: ((Any) -> Void)? = nil
+        // Steel-prefill hybrid (QWISP_HYBRID_PREFILL=1): prefill-scoped forward with GDN dense
+        // matmuls via MLX steel. nil → prefill uses `forward`. Decode/verify NEVER use this.
+        var forwardHybrid: (([Int32]) -> MLXArray?)? = nil
+        var hybridChunk: Int = 64
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
         // Additive — greedy stepArgmax path is untouched.
@@ -171,6 +175,37 @@ extension Tell {
         backend.fullRestore = { snap in
             if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
         }
+        // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
+        // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
+        // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
+        // QWISP_HYBRID_PREFILL=0 opts out (pre-hybrid canonical stream).
+        if ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" {
+            var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let g = spec.gdn else { continue }
+                hw[i] = (qkv: (g.qkvWq, g.qkvSc, g.qkvBi), z: (g.zWq, g.zSc, g.zBi), out: (g.outWq, g.outSc, g.outBi))
+            }
+            fwd.hybridGdnW = hw
+            var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let a = spec.attn else { continue }
+                aw[i] = (q: (a.qWq, a.qSc, a.qBi), k: (a.kWq, a.kSc, a.kBi), v: (a.vWq, a.vSc, a.vBi), o: (a.oWq, a.oSc, a.oBi))
+            }
+            fwd.hybridAttnW = aw
+            if Tell.envInt("QWISP_HYBRID_MOE", 1) == 1 {
+                var mwAll: [Int: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))] = [:]
+                for (i, spec) in engine.layers.enumerated() {
+                    let m = spec.moe
+                    mwAll[i] = (g: (m.swGWq, m.swGSc, m.swGBi), u: (m.swUWq, m.swUSc, m.swUBi), d: (m.swDWq, m.swDSc, m.swDBi))
+                }
+                fwd.hybridMoEW = mwAll
+            }
+            backend.forwardHybrid = { tokens in
+                let x = engine.embed(tokens: tokens)
+                return fwd.forwardRowsHybrid(x, M: tokens.count, finalNormW: fnBuf)
+            }
+            backend.hybridChunk = Swift.min(1024, maxM)
+        }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
         if fwd.head != nil {
@@ -215,6 +250,37 @@ extension Tell {
         backend.fullSnapshot = { fwd.fullSnapshot() }
         backend.fullRestore = { snap in
             if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
+        }
+        // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
+        // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
+        // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
+        // QWISP_HYBRID_PREFILL=0 opts out (pre-hybrid canonical stream).
+        if ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" {
+            var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let g = spec.gdn else { continue }
+                hw[i] = (qkv: (g.qkvWq, g.qkvSc, g.qkvBi), z: (g.zWq, g.zSc, g.zBi), out: (g.outWq, g.outSc, g.outBi))
+            }
+            fwd.hybridGdnW = hw
+            var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                guard let a = spec.attn else { continue }
+                aw[i] = (q: (a.qWq, a.qSc, a.qBi), k: (a.kWq, a.kSc, a.kBi), v: (a.vWq, a.vSc, a.vBi), o: (a.oWq, a.oSc, a.oBi))
+            }
+            fwd.hybridAttnW = aw
+            if Tell.envInt("QWISP_HYBRID_MOE", 1) == 1 {
+                var mwAll: [Int: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))] = [:]
+                for (i, spec) in engine.layers.enumerated() {
+                    let m = spec.moe
+                    mwAll[i] = (g: (m.swGWq, m.swGSc, m.swGBi), u: (m.swUWq, m.swUSc, m.swUBi), d: (m.swDWq, m.swDSc, m.swDBi))
+                }
+                fwd.hybridMoEW = mwAll
+            }
+            backend.forwardHybrid = { tokens in
+                let x = engine.embed(tokens: tokens)
+                return fwd.forwardRowsHybrid(x, M: tokens.count, finalNormW: fnBuf)
+            }
+            backend.hybridChunk = Swift.min(1024, maxM)
         }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         if fwd.head != nil {
@@ -297,13 +363,15 @@ extension Tell {
                         mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
-        let chunkSize = 64
+        // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
+        let fwdFn = backend.forwardHybrid ?? backend.forward
+        let chunkSize = backend.forwardHybrid != nil ? backend.hybridChunk : 64
         var lastNormed: MLXArray? = nil
         var pos = 0
         while pos < pLen {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
-            guard let normed = backend.forward(chunk) else { return nil }
+            guard let normed = fwdFn(chunk) else { return nil }
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).

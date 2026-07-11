@@ -192,7 +192,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     let sb: Tell.SpecBackend? = cfg.isStreaming
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
-                        : Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: maxSeqLen)
+                        : Tell.fusedBackend(engine: self.engine,
+                                            maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
+                                            maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
                     let onTok: (Int) -> Void = { continuation.yield($0) }
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
@@ -254,7 +256,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     while newLen < needed { newLen *= 2 }
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
-                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: cfg.maxM, maxSeqLen: newLen) else {
+                    // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
+                    let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
+                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen) else {
                         continuation.finish(); return
                     }
                     self.prefixBackend = b; self.prefixArenaLen = newLen
