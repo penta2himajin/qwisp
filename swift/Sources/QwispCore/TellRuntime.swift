@@ -286,6 +286,11 @@ extension Tell {
         if fwd.head != nil {
             backend.chainedStepArgmax = { token, k in fwd.chainedStepArgmax(token, K: k) }
         }
+        // Option B sampling (CPU logits readback). Pre-v0.3.0 the streaming tier wired
+        // NO sampling rows at all, so any temperature>0 request on <32GB returned an
+        // EMPTY completion (runSpecSampleLoop guards on stepLogitsRows → nil → 0 tokens).
+        // The GPU sampler (stepSampleRows) stays resident/bolt-only (1-CB head path).
+        backend.stepLogitsRows = makeStepLogits(engine: engine, forward: forward)
         return (backend, fwd, providers)
     }
 
