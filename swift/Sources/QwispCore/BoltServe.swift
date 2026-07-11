@@ -19,9 +19,18 @@ import MLX
 // its strict prefill FIRST and freezes (ensure top-C + rebuild tables + setBoltTables)
 // AFTER, mirroring runBoltMode's phase 4 → phase 5 order.
 //
-// v1 scope (ponytail): greedy only (the server falls back to strict streaming for
-// sampling requests), sync rolling recalib (notes/13, R=128); async refresh
-// (notes/14 staging pipeline, slow-NAND +41-48%) is a follow-up.
+// Scope: greedy only (the server falls back to strict streaming for sampling
+// requests). Rolling recalib (notes/13, R=128) refreshes residency SYNCHRONOUSLY
+// by default. The async staged-swap pipeline (notes/14) is ported but OPT-IN
+// (QWISP_BOLT_REFRESH_ASYNC=1): free-run A/B on nl text (600 tok, C=64) showed
+// the staggered per-layer table swaps open a mixed-vintage window that dips
+// quality mid-transition, and greedy decode then locks into a repetition
+// attractor it never exits — even when the endpoint tables are byte-verified
+// correct and a full convergence freeze runs after the last chunk. The bench
+// validation (notes/14, +41-48% slow-NAND) measured teacher-forced fidelity,
+// which cannot exhibit free-run attractors, so this regression was invisible
+// there. Making async free-run-safe (atomic table flip / double-buffered slots)
+// is a separate campaign.
 //
 // Lifetime: one instance per SeedlessBackend. The expert arena (providers) and the
 // freeze basis (last calib/recalib routing window) persist across requests; each
@@ -51,6 +60,13 @@ final class BoltServe {
     private let biasEps = Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0.25)
     private let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
     private let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+    private let refreshB = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
+    // Server default 0 (sync) — free-run attractor regression, see header. Bench keeps its own default.
+    private var refreshAsync: Bool { recalibR > 0 && Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 0) != 0 && stagingArenas.count == 2 }
+    // Async refresh staging: 2 ping-pong arenas (N=refreshB each), background pread pipeline
+    // (bounded buffer via semaphores). Created once, after the first calib (needs providers).
+    private var stagingArenas: [ExpertArena] = []
+    private let bgQueue = DispatchQueue(label: "qwisp.boltserve.async_refresh", qos: .userInitiated)
     private static let nE = 256
     private static let Ktop = 8
 
@@ -126,6 +142,16 @@ final class BoltServe {
             winCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
             winCoact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
                                  count: nLayers)
+            // Staging arenas for the async refresh pipeline (best-effort: on failure the
+            // refreshAsync computed property stays false → sync refresh path).
+            if Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 0) != 0, let first = provs.first {
+                for _ in 0 ..< 2 {
+                    if let a = try? ExpertArena(device: first.cache.arena.device,
+                                                source: first.cache.arena.source,
+                                                N: refreshB, refLayer: 0) { stagingArenas.append(a) }
+                }
+                if stagingArenas.count < 2 { stagingArenas = [] }
+            }
             calibrated = true
         }
         guard let providers else { return nil }
@@ -169,10 +195,15 @@ final class BoltServe {
                     counts: &winCounts[li], coact: &winCoact[li])
             }
         }
-        /// Recalib refresh: the observation window becomes the new freeze basis.
+        /// Recalib refresh (sync): the observation window becomes the new freeze basis.
         func refresh() {
             swap(&baseCounts, &winCounts)
             swap(&baseCoact, &winCoact)
+            if Tell.envFlag("QWISP_BOLT_DEBUG") {
+                let obs = baseCounts.reduce(0) { $0 + $1.reduce(0, +) }
+                let top8 = baseCounts[0].enumerated().sorted { $0.element > $1.element }.prefix(8).map { "\($0.offset):\($0.element)" }
+                FileHandle.standardError.write(Data("[boltserve] sync refresh: windowObs=\(obs) L0top8=\(top8.joined(separator: ","))\n".utf8))
+            }
             freeze(fwd)
             for li in 0 ..< nLayers {
                 for e in 0 ..< nE { winCounts[li][e] = 0; winCoact[li][e] = [Int](repeating: 0, count: nE) }
@@ -180,16 +211,149 @@ final class BoltServe {
             tokensSinceRefresh = 0
         }
 
-        // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
+        // Decode-loop state (declared before the async machinery below captures it).
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
         var stSteps = 0, stDrafted = 0, stAccepted = 0, stD0 = 0
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
 
+        // ── Async refresh plan state (notes/14; mirror of runBoltMode's machinery) ──
+        struct CrossJob { let li: Int; let expert: Int; let victimSlot: Int }
+        var asyncBoundary = 0
+        var asyncChunks = [[CrossJob]]()
+        var asyncNextSwap = 0
+        var asyncStride = 1
+        var semFree = DispatchSemaphore(value: 2)
+        var semReady = DispatchSemaphore(value: 0)
+        /// Background pipeline: pread every chunk into the 2 staging arenas (bounded buffer).
+        /// Writes ONLY to stagingArenas — providers are touched by swapChunk on this thread.
+        func startBgPlan() {
+            guard refreshAsync, !asyncChunks.isEmpty else { return }
+            let chunks = asyncChunks, stages = stagingArenas
+            let sf = semFree, sr = semReady
+            bgQueue.async {
+                for (j, chunk) in chunks.enumerated() {
+                    sf.wait()
+                    let stage = stages[j % 2]
+                    var byLayer = [Int: [(e: Int, slot: Int)]]()
+                    for (k, cj) in chunk.enumerated() {
+                        byLayer[cj.li, default: []].append((e: cj.expert, slot: k))
+                    }
+                    for (layer, jobs) in byLayer { stage.loadMany(layer, jobs) }
+                    sr.signal()
+                }
+            }
+        }
+        /// Atomic CPU-turn swap of chunk j: staging → arena victim slots + bookkeeping +
+        /// per-touched-layer buddy/table/bias rebuild (baseCoact = the plan's window snapshot).
+        func swapChunk(_ j: Int) {
+            guard refreshAsync, j < asyncChunks.count else { return }
+            semReady.wait()
+            let chunk = asyncChunks[j]
+            let stage = stagingArenas[j % 2]
+            for (k, cj) in chunk.enumerated() {
+                let cache = providers[cj.li].cache
+                let arena = cache.arena
+                for key in stage.slots.keys {
+                    guard let srcS = stage.slots[key], let dstS = arena.slots[key] else { continue }
+                    memcpy(dstS.ptr + cj.victimSlot * dstS.sliceBytes,
+                           srcS.ptr + k             * srcS.sliceBytes,
+                           srcS.sliceBytes)
+                }
+                let cur = cache.expertAt[cj.victimSlot]
+                if cur >= 0 && cur != cj.expert { cache.slotOf.removeValue(forKey: cur) }
+                cache.slotOf[cj.expert]       = cj.victimSlot
+                cache.expertAt[cj.victimSlot] = cj.expert
+                cache.clock                  += 1
+                cache.tick[cj.victimSlot]     = cache.clock
+                // ensure() parity: slotOf changed → the STRICT-path derived GPU arrays
+                // (slotTableGPU / hotMask) must rebuild, or the next segment's strict
+                // prefill remaps routed experts to pre-swap slots = silent garbage.
+                // (runBoltMode never runs strict again after its swaps, so the bench
+                // template omits this; the server does — every segment prefills strict.)
+                cache.slotTableDirty = true
+                cache.slotVersion   += 1
+            }
+            LayerExpertCache.missTotal += chunk.count
+            if Tell.envFlag("QWISP_BOLT_DEBUG") {
+                FileHandle.standardError.write(Data("[boltserve] swap chunk \(j): \(chunk.count) jobs, layers=\(Set(chunk.map { $0.li }).count)\n".utf8))
+            }
+            for li in Set(chunk.map { $0.li }).sorted() {
+                let cache = providers[li].cache
+                cache.buildBuddyTable(coact: baseCoact[li], numExperts: nE)
+                fwd.setBoltTable(li, cache.buddyTableCPU)
+                if biasEps > 0 {
+                    fwd.updateRouteBiasMask(li, (0 ..< nE).map { Int32(cache.buddyExpertCPU[$0] == $0 ? 1 : 0) })
+                }
+            }
+            // Convergence freeze: after the last chunk, rebuild ALL layers against the
+            // plan window — endpoint identical to a sync refresh (cheap; ensure all-hit).
+            if j == asyncChunks.count - 1 { freeze(fwd) }
+            semFree.signal()
+        }
+        /// Drain all pending chunks (blocking). MUST run before replacing the plan/semaphores
+        /// and before every return — an undrained semaphore pair traps in dispose (SIGTRAP),
+        /// and undrained victim bookkeeping would go stale across the next segment's prefill.
+        func drainAsync() {
+            while asyncNextSwap < asyncChunks.count { swapChunk(asyncNextSwap); asyncNextSwap += 1 }
+        }
+        defer { drainAsync() }
+        /// Recalib refresh (async): window → freeze basis, plan diffs, kick the bg pipeline.
+        /// Swaps land at fixed token positions (asyncStride) at the decode loop head.
+        func refreshAsyncPlan() {
+            drainAsync()                       // leftover chunks from the previous plan
+            swap(&baseCounts, &winCounts)
+            swap(&baseCoact, &winCoact)
+            var allJobs = [CrossJob]()
+            for (li, provider) in providers.enumerated() {
+                if let plan = BoltAsyncRefresh.makePlan(
+                    counts: baseCounts[li], coact: baseCoact[li],
+                    slotOf: provider.cache.slotOf, expertAt: provider.cache.expertAt,
+                    tick: provider.cache.tick, pinnedSlots: provider.cache.pinnedSlots,
+                    C: C, nE: nE, B: refreshB) {
+                    for job in plan.jobs {
+                        allJobs.append(CrossJob(li: li, expert: job.expert, victimSlot: job.victimSlot))
+                    }
+                }
+            }
+            asyncBoundary = out.count
+            asyncChunks = stride(from: 0, to: allJobs.count, by: refreshB).map {
+                Array(allJobs[$0 ..< Swift.min($0 + refreshB, allJobs.count)])
+            }
+            if Tell.envFlag("QWISP_BOLT_DEBUG") {
+                let obs = baseCounts.reduce(0) { $0 + $1.reduce(0, +) }
+                let top8 = baseCounts[0].enumerated().sorted { $0.element > $1.element }.prefix(8).map { "\($0.offset):\($0.element)" }
+                FileHandle.standardError.write(Data("[boltserve] async plan: jobs=\(allJobs.count) chunks=\(asyncChunks.count) boundary=\(asyncBoundary) windowObs=\(obs) L0top8=\(top8.joined(separator: ","))\n".utf8))
+            }
+            asyncNextSwap = 0
+            // Spread swaps over the half-window (OAT 2026-07-07: full-width lags table
+            // freshness, tighter blocks on GPU-idle swaps). QWISP_BOLT_REFRESH_S overrides
+            // (bench parity knob).
+            let sOverride = Tell.envInt("QWISP_BOLT_REFRESH_S", 0)
+            asyncStride = sOverride > 0 ? sOverride
+                        : Swift.max(1, (recalibR / 2) / Swift.max(1, asyncChunks.count))
+            for li in 0 ..< nLayers {
+                for e in 0 ..< nE { winCounts[li][e] = 0; winCoact[li][e] = [Int](repeating: 0, count: nE) }
+            }
+            tokensSinceRefresh = 0
+            semFree = DispatchSemaphore(value: 2)
+            semReady = DispatchSemaphore(value: 0)
+            startBgPlan()
+        }
+
+        // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            if recalibR > 0 && tokensSinceRefresh >= recalibR { refresh() }
+            if recalibR > 0 && tokensSinceRefresh >= recalibR {
+                if refreshAsync { refreshAsyncPlan() } else { refresh() }
+            }
+            // Async: swap due chunks at fixed token positions (chain/verify spans jump
+            // out.count, so consume ALL due chunks here — bg pipeline has them preread).
+            while refreshAsync, asyncNextSwap < asyncChunks.count,
+                  out.count >= asyncBoundary + (asyncNextSwap + 1) * asyncStride {
+                swapChunk(asyncNextSwap); asyncNextSwap += 1
+            }
             let before = out.count
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D = drafts.count
