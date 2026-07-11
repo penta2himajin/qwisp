@@ -20,17 +20,22 @@ import MLX
 // AFTER, mirroring runBoltMode's phase 4 → phase 5 order.
 //
 // Scope: greedy only (the server falls back to strict streaming for sampling
-// requests). Rolling recalib (notes/13, R=128) refreshes residency SYNCHRONOUSLY
-// by default. The async staged-swap pipeline (notes/14) is ported but OPT-IN
-// (QWISP_BOLT_REFRESH_ASYNC=1): free-run A/B on nl text (600 tok, C=64) showed
-// the staggered per-layer table swaps open a mixed-vintage window that dips
-// quality mid-transition, and greedy decode then locks into a repetition
-// attractor it never exits — even when the endpoint tables are byte-verified
-// correct and a full convergence freeze runs after the last chunk. The bench
-// validation (notes/14, +41-48% slow-NAND) measured teacher-forced fidelity,
-// which cannot exhibit free-run attractors, so this regression was invisible
-// there. Making async free-run-safe (atomic table flip / double-buffered slots)
-// is a separate campaign.
+// requests). Rolling recalib (notes/13, R=128) refreshes residency; the async
+// staged-swap pipeline (notes/14) is default ON (QWISP_BOLT_REFRESH_ASYNC=0 →
+// sync). Async is free-run-safe only since the FALLBACK-SLOT fix: free-run A/B
+// on nl text (600 tok, C=64, deterministic) initially showed async decode
+// locking into a repetition attractor while sync stayed coherent. The evidence
+// chain (swap bytes memcmp-MATCH on all 9 planes × all jobs; S=1 immediate
+// swaps; atomic single-turn application; convergence freeze ⇒ endpoint ≡ sync)
+// eliminated every timing/data suspect — the one semantic difference left was
+// buildBuddyTable's slot-0 fallback: cold experts with no in-window
+// co-activation (~100+/256 on a sparse 128-token window) remap to WHATEVER
+// EXPERT OCCUPIES SLOT 0, and ensure() vs staged-swap victim assignment park
+// different experts there. That fallback-target lottery compounded per refresh
+// into the attractor. Fixed by pinning the fallback to the basis window's
+// top-count resident (buildBuddyTable(fallbackSlot:), additive, default 0 =
+// bench byte-identical). The notes/14 validation measured teacher-forced
+// fidelity on a re-canonicalized state, which structurally hides both effects.
 //
 // Lifetime: one instance per SeedlessBackend. The expert arena (providers) and the
 // freeze basis (last calib/recalib routing window) persist across requests; each
@@ -61,8 +66,8 @@ final class BoltServe {
     private let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
     private let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
     private let refreshB = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
-    // Server default 0 (sync) — free-run attractor regression, see header. Bench keeps its own default.
-    private var refreshAsync: Bool { recalibR > 0 && Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 0) != 0 && stagingArenas.count == 2 }
+    // Default ON since the fallback-slot fix (see header); QWISP_BOLT_REFRESH_ASYNC=0 opts out to sync.
+    private var refreshAsync: Bool { recalibR > 0 && Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0 && stagingArenas.count == 2 }
     // Async refresh staging: 2 ping-pong arenas (N=refreshB each), background pread pipeline
     // (bounded buffer via semaphores). Created once, after the first calib (needs providers).
     private var stagingArenas: [ExpertArena] = []
@@ -81,6 +86,20 @@ final class BoltServe {
     /// Freeze current residency to `fwd`: ensure top-C of the basis window, rebuild
     /// buddy tables against the CURRENT slot state, upload tables + residency bias.
     /// Must run AFTER any ensure-moving operation (prefill, refresh) — see header.
+    /// Slot of the basis window's top-count expert — the deterministic remap target for
+    /// coactivation-less cold experts. The historical slot-0 fallback made that target the
+    /// slot-0 occupant LOTTERY: ensure() and staged swaps assign slots differently, so sync
+    /// and async runs silently remapped the fallback mass (~100+/256 experts on a sparse
+    /// 128-token window) to DIFFERENT experts — measured as compounding free-run divergence.
+    private func fallbackSlot(_ li: Int) -> Int {
+        guard let providers else { return 0 }
+        let top1 = baseCounts[li].enumerated()
+            .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+            .first?.offset
+        guard let t = top1, let s = providers[li].cache.slotOf[t] else { return 0 }
+        return s
+    }
+
     private func freeze(_ fwd: SeedlessFusedVerify.SeedlessFusedForward) {
         guard let providers else { return }
         for (li, provider) in providers.enumerated() {
@@ -88,7 +107,7 @@ final class BoltServe {
                 .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
                 .prefix(C).map { $0.offset }
             _ = provider.cache.ensure(Array(top))
-            provider.cache.buildBuddyTable(coact: baseCoact[li], numExperts: Self.nE)
+            provider.cache.buildBuddyTable(coact: baseCoact[li], numExperts: Self.nE, fallbackSlot: fallbackSlot(li))
         }
         fwd.setBoltTables(providers.map { $0.cache.buddyTableCPU })
         if biasEps > 0 {
@@ -144,7 +163,7 @@ final class BoltServe {
                                  count: nLayers)
             // Staging arenas for the async refresh pipeline (best-effort: on failure the
             // refreshAsync computed property stays false → sync refresh path).
-            if Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 0) != 0, let first = provs.first {
+            if Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0, let first = provs.first {
                 for _ in 0 ..< 2 {
                     if let a = try? ExpertArena(device: first.cache.arena.device,
                                                 source: first.cache.arena.source,
@@ -277,11 +296,28 @@ final class BoltServe {
             }
             LayerExpertCache.missTotal += chunk.count
             if Tell.envFlag("QWISP_BOLT_DEBUG") {
-                FileHandle.standardError.write(Data("[boltserve] swap chunk \(j): \(chunk.count) jobs, layers=\(Set(chunk.map { $0.li }).count)\n".utf8))
+                // Full bytecheck: every job × every plane, arena victim vs fresh pread.
+                var bad: [String: Int] = [:], checked = 0
+                for cj in chunk {
+                    let arena = providers[cj.li].cache.arena
+                    for proj in ExpertSource.projs {
+                        for part in ExpertSource.parts {
+                            guard let s = arena.slots["\(proj).\(part)"] else { continue }
+                            let tmp = UnsafeMutableRawPointer.allocate(byteCount: s.sliceBytes, alignment: 16)
+                            defer { tmp.deallocate() }
+                            try? arena.source.preadInto(tmp, cj.li, proj, part, cj.expert)
+                            checked += 1
+                            if memcmp(tmp, s.ptr + cj.victimSlot * s.sliceBytes, s.sliceBytes) != 0 {
+                                bad["\(proj).\(part)", default: 0] += 1
+                            }
+                        }
+                    }
+                }
+                FileHandle.standardError.write(Data("[boltserve] swap chunk \(j): \(chunk.count) jobs, planes checked=\(checked) mismatch=\(bad.isEmpty ? "NONE" : String(describing: bad))\n".utf8))
             }
             for li in Set(chunk.map { $0.li }).sorted() {
                 let cache = providers[li].cache
-                cache.buildBuddyTable(coact: baseCoact[li], numExperts: nE)
+                cache.buildBuddyTable(coact: baseCoact[li], numExperts: nE, fallbackSlot: fallbackSlot(li))
                 fwd.setBoltTable(li, cache.buddyTableCPU)
                 if biasEps > 0 {
                     fwd.updateRouteBiasMask(li, (0 ..< nE).map { Int32(cache.buddyExpertCPU[$0] == $0 ? 1 : 0) })
@@ -305,17 +341,29 @@ final class BoltServe {
             drainAsync()                       // leftover chunks from the previous plan
             swap(&baseCounts, &winCounts)
             swap(&baseCoact, &winCoact)
-            var allJobs = [CrossJob]()
+            var perLayer = [[CrossJob]]()
             for (li, provider) in providers.enumerated() {
+                var jobs = [CrossJob]()
                 if let plan = BoltAsyncRefresh.makePlan(
                     counts: baseCounts[li], coact: baseCoact[li],
                     slotOf: provider.cache.slotOf, expertAt: provider.cache.expertAt,
                     tick: provider.cache.tick, pinnedSlots: provider.cache.pinnedSlots,
                     C: C, nE: nE, B: refreshB) {
                     for job in plan.jobs {
-                        allJobs.append(CrossJob(li: li, expert: job.expert, victimSlot: job.victimSlot))
+                        jobs.append(CrossJob(li: li, expert: job.expert, victimSlot: job.victimSlot))
                     }
                 }
+                perLayer.append(jobs)
+            }
+            // Round-robin interleave across layers: each chunk advances EVERY layer by
+            // ~1 expert, so intermediate states are uniform-vintage snapshots (a series
+            // of small sync-like refreshes). Layer-contiguous chunking staggered layer
+            // vintages across the transition window — the measured free-run attractor
+            // seed (see header). Uniformity is what makes async free-run-safe.
+            var allJobs = [CrossJob]()
+            let maxLen = perLayer.map(\.count).max() ?? 0
+            for r in 0 ..< maxLen {
+                for lj in perLayer where r < lj.count { allJobs.append(lj[r]) }
             }
             asyncBoundary = out.count
             asyncChunks = stride(from: 0, to: allJobs.count, by: refreshB).map {
@@ -340,6 +388,10 @@ final class BoltServe {
             semFree = DispatchSemaphore(value: 2)
             semReady = DispatchSemaphore(value: 0)
             startBgPlan()
+            // Atomic-apply diag (QWISP_BOLT_ATOMIC=1): drain every chunk right here —
+            // staged IO, but application collapses to ONE CPU turn like a sync refresh.
+            // Discriminates "spread-out application is the poison" from "swap mechanics".
+            if Tell.envFlag("QWISP_BOLT_ATOMIC") { drainAsync() }
         }
 
         // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
