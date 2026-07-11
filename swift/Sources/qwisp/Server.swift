@@ -89,8 +89,8 @@ final class QwispEngine: @unchecked Sendable {
         let st = Tell.lastSpecStats
         let tokPerStep = st.steps > 0 ? Double(st.accepted + st.steps) / Double(st.steps) : 0
         let acc = st.drafted > 0 ? 100.0 * Double(st.accepted) / Double(st.drafted) : 0
-        fputs(String(format: "[qwisp] %@ prompt=%d gen=%d ttft=%@ decode=%.1f tok/s (%.2fs) spec[steps=%d tok/step=%.2f accept=%.0f%% d0=%d]\n",
-                     tag, prompt, gen, ttft, rate, now.timeIntervalSince(t0), st.steps, tokPerStep, acc, st.d0), stderr)
+        fputs(String(format: "[qwisp] %@ prompt=%d gen=%d ttft=%@ decode=%.1f tok/s (%.2fs) spec[steps=%d tok/step=%.2f accept=%.0f%% d0=%d rej=%d alt=%d]\n",
+                     tag, prompt, gen, ttft, rate, now.timeIntervalSince(t0), st.steps, tokPerStep, acc, st.d0, st.rejects, st.altHits), stderr)
     }
 
     /// Non-streaming completion.

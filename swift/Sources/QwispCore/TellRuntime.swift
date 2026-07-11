@@ -394,7 +394,11 @@ extension Tell {
     /// Returns out[0..<N] token ids.
     /// Last greedy spec-loop stats (server throughput log): steps = verify forwards,
     /// drafted/accepted = suffix-draft tokens offered/accepted. Measurement-only.
-    nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int) = (0, 0, 0, 0)
+    /// rejects = draft steps that mismatched; altHits = of those, how many the draft vote's
+    /// runner-up token WOULD have matched the model (QWISP_ACCEPT_TRACE=1 to fill) — the
+    /// measured prize of a width-2 depth-1 draft tree (m-gt-1-decode-leads ①). Diag only.
+    nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int, rejects: Int, altHits: Int) = (0, 0, 0, 0, 0, 0)
+    static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
 
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
@@ -412,6 +416,7 @@ extension Tell {
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
         var stSteps = 0, stDrafted = 0, stAccepted = 0, stD0 = 0   // accept telemetry
+        var stRejects = 0, stAltHits = 0                           // width-2 tree prize probe
         var pending: [Int] = []  // A3: pending prefix tokens
         let pendingCap = 24
         // Phase II-a chain on the server decode path: real-traffic d0 ≈ 90% (telemetry
@@ -431,7 +436,8 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
+                                          traceAlts: Tell.traceAltsEnabled)
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
@@ -518,6 +524,12 @@ extension Tell {
                     for d in drafts { out.append(d); hist.append(d) }
                     u = evals[D]
                 } else {
+                    // Width-2 tree prize probe: would the draft vote's runner-up at the reject
+                    // position have matched the model's true token? (evals[p] = argmax after
+                    // the accepted prefix = the token a width-2 branch would need to hit.)
+                    stRejects += 1
+                    if Tell.traceAltsEnabled, p < Tell.lastDraftAlts.count,
+                       Tell.lastDraftAlts[p] == evals[p] { stAltHits += 1 }
                     backend.rollback(snap)
                     out.append(u); hist.append(u)
                     for d in drafts.prefix(p) { out.append(d); hist.append(d) }
@@ -528,7 +540,7 @@ extension Tell {
             }
         }
         flush()
-        Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0)
+        Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0, stRejects, stAltHits)
         return Array(out.prefix(N))
     }
 
