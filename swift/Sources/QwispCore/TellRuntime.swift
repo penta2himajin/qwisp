@@ -414,6 +414,13 @@ extension Tell {
         var stSteps = 0, stDrafted = 0, stAccepted = 0, stD0 = 0   // accept telemetry
         var pending: [Int] = []  // A3: pending prefix tokens
         let pendingCap = 24
+        // Phase II-a chain on the server decode path: real-traffic d0 ≈ 90% (telemetry
+        // @03c9d4c) so the draftless span dominates. chainedStepArgmax runs K greedy steps
+        // in ONE command buffer, bit-exact to K sequential stepArgmax([t]) calls → the
+        // greedy stream stays byte-identical while collapsing K CPU round-trips to 1.
+        // Strict streaming wires no chain fn (needs a CPU turn per step to ensure/pread
+        // the expert union) → nil → per-step fallback by construction. QWISP_CHAIN_K=0 opts out.
+        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
@@ -431,6 +438,20 @@ extension Tell {
             var snap = backend.snapshot()
 
             if D == 0 {
+                // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
+                // empty-pending greedy span. Chained tokens skip drafting opportunities for
+                // those positions — at d0≈90% almost always free. nil chain fn / failed call
+                // → fall through to per-step.
+                if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
+                   let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
+                    out.append(u); hist.append(u)
+                    let addN = Swift.min(chainResult.count - 1, N - out.count)
+                    for i in 0 ..< addN {
+                        out.append(chainResult[i]); hist.append(chainResult[i])
+                    }
+                    u = chainResult[chainResult.count - 1]
+                    continue
+                }
                 if useA3 && !pending.isEmpty {
                     // A3 D==0: stepArgmax on [pending, u] (batched)—ONE forward to realize pending
                     let pk = pending.count
