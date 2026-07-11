@@ -392,6 +392,10 @@ extension Tell {
 
     /// SuffixSpec ループ本体(main run / self-check / stream-vs-resident check の 3 箇所で共用)。
     /// Returns out[0..<N] token ids.
+    /// Last greedy spec-loop stats (server throughput log): steps = verify forwards,
+    /// drafted/accepted = suffix-draft tokens offered/accepted. Measurement-only.
+    nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int) = (0, 0, 0, 0)
+
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
@@ -407,8 +411,16 @@ extension Tell {
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
+        var stSteps = 0, stDrafted = 0, stAccepted = 0, stD0 = 0   // accept telemetry
         var pending: [Int] = []  // A3: pending prefix tokens
         let pendingCap = 24
+        // Phase II-a chain on the server decode path: real-traffic d0 ≈ 90% (telemetry
+        // @03c9d4c) so the draftless span dominates. chainedStepArgmax runs K greedy steps
+        // in ONE command buffer, bit-exact to K sequential stepArgmax([t]) calls → the
+        // greedy stream stays byte-identical while collapsing K CPU round-trips to 1.
+        // Strict streaming wires no chain fn (needs a CPU turn per step to ensure/pread
+        // the expert union) → nil → per-step fallback by construction. QWISP_CHAIN_K=0 opts out.
+        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
@@ -419,12 +431,27 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D      = drafts.count
+            stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
             var snap = backend.snapshot()
 
             if D == 0 {
+                // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
+                // empty-pending greedy span. Chained tokens skip drafting opportunities for
+                // those positions — at d0≈90% almost always free. nil chain fn / failed call
+                // → fall through to per-step.
+                if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
+                   let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
+                    out.append(u); hist.append(u)
+                    let addN = Swift.min(chainResult.count - 1, N - out.count)
+                    for i in 0 ..< addN {
+                        out.append(chainResult[i]); hist.append(chainResult[i])
+                    }
+                    u = chainResult[chainResult.count - 1]
+                    continue
+                }
                 if useA3 && !pending.isEmpty {
                     // A3 D==0: stepArgmax on [pending, u] (batched)—ONE forward to realize pending
                     let pk = pending.count
@@ -453,6 +480,7 @@ extension Tell {
                 // an off-by-one: the u-row IS the comparison origin, not a skip.
                 var p = 0
                 while p < D && drafts[p] == evals[pk + p] { p += 1 }
+                stAccepted += p
 
                 if p == D {
                     // A3 full accept: fused forward already advanced cache to B+pk+1+D
@@ -483,6 +511,7 @@ extension Tell {
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
+                stAccepted += p
 
                 if p == D {
                     out.append(u); hist.append(u)
@@ -499,6 +528,7 @@ extension Tell {
             }
         }
         flush()
+        Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0)
         return Array(out.prefix(N))
     }
 
@@ -541,7 +571,7 @@ extension Tell {
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D = drafts.count
             let snap = backend.snapshot()
 
@@ -629,7 +659,7 @@ extension Tell {
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D = drafts.count
             let snap = backend.snapshot()
             let basePos = out.count   // monotonic absolute position → reproducible per-position RNG
@@ -874,7 +904,7 @@ extension Tell {
                 let resPerLayer = _reuseStreamProviders?.map { Set($0.cache.slotOf.keys) } ?? []
                 return (ctx: _reuseCtx, residentPerLayer: resPerLayer, alpha: _reuseAlpha)
             }() : nil
-            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4,
+            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
                                           reuseCtx: _reuseArg)
             var D      = drafts.count
 
@@ -1514,7 +1544,7 @@ extension Tell {
             if boltBiasEps > 0 && boltBiasDecayH > 0 {
                 fwd2.setRouteBiasEps(boltBiasEps * Swift.max(0, 1 - Float(out.count) / Float(boltBiasDecayH)))
             }
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D      = drafts.count
             let snap   = backend2.snapshot()
 
