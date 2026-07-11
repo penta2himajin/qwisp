@@ -184,7 +184,12 @@ nonisolated(unsafe) public static var chunkTotal: Int = 0       // 累積 chunk 
     /// BuddyMoE: cold expert を「最も共活性化する hot expert」の slot に remap する table を構築。
     /// hot は現在 slotOf にいる expert。coact[e][h] = calib で e と h が同 token で共 routed した回数。
     /// 各 cold e → argmax_h(coact[e][h]) の slot（co-activation 無ければ slot-0 fallback）。
-    public func buildBuddyTable(coact: [[Int]], numExperts: Int) {
+    /// fallbackSlot: remap target for coactivation-less cold experts. Default 0 preserves the
+    /// historical behavior (slot-0 fallback), whose TARGET EXPERT silently depends on how slots
+    /// were assigned — ensure() and async staged swaps assign differently, which BoltServe
+    /// measured as a free-run quality divergence (the slot-0 occupant lottery). Callers that
+    /// know the basis window should pass the top-count resident's slot instead.
+    public func buildBuddyTable(coact: [[Int]], numExperts: Int, fallbackSlot: Int = 0) {
         // 決定化: Dictionary iteration はプロセス毎に乱択（hash seed）で、coact の同点 buddy が
         // 走査順で決まると run 毎に table が変わる（C=64 fidelity ±2-5pt の非決定性の原因）。
         // 同点 tie-break は「最小 expert id 固定」だと全 cold の同点が同一低 id hot に集中し
@@ -199,7 +204,7 @@ nonisolated(unsafe) public static var chunkTotal: Int = 0       // 累積 chunk 
             let n = hot.count
             for i in 0 ..< n { let h = hot[(i + e) % n]; let cc = coact[e][h]; if cc > bestC { bestC = cc; bestH = h } }
             if bestH >= 0 && bestC > 0 { bmap[e] = Int32(slotOf[bestH]!); bexp[e] = Int32(bestH) }
-            else { bmap[e] = 0 }   // co-activation 無し: slot-0 fallback（buddy expert 無し）
+            else { bmap[e] = Int32(fallbackSlot) }   // co-activation 無し: fallback（buddy expert 無し）
         }
         let arr = MLXArray(bmap, [numExperts]); arr.eval()
         buddyTable = arr
