@@ -392,6 +392,10 @@ extension Tell {
 
     /// SuffixSpec ループ本体(main run / self-check / stream-vs-resident check の 3 箇所で共用)。
     /// Returns out[0..<N] token ids.
+    /// Last greedy spec-loop stats (server throughput log): steps = verify forwards,
+    /// drafted/accepted = suffix-draft tokens offered/accepted. Measurement-only.
+    nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int) = (0, 0, 0, 0)
+
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
@@ -407,6 +411,7 @@ extension Tell {
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
+        var stSteps = 0, stDrafted = 0, stAccepted = 0, stD0 = 0   // accept telemetry
         var pending: [Int] = []  // A3: pending prefix tokens
         let pendingCap = 24
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
@@ -421,6 +426,7 @@ extension Tell {
             flush()
             let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
             let D      = drafts.count
+            stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
             var snap = backend.snapshot()
 
@@ -453,6 +459,7 @@ extension Tell {
                 // an off-by-one: the u-row IS the comparison origin, not a skip.
                 var p = 0
                 while p < D && drafts[p] == evals[pk + p] { p += 1 }
+                stAccepted += p
 
                 if p == D {
                     // A3 full accept: fused forward already advanced cache to B+pk+1+D
@@ -483,6 +490,7 @@ extension Tell {
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
+                stAccepted += p
 
                 if p == D {
                     out.append(u); hist.append(u)
@@ -499,6 +507,7 @@ extension Tell {
             }
         }
         flush()
+        Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0)
         return Array(out.prefix(N))
     }
 
