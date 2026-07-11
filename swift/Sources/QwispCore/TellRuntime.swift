@@ -431,7 +431,7 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
@@ -571,7 +571,7 @@ extension Tell {
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D = drafts.count
             let snap = backend.snapshot()
 
@@ -659,7 +659,7 @@ extension Tell {
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D = drafts.count
             let snap = backend.snapshot()
             let basePos = out.count   // monotonic absolute position → reproducible per-position RNG
@@ -904,7 +904,7 @@ extension Tell {
                 let resPerLayer = _reuseStreamProviders?.map { Set($0.cache.slotOf.keys) } ?? []
                 return (ctx: _reuseCtx, residentPerLayer: resPerLayer, alpha: _reuseAlpha)
             }() : nil
-            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4,
+            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
                                           reuseCtx: _reuseArg)
             var D      = drafts.count
 
@@ -1544,7 +1544,7 @@ extension Tell {
             if boltBiasEps > 0 && boltBiasDecayH > 0 {
                 fwd2.setRouteBiasEps(boltBiasEps * Swift.max(0, 1 - Float(out.count) / Float(boltBiasDecayH)))
             }
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: 4)
+            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch)
             let D      = drafts.count
             let snap   = backend2.snapshot()
 

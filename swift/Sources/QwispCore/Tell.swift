@@ -24,6 +24,12 @@ public enum Tell {
     /// top1−top2 margin ≤ τ の境界 token は M=1 逐次 replay で確定（機械的 δ-calibration は将来 task）。
     static let certTau: Float = 0.1
 
+    /// SuffixSpec minimum match length (QWISP_SUFFIX_MINMATCH, default 4 = historical
+    /// constant). Lower → more drafts on real traffic (lower d0) at the cost of wasted
+    /// verify rows on rejects; lossless either way (verify gates every draft). Read once
+    /// per process (env-in-loop is 18.8µs, fusion doctrine).
+    static let suffixMinMatch = Swift.max(1, Tell.envInt("QWISP_SUFFIX_MINMATCH", 4))
+
     /// suffix lookup draft（SuffixDecoding-style, 訓練不要・cost ~0）:
     /// 1) seq 末尾の m token(minMatch..maxMatch の最長一致)が seq 内の earlier 位置に出現する
     ///    「全ての」出現位置を収集（旧: 最近 1 箇所のみ）。
