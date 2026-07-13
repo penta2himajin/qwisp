@@ -73,36 +73,50 @@ private func diskSizeGB(modelDir: String) -> Int? {
     return Int((Double(size) / 1e9).rounded())
 }
 
-/// Sequential read bandwidth of the model's biggest shard with the page cache bypassed
-/// (F_NOCACHE) — the honest "what tier is this NAND" number (MacBook-class ≈ 1.5 GB/s,
-/// desktop-class ≈ 5+ GB/s). Reads ≤256MB in 8MB chunks; nil if the model dir is odd.
+/// NVMe device model string ("APPLE SSD AP0256Z" style) via IORegistry. macOS exposes no
+/// NAND channel topology, but the model string IS the hardware bin: capacity × controller
+/// generation maps 1:1 to the channel config (community teardown tables), so together
+/// with the measured read probe it pins the storage tier exactly.
+private func nvmeModel() -> String? {
+    guard let out = runTool("/usr/sbin/ioreg", ["-rc", "IONVMeBlockStorageDevice", "-d", "2"]) else { return nil }
+    guard let r = out.range(of: #""Product Name"="([^"]+)""#, options: .regularExpression) else { return nil }
+    return String(out[r]).split(separator: "=").last.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+}
+
+/// Sequential read bandwidth of the NAND holding the model, page-cache-PROOF: writes a
+/// fresh 256MB temp file next to the model with F_NOCACHE (its pages can never be in the
+/// unified buffer cache), fsyncs, reads it back with F_NOCACHE, times the read. A plain
+/// F_NOCACHE read of an existing shard still serves already-cached pages — measured
+/// 5.7 → 12 GB/s inflation on a warm process. MacBook-class NAND ≈ 1.5 GB/s,
+/// desktop-class ≈ 5+ GB/s.
 private func ssdReadGBs(modelDir: String) -> Double? {
-    let fm = FileManager.default
-    guard let files = try? fm.contentsOfDirectory(atPath: modelDir) else { return nil }
-    var best: (path: String, size: Int)? = nil
-    for f in files where f.hasSuffix(".safetensors") {
-        let p = modelDir + "/" + f
-        let sz = ((try? fm.attributesOfItem(atPath: p))?[.size] as? Int) ?? 0
-        if sz > (best?.size ?? 0) { best = (p, sz) }
-    }
-    guard let target = best, target.size > (64 << 20) else { return nil }
-    let fd = open(target.path, O_RDONLY)
+    let path = modelDir + "/.qwisp-benchtest-probe.tmp"
+    defer { unlink(path) }
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o600)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
     _ = fcntl(fd, F_NOCACHE, 1)
     let chunk = 8 << 20
-    let total = min(target.size, 256 << 20)
+    let total = 256 << 20
     let buf = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 4096)
     defer { buf.deallocate() }
+    memset(buf, 0xA5, chunk)   // non-zero: keep APFS from special-casing the extents
+    var written = 0
+    while written < total {
+        let n = write(fd, buf, chunk)
+        if n <= 0 { return nil }
+        written += n
+    }
+    guard fsync(fd) == 0 else { return nil }
     let t0 = DispatchTime.now()
     var done = 0
-    while done < total {
-        let n = pread(fd, buf, min(chunk, total - done), off_t(done))
+    while done < written {
+        let n = pread(fd, buf, min(chunk, written - done), off_t(done))
         if n <= 0 { break }
         done += n
     }
     let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
-    guard secs > 0, done > (16 << 20) else { return nil }
+    guard secs > 0, done > (64 << 20) else { return nil }
     return Double(done) / 1e9 / secs
 }
 
@@ -233,7 +247,8 @@ func runBenchtest(modelDir: String) async -> String {
     md.append("| chip | \(sysctlString("machdep.cpu.brand_string"))\(gpu) |")
     md.append("| RAM | \(Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0).rounded())) GB |")
     md.append("| macOS | \(ProcessInfo.processInfo.operatingSystemVersionString) |")
-    md.append("| disk | \(diskSizeGB(modelDir: modelDir).map { "\($0) GB" } ?? "n/a"), read \(ssd.map { String(format: "%.1f GB/s", $0) } ?? "n/a") |")
+    let disk = [nvmeModel(), diskSizeGB(modelDir: modelDir).map { "\($0) GB" }].compactMap { $0 }.joined(separator: ", ")
+    md.append("| disk | \(disk.isEmpty ? "n/a" : disk), read \(ssd.map { String(format: "%.1f GB/s", $0) } ?? "n/a") |")
     md.append("| power | \(powerSource()), thermal \(thermalStateName()) |")
     md.append("| model | \(URL(fileURLWithPath: modelDir).lastPathComponent) |")
     md.append("| tier | \(tierDesc) |")
