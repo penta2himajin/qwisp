@@ -150,7 +150,16 @@ final class BoltServe {
                   let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
             MLX.eval([lg0])
             var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
-            for _ in 0 ..< calibN {
+            // Minimum calib corpus: a trivial first request (e.g. "hi", ~18 rows + 48 steps)
+            // freezes residency off nearly no routing evidence, and the next REAL request
+            // then decodes into the greedy repetition attractor (measured via benchtest:
+            // "Say hello." warmup → every later prompt LOOPY; representative warmup → ok).
+            // Extend the calib greedy run so prefill+steps cover ≥ calibMinRows observation
+            // rows — real prompts (≥~100 tokens) pay nothing, tiny ones pay a few seconds
+            // of strict-speed decode ONCE per process.
+            let calibMinRows = Tell.envInt("QWISP_CALIB_MIN_ROWS", 128)
+            let steps = Swift.max(calibN, calibMinRows - promptIds.count)
+            for _ in 0 ..< steps {
                 guard let evals = backend1.stepArgmax([Int32(u)]) else { return nil }
                 u = evals[0]
             }

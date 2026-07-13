@@ -101,7 +101,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     /// tiers (<32GB) otherwise default to bolt (near-lossless L3) — productization
     /// tier→mode decision. Set by the CLI after init (resolved flag > env > config).
     public var losslessForced: Bool? = nil
-    var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
+    public var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
     private var boltServe: BoltServe? = nil
     let modelDir: String
     let tier: SeedlessTier

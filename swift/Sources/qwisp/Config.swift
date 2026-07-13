@@ -19,6 +19,9 @@ struct QwispConfig: Codable {
 
 enum Config {
     // ── defaults (the SSoT) ──────────────────────────────────────────────
+    /// Release version. Bump with each release — release.sh verifies the built binary's
+    /// `qwisp version` output matches the tag and aborts on mismatch.
+    static let version = "0.3.2"
     static let defaultModel = FileManager.default.homeDirectoryForCurrentUser.path
         + "/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
     static let defaultPort = 8080
