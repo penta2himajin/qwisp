@@ -64,6 +64,9 @@ echo "==> bundled: $(cd "$DIST" && ls -d *.bundle | tr '\n' ' ')"
 
 # 3. smoke: the assembled binary runs standalone (GPU-free, no model)
 echo -n "==> smoke: " && "$DIST/qwisp" configtest | tail -1
+# 3b. version guard: the binary's Config.version must match the tag (bump it before tagging).
+BINVER="$("$DIST/qwisp" version)"
+[[ "$BINVER" == "$BARE" ]] || { echo "ERROR: binary reports v$BINVER but tag is v$BARE — bump Config.version"; exit 1; }
 
 # 4. tarball + sha256
 TAR="$WORK/$ASSET"

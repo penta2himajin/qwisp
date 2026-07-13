@@ -94,6 +94,14 @@ case "chat":
                       temperature: temp, topP: topP, seed: seed,
                       frequencyPenalty: freqPen, presencePenalty: presPen, logitBias: bias)
     }
+case "benchtest":
+    // Community benchmark (call-for-testers): env + tiered speed/stability, markdown to stdout.
+    if !ModelStore.isModel(model) {
+        FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
+    }
+    print(await runBenchtest(modelDir: model))
+case "version", "--version", "-v":
+    print(Config.version)
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":
@@ -124,5 +132,5 @@ case "config":
         print(Config.effectiveReport(env: ProcessInfo.processInfo.environment, config: qwispConfig, path: Config.defaultPath))
     }
 default:
-    print("usage: qwisp [serve|chat|pull|config|selftest|comptest|sampletest|configtest]")
+    print("usage: qwisp [serve|chat|pull|config|benchtest|version|selftest|comptest|sampletest|configtest]")
 }

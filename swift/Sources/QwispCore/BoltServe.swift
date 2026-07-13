@@ -128,7 +128,8 @@ final class BoltServe {
 
         // ── First request: strict calib pass (routing frequency + co-activation) ──
         if !calibrated {
-            print("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict")
+            // stderr like the server's perf log — keeps `qwisp benchtest > report.md` clean.
+            FileHandle.standardError.write(Data("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict\n".utf8))
             guard let (backend1, fwd1, provs) = Tell.streamingBackend(
                 engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C)
             else { return nil }
@@ -150,7 +151,16 @@ final class BoltServe {
                   let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
             MLX.eval([lg0])
             var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
-            for _ in 0 ..< calibN {
+            // Minimum calib corpus: a trivial first request (e.g. "hi", ~18 rows + 48 steps)
+            // freezes residency off nearly no routing evidence, and the next REAL request
+            // then decodes into the greedy repetition attractor (measured via benchtest:
+            // "Say hello." warmup → every later prompt LOOPY; representative warmup → ok).
+            // Extend the calib greedy run so prefill+steps cover ≥ calibMinRows observation
+            // rows — real prompts (≥~100 tokens) pay nothing, tiny ones pay a few seconds
+            // of strict-speed decode ONCE per process.
+            let calibMinRows = Tell.envInt("QWISP_CALIB_MIN_ROWS", 128)
+            let steps = Swift.max(calibN, calibMinRows - promptIds.count)
+            for _ in 0 ..< steps {
                 guard let evals = backend1.stepArgmax([Int32(u)]) else { return nil }
                 u = evals[0]
             }

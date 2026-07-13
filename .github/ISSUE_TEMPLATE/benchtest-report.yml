@@ -1,0 +1,25 @@
+name: Benchtest report
+description: Post your `qwisp benchtest` result (community hardware benchmark)
+title: "[benchtest] "
+labels: ["benchtest-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Run `qwisp benchtest` and paste the markdown block below.
+        The one-click link printed at the end of `qwisp benchtest` pre-fills this form.
+  - type: textarea
+    id: report
+    attributes:
+      label: benchtest output
+      description: The markdown block printed by `qwisp benchtest` (env + results tables), as-is.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      description: Anything unusual — other apps running, LOOPY output samples, crashes, memory pressure, disk nearly full, etc.
+    validations:
+      required: false
