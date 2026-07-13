@@ -1,0 +1,49 @@
+# Ingest community benchtest reports: when an issue gets the `benchtest-report`
+# label, parse its report into bench/community/<issue#>.json, regenerate
+# bench/RESULTS.md, and open a bot PR. The owner merging that PR IS the spam
+# filter — nothing lands in main automatically.
+#
+# Re-ingest after an issue edit: remove and re-add the label.
+name: benchtest-ingest
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  ingest:
+    if: github.event.label.name == 'benchtest-report'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The issue body is untrusted input: it reaches the parser only as a JSON
+      # file (never interpolated into shell), and the parser treats it as data.
+      - name: parse report + regenerate RESULTS.md
+        env:
+          ISSUE_JSON: ${{ toJSON(github.event.issue) }}
+        run: |
+          python3 scripts/benchtest_ingest.py --selftest
+          printf '%s' "$ISSUE_JSON" > /tmp/issue.json
+          python3 scripts/benchtest_ingest.py --issue-json /tmp/issue.json
+
+      - name: open bot PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.event.issue.number }}
+        run: |
+          BR="bot/benchtest-$N"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add bench/
+          git diff --cached --quiet && { echo "no changes to ingest"; exit 0; }
+          git commit -m "data(bench): ingest benchtest report #$N"
+          git push -f origin "$BR"
+          gh pr create --head "$BR" \
+            --title "data(bench): community benchtest report #$N" \
+            --body "Auto-ingested from #$N by the benchtest-ingest workflow. Merging accepts the report into bench/RESULTS.md (owner merge = spam filter)." \
+            || echo "PR already open for $BR — force-push updated it"
