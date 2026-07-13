@@ -151,7 +151,7 @@ private struct BenchRow {
     let ttftMs: Int
     let tokPerSec: Double
     let tokens: Int
-    let stable: Bool
+    let stability: Double   // distinct n-gram ratio; < 0.5 → LOOPY
     let tail: String
 }
 
@@ -183,7 +183,7 @@ private func benchRun(name: String, mode: String, prompt: String, maxTokens: Int
     return BenchRow(name: name, mode: mode,
                     ttftMs: Int(tf.timeIntervalSince(t0) * 1000),
                     tokPerSec: rate, tokens: outIds.count,
-                    stable: stabilityRatio(outIds) >= 0.5, tail: tail)
+                    stability: stabilityRatio(outIds), tail: tail)
 }
 
 /// Entry point for `qwisp benchtest`. Returns the markdown report (stdout).
@@ -258,9 +258,9 @@ func runBenchtest(modelDir: String) async -> String {
     md.append("| test | mode | TTFT | decode | tokens | stability |")
     md.append("|---|---|---|---|---|---|")
     for r in rows {
-        md.append(String(format: "| %@ | %@ | %.1fs | %.1f tok/s | %d | %@ |",
+        md.append(String(format: "| %@ | %@ | %.1fs | %.1f tok/s | %d | %@ (%.2f) |",
                          r.name, r.mode, Double(r.ttftMs) / 1000.0, r.tokPerSec, r.tokens,
-                         r.stable ? "ok" : "**LOOPY**"))
+                         r.stability >= 0.5 ? "ok" : "**LOOPY**", r.stability))
     }
     if let long = rows.first(where: { $0.name == "long-600" }) {
         md.append("")

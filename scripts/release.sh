@@ -46,6 +46,18 @@ if [[ $DRY -eq 0 ]] && gh release view "$VERSION" >/dev/null 2>&1; then
   echo "ERROR: release $VERSION already exists"; exit 1
 fi
 
+# 0b. auto-sync Config.version to the tag — the bump can't be forgotten. The binary
+#     guard in 3b stays as the independent check that the build picked it up.
+CONF="swift/Sources/qwisp/Config.swift"
+if ! grep -q "static let version = \"$BARE\"" "$CONF"; then
+  if [[ $DRY -eq 1 ]]; then
+    echo "ERROR: Config.version != $BARE and --dry-run never commits — bump it first"; exit 1
+  fi
+  echo "==> bumping Config.version -> $BARE"
+  /usr/bin/sed -i '' "s|static let version = \".*\"|static let version = \"$BARE\"|" "$CONF"
+  git add "$CONF" && git commit -q -m "chore: bump version to $BARE" && git push -q origin main
+fi
+
 # 1. build Release (qwisp scheme only — qwisp-poc is not shipped)
 echo "==> building Release $VERSION (Xcode 26 required)"
 pkill -f 'Release/qwisp' 2>/dev/null || true
