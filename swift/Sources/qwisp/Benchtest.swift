@@ -21,6 +21,58 @@ private func sysctlString(_ name: String) -> String {
     return String(cString: buf)
 }
 
+private func runTool(_ path: String, _ args: [String]) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = Pipe()
+    guard (try? p.run()) != nil else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8)
+}
+
+/// GPU core count via IORegistry — the brand string alone is ambiguous (e.g. "Apple M1
+/// Max" ships as 24- or 32-core GPU), and decode is GPU-bound.
+private func gpuCoreCount() -> Int? {
+    guard let out = runTool("/usr/sbin/ioreg", ["-rc", "AGXAccelerator", "-d", "1"]) else { return nil }
+    for line in out.split(separator: "\n") where line.contains("\"gpu-core-count\"") {
+        if let v = line.split(separator: "=").last.flatMap({ Int($0.trimmingCharacters(in: .whitespaces)) }) {
+            return v
+        }
+    }
+    return nil
+}
+
+/// AC vs battery — MacBooks throttle GPU clocks on battery, a major variance source in
+/// community-reported numbers.
+private func powerSource() -> String {
+    guard let out = runTool("/usr/bin/pmset", ["-g", "batt"]) else { return "?" }
+    if out.contains("AC Power") { return "AC" }
+    if out.contains("Battery Power") { return "battery" }
+    return "?"
+}
+
+private func thermalStateName() -> String {
+    switch ProcessInfo.processInfo.thermalState {
+    case .nominal: return "nominal"
+    case .fair: return "fair"
+    case .serious: return "serious"
+    case .critical: return "critical"
+    @unknown default: return "?"
+    }
+}
+
+/// Total size of the volume holding the model — 256GB configs have fewer NAND channels
+/// (slower sequential reads, the MacBook-floor tier), so it contextualizes the SSD probe.
+private func diskSizeGB(modelDir: String) -> Int? {
+    guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: modelDir),
+          let size = attrs[.systemSize] as? Int else { return nil }
+    return Int((Double(size) / 1e9).rounded())
+}
+
 /// Sequential read bandwidth of the model's biggest shard with the page cache bypassed
 /// (F_NOCACHE) — the honest "what tier is this NAND" number (MacBook-class ≈ 1.5 GB/s,
 /// desktop-class ≈ 5+ GB/s). Reads ≤256MB in 8MB chunks; nil if the model dir is odd.
@@ -177,10 +229,12 @@ func runBenchtest(modelDir: String) async -> String {
     md.append("")
     md.append("| env | |")
     md.append("|---|---|")
-    md.append("| chip | \(sysctlString("machdep.cpu.brand_string")) |")
+    let gpu = gpuCoreCount().map { " (\($0)-core GPU)" } ?? ""
+    md.append("| chip | \(sysctlString("machdep.cpu.brand_string"))\(gpu) |")
     md.append("| RAM | \(Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0).rounded())) GB |")
     md.append("| macOS | \(ProcessInfo.processInfo.operatingSystemVersionString) |")
-    md.append("| SSD read | \(ssd.map { String(format: "%.1f GB/s", $0) } ?? "n/a") |")
+    md.append("| disk | \(diskSizeGB(modelDir: modelDir).map { "\($0) GB" } ?? "n/a"), read \(ssd.map { String(format: "%.1f GB/s", $0) } ?? "n/a") |")
+    md.append("| power | \(powerSource()), thermal \(thermalStateName()) |")
     md.append("| model | \(URL(fileURLWithPath: modelDir).lastPathComponent) |")
     md.append("| tier | \(tierDesc) |")
     md.append("")
