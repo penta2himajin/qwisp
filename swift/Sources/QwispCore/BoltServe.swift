@@ -128,7 +128,8 @@ final class BoltServe {
 
         // ── First request: strict calib pass (routing frequency + co-activation) ──
         if !calibrated {
-            print("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict")
+            // stderr like the server's perf log — keeps `qwisp benchtest > report.md` clean.
+            FileHandle.standardError.write(Data("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict\n".utf8))
             guard let (backend1, fwd1, provs) = Tell.streamingBackend(
                 engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C)
             else { return nil }
