@@ -57,6 +57,35 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwisp","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+## Performance
+
+Greedy decode rates from `qwisp benchtest` (256–600 token generations, TTFT excluded).
+**Provenance is explicit** — most numbers come from one dev machine; real community hardware
+is what we're collecting now.
+
+| tier | mode | decode | provenance |
+|---|---|---|---|
+| resident (≥32 GB) | strict (lossless) | 85–91 tok/s | dev machine — M1 Max (32c GPU) / 64 GB ([#36](https://github.com/penta2himajin/qwisp/issues/36)) |
+| streaming 8 GB (C=64) | bolt (default) | 73–94 tok/s | dev machine, RAM-forced (`QWISP_DEVICE_RAM=8`) — not real 8 GB hardware |
+| streaming 8 GB (C=64) | strict (`--lossless`) | 23–26 tok/s | same |
+| slow-NAND MacBook (~1.5 GB/s reads) | bolt | ~71 tok/s | SSD-throttle approximation (`QWISP_SSD_THROTTLE_GBS=1.5`) |
+| streaming 16 GB (C=128) | | *no data yet* | **[post a row → #38](https://github.com/penta2himajin/qwisp/issues/38)** |
+
+Modes: **strict** reproduces the quantised greedy token stream bit-for-bit (default on resident;
+`--lossless` forces it anywhere). **bolt** is the near-lossless streaming default — same
+architecture, cached expert routing, much faster under flash streaming.
+
+### Benchmark your Mac
+
+```bash
+qwisp benchtest        # ~2 min after the model is pulled; prints a markdown report
+```
+
+Deterministic, no accounts, no telemetry — the report is printed to your terminal and the last
+line is a one-click URL that opens a pre-filled GitHub issue (you see exactly what you post).
+8/16 GB Macs and 256 GB-SSD MacBooks are the rows we need most — including unstable
+(`LOOPY`) results. Details: [call for testers](https://github.com/penta2himajin/qwisp/issues/38).
+
 ## API
 
 | Endpoint | Notes |
