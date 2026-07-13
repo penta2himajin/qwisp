@@ -238,14 +238,16 @@ func runBenchtest(modelDir: String) async -> String {
     let wall = Int(Date().timeIntervalSince(tWall))
 
     // ── markdown report ──────────────────────────────────────────────────────
+    let chip = sysctlString("machdep.cpu.brand_string")
+    let gpu = gpuCoreCount().map { " (\($0)-core GPU)" } ?? ""
+    let ramGB = Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0).rounded())
     var md: [String] = []
     md.append("### qwisp benchtest v\(Config.version)")
     md.append("")
     md.append("| env | |")
     md.append("|---|---|")
-    let gpu = gpuCoreCount().map { " (\($0)-core GPU)" } ?? ""
-    md.append("| chip | \(sysctlString("machdep.cpu.brand_string"))\(gpu) |")
-    md.append("| RAM | \(Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0).rounded())) GB |")
+    md.append("| chip | \(chip)\(gpu) |")
+    md.append("| RAM | \(ramGB) GB |")
     md.append("| macOS | \(ProcessInfo.processInfo.operatingSystemVersionString) |")
     let disk = [nvmeModel(), diskSizeGB(modelDir: modelDir).map { "\($0) GB" }].compactMap { $0 }.joined(separator: ", ")
     md.append("| disk | \(disk.isEmpty ? "n/a" : disk), read \(ssd.map { String(format: "%.1f GB/s", $0) } ?? "n/a") |")
@@ -265,6 +267,18 @@ func runBenchtest(modelDir: String) async -> String {
         md.append("tail of long-600: `…\(long.tail)`")
     }
     md.append("")
-    md.append("_greedy/deterministic; TTFT includes prefill; \(wall)s total. Post results: https://github.com/penta2himajin/qwisp/issues (call-for-testers)._")
-    return md.joined(separator: "\n")
+    md.append("_greedy; TTFT includes prefill; \(wall)s total._")
+    let report = md.joined(separator: "\n")
+
+    // One-click posting: GitHub issue forms accept field prefills as query params
+    // (param key = the form field id), so this URL opens the benchtest-report form
+    // with the title AND the full report already filled in — cmd+click in the
+    // terminal, then just press Submit. Goes to stderr so `> report.md` stays clean.
+    let title = "[benchtest] \(chip)\(gpu) · \(ramGB)GB · \(isStreaming ? "streaming" : "resident")"
+    let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
+    note("")
+    note("[benchtest] one-click post (cmd+click, then Submit):")
+    note("https://github.com/penta2himajin/qwisp/issues/new?template=benchtest-report.yml&title=\(enc(title))&report=\(enc(report))")
+    return report
 }
