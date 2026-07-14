@@ -47,6 +47,10 @@ First run: the first chat/serve request loads the model (~20 GB), and on <32 GB 
 one-time bolt calibration — a few minutes at strict speed, with progress on stderr. Later
 requests in the same process decode at full bolt speed.
 
+Update notice: `chat`/`serve` check GitHub releases at most once a day (a single GET, no
+payload — `benchtest` never touches the network) and print one line when a newer version
+exists. Disable with `QWISP_UPDATE_CHECK=0`.
+
 Build from source instead (needs Xcode 26 / Swift 6.3):
 
 ```bash

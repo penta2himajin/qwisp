@@ -31,6 +31,8 @@ environment:
   chat sampling (default greedy): QWISP_TEMP QWISP_TOPP QWISP_SEED
                                   QWISP_FREQPEN QWISP_PRESPEN QWISP_LOGIT_BIAS="tok:bias,…"
   note: temperature > 0 on a streaming tier (<32GB) decodes via strict — bolt is greedy-only
+  QWISP_UPDATE_CHECK=0               disable the update notice (a single GET to GitHub
+                                     releases/latest, ≤once/day on chat/serve; no payload)
 
 first run: `qwisp pull` downloads ~20GB. The first chat/serve request loads the model, and
 on <32GB machines runs a one-time bolt calibration (a few minutes; progress goes to stderr).
@@ -51,6 +53,7 @@ case "serve":
         }
         ModelStore.requireSupported(model)
     }
+    UpdateCheck.noticeInBackground()
     let modelID = URL(fileURLWithPath: model).lastPathComponent
     let tok = try await QwispTokenizer(modelDir: model)
     let backend: any LLMBackend
@@ -103,6 +106,7 @@ case "chat":
         } else {
             FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
         }
+        UpdateCheck.noticeInBackground()
         let tok = try await QwispTokenizer(modelDir: effModel)
         let backend: any LLMBackend
         if env["QWISP_FAKE"] == "1" {
@@ -137,7 +141,8 @@ case "benchtest":
     ModelStore.requireSupported(model)
     print(await runBenchtest(modelDir: model))
 case "version", "--version", "-v":
-    print(Config.version)
+    print(Config.version)   // stdout stays the bare version — release.sh 3b compares it
+    await UpdateCheck.reportForVersionCommand()
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":
@@ -149,6 +154,10 @@ case "sampletest":
 case "gpusampletest":
     let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
     print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
+    if passed != total { exit(1) }
+case "updatetest":
+    let (passed, total, log) = UpdateCheck.selfCheck()   // network-free version-compare check
+    print(log.joined(separator: "\n") + (log.isEmpty ? "" : "\n") + "UPDATETEST \(passed)/\(total)")
     if passed != total { exit(1) }
 case "configtest":
     let (passed, total, log) = Config.selfCheck()   // model/port resolution + config load (no GPU, no model)
