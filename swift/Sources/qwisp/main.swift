@@ -45,8 +45,11 @@ switch args.first {
 case "serve":
     let port = Config.resolvePort(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: Config.defaultPort)
     // A daemon has no TTY — never prompt. Missing model → fail fast with the hint.
-    if ProcessInfo.processInfo.environment["QWISP_FAKE"] != "1" && !ModelStore.isModel(model) {
-        FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
+    if ProcessInfo.processInfo.environment["QWISP_FAKE"] != "1" {
+        if !ModelStore.isModel(model) {
+            FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
+        }
+        ModelStore.requireSupported(model)
     }
     let modelID = URL(fileURLWithPath: model).lastPathComponent
     let tok = try await QwispTokenizer(modelDir: model)
@@ -95,6 +98,7 @@ case "chat":
         if env["QWISP_FAKE"] == "1" {
             effModel = model
         } else if let m = await ModelStore.ensureModel(model, allowPrompt: true) {
+            ModelStore.requireSupported(m)
             effModel = m
         } else {
             FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
@@ -130,6 +134,7 @@ case "benchtest":
     if !ModelStore.isModel(model) {
         FileHandle.standardError.write(Data((ModelStore.missingModelHint + "\n").utf8)); exit(1)
     }
+    ModelStore.requireSupported(model)
     print(await runBenchtest(modelDir: model))
 case "version", "--version", "-v":
     print(Config.version)

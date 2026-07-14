@@ -12,6 +12,30 @@ enum ModelStore {
         FileManager.default.fileExists(atPath: path + "/config.json")
     }
 
+    /// The engine is specialised to the MTPLX checkpoint layout; anything else must be
+    /// rejected HERE with a real message — engine preconditions die as a bare trace trap
+    /// (issue #51: an oQ4 requant of the same base model SIGTRAPed benchtest). The MTPLX
+    /// pipeline stamps `mtplx_policy` into config.json; that key is the format signature
+    /// (the oQ4 repo lacks it while matching everything else).
+    static func requireSupported(_ modelDir: String) {
+        let url = URL(fileURLWithPath: modelDir).appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: url),
+              let top = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            FileHandle.standardError.write(Data("cannot read \(url.path) — not a model directory?\n".utf8))
+            exit(1)
+        }
+        guard top["mtplx_policy"] == nil else { return }
+        FileHandle.standardError.write(Data("""
+        Unsupported checkpoint: \(modelDir)
+        qwisp is single-model-specialised: it supports the MTPLX build of Qwen3.6-35B-A3B only
+        (\(defaultRepo)). This directory is a different model or a different quant layout of the
+        same base model, and the engine's kernels are shaped for the MTPLX layout exactly.
+            qwisp pull    # download the supported checkpoint (~20 GB) + write config
+
+        """.utf8))
+        exit(1)
+    }
+
     // Download `repo` and point the config file at it. Returns the local model path.
     // HF_ENDPOINT switches the Hub host (mirrors — e.g. https://hf-mirror.com — for regions
     // where huggingface.co is slow or blocked); HF_TOKEN is picked up by HubApi itself.
