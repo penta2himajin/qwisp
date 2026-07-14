@@ -11,7 +11,36 @@ import QwispCore
 let qwispConfig = Config.load(path: Config.defaultPath)
 let model = Config.resolveModel(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: Config.defaultModel)
 
+let helpText = """
+qwisp \(Config.version) — single-model local inference for Qwen3.6-35B-A3B on Apple Silicon
+
+usage: qwisp <command> [options]
+
+  serve                  OpenAI-compatible server on :8080 (QWISP_PORT / config)
+  chat [opts] <prompt>   one-shot chat; reads stdin if no prompt is given
+      --max-tokens N     cap generation (default: until EOS / context)
+      --lossless         force strict bit-exact mode (streaming tiers default to bolt)
+  pull [hf-repo-id]      download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) + write config
+  config [--defaults]    show effective settings / the full default set
+  benchtest              community benchmark → markdown report + one-click submit URL
+  version                print the version
+
+environment:
+  QWISP_MODEL   model directory      QWISP_PORT      server port
+  QWISP_LOSSLESS=1                   force strict on every tier
+  chat sampling (default greedy): QWISP_TEMP QWISP_TOPP QWISP_SEED
+                                  QWISP_FREQPEN QWISP_PRESPEN QWISP_LOGIT_BIAS="tok:bias,…"
+  note: temperature > 0 on a streaming tier (<32GB) decodes via strict — bolt is greedy-only
+
+first run: `qwisp pull` downloads ~20GB. The first chat/serve request loads the model, and
+on <32GB machines runs a one-time bolt calibration (a few minutes; progress goes to stderr).
+"""
+
 let args = Array(CommandLine.arguments.dropFirst())
+if args.isEmpty || args.contains("--help") || args.contains("-h") || args.first == "help" {
+    print(helpText)
+    exit(0)
+}
 switch args.first {
 case "serve":
     let port = Config.resolvePort(env: ProcessInfo.processInfo.environment, config: qwispConfig, default: Config.defaultPort)
@@ -75,6 +104,8 @@ case "chat":
         if env["QWISP_FAKE"] == "1" {
             backend = FakeBackend(script: tok.encode("(fake backend) hello from qwisp chat."))
         } else {
+            // The load is ~20GB and used to be silent (issue #45) — say what the wait is.
+            FileHandle.standardError.write(Data("[qwisp] loading model from \(URL(fileURLWithPath: effModel).lastPathComponent) …\n".utf8))
             let sb = try SeedlessBackend(modelDir: effModel)
             sb.losslessForced = chatLossless
             backend = sb
@@ -132,5 +163,5 @@ case "config":
         print(Config.effectiveReport(env: ProcessInfo.processInfo.environment, config: qwispConfig, path: Config.defaultPath))
     }
 default:
-    print("usage: qwisp [serve|chat|pull|config|benchtest|version|selftest|comptest|sampletest|configtest]")
+    print(helpText)
 }

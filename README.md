@@ -34,12 +34,18 @@ qwisp pull                                 # download the default model (~20 GB)
 
 qwisp chat "Explain MoE routing in two sentences."
 qwisp chat --max-tokens 256 "…"            # cap length (default: until EOS / context)
+QWISP_TEMP=0.7 qwisp chat "…"              # sampling knobs: QWISP_TEMP / QWISP_TOPP / QWISP_SEED
+                                           #   note: temp>0 on <32GB decodes via strict (bolt is greedy-only)
 
 qwisp serve                                # OpenAI-compatible server on :8080 (QWISP_PORT to change)
 brew services start qwisp                  #   …or run it as a resident background service
 
 qwisp config                               # show effective settings + where each value came from
 ```
+
+First run: the first chat/serve request loads the model (~20 GB), and on <32 GB machines runs a
+one-time bolt calibration — a few minutes at strict speed, with progress on stderr. Later
+requests in the same process decode at full bolt speed.
 
 Build from source instead (needs Xcode 26 / Swift 6.3):
 
