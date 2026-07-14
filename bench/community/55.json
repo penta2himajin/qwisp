@@ -1,0 +1,52 @@
+{
+ "issue": 55,
+ "title": "[benchtest] Apple M1 (8-core GPU) \u00b7 16GB \u00b7 streaming",
+ "version": "0.3.3",
+ "chip": "Apple M1",
+ "gpu_cores": 8,
+ "ram_gb": 16,
+ "macos": "Version 26.5.2 (Build 25F84)",
+ "nvme": "APPLE SSD AP0512Q",
+ "read_gbs": 3.1,
+ "power": "AC, thermal nominal",
+ "model": "Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
+ "tier": "streaming C=128 \u2192 bolt (near-lossless) default",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "bolt",
+   "ttft_s": 7.7,
+   "tok_s": 23.0,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "bolt",
+   "ttft_s": 9.7,
+   "tok_s": 26.4,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "long-600",
+   "mode": "bolt",
+   "ttft_s": 8.7,
+   "tok_s": 20.1,
+   "tokens": 600,
+   "stable": true,
+   "ratio": 0.98
+  },
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 15.1,
+   "tok_s": 1.5,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  }
+ ]
+}
