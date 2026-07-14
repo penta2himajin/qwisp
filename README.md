@@ -75,7 +75,9 @@ is what we're collecting now.
 | streaming 8 GB (C=64) | bolt (default) | 73–94 tok/s | dev machine, RAM-forced (`QWISP_DEVICE_RAM=8`) — not real 8 GB hardware |
 | streaming 8 GB (C=64) | strict (`--lossless`) | 23–26 tok/s | same |
 | slow-NAND MacBook (~1.5 GB/s reads) | bolt | ~71 tok/s | SSD-throttle approximation (`QWISP_SSD_THROTTLE_GBS=1.5`) |
-| streaming 16 GB (C=128) | | *no data yet* | **[post a row → #38](https://github.com/penta2himajin/qwisp/issues/38)** |
+| streaming 16 GB (C=128) | bolt (default) | 46–58 tok/s | **community** — M1 Pro (16c GPU) / 16 GB ([#41](https://github.com/penta2himajin/qwisp/issues/41)) |
+| streaming 16 GB (C=128) | strict (`--lossless`) | 2.3 tok/s | same — real 16 GB memory pressure is far harsher than the throttle approximation predicted |
+| your Mac | | | **[post a row → #38](https://github.com/penta2himajin/qwisp/issues/38)** |
 
 Modes: **strict** reproduces the quantised greedy token stream bit-for-bit (default on resident;
 `--lossless` forces it anywhere). **bolt** is the near-lossless streaming default — same
