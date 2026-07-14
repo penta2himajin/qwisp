@@ -44,10 +44,9 @@ jobs:
           git diff --cached --quiet && { echo "no changes to ingest"; exit 0; }
           git commit -m "data(bench): ingest benchtest report #$N"
           git push -f origin "$BR"
+          BODY="$(printf 'Auto-ingested from #%s by the benchtest-ingest workflow. Merging accepts the report into bench/RESULTS.md (owner merge = spam filter).\n\nCloses #%s' "$N" "$N")"
           gh pr create --head "$BR" \
             --title "data(bench): community benchtest report #$N" \
-            --body "Auto-ingested from #$N by the benchtest-ingest workflow. Merging accepts the report into bench/RESULTS.md (owner merge = spam filter).
-
-Closes #$N" \
+            --body "$BODY" \
             && gh issue comment "$N" --body "Thanks for the report! It parsed cleanly and is queued for [bench/RESULTS.md](https://github.com/penta2himajin/qwisp/blob/main/bench/RESULTS.md). This issue will close automatically once the data PR is merged." \
             || echo "PR already open for $BR — force-push updated it"
