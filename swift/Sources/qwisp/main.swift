@@ -153,7 +153,9 @@ case "pull":
     // qwisp pull [hf-repo-id] — download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) and
     // point ~/.config/qwisp/config.json at it.
     let repo = args.dropFirst().first ?? ModelStore.defaultRepo
-    _ = try await ModelStore.pull(repo: repo)
+    // The error itself (with mirror/workaround hints) is printed inside pull() — a raw
+    // uncaught-error crash dump on top of it helps nobody.
+    do { _ = try await ModelStore.pull(repo: repo) } catch { exit(1) }
 case "config":
     // qwisp config           — effective config with per-key provenance
     // qwisp config --defaults — full default set as JSON (for pinning explicitly)
