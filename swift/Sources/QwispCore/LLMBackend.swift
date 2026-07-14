@@ -103,6 +103,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public var losslessForced: Bool? = nil
     public var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
     private var boltServe: BoltServe? = nil
+    private var samplingFallbackNoted = false
     let modelDir: String
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
@@ -192,6 +193,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // L3, buddy remap) by default; --lossless / QWISP_LOSSLESS forces strict. Sampling
             // requests fall back to strict streaming (the bolt loop is greedy-deterministic; v1).
             let useBolt = cfg.isStreaming && !wantSample && !self.lossless
+            // The fallback is silent otherwise and reads as a mystery slowdown (field report,
+            // issue #45): sampling skips bolt calibration (instant start) and decodes at strict
+            // speed. Say so once per process.
+            if cfg.isStreaming && wantSample && !self.lossless && !samplingFallbackNoted {
+                samplingFallbackNoted = true
+                FileHandle.standardError.write(Data(
+                    "[qwisp] sampling (temperature/top_p/…) on a streaming tier decodes via strict streaming — bolt is greedy-only, expect strict speed; temperature 0 restores bolt\n".utf8))
+            }
             Thread.detachNewThread {
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
