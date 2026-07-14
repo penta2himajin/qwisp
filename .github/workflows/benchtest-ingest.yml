@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -45,5 +46,8 @@ jobs:
           git push -f origin "$BR"
           gh pr create --head "$BR" \
             --title "data(bench): community benchtest report #$N" \
-            --body "Auto-ingested from #$N by the benchtest-ingest workflow. Merging accepts the report into bench/RESULTS.md (owner merge = spam filter)." \
+            --body "Auto-ingested from #$N by the benchtest-ingest workflow. Merging accepts the report into bench/RESULTS.md (owner merge = spam filter).
+
+Closes #$N" \
+            && gh issue comment "$N" --body "Thanks for the report! It parsed cleanly and is queued for [bench/RESULTS.md](https://github.com/penta2himajin/qwisp/blob/main/bench/RESULTS.md). This issue will close automatically once the data PR is merged." \
             || echo "PR already open for $BR — force-push updated it"
