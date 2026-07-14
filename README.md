@@ -169,6 +169,7 @@ Qwisp stands on:
 - **[MLX](https://github.com/ml-explore/mlx)** / **[mlx-swift](https://github.com/ml-explore/mlx-swift)** (Apple) — the numeric substrate (tensors, quantization, mmap loader).
 - **[Hummingbird](https://github.com/hummingbird-project/hummingbird)** — the async HTTP server.
 - **[swift-transformers](https://github.com/huggingface/swift-transformers)** (Hugging Face) — tokenizer + Qwen chat template.
+- User community - with data from community is helping me to improve this product a lot.
 
 ## License
 
