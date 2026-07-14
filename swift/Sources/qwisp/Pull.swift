@@ -13,17 +13,37 @@ enum ModelStore {
     }
 
     // Download `repo` and point the config file at it. Returns the local model path.
+    // HF_ENDPOINT switches the Hub host (mirrors — e.g. https://hf-mirror.com — for regions
+    // where huggingface.co is slow or blocked); HF_TOKEN is picked up by HubApi itself.
     static func pull(repo: String = defaultRepo) async throws -> String {
         let sizeNote = repo == defaultRepo ? " (~20 GB — this takes a while)" : ""
+        let endpoint = ProcessInfo.processInfo.environment["HF_ENDPOINT"]
+        if let endpoint {
+            FileHandle.standardError.write(Data("Using Hub endpoint \(endpoint) (HF_ENDPOINT)\n".utf8))
+        }
         FileHandle.standardError.write(Data("Downloading \(repo)\(sizeNote)…\n".utf8))
-        let hub = HubApi()
+        let hub = HubApi(endpoint: endpoint)
         var lastPct = -1
-        let url = try await hub.snapshot(from: repo, matching: []) { progress in
-            let pct = Int(progress.fractionCompleted * 100)
-            if pct != lastPct {
-                lastPct = pct
-                FileHandle.standardError.write(Data("\r  \(pct)%   ".utf8))
+        let url: URL
+        do {
+            url = try await hub.snapshot(from: repo, matching: []) { progress in
+                let pct = Int(progress.fractionCompleted * 100)
+                if pct != lastPct {
+                    lastPct = pct
+                    FileHandle.standardError.write(Data("\r  \(pct)%   ".utf8))
+                }
             }
+        } catch {
+            FileHandle.standardError.write(Data("""
+
+            download failed: \(error.localizedDescription)
+            If huggingface.co is slow or blocked in your region:
+              • try a mirror:   HF_ENDPOINT=https://hf-mirror.com qwisp pull
+              • or download it any other way (e.g. `hf download \(repo)`) and point qwisp at
+                the directory via QWISP_MODEL or "model" in ~/.config/qwisp/config.json
+
+            """.utf8))
+            throw error
         }
         FileHandle.standardError.write(Data("\r  100%\n".utf8))
         let path = url.path
