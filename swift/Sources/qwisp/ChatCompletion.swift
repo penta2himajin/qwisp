@@ -6,9 +6,33 @@ import QwispCore
 // adapter and the real SeedlessBackend wiring sit on top.
 
 // ── Request ────────────────────────────────────────────────────────────────
+
+/// OpenAI message `content`: the spec allows EITHER a plain string OR an array of typed
+/// parts (`[{"type":"text","text":...}, ...]`). Clients like opencode send the array form
+/// even for text-only turns (#82: `Type mismatch … expected 'String'`). Decode both,
+/// flattening text parts to one string; non-text parts (images) are dropped — qwisp is
+/// text-only, so a multimodal client at least gets its text through instead of a 4xx.
+struct MessageContent: Codable {
+    let text: String?
+    init(text: String?) { self.text = text }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { text = nil; return }
+        if let s = try? c.decode(String.self) { text = s; return }
+        struct Part: Codable { let type: String?; let text: String? }
+        let parts = try c.decode([Part].self)   // let a genuinely malformed content still 4xx
+        let joined = parts.compactMap { $0.type == "text" ? $0.text : nil }.joined()
+        text = joined.isEmpty ? nil : joined
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(text)   // round-trips as a plain string
+    }
+}
+
 struct ChatMessage: Codable {
     let role: String
-    let content: String?                // nil for assistant messages that are only tool_calls
+    let content: MessageContent?         // string OR array of parts (#82); nil for tool-only turns
     var tool_calls: [ReqToolCall]? = nil // assistant → previous function calls (history)
     var tool_call_id: String? = nil      // role:"tool" → which call this result answers
     var name: String? = nil
