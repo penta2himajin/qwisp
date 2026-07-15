@@ -82,7 +82,7 @@ extension Tell {
     /// snapshot/rollback: 直後の forward/stepArgmax「1 回だけ」を取り消す(partial reject 用)。
     struct SpecBackend {
         let forward: ([Int32]) -> MLXArray?
-        let stepArgmax: ([Int32]) -> [Int]?
+        var stepArgmax: ([Int32]) -> [Int]?   // var: reflection-bias prototype swaps it (#47)
         let snapshot: () -> Any
         let rollback: (Any) -> Void
         // Full-state save/restore for arbitrary-length rewind (cross-request prefix caching).
@@ -297,6 +297,34 @@ extension Tell {
             backend.stepSampleRows = { toks, drafts, invT, seed, base, adj, topP in
                 fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
+        }
+        // Reflection-token suppression PROTOTYPE (#47 Part A, QWISP_REFLECT_BIAS=<amp>): a
+        // CyclicReflex-style deterministic steer that subtracts `amp` from the logits of the
+        // high-entropy reflection tokens (Wait/But/However/…) which trigger statement loops
+        // (Circular Reasoning, arxiv 2601.05693). Routes argmax through the CPU-logits path
+        // (stepLogitsRows) + bias, and disables the GPU chain so every token pays the bias.
+        // Prototype only: slow (full-vocab readback/token), non-lossless. Measure, don't ship.
+        let reflectAmp = Tell.envFloat("QWISP_REFLECT_BIAS", 0)
+        if reflectAmp != 0, let logitsRows = backend.stepLogitsRows {
+            // Default reflection ids (Qwen3.6 vocab, with/without leading space).
+            let defaultIds = [13784, 13428, 3850, 1921, 10883, 4213, 88842, 37201, 50821, 32645, 77264, 85152]
+            let parsed = ProcessInfo.processInfo.environment["QWISP_REFLECT_IDS"]?
+                        .split(separator: ",").compactMap { Int($0) }
+            let reflectSet = Set((parsed?.isEmpty == false ? parsed! : defaultIds))
+            let amp = Float(reflectAmp)
+            let biased: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.map { row in
+                    var best = 0; var bestV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        let v = reflectSet.contains(t) ? row[t] - amp : row[t]
+                        if v > bestV { bestV = v; best = t }
+                    }
+                    return best
+                }
+            }
+            backend.stepArgmax = biased
+            backend.chainedStepArgmax = nil   // force per-token biased argmax (no unbiased GPU chain)
         }
         return (backend, fwd, providers)
     }
