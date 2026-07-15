@@ -214,17 +214,30 @@ final class BoltServe {
             fwd.diagObsMaxM = obsMaxM
             fwd.diagRouteBufs = (ib, gb)
         }
-        func accumulate(slot: Int, M: Int) {
+        // Routing-divergence trace (#47 Part A, QWISP_MISS_TRACE=path): per accumulate call,
+        // how many of the EXACT top-8 routed experts are cold (not resident → buddy-remapped)
+        // vs total routed. bolt's routing is exact; the miss set IS the residency divergence
+        // from the "true" (all-resident/strict) expert set. Tests whether the loop onset is
+        // preceded by a small, swappable divergence or a broad one (capacity wall).
+        let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
+        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int)] = []
+        func accumulate(slot: Int, M: Int, tok: Int = 0) {
             guard recalibR > 0, let ib = obsBuf else { return }
+            var traceMiss = 0, traceRouted = 0
             for li in 0 ..< nLayers {
                 let off = ((slot * nLayers + li) * obsMaxM) * Ktop * 4
                 let inds = Array(UnsafeBufferPointer(
                     start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
                     count: M * Ktop))
+                if missTracePath != nil {
+                    let s = providers[li].cache.slotOf
+                    for e in inds where e >= 0 { traceRouted += 1; if s[Int(e)] == nil { traceMiss += 1 } }
+                }
                 _ = SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &winCounts[li], coact: &winCoact[li])
             }
+            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M)) }
         }
         /// Recalib refresh (sync): the observation window becomes the new freeze basis.
         func refresh() {
@@ -427,12 +440,12 @@ final class BoltServe {
             if D == 0 {
                 if let (emitted, nextU) = Tell.boltGreedyChainSpan(
                     backend: backend, u: u, chainK: chainK, budget: N - out.count) {
-                    if recalibR > 0 { for k in 0 ..< chainK { accumulate(slot: k, M: 1) } }
+                    if recalibR > 0 { for k in 0 ..< chainK { accumulate(slot: k, M: 1, tok: out.count + k) } }
                     for t in emitted { out.append(t); hist.append(t) }
                     u = nextU
                 } else {
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
-                    if recalibR > 0 { accumulate(slot: 0, M: 1) }
+                    if recalibR > 0 { accumulate(slot: 0, M: 1, tok: out.count) }
                     out.append(u); hist.append(u)
                     u = evals[0]
                 }
@@ -442,7 +455,7 @@ final class BoltServe {
 
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
             guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
-            if recalibR > 0 { accumulate(slot: 0, M: D + 1) }
+            if recalibR > 0 { accumulate(slot: 0, M: D + 1, tok: out.count) }
 
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
@@ -463,6 +476,10 @@ final class BoltServe {
             tokensSinceRefresh += out.count - before
         }
         flush()
+        if let p = missTracePath, !missTrace.isEmpty {
+            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)" }.joined(separator: "\n")
+            try? ("tok\tmiss\trouted\tM\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+        }
         Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0, 0, 0)
         return Array(out.prefix(N))
     }
