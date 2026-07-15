@@ -51,7 +51,14 @@ public enum DeviceCalibration {
     }
 
     /// engine 既定 C（QWISP_CACHE_C 未指定時に使う）。実効 RAM(physicalRAMGB)から tier 決定。
-    public static func defaultC() -> Int { tier(physicalRAMGB()).1 }
+    /// QWISP_CACHE_C はこのコメントが約束していた env 契約だが productization で配線が落ちて
+    /// いた（CLI は常に .auto → ここ）。#47 Part A の C 掃引・field workaround 用に復元。
+    public static func defaultC() -> Int {
+        if let v = ProcessInfo.processInfo.environment["QWISP_CACHE_C"], let c = Int(v), c > 0 {
+            return Swift.min(c, 256)
+        }
+        return tier(physicalRAMGB()).1
+    }
 
     /// C for the STRICT streaming path only (issue #69). The RAM tier's C=128 carries a
     /// ~11.4GB wired footprint; on a real 16GB Mac that starves the page cache / GPU
