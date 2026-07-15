@@ -1,0 +1,52 @@
+{
+ "issue": 59,
+ "title": "[benchtest] Apple M3 Pro (14-core GPU) \u00b7 18GB \u00b7 streaming",
+ "version": "0.3.4",
+ "chip": "Apple M3 Pro",
+ "gpu_cores": 14,
+ "ram_gb": 18,
+ "macos": "Version 27.0 (Build 26A5378j)",
+ "nvme": "APPLE SSD AP0512Z",
+ "read_gbs": 6.4,
+ "power": "AC, thermal nominal",
+ "model": "Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
+ "tier": "streaming C=128 \u2192 bolt (near-lossless) default",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "bolt",
+   "ttft_s": 9.5,
+   "tok_s": 58.8,
+   "tokens": 104,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "bolt",
+   "ttft_s": 14.5,
+   "tok_s": 30.2,
+   "tokens": 228,
+   "stable": true,
+   "ratio": 0.85
+  },
+  {
+   "test": "long-600",
+   "mode": "bolt",
+   "ttft_s": 6.1,
+   "tok_s": 44.8,
+   "tokens": 600,
+   "stable": true,
+   "ratio": 0.98
+  },
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 21.6,
+   "tok_s": 9.8,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 0.96
+  }
+ ]
+}
