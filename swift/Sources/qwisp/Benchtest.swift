@@ -229,7 +229,12 @@ func runBenchtest(modelDir: String) async -> String {
     }
     // Streaming tiers: measure the strict (--lossless) pair on the first prompt, so the
     // report carries the bolt-vs-strict speed ratio for this hardware.
-    if isStreaming && !lossless {
+    // QWISP_BENCHTEST_SKIP_STRICT=1 drops the pair — for bolt-focused sweeps (e.g. the
+    // #47 Part A matrix), where the strict row reuses the bolt-sized arena under memory
+    // pressure and can dominate wall-clock (~40min/row on an emulated small Mac) without
+    // informing the question. Community reports should keep the default (pair measured).
+    if isStreaming && !lossless
+        && ProcessInfo.processInfo.environment["QWISP_BENCHTEST_SKIP_STRICT"] != "1" {
         backend.losslessForced = true
         if let r = await benchRun(name: "code-256", mode: "strict", prompt: prompts[0].1,
                                   maxTokens: 256, tokenizer: tok, backend: backend) { rows.append(r) }
