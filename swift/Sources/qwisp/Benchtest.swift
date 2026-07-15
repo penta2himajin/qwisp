@@ -122,26 +122,13 @@ private func ssdReadGBs(modelDir: String) -> Double? {
 
 // ── stability signal ─────────────────────────────────────────────────────────
 
-/// Distinct n-gram ratio over the tail of the generated token ids. Greedy repetition
-/// loops (the failure mode worth catching on real hardware) collapse the ratio toward
-/// loopLen/window; healthy text stays near 1.0. Pure — self-checked below.
+/// Shared with the BoltServe stability guard — the detector and the report must agree
+/// on what LOOPY means. Pure; self-checked in StabilityGuard.
 func stabilityRatio(_ ids: [Int], n: Int = 8, window: Int = 256) -> Double {
-    let tail = Array(ids.suffix(window))
-    guard tail.count >= n * 2 else { return 1.0 }
-    var seen = Set<[Int]>()
-    var total = 0
-    for i in 0 ... (tail.count - n) {
-        seen.insert(Array(tail[i ..< i + n])); total += 1
-    }
-    return Double(seen.count) / Double(total)
+    StabilityGuard.ratio(ids, n: n, window: window)
 }
 
-func stabilitySelfCheck() -> Bool {
-    let unique = stabilityRatio(Array(0 ..< 300))                                   // no repeats → ~1.0
-    let loop = stabilityRatio((0 ..< 20).flatMap { _ in Array(0 ..< 16) })          // 16-cycle → ~0.06
-    let short = stabilityRatio([1, 2, 3])                                           // too short → benign 1.0
-    return unique > 0.9 && loop < 0.5 && short == 1.0
-}
+func stabilitySelfCheck() -> Bool { StabilityGuard.selfCheck() }
 
 // ── bench core ───────────────────────────────────────────────────────────────
 

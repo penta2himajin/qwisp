@@ -61,6 +61,12 @@ final class BoltServe {
     private var winCoact: [[[Int]]] = []
     private var tokensSinceRefresh = 0
 
+    // Opt-in stability guard (#47 Part A, QWISP_BOLT_STABILITY_GUARD=1): watch the
+    // generated stream's distinct n-gram ratio; on collapse (< 0.5) stop this bolt
+    // segment so the caller can continue on the strict path. Recalib cannot recover an
+    // established loop (self-poisoned window, measured) — leaving bolt is the recovery.
+    private let guardOn = Tell.envInt("QWISP_BOLT_STABILITY_GUARD", 0) != 0
+    public private(set) var stabilityTripped = false
     private let calibN = Tell.envInt("QWISP_CALIB", 48)
     private let biasEps = Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0.25)
     private let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
@@ -125,6 +131,7 @@ final class BoltServe {
                     onToken: ((Int) -> Void)? = nil) -> [Int]? {
         let nLayers = SeedlessEngine.numLayers
         let nE = Self.nE, Ktop = Self.Ktop
+        stabilityTripped = false   // per-segment; the caller reads it after this returns
 
         // ── First request: strict calib pass (routing frequency + co-activation) ──
         if !calibrated {
@@ -407,8 +414,23 @@ final class BoltServe {
         }
 
         // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
+        var lastGuardCheck = 0
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
+            // Stability guard (#47 Part A, opt-in): a C=64 residency below the workload's
+            // per-layer footprint drives long free-runs into a repetition attractor that
+            // recalib cannot escape (self-poisoned window, measured). Detect the collapse
+            // and stop this segment so the caller finishes on strict. ponytail: forward-only
+            // — the ~1 window of degenerate tokens already streamed can't be un-streamed;
+            // rewind-to-pre-onset is the upgrade path if that tail matters.
+            if guardOn, out.count - lastGuardCheck >= StabilityGuard.checkEvery {
+                lastGuardCheck = out.count
+                if StabilityGuard.ratio(out) < StabilityGuard.tripThreshold {
+                    stabilityTripped = true
+                    FileHandle.standardError.write(Data("[qwisp] bolt stability guard tripped (ratio<\(StabilityGuard.tripThreshold)) at \(out.count) tok — finishing on strict\n".utf8))
+                    break
+                }
+            }
             if recalibR > 0 && tokensSinceRefresh >= recalibR {
                 if refreshAsync { refreshAsyncPlan() } else { refresh() }
             }

@@ -225,11 +225,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
                 var budget = Swift.min(baseline, Swift.max(1, ceiling))
+                var boltActive = useBolt      // flips off if the stability guard trips (#47 Part A)
                 while produced < ceiling && !cancel.isCancelled {
                     let segN = Swift.min(budget, ceiling - produced)
                     let maxSeqLen = seq.count + segN + cfg.maxK + 64
                     let onTok: (Int) -> Void = { continuation.yield($0) }
-                    if useBolt {
+                    if boltActive {
                         if self.boltServe == nil {
                             self.boltServe = BoltServe(engine: self.engine, modelDir: self.modelDir,
                                                        C: cfg.c, maxK: cfg.maxK, maxM: cfg.maxM)
@@ -240,6 +241,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             !seg.isEmpty else { break }
                         seq += seg.map { Int32($0) }
                         produced += seg.count
+                        // Stability guard tripped (#47 Part A): the bolt segment degenerated
+                        // and stopped short. Escalate — finish the response on the strict
+                        // (bit-exact) path for the remaining budget. One-way per request.
+                        if self.boltServe?.stabilityTripped == true {
+                            boltActive = false
+                            continue
+                        }
                         if seg.count < segN { break }
                         budget = Swift.min(budget * 2, 65536)
                         continue
