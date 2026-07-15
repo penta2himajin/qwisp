@@ -340,7 +340,7 @@ extension Tell {
                         if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
                         else if v > secondV { secondV = v; second = t }
                     }
-                    if ri == 0 { Tell.marginTrace.append(second >= 0 ? bestV - secondV : 0) }
+                    if ri == 0 { let mg = second >= 0 ? bestV - secondV : 0; Tell.marginTrace.append(mg); Tell.lastMargin = mg }
                     return best
                 }
             }
@@ -463,6 +463,9 @@ extension Tell {
     // top-1 − top-2 logit gap. Tests the qwisp-lean argmax_stable_of_margin trigger: does the
     // margin collapse BEFORE the loop (causal, unlike miss-rate) and stay open in clean text?
     nonisolated(unsafe) public static var marginTrace: [Float] = []
+    // Latest row-0 margin, set by the margin-trace stepArgmax so BoltServe's miss-trace can
+    // record margin and miss from the SAME forward, per-token aligned (#47 margin×miss overlay).
+    nonisolated(unsafe) public static var lastMargin: Float = 0
     static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
 
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,

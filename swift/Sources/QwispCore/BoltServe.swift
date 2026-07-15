@@ -222,7 +222,7 @@ final class BoltServe {
         // from the "true" (all-resident/strict) expert set. Tests whether the loop onset is
         // preceded by a small, swappable divergence or a broad one (capacity wall).
         let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
-        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float)] = []
+        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float, margin: Float)] = []
         // Cold-expert histogram in the pre-cliff ramp window (#47 Part A, QWISP_MISS_HIST=path
         // + QWISP_CLIFF_TOK=N): is the ramp cold set a small recurring set (pinnable) or diffuse
         // (capacity wall)? Counts cold routings per (layer, expert) for tok ∈ [cliff-70, cliff+10].
@@ -259,7 +259,7 @@ final class BoltServe {
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &winCounts[li], coact: &winCoact[li])
             }
-            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate)) }
+            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate, Tell.lastMargin)) }
         }
         /// Recalib refresh (sync): the observation window becomes the new freeze basis.
         func refresh() {
@@ -499,8 +499,8 @@ final class BoltServe {
         }
         flush()
         if let p = missTracePath, !missTrace.isEmpty {
-            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)" }.joined(separator: "\n")
-            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)\t\($0.margin)" }.joined(separator: "\n")
+            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\tmargin\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
         }
         if let p = ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"], !Tell.marginTrace.isEmpty {
             try? ("margin\n" + Tell.marginTrace.map { String($0) }.joined(separator: "\n")).write(toFile: p, atomically: true, encoding: .utf8)
