@@ -23,6 +23,9 @@ usage: qwisp <command> [options]
   pull [hf-repo-id]      download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) + write config
   config [--defaults]    show effective settings / the full default set
   benchtest              community benchmark → markdown report + one-click submit URL
+  simulate <N>gb         emulate a smaller-RAM Mac on this one (GPU+RAM ballast; ^C to
+                         release; run benchtest in another terminal). Expert knobs:
+                         --gpu-gb X / --ram-gb Y
   version                print the version
 
 environment:
@@ -155,6 +158,9 @@ case "gpusampletest":
     let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
     print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
     if passed != total { exit(1) }
+case "simulate":
+    // qwisp simulate <N>gb [--gpu-gb X] [--ram-gb Y] — small-RAM Mac emulation (issue #71)
+    exit(Simulate.run(args: Array(args.dropFirst())))
 case "updatetest":
     let (passed, total, log) = UpdateCheck.selfCheck()   // network-free version-compare check
     print(log.joined(separator: "\n") + (log.isEmpty ? "" : "\n") + "UPDATETEST \(passed)/\(total)")
