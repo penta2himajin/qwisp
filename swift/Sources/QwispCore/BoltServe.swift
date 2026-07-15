@@ -203,6 +203,7 @@ final class BoltServe {
         let obsMaxM = recalibR > 0 ? maxM : 1
         let obsSlots = recalibR > 0 ? Swift.max(1, chainK) : 1
         var obsBuf: MTLBuffer? = nil
+        var gateBuf: MTLBuffer? = nil   // per-expert gate values (gl); cold-gate-mass = substitution-error proxy (#47)
         if recalibR > 0 {
             guard SeedlessMetalForward.compileDiagCopyRoute(),
                   let (device, _) = SeedlessMetalForward.ensure(),
@@ -211,6 +212,7 @@ final class BoltServe {
                   let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared)
             else { return nil }
             obsBuf = ib
+            gateBuf = gb
             fwd.diagObsMaxM = obsMaxM
             fwd.diagRouteBufs = (ib, gb)
         }
@@ -220,7 +222,7 @@ final class BoltServe {
         // from the "true" (all-resident/strict) expert set. Tests whether the loop onset is
         // preceded by a small, swappable divergence or a broad one (capacity wall).
         let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
-        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int)] = []
+        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float)] = []
         // Cold-expert histogram in the pre-cliff ramp window (#47 Part A, QWISP_MISS_HIST=path
         // + QWISP_CLIFF_TOK=N): is the ramp cold set a small recurring set (pinnable) or diffuse
         // (capacity wall)? Counts cold routings per (layer, expert) for tok ∈ [cliff-70, cliff+10].
@@ -230,6 +232,10 @@ final class BoltServe {
         func accumulate(slot: Int, M: Int, tok: Int = 0) {
             guard recalibR > 0, let ib = obsBuf else { return }
             var traceMiss = 0, traceRouted = 0
+            var coldGate: Float = 0, totGate: Float = 0
+            // gl gate values are captured only for M==1/slot0 (Stage-0 diag glOn condition).
+            let gatePtr = (missTracePath != nil && M == 1 && slot == 0)
+                ? gateBuf?.contents().assumingMemoryBound(to: Float16.self) : nil
             let inRamp = missHistPath != nil && cliffTok > 0 && tok >= cliffTok - 70 && tok <= cliffTok + 10
             for li in 0 ..< nLayers {
                 let off = ((slot * nLayers + li) * obsMaxM) * Ktop * 4
@@ -238,7 +244,12 @@ final class BoltServe {
                     count: M * Ktop))
                 if missTracePath != nil {
                     let s = providers[li].cache.slotOf
-                    for e in inds where e >= 0 { traceRouted += 1; if s[Int(e)] == nil { traceMiss += 1 } }
+                    for e in inds where e >= 0 {
+                        traceRouted += 1
+                        let g = gatePtr.map { Float($0[li * nE + Int(e)]) } ?? 0
+                        totGate += g
+                        if s[Int(e)] == nil { traceMiss += 1; coldGate += g }   // substitution-error proxy
+                    }
                 }
                 if inRamp {
                     let s = providers[li].cache.slotOf
@@ -248,7 +259,7 @@ final class BoltServe {
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &winCounts[li], coact: &winCoact[li])
             }
-            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M)) }
+            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate)) }
         }
         /// Recalib refresh (sync): the observation window becomes the new freeze basis.
         func refresh() {
@@ -488,8 +499,8 @@ final class BoltServe {
         }
         flush()
         if let p = missTracePath, !missTrace.isEmpty {
-            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)" }.joined(separator: "\n")
-            try? ("tok\tmiss\trouted\tM\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)" }.joined(separator: "\n")
+            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
         }
         if let p = ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"], !Tell.marginTrace.isEmpty {
             try? ("margin\n" + Tell.marginTrace.map { String($0) }.joined(separator: "\n")).write(toFile: p, atomically: true, encoding: .utf8)
