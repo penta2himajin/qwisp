@@ -491,6 +491,9 @@ final class BoltServe {
             let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)" }.joined(separator: "\n")
             try? ("tok\tmiss\trouted\tM\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
         }
+        if let p = ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"], !Tell.marginTrace.isEmpty {
+            try? ("margin\n" + Tell.marginTrace.map { String($0) }.joined(separator: "\n")).write(toFile: p, atomically: true, encoding: .utf8)
+        }
         // Ramp cold-expert histogram: layer, expert, cold-count, and the expert's frequency RANK
         // in the frozen basis (baseCounts) — so we can tell if the ramp cold set is the same
         // "next-after-C" tail that C=80 already added (rank ~65-80) or a distinct deep-tail set.

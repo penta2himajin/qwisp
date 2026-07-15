@@ -326,6 +326,27 @@ extension Tell {
             backend.stepArgmax = biased
             backend.chainedStepArgmax = nil   // force per-token biased argmax (no unbiased GPU chain)
         }
+        // Margin trace (#47 Part A, QWISP_MARGIN_TRACE): CPU-logits stepArgmax that records the
+        // row-0 top-1 − top-2 gap (the argmax_stable_of_margin quantity) into Tell.marginTrace.
+        // Chain disabled so every token is measured. Slow (full-vocab readback); measurement only.
+        else if ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"] != nil, let logitsRows = backend.stepLogitsRows {
+            let traced: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.enumerated().map { (ri, row) in
+                    var best = 0, second = -1
+                    var bestV = -Float.greatestFiniteMagnitude, secondV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        let v = row[t]
+                        if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
+                        else if v > secondV { secondV = v; second = t }
+                    }
+                    if ri == 0 { Tell.marginTrace.append(second >= 0 ? bestV - secondV : 0) }
+                    return best
+                }
+            }
+            backend.stepArgmax = traced
+            backend.chainedStepArgmax = nil
+        }
         return (backend, fwd, providers)
     }
 
@@ -438,6 +459,10 @@ extension Tell {
     /// runner-up token WOULD have matched the model (QWISP_ACCEPT_TRACE=1 to fill) — the
     /// measured prize of a width-2 depth-1 draft tree (m-gt-1-decode-leads ①). Diag only.
     nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int, rejects: Int, altHits: Int) = (0, 0, 0, 0, 0, 0)
+    // #47 Part A margin trace (QWISP_MARGIN_TRACE): per row-0 stepArgmax call, the LM-head
+    // top-1 − top-2 logit gap. Tests the qwisp-lean argmax_stable_of_margin trigger: does the
+    // margin collapse BEFORE the loop (causal, unlike miss-rate) and stay open in clean text?
+    nonisolated(unsafe) public static var marginTrace: [Float] = []
     static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
 
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
