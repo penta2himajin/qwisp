@@ -104,6 +104,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
     private var boltServe: BoltServe? = nil
     private var samplingFallbackNoted = false
+    // Segment gate (issue #47): a new request's decode thread must wait for the previous
+    // decode thread's FULL exit. Stream teardown (consumer break / client disconnect) only
+    // requests cooperative cancellation — the old thread keeps running until its next
+    // spec-step boundary and then BoltServe's deferred async-refresh drain, and the server's
+    // AsyncLock is released at teardown, i.e. EARLIER than that exit. Unserialized, the
+    // drain's staged swaps overlap the next request's prefill/ensure() on the same providers
+    // and shared staging arenas (measured: run-to-run nondeterminism, stale-slice arena
+    // corruption, buildBuddyTable force-unwrap crash).
+    private let segGate = DispatchSemaphore(value: 1)
     let modelDir: String
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
@@ -211,6 +220,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     "[qwisp] sampling (temperature/top_p/…) on a streaming tier decodes via strict streaming — bolt is greedy-only, expect strict speed; temperature 0 restores bolt\n".utf8))
             }
             Thread.detachNewThread {
+                self.segGate.wait()           // join the previous segment's decode thread (issue #47)
+                defer { self.segGate.signal() }
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
                 var budget = Swift.min(baseline, Swift.max(1, ceiling))
@@ -288,6 +299,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         return AsyncStream { continuation in
             continuation.onTermination = { _ in cancel.cancel() }
             Thread.detachNewThread {
+                self.segGate.wait()           // same gate as generate() — one decode thread at a time
+                defer { self.segGate.signal() }
                 // Design B: ensure the arena fits prompt + this request's generation; grow (rebuild,
                 // geometric, monotonic) if not. ponytail: unbounded/huge generations cap at
                 // prefixArenaMax (fits ≤64K total by default); >that falls through upstream. Mid-decode
