@@ -162,6 +162,23 @@ enum Config {
         try? FileManager.default.removeItem(atPath: tmp + ".json")
         try? FileManager.default.removeItem(atPath: wpath)
 
+        // OpenAI message content: string, array-of-parts (opencode, #82), and null all decode.
+        func decodeReq(_ json: String) -> ChatCompletionRequest? {
+            try? JSONDecoder().decode(ChatCompletionRequest.self, from: Data(json.utf8))
+        }
+        let strForm = decodeReq(#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        check("content string", strForm?.messages.first?.content?.text == "hi")
+        let arrForm = decodeReq(#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#)
+        check("content array (opencode #82)", arrForm?.messages.first?.content?.text == "hi")
+        let multiPart = decodeReq(#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#)
+        check("content multi-part joins", multiPart?.messages.first?.content?.text == "ab")
+        let imgPart = decodeReq(#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"hi"}]}]}"#)
+        check("content drops non-text part", imgPart?.messages.first?.content?.text == "hi")
+        let toolOnly = decodeReq(#"{"messages":[{"role":"assistant","content":null,"tool_calls":[]}]}"#)
+        check("content null → nil", toolOnly != nil && toolOnly?.messages.first?.content?.text == nil)
+        check("content renders in dict",
+              (arrForm?.messages.first?.renderDict["content"] as? String) == "hi")
+
         return (passed, total, log)
     }
 }

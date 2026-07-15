@@ -62,7 +62,7 @@ struct ToolCallDelta: Codable { let index: Int; let id: String?; let type: Strin
 extension ChatMessage {
     var renderDict: [String: any Sendable] {
         var d: [String: any Sendable] = ["role": role]
-        if let content { d["content"] = content }
+        if let content = content?.text { d["content"] = content }
         if let tool_calls {
             d["tool_calls"] = tool_calls.map { tc -> [String: any Sendable] in
                 let fn: [String: any Sendable] = ["name": tc.function.name,
