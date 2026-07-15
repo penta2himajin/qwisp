@@ -1,0 +1,35 @@
+# Regenerate bench/RESULTS.md whenever accepted community data lands on main
+# (i.e. the owner merged a bot data PR). Commits straight to main — the merge WAS the
+# approval. The regen commit touches only bench/RESULTS.md, which does not match the
+# paths filter below, so it cannot re-trigger itself.
+name: benchtest-results
+
+on:
+  push:
+    branches: [main]
+    paths: ["bench/community/**"]
+
+concurrency:
+  group: benchtest-results
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: regenerate RESULTS.md
+        run: |
+          python3 scripts/benchtest_ingest.py --selftest
+          python3 scripts/benchtest_ingest.py --regen
+      - name: commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/RESULTS.md
+          git diff --cached --quiet && { echo "RESULTS.md unchanged"; exit 0; }
+          git commit -m "data(bench): regenerate RESULTS.md"
+          git pull --rebase origin main
+          git push origin main
