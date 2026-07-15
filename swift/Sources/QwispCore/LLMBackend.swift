@@ -193,6 +193,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // L3, buddy remap) by default; --lossless / QWISP_LOSSLESS forces strict. Sampling
             // requests fall back to strict streaming (the bolt loop is greedy-deterministic; v1).
             let useBolt = cfg.isStreaming && !wantSample && !self.lossless
+            // Strict/sampling streaming uses a budget-fit C (issue #69): the tier C's wired
+            // footprint starves a real small-RAM Mac and collapses strict ~10x. bolt keeps
+            // cfg.c — its frozen residency needs the bigger arena and tolerates the wired set.
+            let strictC = cfg.isStreaming ? DeviceCalibration.strictStreamingC(tierC: cfg.c) : cfg.c
+            let strictMaxK = cfg.isStreaming ? Swift.max(4, strictC * 3 / 8) : cfg.maxK
+            if strictC != cfg.c && !useBolt && !samplingFallbackNoted {
+                FileHandle.standardError.write(Data(
+                    "[qwisp] strict streaming: C \(cfg.c)→\(strictC) to fit this machine's memory budget (override: QWISP_STRICT_C)\n".utf8))
+            }
             // The fallback is silent otherwise and reads as a mystery slowdown (field report,
             // issue #45): sampling skips bolt calibration (instant start) and decodes at strict
             // speed. Say so once per process.
@@ -226,7 +235,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     }
                     let sb: Tell.SpecBackend? = cfg.isStreaming
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
-                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: cfg.c).map { $0.0 }
+                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
                         : Tell.fusedBackend(engine: self.engine,
                                             maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                                             maxSeqLen: maxSeqLen)
@@ -240,7 +249,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     if gpuSample {
                         // GPU sampler: temperature/top_p/penalties/logit_bias on-GPU, tiny readback.
                         // top_p lowers acceptance → narrower draft cuts forward + per-row work.
-                        let sampMaxK = options.topP < 1.0 ? Swift.min(cfg.maxK, 24) : cfg.maxK
+                        let sampMaxK = options.topP < 1.0 ? Swift.min(strictMaxK, 24) : strictMaxK
                         seg = Tell.runSpecSampleLoopGPU(promptIds: seq, backend: backend, engine: self.engine,
                                                         N: segN, maxK: sampMaxK, temperature: options.temperature,
                                                         topP: options.topP, seed: options.seed &+ UInt64(produced),
@@ -250,14 +259,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     } else if wantSample {
                         // CPU sampling fallback (QWISP_SAMPLE_CPU / no head): logits readback, maxK ≤ 8.
                         seg = Tell.runSpecSampleLoop(promptIds: seq, backend: backend, engine: self.engine,
-                                                     N: segN, maxK: Swift.min(cfg.maxK, 8), temperature: options.temperature,
+                                                     N: segN, maxK: Swift.min(strictMaxK, 8), temperature: options.temperature,
                                                      topP: options.topP, seed: options.seed &+ UInt64(produced),
                                                      frequencyPenalty: options.frequencyPenalty,
                                                      presencePenalty: options.presencePenalty, logitBias: options.logitBias,
                                                      isCancelled: { cancel.isCancelled }, onToken: onTok)
                     } else {
                         seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
-                                               N: segN, maxK: cfg.maxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
+                                               N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
                     }
                     guard let seg, !seg.isEmpty else { break }
                     seq += seg.map { Int32($0) }

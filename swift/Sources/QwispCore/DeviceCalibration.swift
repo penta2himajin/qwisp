@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 
 /// device 別自動構成（calibration layer）。起動時に物理 RAM から mode/C/maxK を静的に決め、
@@ -51,6 +52,37 @@ public enum DeviceCalibration {
 
     /// engine 既定 C（QWISP_CACHE_C 未指定時に使う）。実効 RAM(physicalRAMGB)から tier 決定。
     public static func defaultC() -> Int { tier(physicalRAMGB()).1 }
+
+    /// C for the STRICT streaming path only (issue #69). The RAM tier's C=128 carries a
+    /// ~11.4GB wired footprint; on a real 16GB Mac that starves the page cache / GPU
+    /// working set and strict collapses ~10x (field: 1.5-3.4 tok/s on 5 machines;
+    /// ballast-sim reproduced 1.9 and C=64 recovered 6x under identical pressure).
+    /// Budget = recommendedMaxWorkingSetSize (≈ RAM×0.68 on small Macs) × 0.8 margin —
+    /// the wired ceiling that leaves the rest of RAM breathing. bolt keeps the tier C:
+    /// its frozen residency tolerates a big wired set (stable hot subset) and a smaller
+    /// C makes it LOOPY-prone (sim-measured).
+    /// Overrides: QWISP_STRICT_C (direct), QWISP_GPU_BUDGET_GB (budget, for tests/sims).
+    public static func strictStreamingC(tierC: Int) -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let o = env["QWISP_STRICT_C"], let v = Int(o) { return v }
+        let budgetGB: Double
+        if let o = env["QWISP_GPU_BUDGET_GB"], let v = Double(o) {
+            budgetGB = v
+        } else if let dev = MTLCreateSystemDefaultDevice() {
+            budgetGB = Double(dev.recommendedMaxWorkingSetSize) / 1e9
+        } else {
+            return tierC
+        }
+        return fitC(tierC: tierC, budgetGB: budgetGB)
+    }
+
+    /// Pure fitting rule (self-checked from configtest): largest C ≤ tierC, in steps of
+    /// 32 down to 64, whose estimated wired footprint fits budget×0.8.
+    public static func fitC(tierC: Int, budgetGB: Double) -> Int {
+        var c = tierC
+        while c > 64, estRSS(c) > budgetGB * 0.8 { c -= 32 }
+        return c
+    }
 
 
     /// device-config インスペクタ（モデル不要）。現機 + 各 RAM tier の構成を表示。

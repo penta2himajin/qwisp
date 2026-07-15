@@ -1,4 +1,5 @@
 import Foundation
+import QwispCore
 
 // Resident-service config. `brew services` runs qwisp as a LaunchAgent, which does NOT
 // inherit the shell environment — so the model path can't come only from QWISP_MODEL.
@@ -128,6 +129,14 @@ enum Config {
         check("default lossless off",  resolveLossless(env: [:], config: empty) == false)
         check("source lossless env",   sourceOfLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == "env")
         check("source lossless config", sourceOfLossless(env: [:], config: cfg) == "config")
+
+        // strict-streaming C budget fit (issue #69): 16GB Mac (budget 10.9) → 64,
+        // 18GB (12.3) → 96, forced-approx on a big machine (48+) → tier C unchanged.
+        check("fitC 16GB → 64",   DeviceCalibration.fitC(tierC: 128, budgetGB: 10.9) == 64)
+        check("fitC 18GB → 96",   DeviceCalibration.fitC(tierC: 128, budgetGB: 12.3) == 96)
+        check("fitC big → tierC", DeviceCalibration.fitC(tierC: 128, budgetGB: 48) == 128)
+        check("fitC floor is 64", DeviceCalibration.fitC(tierC: 128, budgetGB: 1) == 64)
+        check("fitC 8GB tier stays", DeviceCalibration.fitC(tierC: 64, budgetGB: 5.4) == 64)
 
         // defaultsJSON carries the keys
         let dj = defaultsJSON()
