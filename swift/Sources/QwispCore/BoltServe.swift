@@ -221,9 +221,16 @@ final class BoltServe {
         // preceded by a small, swappable divergence or a broad one (capacity wall).
         let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
         var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int)] = []
+        // Cold-expert histogram in the pre-cliff ramp window (#47 Part A, QWISP_MISS_HIST=path
+        // + QWISP_CLIFF_TOK=N): is the ramp cold set a small recurring set (pinnable) or diffuse
+        // (capacity wall)? Counts cold routings per (layer, expert) for tok ∈ [cliff-70, cliff+10].
+        let missHistPath = ProcessInfo.processInfo.environment["QWISP_MISS_HIST"]
+        let cliffTok = Tell.envInt("QWISP_CLIFF_TOK", -1)
+        var coldHist = [[Int: Int]](repeating: [:], count: nLayers)   // [layer][expert] = cold count in ramp
         func accumulate(slot: Int, M: Int, tok: Int = 0) {
             guard recalibR > 0, let ib = obsBuf else { return }
             var traceMiss = 0, traceRouted = 0
+            let inRamp = missHistPath != nil && cliffTok > 0 && tok >= cliffTok - 70 && tok <= cliffTok + 10
             for li in 0 ..< nLayers {
                 let off = ((slot * nLayers + li) * obsMaxM) * Ktop * 4
                 let inds = Array(UnsafeBufferPointer(
@@ -232,6 +239,10 @@ final class BoltServe {
                 if missTracePath != nil {
                     let s = providers[li].cache.slotOf
                     for e in inds where e >= 0 { traceRouted += 1; if s[Int(e)] == nil { traceMiss += 1 } }
+                }
+                if inRamp {
+                    let s = providers[li].cache.slotOf
+                    for e in inds where e >= 0 && s[Int(e)] == nil { coldHist[li][Int(e), default: 0] += 1 }
                 }
                 _ = SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
@@ -479,6 +490,22 @@ final class BoltServe {
         if let p = missTracePath, !missTrace.isEmpty {
             let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)" }.joined(separator: "\n")
             try? ("tok\tmiss\trouted\tM\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+        }
+        // Ramp cold-expert histogram: layer, expert, cold-count, and the expert's frequency RANK
+        // in the frozen basis (baseCounts) — so we can tell if the ramp cold set is the same
+        // "next-after-C" tail that C=80 already added (rank ~65-80) or a distinct deep-tail set.
+        if let p = missHistPath, coldHist.contains(where: { !$0.isEmpty }) {
+            var lines = ["layer\texpert\tcold_count\tfreq_rank"]
+            for li in 0 ..< nLayers {
+                let ranked = baseCounts[li].enumerated()
+                    .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                    .map { $0.offset }
+                var rankOf = [Int: Int](); for (r, e) in ranked.enumerated() { rankOf[e] = r }
+                for (e, c) in coldHist[li].sorted(by: { $0.value > $1.value }) {
+                    lines.append("\(li)\t\(e)\t\(c)\t\(rankOf[e] ?? -1)")
+                }
+            }
+            try? lines.joined(separator: "\n").write(toFile: p, atomically: true, encoding: .utf8)
         }
         Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0, 0, 0)
         return Array(out.prefix(N))
