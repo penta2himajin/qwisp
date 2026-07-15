@@ -179,6 +179,10 @@ enum Config {
         check("content renders in dict",
               (arrForm?.messages.first?.renderDict["content"] as? String) == "hi")
 
+        // Loop guard (#47 Part A): detector fires on sustained loops, ignores short repeats,
+        // buffer holds ≤ depth, rewind drops only unsent tokens.
+        check("loop guard self-check", LoopGuard.selfCheck())
+
         return (passed, total, log)
     }
 }
