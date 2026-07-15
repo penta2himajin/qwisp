@@ -1,0 +1,52 @@
+{
+ "issue": 61,
+ "title": "[benchtest] Apple M1 Pro (14-core GPU) \u00b7 16GB \u00b7 streaming",
+ "version": "0.3.4",
+ "chip": "Apple M1 Pro",
+ "gpu_cores": 14,
+ "ram_gb": 16,
+ "macos": "Version 26.5.2 (Build 25F84)",
+ "nvme": "APPLE SSD AP0512R",
+ "read_gbs": 4.9,
+ "power": "AC, thermal nominal",
+ "model": "Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
+ "tier": "streaming C=128 \u2192 bolt (near-lossless) default",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "bolt",
+   "ttft_s": 6.8,
+   "tok_s": 45.3,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "bolt",
+   "ttft_s": 7.9,
+   "tok_s": 51.8,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "long-600",
+   "mode": "bolt",
+   "ttft_s": 9.3,
+   "tok_s": 47.6,
+   "tokens": 600,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 15.7,
+   "tok_s": 2.0,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  }
+ ]
+}
