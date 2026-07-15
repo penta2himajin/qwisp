@@ -40,7 +40,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BR"
-          git add bench/
+          # ONLY the per-issue JSON goes in the PR — RESULTS.md is regenerated on main by
+          # benchtest-results.yml after merge. Bot PRs each carrying a full RESULTS.md
+          # snapshot conflicted with each other as soon as one merged (issue #64).
+          git add bench/community/
           git diff --cached --quiet && { echo "no changes to ingest"; exit 0; }
           git commit -m "data(bench): ingest benchtest report #$N"
           git push -f origin "$BR"
