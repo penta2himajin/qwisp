@@ -1,0 +1,52 @@
+{
+ "issue": 57,
+ "title": "[benchtest] Apple M2 (8-core GPU) \u00b7 16GB \u00b7 streaming",
+ "version": "0.3.4",
+ "chip": "Apple M2",
+ "gpu_cores": 8,
+ "ram_gb": 16,
+ "macos": "Version 27.0 (Build 26A5378n)",
+ "nvme": "APPLE SSD AP0256Z",
+ "read_gbs": 2.3,
+ "power": "battery, thermal nominal",
+ "model": "ac34b37a7062318397ee6abde6864b8972aa4281",
+ "tier": "streaming C=128 \u2192 bolt (near-lossless) default",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "bolt",
+   "ttft_s": 12.0,
+   "tok_s": 29.0,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "bolt",
+   "ttft_s": 22.5,
+   "tok_s": 31.5,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "long-600",
+   "mode": "bolt",
+   "ttft_s": 11.9,
+   "tok_s": 30.2,
+   "tokens": 600,
+   "stable": false,
+   "ratio": 0.01
+  },
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 21.1,
+   "tok_s": 3.4,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  }
+ ]
+}
