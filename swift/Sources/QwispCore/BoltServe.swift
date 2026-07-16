@@ -229,6 +229,19 @@ final class BoltServe {
         let missHistPath = ProcessInfo.processInfo.environment["QWISP_MISS_HIST"]
         let cliffTok = Tell.envInt("QWISP_CLIFF_TOK", -1)
         var coldHist = [[Int: Int]](repeating: [:], count: nLayers)   // [layer][expert] = cold count in ramp
+        // Hazard-burst forced refresh (#47 Part A probe 13, opt-in QWISP_HAZARD_REFRESH=1):
+        // when the margin×miss both-bad burst (probe 11/12 conjunction) fires, force a sync
+        // recalib refresh — the deliberate form of the refresh rescue that saved clean QS in
+        // the probe-12 identical-prefix counterexample (loop/clean differed ONLY in refresh
+        // timing). FPs are harmless: a refresh on a clean burst is what default cadence does
+        // anyway. Needs the QWISP_MARGIN_TRACE path (Tell.lastMargin) and sync refresh
+        // (run with QWISP_BOLT_REFRESH_ASYNC=0) — experiment-grade, default off.
+        let hazardOn = Tell.envInt("QWISP_HAZARD_REFRESH", 0) != 0
+        let hazardCooldown = Tell.envInt("QWISP_HAZARD_COOLDOWN", 32)
+        var hazardWin: [Bool] = []
+        var hazardCool = 0
+        var hazardFire = false
+        var hazardFires: [Int] = []
         func accumulate(slot: Int, M: Int, tok: Int = 0) {
             guard recalibR > 0, let ib = obsBuf else { return }
             var traceMiss = 0, traceRouted = 0
@@ -242,7 +255,7 @@ final class BoltServe {
                 let inds = Array(UnsafeBufferPointer(
                     start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
                     count: M * Ktop))
-                if missTracePath != nil {
+                if missTracePath != nil || hazardOn {
                     let s = providers[li].cache.slotOf
                     var lg: [(cold: Bool, g: Float)] = []   // this layer's routed raw gate logits
                     for e in inds where e >= 0 {
@@ -273,6 +286,22 @@ final class BoltServe {
                     counts: &winCounts[li], coact: &winCoact[li])
             }
             if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate, Tell.lastMargin, coldW)) }
+            // Hazard window update + burst check (M=1 decode rows only; margin<3 ∧ miss>0.20,
+            // burst ≥4/10 = probe 11 canon). Cooldown lets the rebased basis take effect.
+            if hazardOn && M == 1 {
+                let mr = traceRouted > 0 ? Float(traceMiss) / Float(traceRouted) : 0
+                let bad = Tell.lastMargin < 3 && mr > 0.20
+                if hazardCool > 0 { hazardCool -= 1 }
+                hazardWin.append(bad)
+                if hazardWin.count > 10 { hazardWin.removeFirst() }
+                if hazardCool == 0, hazardWin.count == 10,
+                   hazardWin.lazy.filter({ $0 }).count >= 4 {
+                    hazardFire = true
+                    hazardCool = hazardCooldown
+                    hazardWin.removeAll()
+                    hazardFires.append(tok)
+                }
+            }
         }
         /// Recalib refresh (sync): the observation window becomes the new freeze basis.
         func refresh() {
@@ -457,6 +486,15 @@ final class BoltServe {
         // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
+            // Hazard-burst forced refresh (probe 13): sync-only — run with
+            // QWISP_BOLT_REFRESH_ASYNC=0 so it cannot race the async staging pipeline.
+            if hazardFire {
+                hazardFire = false
+                if !refreshAsync {
+                    FileHandle.standardError.write(Data("[qwisp] hazard-refresh @ tok \(out.count)\n".utf8))
+                    refresh()
+                }
+            }
             if recalibR > 0 && tokensSinceRefresh >= recalibR {
                 if refreshAsync { refreshAsyncPlan() } else { refresh() }
             }
@@ -511,6 +549,9 @@ final class BoltServe {
             tokensSinceRefresh += out.count - before
         }
         flush()
+        if hazardOn {
+            FileHandle.standardError.write(Data("[qwisp] hazard-refresh fires=\(hazardFires.count) at toks \(hazardFires)\n".utf8))
+        }
         if let p = missTracePath, !missTrace.isEmpty {
             let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)\t\($0.margin)\t\($0.coldW)" }.joined(separator: "\n")
             try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\tmargin\tcoldW\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
