@@ -62,6 +62,25 @@ ground truth). Evidence: `p14/` (`p-*.toks`, `p-*.tsv` 10-col, `p-*.tf.tsv`); an
    non-LOOPY-fication is closed with evidence at every layer: prediction (12), timing
    (13), correction (14).
 
+## Probe 15 (`QWISP_BUDDY_DITHER=k`): buddy-table dithering — NO-GO, landscape beats bias
+
+Signal-processing framing: the loop is a limit cycle of a coarsely-quantized feedback system,
+and dithering is the textbook remedy — a FIXED buddy table makes the substitution error a
+fixed function of context (systematic drift bias toward the same cliffs), so rotate each cold
+expert's substitute among its top-k coactivation candidates by token position (deterministic,
+zero IO, sync-refresh only). Also covers the "swap residents every few tokens" family: the
+ADAPTIVE version (recalib R=16/32) was probe 8 (lottery, 2/4 at best — the observation window
+self-pollutes), and post-establishment rotation is provably useless (strict itself cannot
+escape, closure ③).
+
+Verdict (k=3, 5 prompts, ASYNC=0, token-level onsets, `p15/`): **another lottery re-roll,
+not a fix.** tcp +69, sky +1237 — but story regressed from surviving (>1017) to burning at
+248, qs/hrqs −20. 3 up 2 down, within-arm variance 87→1324. Refutes "systematic drift bias
+is the dominant cause": decorrelating the error direction does not reliably delay ignition —
+the attractor density of the capacity-damaged landscape dominates, and every table policy
+(fixed, adaptive, rotating) samples from the same family. Pre-onset text quality is intact
+under dithering.
+
 **Probe 13 addendum (`QWISP_HAZARD_REFRESH`): burst-timed forced refresh is also NO-GO.**
 Tested whether the refresh rescue that saved clean QS could be made deliberate (fire a sync
 refresh on the both-bad burst). Verdict: refresh timing is a pure trajectory lottery —

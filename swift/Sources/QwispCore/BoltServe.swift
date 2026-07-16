@@ -63,6 +63,15 @@ final class BoltServe {
 
     private let calibN = Tell.envInt("QWISP_CALIB", 48)
     private let biasEps = Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0.25)
+    // Buddy-table dithering (#47 Part A probe 15, opt-in QWISP_BUDDY_DITHER=k): the loop is a
+    // limit cycle of a coarsely-quantized feedback system (capacity-truncated effective model);
+    // a FIXED buddy table makes the substitution error a fixed function of context = systematic
+    // drift bias toward the same cliffs. Dithering = rotate each cold expert's substitute among
+    // its top-k coactivation candidates by token position (deterministic, zero IO) to
+    // decorrelate the bias. Sync-refresh only (async staged swaps move slots and would stale
+    // these tables — run with QWISP_BOLT_REFRESH_ASYNC=0). ditherTables[li][v] = variant v.
+    private let ditherK = Tell.envInt("QWISP_BUDDY_DITHER", 0)
+    private var ditherTables: [[[Int32]]] = []
     private let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
     private let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
     private let refreshB = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
@@ -115,6 +124,41 @@ final class BoltServe {
                 (0 ..< Self.nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
             }
             fwd.setRouteBias(masks: masks, eps: biasEps)
+        }
+        // Probe 15: build the k dither variants from the same basis (variant v maps each cold
+        // expert to its rank-v coactivation candidate among residents, wrapping; hot = self;
+        // same rotated tie-break as buildBuddyTable). Rebuilt on every freeze/refresh so slot
+        // assignments stay consistent (sync path only).
+        if ditherK > 1 {
+            ditherTables = providers.enumerated().map { (li, provider) in
+                let slotOf = provider.cache.slotOf
+                let hot = slotOf.keys.sorted()
+                let n = hot.count
+                var variants = [[Int32]](repeating: [Int32](repeating: 0, count: Self.nE), count: ditherK)
+                for e in 0 ..< Self.nE {
+                    if let s = slotOf[e] {
+                        for v in 0 ..< ditherK { variants[v][e] = Int32(s) }   // hot: self in every variant
+                        continue
+                    }
+                    var cands: [Int] = []
+                    var used = Set<Int>()
+                    for _ in 0 ..< ditherK {
+                        var bestH = -1, bestC = -1
+                        for i in 0 ..< n {
+                            let h = hot[(i + e) % n]
+                            if used.contains(h) { continue }
+                            let cc = baseCoact[li][e][h]
+                            if cc > bestC { bestC = cc; bestH = h }
+                        }
+                        if bestH >= 0, bestC > 0 { cands.append(bestH); used.insert(bestH) } else { break }
+                    }
+                    for v in 0 ..< ditherK {
+                        variants[v][e] = cands.isEmpty ? Int32(fallbackSlot(li))
+                                                       : Int32(slotOf[cands[v % cands.count]]!)
+                    }
+                }
+                return variants
+            }
         }
     }
 
@@ -484,8 +528,15 @@ final class BoltServe {
         }
 
         // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
+        var ditherLast = -1
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
+            // Probe 15: rotate the buddy-table variant by token position (deterministic;
+            // a spec span verifies under one variant). See ditherK doc at the top.
+            if ditherK > 1, !ditherTables.isEmpty {
+                let v = out.count % ditherK
+                if v != ditherLast { fwd.setBoltTables(ditherTables.map { $0[v] }); ditherLast = v }
+            }
             // Hazard-burst forced refresh (probe 13): sync-only — run with
             // QWISP_BOLT_REFRESH_ASYNC=0 so it cannot race the async staging pipeline.
             if hazardFire {
