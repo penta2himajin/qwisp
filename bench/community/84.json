@@ -1,0 +1,43 @@
+{
+ "issue": 84,
+ "title": "[benchtest]  Apple M3 Ultra 96 GB",
+ "version": "0.3.7",
+ "chip": "Apple M3 Ultra",
+ "gpu_cores": 60,
+ "ram_gb": 96,
+ "macos": "Version 26.5.2 (Build 25F84)",
+ "nvme": "APPLE SSD AP1024Z",
+ "read_gbs": 4.4,
+ "power": "AC, thermal nominal",
+ "model": "model",
+ "tier": "resident C=256 \u2192 strict (lossless)",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 0.7,
+   "tok_s": 128.6,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "strict",
+   "ttft_s": 0.6,
+   "tok_s": 128.6,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "long-600",
+   "mode": "strict",
+   "ttft_s": 0.6,
+   "tok_s": 124.9,
+   "tokens": 600,
+   "stable": true,
+   "ratio": 0.97
+  }
+ ]
+}
