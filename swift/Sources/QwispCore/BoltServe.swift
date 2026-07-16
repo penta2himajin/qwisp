@@ -222,7 +222,7 @@ final class BoltServe {
         // from the "true" (all-resident/strict) expert set. Tests whether the loop onset is
         // preceded by a small, swappable divergence or a broad one (capacity wall).
         let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
-        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float, margin: Float, coldW: Float)] = []
+        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float, margin: Float, coldW: Float, entropy: Float, top8: String)] = []
         // Cold-expert histogram in the pre-cliff ramp window (#47 Part A, QWISP_MISS_HIST=path
         // + QWISP_CLIFF_TOK=N): is the ramp cold set a small recurring set (pinnable) or diffuse
         // (capacity wall)? Counts cold routings per (layer, expert) for tok ∈ [cliff-70, cliff+10].
@@ -285,7 +285,7 @@ final class BoltServe {
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &winCounts[li], coact: &winCoact[li])
             }
-            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate, Tell.lastMargin, coldW)) }
+            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate, Tell.lastMargin, coldW, Tell.lastEntropy, Tell.lastTop8)) }
             // Hazard window update + burst check (M=1 decode rows only; margin<3 ∧ miss>0.20,
             // burst ≥4/10 = probe 11 canon). Cooldown lets the rebased basis take effect.
             if hazardOn && M == 1 {
@@ -549,12 +549,17 @@ final class BoltServe {
             tokensSinceRefresh += out.count - before
         }
         flush()
+        // Emitted token ids (#47 probe 14): the TF-replay input (QWISP_TF_REPLAY reads this
+        // to teacher-force the bolt stream through strict and locate realized flips).
+        if let p = ProcessInfo.processInfo.environment["QWISP_TOK_DUMP"] {
+            try? out.map(String.init).joined(separator: "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        }
         if hazardOn {
             FileHandle.standardError.write(Data("[qwisp] hazard-refresh fires=\(hazardFires.count) at toks \(hazardFires)\n".utf8))
         }
         if let p = missTracePath, !missTrace.isEmpty {
-            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)\t\($0.margin)\t\($0.coldW)" }.joined(separator: "\n")
-            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\tmargin\tcoldW\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)\t\($0.margin)\t\($0.coldW)\t\($0.entropy)\t\($0.top8)" }.joined(separator: "\n")
+            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\tmargin\tcoldW\tentropy\ttop8\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
         }
         if let p = ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"], !Tell.marginTrace.isEmpty {
             try? ("margin\n" + Tell.marginTrace.map { String($0) }.joined(separator: "\n")).write(toFile: p, atomically: true, encoding: .utf8)

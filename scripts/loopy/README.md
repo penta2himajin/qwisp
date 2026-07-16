@@ -32,6 +32,36 @@ observables; only verification (computing the true token = spending the IO) can
 discriminate.** Adaptive demand-swap therefore cannot be hazard-triggered — remaining options
 are the known product ones (RAM/C=128, strict fallback, documentation).
 
+## Probe 14 (flip anatomy, TF strict replay): EVERYTHING burns — the "didn't burn" side does not exist
+
+Instrumentation: `QWISP_TOK_DUMP` (emitted token ids), miss-trace cols 9-10 (`entropy`,
+`top8` id:logit), and `QWISP_TF_REPLAY`/`QWISP_TF_OUT` (teacher-force a bolt token stream
+through strict `--lossless`, recording per-position strict argmax + margin = realized-flip
+ground truth). Evidence: `p14/` (`p-*.toks`, `p-*.tsv` 10-col, `p-*.tf.tsv`); analyzer
+`p14an.py`.
+
+1. **Ground-truth correction: all 5 runs loop** (token-level detlag2): story@156, tcp@151,
+   hrqs@146, **sky@87** (period-1 `scscsc…` in the ANSWER stream — stdout was discarded, the
+   reasoning-stream rollstab missed it), **qs@1244** (`Wait, this!` — the probe-12 "clean
+   control" just burned late). On C=64 chain-off, LOOPY is not a tail risk; it is the
+   asymptotic fate, with survival time 87–1244 tok.
+2. **Flip anatomy**: bolt's trajectory diverges from strict at position 4–37 in EVERY run
+   and keeps a 6–16 % background realized-flip rate pre-loop. In-loop flips collapse to
+   0.5–1.9 % — the loop is the shared greedy of bolt AND strict on the polluted prefix
+   (the rewind-failure mechanism, now quantified). Ignition is usually preceded by a dense
+   flip cluster (story 147-155→156), but identical clusters occur mid-run and recover —
+   still no prediction.
+3. **Lever B (hazard-gated exact-step replay) is dead**: flips routinely occur at
+   bolt-margin 8–16 (confident-wrong — the substitution+state drift moves the whole logit
+   landscape, not just near-ties), so no bolt-side gate covers them; correcting all flips =
+   verifying every step = strict. Flips at strict-margin ≥3 (17 in qs) directly expose the
+   accumulated KV/state-drift channel.
+4. **Survival-time reframe**: LOOPY = hitting time of repetition attractors in the effective
+   (capacity-damaged) model's landscape. Decode-time interventions re-roll the walk
+   (probe 13's lottery); the attractor density itself is set by capacity. Decode-time
+   non-LOOPY-fication is closed with evidence at every layer: prediction (12), timing
+   (13), correction (14).
+
 **Probe 13 addendum (`QWISP_HAZARD_REFRESH`): burst-timed forced refresh is also NO-GO.**
 Tested whether the refresh rescue that saved clean QS could be made deliberate (fire a sync
 refresh on the both-bad burst). Verdict: refresh timing is a pure trajectory lottery —

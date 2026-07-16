@@ -309,6 +309,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                      frequencyPenalty: options.frequencyPenalty,
                                                      presencePenalty: options.presencePenalty, logitBias: options.logitBias,
                                                      isCancelled: { cancel.isCancelled }, onToken: onTok)
+                    } else if let rp = ProcessInfo.processInfo.environment["QWISP_TF_REPLAY"],
+                              let tokStr = try? String(contentsOfFile: rp, encoding: .utf8) {
+                        // #47 probe 14: teacher-forced strict replay of a bolt token stream
+                        // (realized-flip ground truth). Diagnostic-only; yields no output tokens.
+                        let toks = tokStr.split(whereSeparator: \.isNewline).compactMap { Int($0) }
+                        let outP = ProcessInfo.processInfo.environment["QWISP_TF_OUT"] ?? (rp + ".tf.tsv")
+                        seg = Tell.runTFReplay(promptIds: seq, backend: backend, engine: self.engine,
+                                               toks: toks, outPath: outP)
                     } else {
                         seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
                                                N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok)

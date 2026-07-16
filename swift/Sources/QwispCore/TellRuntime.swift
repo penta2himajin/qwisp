@@ -340,7 +340,26 @@ extension Tell {
                         if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
                         else if v > secondV { secondV = v; second = t }
                     }
-                    if ri == 0 { let mg = second >= 0 ? bestV - secondV : 0; Tell.marginTrace.append(mg); Tell.lastMargin = mg }
+                    if ri == 0 {
+                        let mg = second >= 0 ? bestV - secondV : 0
+                        Tell.marginTrace.append(mg); Tell.lastMargin = mg
+                        // Distribution shape (#47 probe 14, latent-structure channel): full-vocab
+                        // entropy + top-8 (id:logit) per step — feeds the "didn't burn" analysis
+                        // (near-tie multiplicity, repetition affinity of near-tie candidates).
+                        var z: Double = 0, s: Double = 0
+                        var top: [(Int, Float)] = []   // top-8 by logit, insertion-sorted
+                        for t in 0 ..< row.count {
+                            let d = Double(row[t] - bestV)
+                            let e = exp(d); z += e; s += e * d
+                            if top.count < 8 || row[t] > top[top.count - 1].1 {
+                                let idx = top.firstIndex { row[t] > $0.1 } ?? top.count
+                                top.insert((t, row[t]), at: idx)
+                                if top.count > 8 { top.removeLast() }
+                            }
+                        }
+                        Tell.lastEntropy = Float(log(z) - s / z)
+                        Tell.lastTop8 = top.map { "\($0.0):\($0.1)" }.joined(separator: ",")
+                    }
                     return best
                 }
             }
@@ -466,7 +485,37 @@ extension Tell {
     // Latest row-0 margin, set by the margin-trace stepArgmax so BoltServe's miss-trace can
     // record margin and miss from the SAME forward, per-token aligned (#47 margin×miss overlay).
     nonisolated(unsafe) public static var lastMargin: Float = 0
+    // #47 probe 14 latent-structure channel: full-vocab entropy + top-8 "id:logit,…" of the
+    // latest row-0 step, set alongside lastMargin (same forward, same alignment contract).
+    nonisolated(unsafe) public static var lastEntropy: Float = 0
+    nonisolated(unsafe) public static var lastTop8: String = ""
     static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
+
+    /// #47 probe 14 — teacher-forced strict replay of a bolt-generated token stream
+    /// (QWISP_TF_REPLAY). Feeds each bolt token through the strict backend and records the
+    /// strict argmax given the bolt prefix — realized-flip ground truth ("did it actually
+    /// burn?"). Run with QWISP_MARGIN_TRACE set so the traced stepArgmax fills the margin
+    /// column (pos 0's margin is -1: it comes from prefill logits, not a traced step).
+    /// TSV: pos, boltTok (what bolt emitted), strictPred (what strict would emit from the
+    /// same prefix), match, margin. Returns toks so segment accounting terminates normally.
+    static func runTFReplay(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
+                            toks: [Int], outPath: String) -> [Int]? {
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend),
+              let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
+        MLX.eval([lg0])
+        var pred = MLX.argMax(lg0[0], axis: -1).item(Int.self)
+        var margin: Float = -1
+        var lines = ["pos\tboltTok\tstrictPred\tmatch\tmargin"]
+        for (i, t) in toks.enumerated() {
+            lines.append("\(i)\t\(t)\t\(pred)\t\(t == pred ? 1 : 0)\t\(margin)")
+            guard i + 1 < toks.count, let nxt = backend.stepArgmax([Int32(t)]) else { break }
+            pred = nxt[0]
+            margin = Tell.lastMargin
+        }
+        try? lines.joined(separator: "\n").write(toFile: outPath, atomically: true, encoding: .utf8)
+        FileHandle.standardError.write(Data("[qwisp] TF replay: \(toks.count) tokens → \(outPath)\n".utf8))
+        return toks
+    }
 
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
