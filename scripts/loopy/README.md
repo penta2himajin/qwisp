@@ -32,6 +32,15 @@ observables; only verification (computing the true token = spending the IO) can
 discriminate.** Adaptive demand-swap therefore cannot be hazard-triggered — remaining options
 are the known product ones (RAM/C=128, strict fallback, documentation).
 
+**Probe 13 addendum (`QWISP_HAZARD_REFRESH`): burst-timed forced refresh is also NO-GO.**
+Tested whether the refresh rescue that saved clean QS could be made deliberate (fire a sync
+refresh on the both-bad burst). Verdict: refresh timing is a pure trajectory lottery —
+sync-vs-async alone flips outcomes both ways, and burst-timed firing flipped a clean control
+INTO a loop while saving nothing. The one theoretically-sound lever left is hazard-gated
+exact-step replay (correction, not perturbation; `traj_stable_of_margin` gives trajectory ≡
+strict modulo classifier soundness; Neo roofline ~12-13 tok/s) — parked until the Neo
+slow-NAND tier has real users.
+
 ## History: the probe-11 lead (superseded by the verdict above)
 
 `conj.py` — **margin × miss co-occurrence burst**: `both_bad = margin < 3 AND miss/routed >
