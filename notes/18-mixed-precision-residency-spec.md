@@ -56,8 +56,13 @@ Consequences:
    scales F16, biases F16}, affine gs=64, same tensor names/index format as the model).
    **Provenance verified bit-exact**: slice(L7,E123) == `mx.quantize(mx.dequantize(4bit), bits=2)`
    — i.e. exactly what the oracle sweep computed with. Workstream ③ (offline tail requant) is
-   effectively DONE; remaining: archive the regeneration script in `oracle/`, and a load-time
-   shape/gs sanity check.
+   effectively DONE; regeneration script archived: `oracle/requant_experts_2bit.py`
+   (naive + cal modes). Remaining: a load-time shape/gs sanity check.
+   **Calibrated artifact** (2026-07-18): `~/.mtplx/models/qwisp-experts-2bit-cal/` — same
+   360 tensor names/shapes/dtypes (header-identical), MSE-optimal affine fit
+   (mixprec.py#cal2bit, sweep-validated 0/4 loops at K4∈{8,0}); the fitted (q,s,b) are
+   packed directly (a `mx.quantize` re-encode would min/max-refit and distort groups not
+   spanning all 4 codes). Verified: L7/E123 gate MSE −31.0% vs naive.
 2. **Kernel precedent**: `gqmm3`/`gqmm3Rows` (in `SeedlessMetalForward.swift`; the notes/11
    3-bit UD-tier product spec is RETIRED 2026-07-18 — mixed residency supersedes that
    lower-RAM direction, owner decision; the gqmm3 kernel + its locked tests remain as
