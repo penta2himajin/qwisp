@@ -24,6 +24,35 @@ from mlx_lm.models.cache import make_prompt_cache
 
 MDL = os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16")
 K4S = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "40,20,0").split(",")]  # descending — incremental demotion
+CAL = len(sys.argv) > 3 and sys.argv[3] == "cal"   # calibrated-affine 2-bit (MSE-optimal) instead of min/max
+PFX = "ck" if CAL else "k"                          # output tag prefix (ck8-* vs k8-*)
+
+
+def cal2bit(deq):
+    """MSE-optimal affine 2-bit per gs=64 group: alternating code-assignment / least-squares
+    (s,b) fit, init = min/max affine (the naive baseline — so result is never worse in MSE).
+    Returns dequantized values on the fitted grid. Levels stay equally spaced (b + s*q),
+    so the exact 4-bit gs=64 re-encode property is preserved (spacing s -> s4 = span/15
+    always divides the level offsets)."""
+    shp = deq.shape
+    g = deq.reshape(-1, 64).astype(mx.float32)
+    mn = g.min(axis=1, keepdims=True)
+    mxv = g.max(axis=1, keepdims=True)
+    s = (mxv - mn) / 3
+    s = mx.where(mx.abs(s) < 1e-8, mx.ones_like(s), s)
+    b = mn
+    for _ in range(15):
+        q = mx.clip(mx.round((g - b) / s), 0, 3)
+        qm = q.mean(axis=1, keepdims=True)
+        gm = g.mean(axis=1, keepdims=True)
+        var = ((q - qm) ** 2).mean(axis=1, keepdims=True)
+        cov = ((q - qm) * (g - gm)).mean(axis=1, keepdims=True)
+        s = mx.where(var > 1e-12, cov / mx.maximum(var, mx.array(1e-12)), s)
+        s = mx.where(mx.abs(s) < 1e-8, mx.ones_like(s), s)
+        b = gm - s * qm
+    q = mx.clip(mx.round((g - b) / s), 0, 3)
+    d2 = (s * q + b).astype(deq.dtype)
+    return d2.reshape(shp)
 GS = 64
 PROMPTS = {
     "story": "Write a short story about a lighthouse keeper who discovers a message in a bottle.",
@@ -104,8 +133,18 @@ def demote(rows_per_layer):
             deq = mx.dequantize(mx.take(w, tsel, axis=0), mx.take(s, tsel, axis=0),
                                 mx.take(b, tsel, axis=0), group_size=GS, bits=4)
             shp = deq.shape
-            q2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
-            d2 = mx.dequantize(*q2, group_size=GS, bits=2)
+            if CAL:
+                d2 = cal2bit(deq.reshape(-1, shp[-1]))
+                if li == 0 and pname == "gate_proj":   # one-time sanity: MSE naive vs calibrated (f32 — f16 squares underflow)
+                    q2n = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
+                    d2n = mx.dequantize(*q2n, group_size=GS, bits=2)
+                    df = deq.reshape(-1, shp[-1]).astype(mx.float32)
+                    en = ((df - d2n.astype(mx.float32)) ** 2).mean().item()
+                    ec = ((df - d2.astype(mx.float32)) ** 2).mean().item()
+                    print(f"[mixprec] cal sanity L0 gate: MSE naive={en:.3e} cal={ec:.3e} ({100*(1-ec/max(en,1e-30)):.1f}% lower)", flush=True)
+            else:
+                q2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
+                d2 = mx.dequantize(*q2, group_size=GS, bits=2)
             rq = mx.quantize(d2, group_size=GS, bits=4)
             nw, ns, nb = (x.reshape(len(rows), shp[1], -1) for x in rq)
             # numpy round trip for row assignment (mx fancy setitem is version-dependent)
@@ -146,19 +185,19 @@ prev = 256  # demoted so far: ranks [K4, prev) are newly tailed at each step
 for k4 in K4S:
     demote([sorted(o[k4:prev]) for o in orders])
     prev = k4
-    print(f"[mixprec] === design point K4={k4} (tail {256 - k4} experts at 2-bit) ===", flush=True)
-    gen(f"k{k4}")
+    print(f"[mixprec] === design point K4={k4} (tail {256 - k4} experts at 2-bit, cal={CAL}) ===", flush=True)
+    gen(f"{PFX}{k4}")
     tf[k4] = {}
     for name in PROMPTS:
         hit, n = tf_match(name)
         tf[k4][name] = (hit, n)
-        print(f"[mixprec] TF k{k4}-{name}: {hit}/{n} = {100*hit/n:.2f}%", flush=True)
+        print(f"[mixprec] TF {PFX}{k4}-{name}: {hit}/{n} = {100*hit/n:.2f}%", flush=True)
 
 # ── summary: loops (detlag2), 8-gram min (rollstab), TF-match ──
 here = os.path.dirname(os.path.abspath(__file__))
 for k4 in K4S:
-    toks = [f"{out}/k{k4}-{n}.toks" for n in PROMPTS]
-    txts = [f"{out}/k{k4}-{n}.txt" for n in PROMPTS if os.path.exists(f"{out}/k{k4}-{n}.txt")]
+    toks = [f"{out}/{PFX}{k4}-{n}.toks" for n in PROMPTS]
+    txts = [f"{out}/{PFX}{k4}-{n}.txt" for n in PROMPTS if os.path.exists(f"{out}/{PFX}{k4}-{n}.txt")]
     print(f"\n=== K4={k4} ===", flush=True)
     subprocess.run([sys.executable, f"{here}/../detlag2.py"] + toks)
     if txts:

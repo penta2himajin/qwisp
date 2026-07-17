@@ -1,0 +1,55 @@
+Here's a thinking process that leads to the explanation of TCP congestion control:
+
+1.  **Understand the Goal:** The user wants a detailed explanation of TCP congestion control, specifically covering four key mechanisms: Slow Start, Congestion Avoidance, Fast Retransmit, and Fast Recovery.
+
+2.  **Target Audience:** The explanation should be technical but accessible, suitable for someone studying networking or computer science. It needs to cover the *how* and the *why* of these mechanisms.
+
+3.  **Key Concepts to Define:**
+    *   **Congestion Window (CWND):** The variable that controls the amount of data sent.
+    *   **Slow Start:** The initial phase.
+    *   **Congestion Avoidance:** The linear growth phase.
+    *   **Fast Retransmit:** The detection of loss (Dup ACKs).
+    *   **Fast Recovery:** The recovery phase (handling loss).
+
+4.  **Structure the Explanation:**
+    *   **Introduction:** Briefly define TCP congestion control and its purpose (preventing network overload).
+    *   **The Core Mechanism (CWND):** Explain what it is and how it changes.
+    *   **Phase 1: Slow Start:** Explain the exponential growth.
+    *   **Phase 2: Congestion Avoidance:** Explain the linear growth.
+    *   **Phase 3: Handling Loss (The "What happens when things go wrong" section):**
+        *   *Fast Retransmit* (Dup ACKs).
+        *   *Fast Recovery* (Loss detection).
+    *   **Summary/Conclusion:** Wrap up.
+
+5.  **Drafting Content - Section by Section:**
+
+    *   *Introduction:* TCP is a reliable protocol. If the network is congested, packets drop. TCP needs to detect this and reduce the sending rate. It uses a variable called the **Congestion Window (CWND)**.
+
+    *   *Slow Start:*
+        *   *Concept:* When a connection starts, TCP doesn't know the capacity. It starts small.
+        *   *Mechanism:* It starts with a CWND of 1 segment (or 10 bytes in modern implementations).
+        *   *Growth:* Every time an ACK is received, the CWND increases by 1 segment. This is *exponential* growth (1, 2, 4, 8, 16...).
+        *   *The "Slow Start" Threshold (SSThresh):* This is the limit. Once CWND reaches SSThresh, it stops exponential growth and switches to Congestion Avoidance.
+
+    *   *Congestion Avoidance:*
+        *   *Concept:* Once we know the capacity (reached SSThresh), we want to be careful not to overshoot.
+        *   *Mechanism:* Linear growth. For every ACK received, CWND increases by 1 segment (or 1 MSS).
+        *   *Why:* It prevents the "burst" behavior of Slow Start. It probes the network slowly.
+
+    *   *Handling Loss (The critical part):*
+        *   *Scenario:* A packet is lost. TCP detects this.
+        *   *Mechanism 1: Fast Retransmit (Dup ACKs).*
+            *   *Trigger:* Receiver sends 3 duplicate ACKs (Dup ACKs). This means a packet was lost, but subsequent packets arrived.
+            *   *Action:* TCP assumes the loss is a single packet (not a burst).
+            *   *CWND:* Sets CWND to half of the current value (or SSThresh).
+            *   *SSThresh:* Sets SSThresh to half of the current value.
+            *   *Retransmission:* Sends the lost packet immediately (Fast Retransmit).
+            *   *Note:* This is often called "Fast Recovery" in older texts, but modern TCP (RFC 666) distinguishes them. I need to be precise here. *Fast Retransmit* is the *trigger* for recovery.
+
+        *   *Mechanism 2: Fast Recovery (Loss Detection).*
+            *   *Trigger:* Timeout (Retransmission Timer expires) OR 3+ Dup ACKs indicating a burst of losses.
+            *   *Action:* TCP assumes multiple packets were lost.
+            *   *CWND:* Sets to 1 segment (or 10 bytes).
+            *   *SSThresh:* Sets to half of the current value.
+            *   *Retransmission:* Sends the lost packet.
+            *   *The "Fast Recovery" Algorithm (RFC 666):* This is crucial. It prevents the CW

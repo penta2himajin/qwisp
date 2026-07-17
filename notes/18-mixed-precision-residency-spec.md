@@ -58,7 +58,10 @@ Consequences:
    — i.e. exactly what the oracle sweep computed with. Workstream ③ (offline tail requant) is
    effectively DONE; remaining: archive the regeneration script in `oracle/`, and a load-time
    shape/gs sanity check.
-2. **Kernel precedent**: `gqmm3`/`gqmm3Rows` (notes/11, in `SeedlessMetalForward.swift`) —
+2. **Kernel precedent**: `gqmm3`/`gqmm3Rows` (in `SeedlessMetalForward.swift`; the notes/11
+   3-bit UD-tier product spec is RETIRED 2026-07-18 — mixed residency supersedes that
+   lower-RAM direction, owner decision; the gqmm3 kernel + its locked tests remain as
+   shipped reference, spec text lives in git history) —
    the additive sub-4-bit port pattern (MLX `qdot<bits>` verbatim, bit-exact locked test
    against the MLX oracle, gqmm4 untouched) is proven. bits=2 is *simpler* than bits=3:
    pack_factor 16/u32, no byte-straddle terms.
