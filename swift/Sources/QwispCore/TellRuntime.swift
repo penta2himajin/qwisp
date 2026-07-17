@@ -82,7 +82,7 @@ extension Tell {
     /// snapshot/rollback: 直後の forward/stepArgmax「1 回だけ」を取り消す(partial reject 用)。
     struct SpecBackend {
         let forward: ([Int32]) -> MLXArray?
-        let stepArgmax: ([Int32]) -> [Int]?
+        var stepArgmax: ([Int32]) -> [Int]?   // var: reflection-bias prototype swaps it (#47)
         let snapshot: () -> Any
         let rollback: (Any) -> Void
         // Full-state save/restore for arbitrary-length rewind (cross-request prefix caching).
@@ -298,6 +298,108 @@ extension Tell {
                 fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
         }
+        // Reflection-token suppression PROTOTYPE (#47 Part A, QWISP_REFLECT_BIAS=<amp>): a
+        // CyclicReflex-style deterministic steer that subtracts `amp` from the logits of the
+        // high-entropy reflection tokens (Wait/But/However/…) which trigger statement loops
+        // (Circular Reasoning, arxiv 2601.05693). Routes argmax through the CPU-logits path
+        // (stepLogitsRows) + bias, and disables the GPU chain so every token pays the bias.
+        // Prototype only: slow (full-vocab readback/token), non-lossless. Measure, don't ship.
+        let reflectAmp = Tell.envFloat("QWISP_REFLECT_BIAS", 0)
+        if reflectAmp != 0, let logitsRows = backend.stepLogitsRows {
+            // Default reflection ids (Qwen3.6 vocab, with/without leading space).
+            let defaultIds = [13784, 13428, 3850, 1921, 10883, 4213, 88842, 37201, 50821, 32645, 77264, 85152]
+            let parsed = ProcessInfo.processInfo.environment["QWISP_REFLECT_IDS"]?
+                        .split(separator: ",").compactMap { Int($0) }
+            let reflectSet = Set((parsed?.isEmpty == false ? parsed! : defaultIds))
+            let amp = Float(reflectAmp)
+            let biased: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.map { row in
+                    var best = 0; var bestV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        let v = reflectSet.contains(t) ? row[t] - amp : row[t]
+                        if v > bestV { bestV = v; best = t }
+                    }
+                    return best
+                }
+            }
+            backend.stepArgmax = biased
+            backend.chainedStepArgmax = nil   // force per-token biased argmax (no unbiased GPU chain)
+        }
+        // Bolt sampled decode PROTOTYPE (#47 Part A probe 16, QWISP_BOLT_SAMPLE=<temp>): LOOPY
+        // is a greedy pathology (a deterministic argmax cycle); temperature sampling breaks the
+        // lock-in stochastically. bolt is greedy-only in the product (sampling falls back to
+        // strict), so 8GB users never get bolt speed on normal chat settings — this probes
+        // whether sampled bolt survives the horizon that burns greedy bolt (5/5). Gumbel-max
+        // per row = exact categorical sampling in one pass; the spec-verify contract stays
+        // sound (a committed token is always the sample conditioned on its true prefix; draft
+        // mismatches just reject → lower accept rate, not bias). Seeded (QWISP_BOLT_SAMPLE_SEED,
+        // default 42) so runs are reproducible. Slow (full-vocab readback); measure, don't ship.
+        else if let tempS = ProcessInfo.processInfo.environment["QWISP_BOLT_SAMPLE"],
+                let temp = Float(tempS), temp > 0, let logitsRows = backend.stepLogitsRows {
+            var rngState = UInt64(Tell.envInt("QWISP_BOLT_SAMPLE_SEED", 42)) &* 0x9E3779B97F4A7C15
+            let sampled: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.map { row in
+                    var best = 0
+                    var bestV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        // SplitMix64 step → uniform (0,1) → Gumbel noise.
+                        rngState &+= 0x9E3779B97F4A7C15
+                        var z = rngState
+                        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+                        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+                        z ^= z >> 31
+                        let u = max(Float(z >> 40) * (1.0 / Float(1 << 24)), 1e-9)
+                        let v = row[t] / temp - log(-log(u))
+                        if v > bestV { bestV = v; best = t }
+                    }
+                    return best
+                }
+            }
+            backend.stepArgmax = sampled
+            backend.chainedStepArgmax = nil   // per-token sampling; the GPU chain is argmax-only
+        }
+        // Margin trace (#47 Part A, QWISP_MARGIN_TRACE): CPU-logits stepArgmax that records the
+        // row-0 top-1 − top-2 gap (the argmax_stable_of_margin quantity) into Tell.marginTrace.
+        // Chain disabled so every token is measured. Slow (full-vocab readback); measurement only.
+        else if ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"] != nil, let logitsRows = backend.stepLogitsRows {
+            let traced: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.enumerated().map { (ri, row) in
+                    var best = 0, second = -1
+                    var bestV = -Float.greatestFiniteMagnitude, secondV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        let v = row[t]
+                        if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
+                        else if v > secondV { secondV = v; second = t }
+                    }
+                    if ri == 0 {
+                        let mg = second >= 0 ? bestV - secondV : 0
+                        Tell.marginTrace.append(mg); Tell.lastMargin = mg
+                        // Distribution shape (#47 probe 14, latent-structure channel): full-vocab
+                        // entropy + top-8 (id:logit) per step — feeds the "didn't burn" analysis
+                        // (near-tie multiplicity, repetition affinity of near-tie candidates).
+                        var z: Double = 0, s: Double = 0
+                        var top: [(Int, Float)] = []   // top-8 by logit, insertion-sorted
+                        for t in 0 ..< row.count {
+                            let d = Double(row[t] - bestV)
+                            let e = exp(d); z += e; s += e * d
+                            if top.count < 8 || row[t] > top[top.count - 1].1 {
+                                let idx = top.firstIndex { row[t] > $0.1 } ?? top.count
+                                top.insert((t, row[t]), at: idx)
+                                if top.count > 8 { top.removeLast() }
+                            }
+                        }
+                        Tell.lastEntropy = Float(log(z) - s / z)
+                        Tell.lastTop8 = top.map { "\($0.0):\($0.1)" }.joined(separator: ",")
+                    }
+                    return best
+                }
+            }
+            backend.stepArgmax = traced
+            backend.chainedStepArgmax = nil
+        }
         return (backend, fwd, providers)
     }
 
@@ -410,7 +512,44 @@ extension Tell {
     /// runner-up token WOULD have matched the model (QWISP_ACCEPT_TRACE=1 to fill) — the
     /// measured prize of a width-2 depth-1 draft tree (m-gt-1-decode-leads ①). Diag only.
     nonisolated(unsafe) public static var lastSpecStats: (steps: Int, drafted: Int, accepted: Int, d0: Int, rejects: Int, altHits: Int) = (0, 0, 0, 0, 0, 0)
+    // #47 Part A margin trace (QWISP_MARGIN_TRACE): per row-0 stepArgmax call, the LM-head
+    // top-1 − top-2 logit gap. Tests the qwisp-lean argmax_stable_of_margin trigger: does the
+    // margin collapse BEFORE the loop (causal, unlike miss-rate) and stay open in clean text?
+    nonisolated(unsafe) public static var marginTrace: [Float] = []
+    // Latest row-0 margin, set by the margin-trace stepArgmax so BoltServe's miss-trace can
+    // record margin and miss from the SAME forward, per-token aligned (#47 margin×miss overlay).
+    nonisolated(unsafe) public static var lastMargin: Float = 0
+    // #47 probe 14 latent-structure channel: full-vocab entropy + top-8 "id:logit,…" of the
+    // latest row-0 step, set alongside lastMargin (same forward, same alignment contract).
+    nonisolated(unsafe) public static var lastEntropy: Float = 0
+    nonisolated(unsafe) public static var lastTop8: String = ""
     static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
+
+    /// #47 probe 14 — teacher-forced strict replay of a bolt-generated token stream
+    /// (QWISP_TF_REPLAY). Feeds each bolt token through the strict backend and records the
+    /// strict argmax given the bolt prefix — realized-flip ground truth ("did it actually
+    /// burn?"). Run with QWISP_MARGIN_TRACE set so the traced stepArgmax fills the margin
+    /// column (pos 0's margin is -1: it comes from prefill logits, not a traced step).
+    /// TSV: pos, boltTok (what bolt emitted), strictPred (what strict would emit from the
+    /// same prefix), match, margin. Returns toks so segment accounting terminates normally.
+    static func runTFReplay(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
+                            toks: [Int], outPath: String) -> [Int]? {
+        guard let lastNormed = prefill(promptIds: promptIds, backend: backend),
+              let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
+        MLX.eval([lg0])
+        var pred = MLX.argMax(lg0[0], axis: -1).item(Int.self)
+        var margin: Float = -1
+        var lines = ["pos\tboltTok\tstrictPred\tmatch\tmargin"]
+        for (i, t) in toks.enumerated() {
+            lines.append("\(i)\t\(t)\t\(pred)\t\(t == pred ? 1 : 0)\t\(margin)")
+            guard i + 1 < toks.count, let nxt = backend.stepArgmax([Int32(t)]) else { break }
+            pred = nxt[0]
+            margin = Tell.lastMargin
+        }
+        try? lines.joined(separator: "\n").write(toFile: outPath, atomically: true, encoding: .utf8)
+        FileHandle.standardError.write(Data("[qwisp] TF replay: \(toks.count) tokens → \(outPath)\n".utf8))
+        return toks
+    }
 
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,

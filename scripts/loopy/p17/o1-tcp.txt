@@ -1,0 +1,65 @@
+Here's a thinking process that leads to the explanation of TCP congestion control:
+
+1.  **Deconstruct the Request:**
+    *   **Topic:** TCP Congestion Control.
+    *   **Key Components:** Slow Start, Congestion Avoidance, Fast Retransmit, Fast Recovery.
+    *   **Requirement:** Detailed explanation.
+
+2.  **Initial Knowledge Retrieval & Structuring:**
+    *   *What is TCP?* Transmission Control Protocol. Reliable, connection-oriented.
+    *   *What is Congestion Control?* Mechanisms to prevent network overload (packets dropping).
+    *   *Key Variables:*
+        *   `cwnd` (Congestion Window): How much data can be sent before an ACK.
+        *   `ssthresh` (Slow Start Threshold): The boundary between Slow Start and Congestion Avoidance.
+        *   `rtt` (Round Trip Time): Time for a packet to go and come back.
+        *   `srtt` (Smoothed RTT).
+    *   *The Four Phases:*
+        1.  Slow Start (Exponential growth).
+        2.  Congestion Avoidance (Linear growth).
+        3.  Fast Retransmit (Resending without waiting for timeout).
+        4.  Fast Recovery (Recovering from loss without restarting from scratch).
+
+3.  **Drafting the Content - Section by Section:**
+
+    *   **Introduction:**
+        *   Define the goal: Keep the network from getting congested (dropping packets).
+        *   Define the "window" concept (cwnd).
+
+    *   **Phase 1: Slow Start:**
+        *   *Concept:* Start small, grow fast.
+        *   *Mechanism:* Start with `cwnd` = 1 MSS (Maximum Segment Size).
+        *   *Growth:* Every ACK received, `cwnd` increases by 1 MSS.
+        *   *Result:* Exponential growth (1, 2, 4, 8...).
+        *   *Termination:* When `cwnd` > `ssthresh`.
+
+    *   **Phase 2: Congestion Avoidance:**
+        *   *Concept:* Once we hit the threshold, be careful.
+        *   *Mechanism:* Add 1 MSS per *entire* RTT (not per ACK).
+        *   *Growth:* Linear growth (1, 2, 3, 4...).
+        *   *Why?* "Slow" start is actually "Fast" start, but "Congestion Avoidance" is the slow part. (Note: Naming confusion is common, clarify it).
+
+    *   **The Trigger: Packet Loss:**
+        *   How does TCP know there's congestion?
+        *   1. Timeout (3-way handshake for retransmission).
+        *   2. Duplicate ACKs (Fast Retransmit).
+
+    *   **Phase 3: Fast Retransmit:**
+        *   *Scenario:* Sender receives 3 duplicate ACKs (DupACKs).
+        *   *Meaning:* The receiver got packets, but one is missing. The network is likely congested, but not completely dead.
+        *   *Action:* Resend the missing packet immediately (don't wait for the retransmission timer).
+        *   *State Change:* Set `ssthresh` = `cwnd` / 2. Set `cwnd` = 3 MSS (or 1 MSS + 3 MSS, depending on the specific implementation, usually 3 MSS for Fast Recovery).
+
+    *   **Phase 4: Fast Recovery:**
+        *   *Goal:* Avoid going back to Slow Start (which is slow).
+        *   *Mechanism:*
+            *   Increase `cwnd` by 1 MSS for every *extra* ACK received (cumulative ACKs).
+            *   This allows the sender to "piggyback" on the existing data to probe the network.
+        *   *Termination:* When a new ACK (acknowledging the retransmitted packet) arrives.
+        *   *State Change:* Set `cwnd` = `ssthresh`. Resume Congestion Avoidance.
+
+    *   **Timeout (The "Nuclear Option"):**
+        *   If no ACKs arrive within a specific time (RTO).
+        *   Action: `ssthresh` = `cwnd` / 2. `cwnd` = 1 MSS. Restart Slow Start.
+
+4.  **Refining and Polishing:**
+    *   *Visuals/Examples:* Use a concrete example (e

@@ -63,6 +63,15 @@ final class BoltServe {
 
     private let calibN = Tell.envInt("QWISP_CALIB", 48)
     private let biasEps = Tell.envFloat("QWISP_ROUTE_BIAS_EPS", 0.25)
+    // Buddy-table dithering (#47 Part A probe 15, opt-in QWISP_BUDDY_DITHER=k): the loop is a
+    // limit cycle of a coarsely-quantized feedback system (capacity-truncated effective model);
+    // a FIXED buddy table makes the substitution error a fixed function of context = systematic
+    // drift bias toward the same cliffs. Dithering = rotate each cold expert's substitute among
+    // its top-k coactivation candidates by token position (deterministic, zero IO) to
+    // decorrelate the bias. Sync-refresh only (async staged swaps move slots and would stale
+    // these tables — run with QWISP_BOLT_REFRESH_ASYNC=0). ditherTables[li][v] = variant v.
+    private let ditherK = Tell.envInt("QWISP_BUDDY_DITHER", 0)
+    private var ditherTables: [[[Int32]]] = []
     private let recalibR = Tell.envInt("QWISP_BOLT_RECALIB_R", 128)
     private let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
     private let refreshB = Tell.envInt("QWISP_BOLT_REFRESH_B", 32)
@@ -115,6 +124,41 @@ final class BoltServe {
                 (0 ..< Self.nE).map { Int32(p.cache.buddyExpertCPU[$0] == $0 ? 1 : 0) }
             }
             fwd.setRouteBias(masks: masks, eps: biasEps)
+        }
+        // Probe 15: build the k dither variants from the same basis (variant v maps each cold
+        // expert to its rank-v coactivation candidate among residents, wrapping; hot = self;
+        // same rotated tie-break as buildBuddyTable). Rebuilt on every freeze/refresh so slot
+        // assignments stay consistent (sync path only).
+        if ditherK > 1 {
+            ditherTables = providers.enumerated().map { (li, provider) in
+                let slotOf = provider.cache.slotOf
+                let hot = slotOf.keys.sorted()
+                let n = hot.count
+                var variants = [[Int32]](repeating: [Int32](repeating: 0, count: Self.nE), count: ditherK)
+                for e in 0 ..< Self.nE {
+                    if let s = slotOf[e] {
+                        for v in 0 ..< ditherK { variants[v][e] = Int32(s) }   // hot: self in every variant
+                        continue
+                    }
+                    var cands: [Int] = []
+                    var used = Set<Int>()
+                    for _ in 0 ..< ditherK {
+                        var bestH = -1, bestC = -1
+                        for i in 0 ..< n {
+                            let h = hot[(i + e) % n]
+                            if used.contains(h) { continue }
+                            let cc = baseCoact[li][e][h]
+                            if cc > bestC { bestC = cc; bestH = h }
+                        }
+                        if bestH >= 0, bestC > 0 { cands.append(bestH); used.insert(bestH) } else { break }
+                    }
+                    for v in 0 ..< ditherK {
+                        variants[v][e] = cands.isEmpty ? Int32(fallbackSlot(li))
+                                                       : Int32(slotOf[cands[v % cands.count]]!)
+                    }
+                }
+                return variants
+            }
         }
     }
 
@@ -203,6 +247,7 @@ final class BoltServe {
         let obsMaxM = recalibR > 0 ? maxM : 1
         let obsSlots = recalibR > 0 ? Swift.max(1, chainK) : 1
         var obsBuf: MTLBuffer? = nil
+        var gateBuf: MTLBuffer? = nil   // per-expert gate values (gl); cold-gate-mass = substitution-error proxy (#47)
         if recalibR > 0 {
             guard SeedlessMetalForward.compileDiagCopyRoute(),
                   let (device, _) = SeedlessMetalForward.ensure(),
@@ -211,19 +256,95 @@ final class BoltServe {
                   let gb = device.makeBuffer(length: nLayers * nE * 2, options: .storageModeShared)
             else { return nil }
             obsBuf = ib
+            gateBuf = gb
             fwd.diagObsMaxM = obsMaxM
             fwd.diagRouteBufs = (ib, gb)
         }
-        func accumulate(slot: Int, M: Int) {
+        // Routing-divergence trace (#47 Part A, QWISP_MISS_TRACE=path): per accumulate call,
+        // how many of the EXACT top-8 routed experts are cold (not resident → buddy-remapped)
+        // vs total routed. bolt's routing is exact; the miss set IS the residency divergence
+        // from the "true" (all-resident/strict) expert set. Tests whether the loop onset is
+        // preceded by a small, swappable divergence or a broad one (capacity wall).
+        let missTracePath = ProcessInfo.processInfo.environment["QWISP_MISS_TRACE"]
+        var missTrace: [(tok: Int, miss: Int, routed: Int, M: Int, coldGate: Float, totGate: Float, margin: Float, coldW: Float, entropy: Float, top8: String)] = []
+        // Cold-expert histogram in the pre-cliff ramp window (#47 Part A, QWISP_MISS_HIST=path
+        // + QWISP_CLIFF_TOK=N): is the ramp cold set a small recurring set (pinnable) or diffuse
+        // (capacity wall)? Counts cold routings per (layer, expert) for tok ∈ [cliff-70, cliff+10].
+        let missHistPath = ProcessInfo.processInfo.environment["QWISP_MISS_HIST"]
+        let cliffTok = Tell.envInt("QWISP_CLIFF_TOK", -1)
+        var coldHist = [[Int: Int]](repeating: [:], count: nLayers)   // [layer][expert] = cold count in ramp
+        // Hazard-burst forced refresh (#47 Part A probe 13, opt-in QWISP_HAZARD_REFRESH=1):
+        // when the margin×miss both-bad burst (probe 11/12 conjunction) fires, force a sync
+        // recalib refresh — the deliberate form of the refresh rescue that saved clean QS in
+        // the probe-12 identical-prefix counterexample (loop/clean differed ONLY in refresh
+        // timing). FPs are harmless: a refresh on a clean burst is what default cadence does
+        // anyway. Needs the QWISP_MARGIN_TRACE path (Tell.lastMargin) and sync refresh
+        // (run with QWISP_BOLT_REFRESH_ASYNC=0) — experiment-grade, default off.
+        let hazardOn = Tell.envInt("QWISP_HAZARD_REFRESH", 0) != 0
+        let hazardCooldown = Tell.envInt("QWISP_HAZARD_COOLDOWN", 32)
+        var hazardWin: [Bool] = []
+        var hazardCool = 0
+        var hazardFire = false
+        var hazardFires: [Int] = []
+        func accumulate(slot: Int, M: Int, tok: Int = 0) {
             guard recalibR > 0, let ib = obsBuf else { return }
+            var traceMiss = 0, traceRouted = 0
+            var coldGate: Float = 0, totGate: Float = 0, coldW: Float = 0
+            // gl gate values are captured only for M==1/slot0 (Stage-0 diag glOn condition).
+            let gatePtr = (missTracePath != nil && M == 1 && slot == 0)
+                ? gateBuf?.contents().assumingMemoryBound(to: Float16.self) : nil
+            let inRamp = missHistPath != nil && cliffTok > 0 && tok >= cliffTok - 70 && tok <= cliffTok + 10
             for li in 0 ..< nLayers {
                 let off = ((slot * nLayers + li) * obsMaxM) * Ktop * 4
                 let inds = Array(UnsafeBufferPointer(
                     start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
                     count: M * Ktop))
+                if missTracePath != nil || hazardOn {
+                    let s = providers[li].cache.slotOf
+                    var lg: [(cold: Bool, g: Float)] = []   // this layer's routed raw gate logits
+                    for e in inds where e >= 0 {
+                        traceRouted += 1
+                        let g = gatePtr.map { Float($0[li * nE + Int(e)]) } ?? 0
+                        totGate += g
+                        let cold = s[Int(e)] == nil
+                        if cold { traceMiss += 1; coldGate += g }   // substitution-error proxy
+                        if gatePtr != nil { lg.append((cold, g)) }
+                    }
+                    // Softmax-normalized cold gate share, summed over layers (#47 hazard ratio
+                    // ρ = coldW/margin, qwisp-lean LoopTrigger.lean): per-layer softmax over the
+                    // routed raw logits — comparable across steps, unlike the raw coldGate sums.
+                    if let mx = lg.map(\.g).max() {
+                        let exps = lg.map { expf($0.g - mx) }
+                        let z = exps.reduce(0, +)
+                        if z > 0 {
+                            for (i, p) in lg.enumerated() where p.cold { coldW += exps[i] / z }
+                        }
+                    }
+                }
+                if inRamp {
+                    let s = providers[li].cache.slotOf
+                    for e in inds where e >= 0 && s[Int(e)] == nil { coldHist[li][Int(e), default: 0] += 1 }
+                }
                 _ = SeedlessFusedVerify.SeedlessFusedForward.recalibAccumulate(
                     inds: inds, M: M, Ktop: Ktop, nE: nE,
                     counts: &winCounts[li], coact: &winCoact[li])
+            }
+            if missTracePath != nil { missTrace.append((tok, traceMiss, traceRouted, M, coldGate, totGate, Tell.lastMargin, coldW, Tell.lastEntropy, Tell.lastTop8)) }
+            // Hazard window update + burst check (M=1 decode rows only; margin<3 ∧ miss>0.20,
+            // burst ≥4/10 = probe 11 canon). Cooldown lets the rebased basis take effect.
+            if hazardOn && M == 1 {
+                let mr = traceRouted > 0 ? Float(traceMiss) / Float(traceRouted) : 0
+                let bad = Tell.lastMargin < 3 && mr > 0.20
+                if hazardCool > 0 { hazardCool -= 1 }
+                hazardWin.append(bad)
+                if hazardWin.count > 10 { hazardWin.removeFirst() }
+                if hazardCool == 0, hazardWin.count == 10,
+                   hazardWin.lazy.filter({ $0 }).count >= 4 {
+                    hazardFire = true
+                    hazardCool = hazardCooldown
+                    hazardWin.removeAll()
+                    hazardFires.append(tok)
+                }
             }
         }
         /// Recalib refresh (sync): the observation window becomes the new freeze basis.
@@ -407,8 +528,24 @@ final class BoltServe {
         }
 
         // ── Bolt spec decode loop (mirror of runBoltMode phase 6, server contract) ──
+        var ditherLast = -1
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
+            // Probe 15: rotate the buddy-table variant by token position (deterministic;
+            // a spec span verifies under one variant). See ditherK doc at the top.
+            if ditherK > 1, !ditherTables.isEmpty {
+                let v = out.count % ditherK
+                if v != ditherLast { fwd.setBoltTables(ditherTables.map { $0[v] }); ditherLast = v }
+            }
+            // Hazard-burst forced refresh (probe 13): sync-only — run with
+            // QWISP_BOLT_REFRESH_ASYNC=0 so it cannot race the async staging pipeline.
+            if hazardFire {
+                hazardFire = false
+                if !refreshAsync {
+                    FileHandle.standardError.write(Data("[qwisp] hazard-refresh @ tok \(out.count)\n".utf8))
+                    refresh()
+                }
+            }
             if recalibR > 0 && tokensSinceRefresh >= recalibR {
                 if refreshAsync { refreshAsyncPlan() } else { refresh() }
             }
@@ -427,12 +564,12 @@ final class BoltServe {
             if D == 0 {
                 if let (emitted, nextU) = Tell.boltGreedyChainSpan(
                     backend: backend, u: u, chainK: chainK, budget: N - out.count) {
-                    if recalibR > 0 { for k in 0 ..< chainK { accumulate(slot: k, M: 1) } }
+                    if recalibR > 0 { for k in 0 ..< chainK { accumulate(slot: k, M: 1, tok: out.count + k) } }
                     for t in emitted { out.append(t); hist.append(t) }
                     u = nextU
                 } else {
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
-                    if recalibR > 0 { accumulate(slot: 0, M: 1) }
+                    if recalibR > 0 { accumulate(slot: 0, M: 1, tok: out.count) }
                     out.append(u); hist.append(u)
                     u = evals[0]
                 }
@@ -442,7 +579,7 @@ final class BoltServe {
 
             let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
             guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
-            if recalibR > 0 { accumulate(slot: 0, M: D + 1) }
+            if recalibR > 0 { accumulate(slot: 0, M: D + 1, tok: out.count) }
 
             var p = 0
             while p < D && drafts[p] == evals[p] { p += 1 }
@@ -463,6 +600,37 @@ final class BoltServe {
             tokensSinceRefresh += out.count - before
         }
         flush()
+        // Emitted token ids (#47 probe 14): the TF-replay input (QWISP_TF_REPLAY reads this
+        // to teacher-force the bolt stream through strict and locate realized flips).
+        if let p = ProcessInfo.processInfo.environment["QWISP_TOK_DUMP"] {
+            try? out.map(String.init).joined(separator: "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        }
+        if hazardOn {
+            FileHandle.standardError.write(Data("[qwisp] hazard-refresh fires=\(hazardFires.count) at toks \(hazardFires)\n".utf8))
+        }
+        if let p = missTracePath, !missTrace.isEmpty {
+            let body = missTrace.map { "\($0.tok)\t\($0.miss)\t\($0.routed)\t\($0.M)\t\($0.coldGate)\t\($0.totGate)\t\($0.margin)\t\($0.coldW)\t\($0.entropy)\t\($0.top8)" }.joined(separator: "\n")
+            try? ("tok\tmiss\trouted\tM\tcoldGate\ttotGate\tmargin\tcoldW\tentropy\ttop8\n" + body).write(toFile: p, atomically: true, encoding: .utf8)
+        }
+        if let p = ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"], !Tell.marginTrace.isEmpty {
+            try? ("margin\n" + Tell.marginTrace.map { String($0) }.joined(separator: "\n")).write(toFile: p, atomically: true, encoding: .utf8)
+        }
+        // Ramp cold-expert histogram: layer, expert, cold-count, and the expert's frequency RANK
+        // in the frozen basis (baseCounts) — so we can tell if the ramp cold set is the same
+        // "next-after-C" tail that C=80 already added (rank ~65-80) or a distinct deep-tail set.
+        if let p = missHistPath, coldHist.contains(where: { !$0.isEmpty }) {
+            var lines = ["layer\texpert\tcold_count\tfreq_rank"]
+            for li in 0 ..< nLayers {
+                let ranked = baseCounts[li].enumerated()
+                    .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                    .map { $0.offset }
+                var rankOf = [Int: Int](); for (r, e) in ranked.enumerated() { rankOf[e] = r }
+                for (e, c) in coldHist[li].sorted(by: { $0.value > $1.value }) {
+                    lines.append("\(li)\t\(e)\t\(c)\t\(rankOf[e] ?? -1)")
+                }
+            }
+            try? lines.joined(separator: "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        }
         Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0, 0, 0)
         return Array(out.prefix(N))
     }

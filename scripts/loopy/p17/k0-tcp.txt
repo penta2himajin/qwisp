@@ -1,0 +1,55 @@
+Here's a thinking process that leads to the explanation of TCP congestion control:
+
+1.  **Deconstruct the Request:**
+    *   **Topic:** TCP Congestion Control.
+    *   **Key Components to Cover:** Slow Start, Congestion Avoidance, Fast Retransmit, Fast Recovery.
+    *   **Level of Detail:** "In detail."
+
+2.  **Initial Knowledge Retrieval & Structuring:**
+    *   *What is TCP?* Transmission Control Protocol. It's connection-oriented, reliable, and handles flow/congestion control.
+    *   *What is Congestion Control?* It's the mechanism to prevent the network from becoming overwhelmed (packet loss) by adjusting the sending rate based on network conditions.
+    *   *The Algorithm:* It's usually a hybrid of additive/multiplicative increase (AIMD) and exponential growth (Slow Start).
+    *   *Key Variables:*
+        *   Congestion Window ($cwnd$): The limit on how many packets can be sent.
+        *   Slow Start Threshold ($ssthresh$): The boundary between Slow Start and Congestion Avoidance.
+        *   Slow Start Threshold (often abbreviated as $SST$ or $SSTH$).
+        *   Slow Start Threshold (often abbreviated as $SST$ or $SSTH$).
+        *   Slow Start Threshold (often abbreviated as $SST$ or $SSTH$).
+        *   *Correction:* Let's stick to standard terms: $cwnd$, $ssthresh$ (or $SST$), $rto$ (Retransmission Timeout).
+
+    *   *The Phases:*
+        1.  **Slow Start:** Exponential growth (doubling $cwnd$).
+        2.  **Congestion Avoidance:** Linear growth (Additive Increase).
+        3.  **Fast Retransmit:** Detecting loss without waiting for a timeout (using duplicate ACKs).
+        4.  **Fast Recovery:** Handling the loss without resetting the window to zero (partial recovery).
+
+3.  **Drafting the Content - Section by Section:**
+
+    *   **Introduction:** Define the goal (prevent network collapse) and the mechanism (adjusting window size). Mention the two main variables: $cwnd$ and $ssthresh$.
+
+    *   **Phase 1: Slow Start:**
+        *   *Concept:* Start small, grow fast.
+        *   *Mechanism:* $cwnd$ starts at 1 (or 10, depending on implementation, but usually 1 MSS).
+        *   *Action:* Every ACK received, $cwnd$ doubles (exponential).
+        *   *Goal:* Find the bandwidth of the link quickly.
+        *   *Transition:* When $cwnd$ reaches $ssthresh$, move to Congestion Avoidance.
+
+    *   **Phase 2: Congestion Avoidance (The "Additive Increase" phase):**
+        *   *Concept:* Once we know the rough capacity, don't be too aggressive.
+        *   *Mechanism:* Add 1 packet per RTT (Round Trip Time).
+        *   *Why?* Exponential growth is too risky for high bandwidth. Linear growth is safer.
+        *   *Interaction:* This is the "Congestion Avoidance" phase.
+
+    *   **Phase 3: Handling Loss (The "Fast" mechanisms):**
+        *   *Standard Loss:* If a packet is lost, the sender waits for a timeout ($RTO$). This is slow.
+        *   *Fast Retransmit:* How do we know a packet is lost before the timeout?
+            *   *Mechanism:* The receiver sends duplicate ACKs (DACKs) for the same sequence number.
+            *   *Logic:* If the sender receives 3 DACKs, it assumes the packet was lost (or the next one).
+            *   *Action:* Resend the lost packet immediately (Fast Retransmit).
+        *   *Fast Recovery:* What happens after Fast Retransmit?
+            *   *Old behavior:* Reset $cwnd$ to 1 (Slow Start). This kills throughput.
+            *   *New behavior (RFC 2011 / Modern TCP):* Keep $cwnd$ high, but limit it to $ssthresh$ (or half the current $cwnd$).
+            *   *Mechanism:* The sender enters "Fast Recovery" state. It continues to send packets (up to the limit) while waiting for the ACK for the retransmitted packet.
+
+    *   **The "Cut-off" / Reset:**
+        *   When the ACK

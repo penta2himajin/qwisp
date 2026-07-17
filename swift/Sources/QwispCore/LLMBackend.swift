@@ -219,27 +219,61 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 FileHandle.standardError.write(Data(
                     "[qwisp] sampling (temperature/top_p/…) on a streaming tier decodes via strict streaming — bolt is greedy-only, expect strict speed; temperature 0 restores bolt\n".utf8))
             }
+            // Loop guard (#47 Part A, opt-in QWISP_BOLT_STABILITY_GUARD=1): only the bolt
+            // greedy path can enter the C=64 free-run repetition attractor. When it does,
+            // rewind the degenerate tail to its clean onset and re-decode on strict; on the
+            // re-arm policy (QWISP_LOOP_REARM=M > 0) return to bolt after M strict tokens
+            // (0 = stay strict for the rest of the request). All greedy tokens flow through
+            // the guard so seq/produced derive from it and rewind auto-reconciles.
+            let guardOn = useBolt && Tell.envInt("QWISP_BOLT_STABILITY_GUARD", 0) != 0
+            let rearmM = Tell.envInt("QWISP_LOOP_REARM", 0)
+            let guardDbg = Tell.envFlag("QWISP_LOOP_DEBUG")
             Thread.detachNewThread {
                 self.segGate.wait()           // join the previous segment's decode thread (issue #47)
                 defer { self.segGate.signal() }
+                let lguard = guardOn ? LoopGuard() : nil
                 var seq = promptIds0          // prompt + all accepted tokens so far
                 var produced = 0
                 var budget = Swift.min(baseline, Swift.max(1, ceiling))
+                var boltActive = useBolt
+                var strictSinceTrip = 0
+                // Guarded greedy tokens flow through the rollback buffer; everything else
+                // (sampling) streams directly. reconcile() re-derives seq/produced from the
+                // guard's authoritative token list (auto-truncated on rewind).
+                let onTok: (Int) -> Void = { tok in
+                    if let g = lguard { for t in g.push(tok) { continuation.yield(t) } }
+                    else { continuation.yield(tok) }
+                }
+                func reconcile() {
+                    guard let g = lguard else { return }
+                    seq = promptIds0 + g.gen.map { Int32($0) }
+                    produced = g.gen.count
+                }
                 while produced < ceiling && !cancel.isCancelled {
-                    let segN = Swift.min(budget, ceiling - produced)
+                    // In a strict re-arm window, cap the segment at M so we can return to bolt.
+                    let inRearmWindow = lguard != nil && !boltActive && rearmM > 0
+                    let segN = inRearmWindow ? Swift.min(rearmM, ceiling - produced)
+                                             : Swift.min(budget, ceiling - produced)
                     let maxSeqLen = seq.count + segN + cfg.maxK + 64
-                    let onTok: (Int) -> Void = { continuation.yield($0) }
-                    if useBolt {
+                    if boltActive {
                         if self.boltServe == nil {
                             self.boltServe = BoltServe(engine: self.engine, modelDir: self.modelDir,
                                                        C: cfg.c, maxK: cfg.maxK, maxM: cfg.maxM)
                         }
                         guard let seg = self.boltServe?.runSegment(
                             promptIds: seq, N: segN, maxSeqLen: maxSeqLen,
-                            isCancelled: { cancel.isCancelled }, onToken: onTok),
+                            isCancelled: { cancel.isCancelled || lguard?.trip != nil }, onToken: onTok),
                             !seg.isEmpty else { break }
-                        seq += seg.map { Int32($0) }
-                        produced += seg.count
+                        if let g = lguard, let tr = g.trip {
+                            _ = g.rewind()          // truncate tail to onset (unsent tokens only)
+                            reconcile()
+                            boltActive = false
+                            strictSinceTrip = 0
+                            if guardDbg { FileHandle.standardError.write(Data(
+                                "[qwisp] loop guard: rewind to onset \(tr.onset) (period \(tr.period), span \(tr.span)) → strict\n".utf8)) }
+                            continue
+                        }
+                        reconcile()
                         if seg.count < segN { break }
                         budget = Swift.min(budget * 2, 65536)
                         continue
@@ -275,16 +309,38 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                      frequencyPenalty: options.frequencyPenalty,
                                                      presencePenalty: options.presencePenalty, logitBias: options.logitBias,
                                                      isCancelled: { cancel.isCancelled }, onToken: onTok)
+                    } else if let rp = ProcessInfo.processInfo.environment["QWISP_TF_REPLAY"],
+                              let tokStr = try? String(contentsOfFile: rp, encoding: .utf8) {
+                        // #47 probe 14: teacher-forced strict replay of a bolt token stream
+                        // (realized-flip ground truth). Diagnostic-only; yields no output tokens.
+                        let toks = tokStr.split(whereSeparator: \.isNewline).compactMap { Int($0) }
+                        let outP = ProcessInfo.processInfo.environment["QWISP_TF_OUT"] ?? (rp + ".tf.tsv")
+                        seg = Tell.runTFReplay(promptIds: seq, backend: backend, engine: self.engine,
+                                               toks: toks, outPath: outP)
                     } else {
                         seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
                                                N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
                     }
                     guard let seg, !seg.isEmpty else { break }
-                    seq += seg.map { Int32($0) }
-                    produced += seg.count
-                    if seg.count < segN { break }   // stopped early (consumer cancel / EOS) → done
+                    // Greedy strict flows through the guard (unified seq/produced + re-arm);
+                    // sampling streams directly and keeps its own accounting.
+                    if lguard != nil && !wantSample {
+                        reconcile()
+                        strictSinceTrip += seg.count
+                        if seg.count < segN { break }        // EOS → done
+                        if rearmM > 0 && strictSinceTrip >= rearmM {
+                            boltActive = true                // re-arm: return to bolt
+                            if guardDbg { FileHandle.standardError.write(Data(
+                                "[qwisp] loop guard: re-arm → bolt after \(strictSinceTrip) strict tok\n".utf8)) }
+                        }
+                    } else {
+                        seq += seg.map { Int32($0) }
+                        produced += seg.count
+                        if seg.count < segN { break }   // stopped early (consumer cancel / EOS) → done
+                    }
                     budget = Swift.min(budget * 2, 65536)
                 }
+                if let g = lguard { for t in g.flush() { continuation.yield(t) } }
                 continuation.finish()
             }
         }
