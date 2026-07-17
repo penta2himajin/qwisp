@@ -4351,6 +4351,366 @@ public enum SeedlessMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
     }
 
+    // ── W1b: mixed-precision (4-bit core + 2-bit tail) gather kernels ─────────
+    // notes/18 W1 "Mixed dispatch design". One dispatch serves routed rows whose
+    // slot may be 4-bit (s < K4) or 2-bit (s >= K4, local index s-K4). Branch is on
+    // tid.z-uniform slot data → no simd divergence. scales/biases indexed by GLOBAL
+    // slot s; weight buffers separate per class (w4 by s, w2 by s-K4).
+
+    nonisolated(unsafe) static var _gqmmMixRowsPipeline: MTLComputePipelineState?
+
+    /// Mixed 4-bit/2-bit MoE gather-qmv rows (M≥1). One dispatch, tid.z-uniform branch
+    /// on slot s: s<K4 → 4-bit path (w4[s], gqmm4_rows loop verbatim), s>=K4 → 2-bit path
+    /// (w2[s-K4], gqmm2_rows loop verbatim). scales/biases indexed by GLOBAL slot s in
+    /// both branches. x[M,K] (or [M*Ktop,K] if lhsPerExpert), w4[K4,N,K/8], w2[M2,N,K/16],
+    /// scales/biases[K4+M2,N,K/64], inds[M*Ktop] → out[M*Ktop,N].
+    public static func gqmmMixRows(_ x: MLXArray, w4: MLXArray, w2: MLXArray,
+                                    scales: MLXArray, biases: MLXArray, inds: MLXArray,
+                                    K4: Int, M: Int, Ktop: Int, K: Int, N: Int,
+                                    gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
+            print("[raw-gqmm-mix-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
+        }
+        if _gqmmMixRowsPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            #define SIMD_SIZE 32
+            inline float ld16(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i] = x[i]; xt[i+1] = x[i+1]/16.0f; xt[i+2] = x[i+2]/256.0f; xt[i+3] = x[i+3]/4096.0f;
+                }
+                return sum;
+            }
+            inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                const device uint16_t* ws = (const device uint16_t*)w;
+                for (int i = 0; i < 4; i++) {
+                    accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                              xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                              xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                              xt[4*i+3] * (float)(ws[i] & 0xf000));
+                }
+                return scale * accum + sum * bias;
+            }
+            inline float ld16_b2(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i]   = x[i];
+                    xt[i+1] = x[i+1] / 4.0f;
+                    xt[i+2] = x[i+2] / 16.0f;
+                    xt[i+3] = x[i+3] / 64.0f;
+                }
+                return sum;
+            }
+            inline float qd2(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    accum += (float)(w[i] & 0x03) * xt[4*i]
+                           + (float)(w[i] & 0x0c) * xt[4*i+1]
+                           + (float)(w[i] & 0x30) * xt[4*i+2]
+                           + (float)(w[i] & 0xc0) * xt[4*i+3];
+                }
+                return scale * accum + sum * bias;
+            }
+            // tid.z-uniform branch on slot s (expert routing decision, same across a threadgroup's
+            // simd lanes) → no simd divergence. Each branch is a verbatim copy of the gqmm4_rows /
+            // gqmm2_rows K-block loop body (own local ws/scales/biases/x pointers + advance stride).
+            kernel void gqmm_mix_rows(device const uint32_t* w4     [[buffer(0)]],   // [K4, N, K/8]
+                              device const uint32_t* w2     [[buffer(1)]],   // [M2, N, K/16]
+                              device const half*     scales [[buffer(2)]],   // [K4+M2, N, K/64]
+                              device const half*     biases [[buffer(3)]],
+                              device const half*     x      [[buffer(4)]],   // [M, K]
+                              device const int*      inds   [[buffer(5)]],   // [M*Ktop]
+                              device half*           y      [[buffer(6)]],   // [M*Ktop, N]
+                              constant int& in_vec_size  [[buffer(7)]],
+                              constant int& out_vec_size [[buffer(8)]],
+                              constant int& ktop         [[buffer(9)]],
+                              device const int* stopFlag [[buffer(10)]],
+                              constant uint& lhsPer      [[buffer(11)]],
+                              constant int& k4           [[buffer(12)]],
+                              uint3 tid      [[threadgroup_position_in_grid]],
+                              uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                              uint  simd_lid [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;
+                constexpr int num_simdgroups = 2, results_per_simdgroup = 4;
+                constexpr int values_per_thread = 16;
+                constexpr int block_size = 512, scale_step_per_thread = 4;
+                typedef float U;
+                thread U result[4] = {0};
+                const int in_vec_size_g = in_vec_size / 64;
+                uint mk = tid.z;
+                int slot = inds[mk];
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                device const half* scalesBase = scales + (size_t)slot * out_vec_size * in_vec_size_g
+                                                        + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* biasesBase = biases + (size_t)slot * out_vec_size * in_vec_size_g
+                                                        + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* xBase = x + (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+                device half* yr = y + (size_t)mk * out_vec_size + out_row;
+                if (slot < k4) {
+                    constexpr int packs_per_thread = 2, pack_factor = 8, bytes_per_pack = 4;
+                    const device uint8_t* ws = (const device uint8_t*)w4;
+                    thread U x_thread[16];
+                    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                    uint e = (uint)slot;
+                    ws += (size_t)e * out_vec_size * in_vec_size_w;
+                    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+                    device const half* scalesL = scalesBase;
+                    device const half* biasesL = biasesBase;
+                    device const half* xL = xBase;
+                    for (int k = 0; k < in_vec_size; k += block_size) {
+                        U sum = ld16(xL, x_thread);
+                        for (int row = 0; row < results_per_simdgroup; row++) {
+                            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                            const device half* sl = scalesL + row * in_vec_size_g;
+                            const device half* bl = biasesL + row * in_vec_size_g;
+                            U s = sl[0]; U b = bl[0];
+                            result[row] += qd4(wl, x_thread, s, b, sum);
+                        }
+                        ws += block_size * bytes_per_pack / pack_factor;
+                        scalesL += block_size / 64; biasesL += block_size / 64; xL += block_size;
+                    }
+                } else {
+                    constexpr int packs_per_thread = 1, pack_factor = 16, bytes_per_pack = 4;
+                    const device uint8_t* ws = (const device uint8_t*)w2;
+                    thread U x_thread[16];
+                    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                    uint e = (uint)(slot - k4);
+                    ws += (size_t)e * out_vec_size * in_vec_size_w;
+                    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+                    device const half* scalesL = scalesBase;
+                    device const half* biasesL = biasesBase;
+                    device const half* xL = xBase;
+                    for (int k = 0; k < in_vec_size; k += block_size) {
+                        U sum = ld16_b2(xL, x_thread);
+                        for (int row = 0; row < results_per_simdgroup; row++) {
+                            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                            const device half* sl = scalesL + row * in_vec_size_g;
+                            const device half* bl = biasesL + row * in_vec_size_g;
+                            U s = sl[0]; U b = bl[0];
+                            result[row] += qd2(wl, x_thread, s, b, sum);
+                        }
+                        ws += block_size * bytes_per_pack / pack_factor;
+                        scalesL += block_size / 64; biasesL += block_size / 64; xL += block_size;
+                    }
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    result[row] = simd_sum(result[row]);
+                    if (simd_lid == 0) yr[row] = (half)result[row];
+                }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 _gqmmMixRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm_mix_rows")!)
+            } catch { print("[raw-gqmm-mix-rows] compile: \(error)"); return nil }
+        }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bw4 = mtlBuf(w4, device),
+              let bw2 = mtlBuf(w2, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_gqmmMixRowsPipeline!)
+        enc.setBuffer(bw4, offset: 0, index: 0); enc.setBuffer(bw2, offset: 0, index: 1)
+        enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3)
+        enc.setBuffer(bx, offset: 0, index: 4); enc.setBuffer(bin, offset: 0, index: 5)
+        enc.setBuffer(outBuf, offset: 0, index: 6)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&nn, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
+        bindStop(enc, 10)
+        var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 11)
+        var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 12)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
+    }
+
+    nonisolated(unsafe) static var _gqmmMixSwigluRowsPipeline: MTLComputePipelineState?
+
+    /// Fused mixed-precision gate·up swiglu rows (M≥1). Mirrors gqmm4_swiglu_rows's fused
+    /// form (x loaded once per block, shared by gate+up) with the same slot<K4 branch as
+    /// gqmmMixRows, duplicated for gate and up accumulators. scales/biases indexed by GLOBAL
+    /// slot s. x[M,K], gate/up weights split per class, inds[M*Ktop] → h[M*Ktop,N] = swiglu(gate, up).
+    /// x offset uses mk/Ktop (gate/up form; no lhsPer).
+    public static func gqmmMixSwigluRows(_ x: MLXArray, gw4: MLXArray, gw2: MLXArray,
+                                          gsc: MLXArray, gbi: MLXArray,
+                                          uw4: MLXArray, uw2: MLXArray,
+                                          usc: MLXArray, ubi: MLXArray, inds: MLXArray,
+                                          K4: Int, M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0 else {
+            print("[raw-gqmm-mix-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil
+        }
+        if _gqmmMixSwigluRowsPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            inline float ld16(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) { sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+                    xt[i]=x[i]; xt[i+1]=x[i+1]/16.0f; xt[i+2]=x[i+2]/256.0f; xt[i+3]=x[i+3]/4096.0f; }
+                return sum;
+            }
+            inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f; const device uint16_t* ws = (const device uint16_t*)w;
+                for (int i = 0; i < 4; i++) {
+                    accum += (xt[4*i]*(float)(ws[i]&0x000f) + xt[4*i+1]*(float)(ws[i]&0x00f0) +
+                              xt[4*i+2]*(float)(ws[i]&0x0f00) + xt[4*i+3]*(float)(ws[i]&0xf000));
+                }
+                return scale * accum + sum * bias;
+            }
+            inline float ld16_b2(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i]   = x[i];
+                    xt[i+1] = x[i+1] / 4.0f;
+                    xt[i+2] = x[i+2] / 16.0f;
+                    xt[i+3] = x[i+3] / 64.0f;
+                }
+                return sum;
+            }
+            inline float qd2(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    accum += (float)(w[i] & 0x03) * xt[4*i]
+                           + (float)(w[i] & 0x0c) * xt[4*i+1]
+                           + (float)(w[i] & 0x30) * xt[4*i+2]
+                           + (float)(w[i] & 0xc0) * xt[4*i+3];
+                }
+                return scale * accum + sum * bias;
+            }
+            kernel void gqmm_mix_swiglu_rows(device const uint32_t* gw4 [[buffer(0)]],
+                                          device const uint32_t* gw2 [[buffer(1)]],
+                                          device const half* gsc [[buffer(2)]],
+                                          device const half* gbi [[buffer(3)]],
+                                          device const uint32_t* uw4 [[buffer(4)]],
+                                          device const uint32_t* uw2 [[buffer(5)]],
+                                          device const half* usc [[buffer(6)]],
+                                          device const half* ubi [[buffer(7)]],
+                                          device const half* x [[buffer(8)]],
+                                          device const int* inds [[buffer(9)]],
+                                          device half* h [[buffer(10)]],
+                                          constant int& in_vec_size [[buffer(11)]],
+                                          constant int& out_vec_size [[buffer(12)]],
+                                          constant int& ktop [[buffer(13)]],
+                                          device const int* stopFlag [[buffer(14)]],
+                                          constant int& k4 [[buffer(15)]],
+                                          uint3 tid [[threadgroup_position_in_grid]],
+                                          uint simd_gid [[simdgroup_index_in_threadgroup]],
+                                          uint simd_lid [[thread_index_in_simdgroup]]) {
+                if (stopFlag[0] != 0) return;
+                constexpr int num_simdgroups = 2, results_per_simdgroup = 4;
+                constexpr int values_per_thread = 16;
+                constexpr int block_size = 512, scale_step_per_thread = 4;
+                typedef float U;
+                thread U gres[4] = {0}, ures[4] = {0};
+                const int in_vec_size_g = in_vec_size / 64;
+                uint mk = tid.z;
+                int slot = inds[mk];
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                device const half* gscBase = gsc + (size_t)slot * out_vec_size * in_vec_size_g
+                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* gbiBase = gbi + (size_t)slot * out_vec_size * in_vec_size_g
+                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* uscBase = usc + (size_t)slot * out_vec_size * in_vec_size_g
+                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* ubiBase = ubi + (size_t)slot * out_vec_size * in_vec_size_g
+                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                device const half* xBase = x + (size_t)(mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+                device half* hr = h + (size_t)mk * out_vec_size + out_row;
+                if (slot < k4) {
+                    constexpr int packs_per_thread = 2, pack_factor = 8, bytes_per_pack = 4;
+                    const device uint8_t* gws = (const device uint8_t*)gw4;
+                    const device uint8_t* uws = (const device uint8_t*)uw4;
+                    thread U x_thread[16];
+                    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                    uint e = (uint)slot;
+                    size_t eOffW = (size_t)e * out_vec_size * in_vec_size_w;
+                    gws += eOffW; uws += eOffW;
+                    gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+                    uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+                    device const half* gscL = gscBase; device const half* gbiL = gbiBase;
+                    device const half* uscL = uscBase; device const half* ubiL = ubiBase;
+                    device const half* xL = xBase;
+                    for (int k = 0; k < in_vec_size; k += block_size) {
+                        U sum = ld16(xL, x_thread);   // x ロードは 1 回（gate/up で共有）
+                        for (int row = 0; row < results_per_simdgroup; row++) {
+                            gres[row] += qd4((const device uint8_t*)(gws + row*in_vec_size_w), x_thread, gscL[row*in_vec_size_g], gbiL[row*in_vec_size_g], sum);
+                            ures[row] += qd4((const device uint8_t*)(uws + row*in_vec_size_w), x_thread, uscL[row*in_vec_size_g], ubiL[row*in_vec_size_g], sum);
+                        }
+                        gws += block_size*bytes_per_pack/pack_factor; uws += block_size*bytes_per_pack/pack_factor;
+                        gscL += block_size/64; gbiL += block_size/64; uscL += block_size/64; ubiL += block_size/64; xL += block_size;
+                    }
+                } else {
+                    constexpr int packs_per_thread = 1, pack_factor = 16, bytes_per_pack = 4;
+                    const device uint8_t* gws = (const device uint8_t*)gw2;
+                    const device uint8_t* uws = (const device uint8_t*)uw2;
+                    thread U x_thread[16];
+                    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                    uint e = (uint)(slot - k4);
+                    size_t eOffW = (size_t)e * out_vec_size * in_vec_size_w;
+                    gws += eOffW; uws += eOffW;
+                    gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+                    uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
+                    device const half* gscL = gscBase; device const half* gbiL = gbiBase;
+                    device const half* uscL = uscBase; device const half* ubiL = ubiBase;
+                    device const half* xL = xBase;
+                    for (int k = 0; k < in_vec_size; k += block_size) {
+                        U sum = ld16_b2(xL, x_thread);   // x ロードは 1 回（gate/up で共有）
+                        for (int row = 0; row < results_per_simdgroup; row++) {
+                            gres[row] += qd2((const device uint8_t*)(gws + row*in_vec_size_w), x_thread, gscL[row*in_vec_size_g], gbiL[row*in_vec_size_g], sum);
+                            ures[row] += qd2((const device uint8_t*)(uws + row*in_vec_size_w), x_thread, uscL[row*in_vec_size_g], ubiL[row*in_vec_size_g], sum);
+                        }
+                        gws += block_size*bytes_per_pack/pack_factor; uws += block_size*bytes_per_pack/pack_factor;
+                        gscL += block_size/64; gbiL += block_size/64; uscL += block_size/64; ubiL += block_size/64; xL += block_size;
+                    }
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    half gv = (half)simd_sum(gres[row]); half uv = (half)simd_sum(ures[row]);
+                    if (simd_lid == 0) { half y = (half)1/((half)1+exp(metal::abs(gv))); half sg = (gv<(half)0)?y:((half)1-y); hr[row] = (gv*sg)*uv; }
+                }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 _gqmmMixSwigluRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm_mix_swiglu_rows")!)
+            } catch { print("[raw-gqmm-mix-swiglu-rows] compile: \(error)"); return nil }
+        }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bgw4 = mtlBuf(gw4, device), let bgw2 = mtlBuf(gw2, device),
+              let bgsc = mtlBuf(gsc.asType(.float16), device), let bgbi = mtlBuf(gbi.asType(.float16), device),
+              let buw4 = mtlBuf(uw4, device), let buw2 = mtlBuf(uw2, device),
+              let busc = mtlBuf(usc.asType(.float16), device), let bubi = mtlBuf(ubi.asType(.float16), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_gqmmMixSwigluRowsPipeline!)
+        enc.setBuffer(bgw4, offset: 0, index: 0); enc.setBuffer(bgw2, offset: 0, index: 1)
+        enc.setBuffer(bgsc, offset: 0, index: 2); enc.setBuffer(bgbi, offset: 0, index: 3)
+        enc.setBuffer(buw4, offset: 0, index: 4); enc.setBuffer(buw2, offset: 0, index: 5)
+        enc.setBuffer(busc, offset: 0, index: 6); enc.setBuffer(bubi, offset: 0, index: 7)
+        enc.setBuffer(bx, offset: 0, index: 8); enc.setBuffer(bin, offset: 0, index: 9)
+        enc.setBuffer(outBuf, offset: 0, index: 10)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 11); enc.setBytes(&nn, length: 4, index: 12); enc.setBytes(&kt, length: 4, index: 13)
+        bindStop(enc, 14)
+        var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 15)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
+    }
+
     /// 3-bit MoE gather-qmv (M=1).  Thin wrapper over gqmm3Rows(M=1, lhsPerExpert:false) — the
     /// M=1 rows kernel maps all Ktop slots to x-row 0 (mk/Ktop==0), so this is gather_qmv<3> exactly
     /// and is order-stable-by-construction identical to the M-row path.

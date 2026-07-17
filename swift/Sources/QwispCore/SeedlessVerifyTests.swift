@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 80
+        let total = 82
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4760,6 +4760,145 @@ public enum SeedlessVerifyTests {
             let r = SeedlessBackend.config(tier: .resident, promptLen: 10, maxTokens: 48)
             let rWant = SeedlessBackend.Config(isStreaming: false, c: 256, maxK: 96, maxM: 121, maxSeqLen: 218)
             if r != rWant { return (false, "resident got \(r) want \(rWant)") }
+            return (true, "ok")
+        }
+
+        // ── W1b: mixed-precision (4-bit core + 2-bit tail) gather kernels ────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these two tests.
+        // They encode the notes/18 W1 "Mixed dispatch design" acceptance gate.
+        //
+        // Geometry E=64 = K4=16 four-bit core + M2=48 two-bit tail, K=2048, N=512,
+        // Ktop=4, M∈{1,2,9,17,25}. A single mixed dispatch serves routed rows whose
+        // slot may be either class: slot s<16 → 4-bit path (w4[s]); s>=16 → 2-bit path
+        // (w2[s-16]). scales/biases are ONE global-slot-indexed buffer (concat of the
+        // per-class quant outputs), so scales[s]==s4[s] for s<16 and ==s2[s-16] else.
+        //
+        // Reference uses ONLY already-proven production kernels: the 4-bit branch is
+        // exactly gatherQmmRows(M:1,Ktop:1) on the 4-bit buffers, the 2-bit branch is
+        // gqmm2Rows(M:1,Ktop:1) on the 2-bit buffers, composed per (row,slot) pair and
+        // concatenated → [M*Ktop, N].  Both tests are RED ("not implemented") on the
+        // stub tree and GREEN only when the mixed kernel copies both branch bodies
+        // verbatim (add order + safe-math preserved).
+
+        // Fixed 48-entry index pool spanning BOTH classes (values <16 and >=16 present),
+        // cycled so every M variant covers a mix of 4-bit and 2-bit slots.
+        let mixPool: [Int32] = [ 3, 20, 40, 62,  0, 17, 25, 50,
+                                33,  7, 55, 12, 41, 15,  2, 60,
+                                 8, 30, 11, 45, 22, 38, 61,  5,
+                                18, 44, 29,  1, 36, 52,  6, 19,
+                                 9, 27, 48, 14, 37,  4, 23, 53,
+                                10, 16, 31, 39, 47, 57, 13, 21]
+
+        // Test 80 (W1b-1): gqmmMixRows ≡ per-(row,slot)-class gatherQmmRows/gqmm2Rows.
+        run("gqmm_mix_rows_bitexact") {
+            let E = 64, K4 = 16, K = 2048, N = 512, Ktop = 4
+            // f16 weight fixture; split into 4-bit core (0..<16) and 2-bit tail (16..<64).
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (w4, s4, b4o) = MLX.quantized(wf[0 ..< K4],  groupSize: 64, bits: 4, mode: .affine)
+            let (w2, s2, b2o) = MLX.quantized(wf[K4 ..< E],  groupSize: 64, bits: 2, mode: .affine)
+            guard let b4 = b4o, let b2 = b2o else { return (false, "biases nil") }
+            // Global-slot-indexed scales/biases: concat of the two per-class outputs.
+            let scales = MLX.concatenated([s4, s2], axis: 0).asType(.float16)
+            let biases = MLX.concatenated([b4, b2], axis: 0).asType(.float16)
+            MLX.eval([w4, s4, b4, w2, s2, b2, scales, biases])
+
+            // Reference for one (mk-indexed) inds vector against ONE gqmmMixRows call.
+            func check(_ x: MLXArray, _ indsFlat: [Int32], _ M: Int, lhsPer: Bool) -> (Bool, String) {
+                let inds = MLXArray(indsFlat, [M * Ktop]); inds.eval()
+                var refParts: [MLXArray] = []
+                for mk in 0 ..< M * Ktop {
+                    let row = lhsPer ? mk : mk / Ktop
+                    let xRow = x[row ..< row + 1]; xRow.eval()   // [1, K]
+                    let s = Int(indsFlat[mk])
+                    let r: MLXArray?
+                    if s < K4 {
+                        let si = MLXArray([Int32(s)], [1]); si.eval()
+                        r = SeedlessMetalForward.gatherQmmRows(xRow, w4, scales: s4, biases: b4,
+                                                               inds: si, M: 1, Ktop: 1, K: K, N: N)
+                    } else {
+                        let si = MLXArray([Int32(s - K4)], [1]); si.eval()
+                        r = SeedlessMetalForward.gqmm2Rows(xRow, w2, scales: s2, biases: b2,
+                                                           inds: si, M: 1, Ktop: 1, K: K, N: N)
+                    }
+                    guard let rr = r else { return (false, "ref nil M=\(M) mk=\(mk) s=\(s)") }
+                    rr.eval(); refParts.append(rr)   // [1, N]
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
+                guard let got = SeedlessMetalForward.gqmmMixRows(x, w4: w4, w2: w2,
+                                                                 scales: scales, biases: biases,
+                                                                 inds: inds, K4: K4,
+                                                                 M: M, Ktop: Ktop, K: K, N: N,
+                                                                 lhsPerExpert: lhsPer)
+                else { return (false, "not implemented (M=\(M) lhsPer=\(lhsPer))") }
+                got.eval()
+                return bitEqual(got, ref)
+            }
+
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let (ok, d) = check(x, indsFlat, M, lhsPer: false)
+                if !ok { return (false, "M=\(M): \(d)") }
+            }
+            // lhsPerExpert:true — per-row lhs, x[M*Ktop, K].
+            do {
+                let M = 9
+                let x = MLXRandom.normal([M * Ktop, K]).asType(.float16); x.eval()
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let (ok, d) = check(x, indsFlat, M, lhsPer: true)
+                if !ok { return (false, "lhsPer M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 81 (W1b-2): gqmmMixSwigluRows ≡ gqmmMixRows(gate) ⊗ gqmmMixRows(up) via swigluRaw.
+        // Reference composes the (already test-80-validated) mixed gather twice through the
+        // production swigluRaw — bit-exact only if the fused epilogue is copied verbatim from
+        // gqmm4_swiglu_rows (swigluRaw implements the identical half/sigmoid sequence).
+        run("gqmm_mix_swiglu_rows_bitexact") {
+            let E = 64, K4 = 16, K = 2048, N = 512, Ktop = 4
+            func mixWeights(_ seed: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
+                let (q4, s4, b4o) = MLX.quantized(seed[0 ..< K4], groupSize: 64, bits: 4, mode: .affine)
+                let (q2, s2, b2o) = MLX.quantized(seed[K4 ..< E], groupSize: 64, bits: 2, mode: .affine)
+                let sc = MLX.concatenated([s4, s2], axis: 0).asType(.float16)
+                let bi = MLX.concatenated([b4o!, b2o!], axis: 0).asType(.float16)
+                MLX.eval([q4, q2, sc, bi])
+                return (q4, q2, sc, bi, seed)   // seed returned only to keep it alive
+            }
+            // Independent gate and up fixtures, each split/quantized the same way.
+            let gf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let uf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (gw4, gw2, gsc, gbi, _) = mixWeights(gf)
+            let (uw4, uw2, usc, ubi, _) = mixWeights(uf)
+
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                // Reference: mixed gather (gate) and mixed gather (up), then swiglu.
+                guard let g = SeedlessMetalForward.gqmmMixRows(x, w4: gw4, w2: gw2,
+                                                               scales: gsc, biases: gbi, inds: inds,
+                                                               K4: K4, M: M, Ktop: Ktop, K: K, N: N),
+                      let u = SeedlessMetalForward.gqmmMixRows(x, w4: uw4, w2: uw2,
+                                                               scales: usc, biases: ubi, inds: inds,
+                                                               K4: K4, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "ref mix gather nil (M=\(M))") }
+                g.eval(); u.eval()
+                guard let hRef = SeedlessMetalForward.swigluRaw(g, u)
+                else { return (false, "ref swiglu nil (M=\(M))") }
+                hRef.eval()
+                // Fused kernel under test.
+                guard let hGot = SeedlessMetalForward.gqmmMixSwigluRows(x,
+                                    gw4: gw4, gw2: gw2, gsc: gsc, gbi: gbi,
+                                    uw4: uw4, uw2: uw2, usc: usc, ubi: ubi, inds: inds,
+                                    K4: K4, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "not implemented (M=\(M))") }
+                hGot.eval()
+                let (ok, d) = bitEqual(hGot, hRef)
+                if !ok { return (false, "M=\(M): \(d)") }
+            }
             return (true, "ok")
         }
 
