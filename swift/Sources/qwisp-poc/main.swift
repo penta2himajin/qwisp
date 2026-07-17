@@ -34,6 +34,7 @@ if CommandLine.arguments.contains("stream") {
         ("prefix-cache-e2e", { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
         ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
+        ("gqmm2-bench", { _, _ in SeedlessMetalForward.gqmm2Bench() }),   // notes/18 W1 speed sim
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {

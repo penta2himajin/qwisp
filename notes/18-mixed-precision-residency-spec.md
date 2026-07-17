@@ -88,9 +88,10 @@ Consequences:
   (core rows / tail rows) with row masking — decide on measurement.
 
 ### W2 — mixed-slot arena + cache policy
-- Arena layout per proj: **weight buffer = [K4 slots × slice4][M slots × slice2] contiguous**
-  (one buffer, offset math in kernel); scales/biases buffers stay uniform `[K4+M, …]`
-  (identical slice size both pools) ⇒ provider still returns 9 buffers + binds K4.
+- Arena layout per proj: **weight buffers SPLIT per class** — w4 `[K4, …]` + w2 `[M, …]`
+  (as shipped in the W1b kernels: separate buffer args, w2 indexed by slot−K4); scales/biases
+  stay ONE uniform buffer `[K4+M, …]` (identical slice size both pools) ⇒ 12 gather buffers
+  + K4 constant. (Earlier contiguous-single-buffer idea superseded by the kernel contract.)
 - `LayerExpertCache` extension (or `MixedLayerExpertCache`): slots `0..<K4` = core (pinned,
   freeze-basis top-K4 by routing frequency — same basis buildBuddyTable already uses);
   slots `K4..<K4+M` = tail LRU. Tail misses pread from the 2-bit ExpertSource.
@@ -147,6 +148,91 @@ gatherBench pattern — note: the `QWISP_RUN=raw-gather-bench` dispatch was prun
 qwisp-poc during productization; re-wire it or bench via a RAWTESTS-style entry). That is
 W1's front half — the speed sim and the first implementation step are the same work. Final
 tok/s only from the 8GB device sim (QWISP_DEVICE_RAM=8) after W1+W2.
+
+**Kernel sim measured (2026-07-17, `QWISP_RUN=gqmm2-bench`, W1 landed)**: on the M1 Max
+(400 GB/s) dev box, gqmm2_rows vs gqmm4_rows reads **r = 0.91–1.0** at all production
+shapes/M. Mechanism: at M≥16 the 4-bit kernel sits AT the DRAM roof (measured 376–378 GB/s
+effective on weight bytes) while the 2-bit kernel moves half the bytes in the same time —
+i.e. qd2/qd4 have near-identical instruction streams (same load count, same FMA-per-value),
+so the 2-bit kernel is **value/issue-bound**, and on a Max-class part both walls coincide.
+Consequence for the product: on the 8GB TARGET tier (base chips, ~100 GB/s) the 4-bit
+kernel's 350+ GB/s DRAM demand is 3.5× oversubscribed ⇒ deeply byte-bound ⇒ the 2-bit
+issue-limit time stays well below the DRAM time and **r→~0.56 applies there** — the +20–40%
+estimate survives, but ONLY on low-BW devices. On Pro/Max-class machines mixed residency
+buys ~no kernel speed (it still buys the LOOPY fix + RAM). Exactly the right shape: the
+tier that needs the fix is the tier that gets the speedup. Confirm on-device in W4.
+
+### W5 (deferred consideration, owner-requested 2026-07-17) — bolt-draft + batched strict verify = bit-exact "strict-turbo" on partial tiers
+
+Not part of this project's acceptance; recorded for after W1–W4.
+
+**Construction**: draft = the mixed-residency bolt (2.4 GB arena, io≈0, resident-class speed);
+verifier = strict streaming (C=128); verify pipeline = the SHIPPED SuffixSpec batched verify
+(f32 canonical, union-overflow guard + exact safe-prefix, seqMultiToken GDN exactness) with
+the draft SOURCE swapped/augmented: suffix hit → suffix draft (free), else bolt free-run
+draft. Committed tokens are always the verifier's argmax ⇒ **output is bit-exact strict L1**
+— this is a strict-tier speedup, not a bolt variant (naming: strict-turbo, not bolt).
+
+**Why the arithmetic works only on partial tiers**: draft-model spec is dead on 32GB+
+resident (latency-bound ⇒ t_draft ≈ 0.9·t_target ⇒ ≤1.1×; SuffixSpec/MTP-D1 already own the
+cheap-draft slots) and irrelevant where strict is resident. On 16–24GB the draft runs
+resident-class (~6 ms/tok) while the target pays per-token miss-IO + per-layer sync; batched
+verify amortizes both by the accept-run length. Measured acceptance a = TF-match 87–92%
+(sweep) / p14 background flip 6–16% ⇒ E[run] ≈ 8–12 tok/verify ⇒ ~8 ms/tok ≈ 120 tok/s-class
+bit-exact strict on prose where SuffixSpec is weak (est. 2–3× the nl streaming cell); hybrid
+draft keeps code/agentic monotone.
+
+**Soundness / LOOPY**: lever B died on GATING unsoundness (p14: flips at bolt-margin 8–16 —
+no gate covers them); here every token is verified, soundness by construction. LOOPY is
+structurally eliminated in this tier: context only ever contains strict tokens, so the
+polluted-prefix mechanism (p14's shared-greedy loop) never forms — bolt drift is cut every
+8–12 tokens.
+
+**RAM**: 8GB can't hold both arenas (solo mixed bolt remains the 8GB answer); 16GB ≈ 15 GB
+borderline (shrink strict C to fit — measure); 24GB comfortable; 32GB+ pointless.
+
+**De-risk order**: (1) oracle acceptance at coverage-108 + deep-tail buddy (the sweep was
+full-coverage; real draft a is somewhat lower — this sets the true run length); (2) after
+W1–W3, a small W5 spike: swap the draft source only, verifier untouched (Prohibition 3
+safe); (3) decision bar: 16/24GB nl cell must significantly beat today's strict streaming;
+code cell non-regression via hybrid draft.
+
+## W4 results (2026-07-18, dev box M1 Max, QWISP_DEVICE_RAM=8 sim, evidence: scripts/loopy/w4/)
+
+LOOPY battery (4 canonical prompts, 1000–1500 tok, token-level detlag2, same build both arms):
+
+| prompt | generic bolt C=64 | mixed K4=8/M2=100 (coverage 108) |
+|---|---|---|
+| story | loop @185 (p16) | **clean** (coherent prose) |
+| tcp | loop @173 (p11) | loop @194 (p25) — residual |
+| qs | loop @570 (p8) | **clean** (correct code) |
+| sky | loop @87 (p1) | **clean, natural EOS** |
+
+**0/4 → 3/4.** The tcp residual is capacity-consistent: the C-spectrum measured tcp as the
+heaviest prompt (first healthy at C=128) and coverage 108 < 128 is unreachable in the same
+bytes (corrected RAM math above). Generic reproduces the p14 ground truth exactly (sky@87).
+
+TF-fidelity (QWISP_TF_REPLAY through strict, full-length maxSeqLen): mixed clean streams
+**story 78.1% / qs 86.7%** ≈ oracle full-coverage (82.0/90.4) minus ~4pt of deep-tail buddy
+— exactly the expected product-vs-oracle gap. Loop-containing streams read inflated
+(mixed-tcp 98.2%, generic 94.7–96.1%) because in-loop positions match at 98%+ (p14).
+
+Speed: mixed ≈ generic wall-time parity on the M1 Max (value-bound, as predicted by
+gqmm2-bench); the +20–40% low-BW claim remains unverifiable on this box — needs a base-chip
+device or a BW-throttle sim.
+
+Bugs found (neither mixed-specific): (a) flaky SIGSEGV/SIGTRAP at `qwisp chat` process exit
+in BOTH arms — MLX scheduler teardown race (`get_default_stream` on destructed singleton)
+against the detached decode thread's tail; file separately. (b) QWISP_TOK_DUMP not written
+on early-natural-EOS runs (mixed-sky verdict taken from text). (c) TF-replay pitfall: the
+replay chat invocation must pass `--max-tokens ≥ stream length` or the KV allocation
+truncates and predictions collapse to ~10% match (cost one debugging round — documented).
+
+**Verdict: GO as opt-in.** QWISP_MIXED=1 turns 8GB bolt LOOPY from an asymptotic fate
+(4/4, survival 87–1244 tok) into a residual risk on the heaviest prompts (1/4), at
+oracle-predicted fidelity. Default-ON decision deferred (owner): candidates for closing the
+tcp residual = rolling-refresh dynamics tuning, calibrated 2-bit tail (quality upside),
+or accepting + documenting with the LoopGuard opt-in as belt-and-braces.
 
 ## Design point
 

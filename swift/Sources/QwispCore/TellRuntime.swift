@@ -228,6 +228,26 @@ extension Tell {
         guard let (fwd, fnBuf, providers) = engine.makeFusedStreaming(
             modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
             existingProviders: existingProviders) else { return nil }
+        return (streamingBackendGlue(engine: engine, fwd: fwd, fnBuf: fnBuf, maxM: maxM), fwd, providers)
+    }
+
+    /// ★ W3b mixed residency(notes/18): streamingBackend の混合精度版。SpecBackend glue は
+    /// streamingBackendGlue を共用(provider 型のみ異なる)。budgetC は 4-bit slot 換算の予算。
+    static func streamingBackendMixed(engine: SeedlessEngine, modelDir: String, tailDir: String,
+                                      maxM: Int, maxSeqLen: Int, budgetC: Int,
+                                      existingProviders: [MixedArenaExpertProvider]? = nil)
+        -> (SpecBackend, SeedlessFusedVerify.SeedlessFusedForward, [MixedArenaExpertProvider])? {
+        guard let (fwd, fnBuf, providers) = engine.makeFusedStreamingMixed(
+            modelDir: modelDir, tailDir: tailDir, maxM: maxM, maxSeqLen: maxSeqLen,
+            budgetC: budgetC, existingProviders: existingProviders) else { return nil }
+        return (streamingBackendGlue(engine: engine, fwd: fwd, fnBuf: fnBuf, maxM: maxM), fwd, providers)
+    }
+
+    /// streamingBackend の SpecBackend 組み立て glue(pure 抽出、W3b で mixed と共用化)。
+    /// providers には依存しない(forward/step/snapshot/hybrid/chain/sampler/diag 配線のみ)。
+    private static func streamingBackendGlue(engine: SeedlessEngine,
+                                             fwd: SeedlessFusedVerify.SeedlessFusedForward,
+                                             fnBuf: MTLBuffer, maxM: Int) -> SpecBackend {
         let forward: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
             return fwd.forwardRows(x, M: tokens.count, finalNormW: fnBuf)
@@ -400,7 +420,7 @@ extension Tell {
             backend.stepArgmax = traced
             backend.chainedStepArgmax = nil
         }
-        return (backend, fwd, providers)
+        return backend
     }
 
     // ── Phase II-b: bolt-tier chain wiring seam ─────────────────────────────

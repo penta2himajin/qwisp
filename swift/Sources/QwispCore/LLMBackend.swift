@@ -257,8 +257,24 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     let maxSeqLen = seq.count + segN + cfg.maxK + 64
                     if boltActive {
                         if self.boltServe == nil {
+                            // ★ W3b mixed residency (notes/18, opt-in QWISP_MIXED=1): bolt tier swaps the
+                            //   C-slot 4-bit arena for K4 4-bit core + M2 2-bit tail (coverage ≈ C×1.7 in
+                            //   the same bytes). Needs the 2-bit experts checkpoint; missing dir → fall
+                            //   back to generic bolt with a note (never silently change the model).
+                            var tailDir: String? = nil
+                            if Tell.envInt("QWISP_MIXED", 0) != 0 {
+                                let d = ProcessInfo.processInfo.environment["QWISP_EXPERTS_2BIT"]
+                                    ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/qwisp-experts-2bit"
+                                if FileManager.default.fileExists(atPath: d + "/model.safetensors.index.json") {
+                                    tailDir = d
+                                } else {
+                                    FileHandle.standardError.write(Data(
+                                        "[qwisp] QWISP_MIXED=1 but 2-bit experts checkpoint not found at \(d) (set QWISP_EXPERTS_2BIT) — using generic bolt\n".utf8))
+                                }
+                            }
                             self.boltServe = BoltServe(engine: self.engine, modelDir: self.modelDir,
-                                                       C: cfg.c, maxK: cfg.maxK, maxM: cfg.maxM)
+                                                       C: cfg.c, maxK: cfg.maxK, maxM: cfg.maxM,
+                                                       mixedTailDir: tailDir)
                         }
                         guard let seg = self.boltServe?.runSegment(
                             promptIds: seq, N: segN, maxSeqLen: maxSeqLen,

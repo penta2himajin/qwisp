@@ -229,6 +229,78 @@ public struct SeedlessEngine {
         return (fwd, fnBuf, providers)
     }
 
+    /// ★ W3b mixed residency(notes/18): makeFusedStreaming の混合精度版。4-bit core K4 slot +
+    /// 2-bit tail M2 slot(K4/M2 は byte 予算から導出: budgetC × slot4Bytes を DeviceCalibration.mixedKM
+    /// で分割、K4 は QWISP_MIX_K4 既定 8)。tailDir = 2-bit experts checkpoint(全 256 expert、
+    /// affine gs=64、scales/biases 形状は 4-bit と同一 — MixedExpertArena init が検証)。
+    public func makeFusedStreamingMixed(modelDir: String, tailDir: String, maxM: Int, maxSeqLen: Int,
+                                        budgetC: Int,
+                                        existingProviders: [MixedArenaExpertProvider]? = nil)
+        -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer, [MixedArenaExpertProvider])? {
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return nil }
+
+        let providers: [MixedArenaExpertProvider]
+        if let ep = existingProviders {
+            providers = ep
+        } else {
+            guard let source4 = try? ExpertSource(modelDir: modelDir),
+                  let source2 = try? ExpertSource(modelDir: tailDir) else {
+                print("[makeFusedStreamingMixed] ERROR: ExpertSource init failed")
+                return nil
+            }
+            do { try source4.warm(); try source2.warm() } catch {
+                print("[makeFusedStreamingMixed] ERROR: ExpertSource.warm() failed: \(error)")
+                return nil
+            }
+            // per-expert slot bytes = Σ projs (weight + scales + biases)
+            func slotBytes(_ s: ExpertSource) -> Int {
+                var b = 0
+                for proj in ExpertSource.projs {
+                    for part in ExpertSource.parts {
+                        b += (try? s.sliceBytes(0, proj, part)) ?? 0
+                    }
+                }
+                return b
+            }
+            let slot4 = slotBytes(source4), slot2 = slotBytes(source2)
+            guard slot4 > 0, slot2 > 0, slot2 < slot4 else {
+                print("[makeFusedStreamingMixed] ERROR: implausible slot bytes (slot4=\(slot4) slot2=\(slot2))")
+                return nil
+            }
+            let (k4, m2) = DeviceCalibration.mixedKM(budgetBytes: budgetC * slot4,
+                                                     slot4Bytes: slot4, slot2Bytes: slot2,
+                                                     k4: DeviceCalibration.mixedDefaultK4())
+            guard m2 > 0 else {
+                print("[makeFusedStreamingMixed] ERROR: budget too small (K4=\(k4), M2=\(m2))")
+                return nil
+            }
+            FileHandle.standardError.write(Data(
+                "[qwisp] mixed residency: K4=\(k4) (4-bit core) + M2=\(m2) (2-bit tail) = coverage \(k4 + m2)/layer (budgetC=\(budgetC))\n".utf8))
+            var ps: [MixedArenaExpertProvider] = []
+            for i in 0 ..< Self.numLayers {
+                guard let cache = try? MixedLayerExpertCache(device: device, source4: source4,
+                                                             source2: source2, K4: k4, M2: m2, layer: i) else {
+                    print("[makeFusedStreamingMixed] ERROR: MixedLayerExpertCache init failed at layer \(i)")
+                    return nil
+                }
+                ps.append(MixedArenaExpertProvider(cache: cache))
+            }
+            providers = ps
+        }
+
+        guard let fwd = SeedlessFusedVerify.SeedlessFusedForward(
+            layers: layers, caches: freshCaches(),
+            maxM: maxM, H: Self.H, maxSeqLen: maxSeqLen,
+            providers: providers) else { return nil }
+
+        let fnA = fnW.asType(.float16)
+        fwd.retainedArrays.append(fnA)
+        guard let fnBuf = SeedlessMetalForward.mtlBuf(fnA, device) else { return nil }
+        _ = fwd.attachHead(embedW: embedW, embedS: embedS, embedB: embedB,
+                           lmW: lmW, lmS: lmS, lmB: lmB, fnW: fnW, vocab: vocab)
+        return (fwd, fnBuf, providers)
+    }
+
     /// 全層 1-CB fused forward(cache 常駐)を cold cache で構築。final norm buffer も返す。
     /// forwardRows(x, M, finalNormW: fnBuf) で「40層+final norm」が 1 CB になる。
     public func makeFused(maxM: Int, maxSeqLen: Int) -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer)? {

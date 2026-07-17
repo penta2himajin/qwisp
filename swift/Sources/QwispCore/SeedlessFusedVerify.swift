@@ -75,6 +75,59 @@ public enum SeedlessFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
+    // ── W3a (notes/18): mixed-precision (4-bit core + 2-bit tail) encode-only statics ──
+    // Mirror encodeGatherQmmRows/encodeGatherQmmSwigluRows but drive the one-shot mix
+    // kernels' bind order verbatim (SeedlessMetalForward gqmmMixRows/gqmmMixSwigluRows).
+    // grid (1, N/8, M*Ktop), threads (32,2,1). k4 = number of 4-bit core slots (Int32);
+    // lhsPer selects per-row x indexing (UInt32) — widths match the shipped wrappers.
+
+    /// gqmm_mix_rows を encode-only で提供(cb/readback 無し)。bind 順は gqmmMixRows(SeedlessMetalForward)
+    /// の one-shot dispatch と完全一致(w4,w2,scales,biases@0-3, x@4, inds@5, out@6, K@7, N@8, Ktop@9,
+    /// stop@10, lhsPer@11, k4@12)。xByteOffset/indsOffset/outByteOffset は encodeGatherQmmRows と同様、
+    /// 行範囲 gather(streaming chunk)用の追加パラメータ(既定 0 = 非チャンク呼び出しと同一挙動)。
+    static func encodeGqmmMixRows(_ enc: MTLComputeCommandEncoder,
+                                  w4: MTLBuffer, w2: MTLBuffer, sc: MTLBuffer, bi: MTLBuffer,
+                                  x: MTLBuffer, inds: MTLBuffer, out: MTLBuffer,
+                                  M: Int, Ktop: Int, K: Int, N: Int, lhsPer: Bool, k4: Int,
+                                  xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
+        enc.setComputePipelineState(SeedlessMetalForward._gqmmMixRowsPipeline!)
+        enc.setBuffer(w4, offset: 0, index: 0); enc.setBuffer(w2, offset: 0, index: 1)
+        enc.setBuffer(sc, offset: 0, index: 2); enc.setBuffer(bi, offset: 0, index: 3)
+        enc.setBuffer(x, offset: xByteOffset, index: 4); enc.setBuffer(inds, offset: indsOffset, index: 5)
+        enc.setBuffer(out, offset: outByteOffset, index: 6)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&nn, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
+        SeedlessMetalForward.bindStop(enc, 10)
+        var lp = UInt32(lhsPer ? 1 : 0); enc.setBytes(&lp, length: 4, index: 11)
+        var k4v = Int32(k4); enc.setBytes(&k4v, length: 4, index: 12)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    /// gqmm_mix_swiglu_rows を encode-only で提供。bind 順は gqmmMixSwigluRows(SeedlessMetalForward)
+    /// の one-shot dispatch と完全一致(gw4,gw2,gsc,gbi,uw4,uw2,usc,ubi@0-7, x@8, inds@9, h@10, K@11,
+    /// N@12, Ktop@13, stop@14, k4@15)。byte offset 引数は encodeGatherQmmSwigluRows と同様の意味。
+    static func encodeGqmmMixSwigluRows(_ enc: MTLComputeCommandEncoder,
+                                        gw4: MTLBuffer, gw2: MTLBuffer, gsc: MTLBuffer, gbi: MTLBuffer,
+                                        uw4: MTLBuffer, uw2: MTLBuffer, usc: MTLBuffer, ubi: MTLBuffer,
+                                        x: MTLBuffer, inds: MTLBuffer, h: MTLBuffer,
+                                        M: Int, Ktop: Int, K: Int, N: Int, k4: Int,
+                                        xByteOffset: Int = 0, indsOffset: Int = 0, outByteOffset: Int = 0) {
+        enc.setComputePipelineState(SeedlessMetalForward._gqmmMixSwigluRowsPipeline!)
+        enc.setBuffer(gw4, offset: 0, index: 0); enc.setBuffer(gw2, offset: 0, index: 1)
+        enc.setBuffer(gsc, offset: 0, index: 2); enc.setBuffer(gbi, offset: 0, index: 3)
+        enc.setBuffer(uw4, offset: 0, index: 4); enc.setBuffer(uw2, offset: 0, index: 5)
+        enc.setBuffer(usc, offset: 0, index: 6); enc.setBuffer(ubi, offset: 0, index: 7)
+        enc.setBuffer(x, offset: xByteOffset, index: 8); enc.setBuffer(inds, offset: indsOffset, index: 9)
+        enc.setBuffer(h, offset: outByteOffset, index: 10)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 11); enc.setBytes(&nn, length: 4, index: 12); enc.setBytes(&kt, length: 4, index: 13)
+        SeedlessMetalForward.bindStop(enc, 14)
+        var k4v = Int32(k4); enc.setBytes(&k4v, length: 4, index: 15)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
     /// P3 テスト支援: gate(lhsPer=false, x[M,K]共有 → g[M*Ktop,I])→ down(lhsPer=true, g → out[M*Ktop,K2])を
     /// 単一 CB + 常駐中間で実行。gatherQmmRows 2 回と bit 一致すれば gather の CB 融合が順序保存であることの証明。
     public static func fusedGatherChain(_ x: MLXArray, inds: MLXArray,
@@ -1544,13 +1597,18 @@ public enum SeedlessFusedVerify {
         // ★ zero-copy(bytesNoCopy)buffer の裏 MLXArray を保持。asType 変換が生む一時 array の
         //   buffer が解放→MLX allocator 再利用で clobber されるのを防ぐ(mlx-swift asMTLBuffer の寿命規約)。
         let retained: [MLXArray]
+        // ★ W3a mixed residency(notes/18): 非 nil なら routed gather は mix kernel 経路。
+        //   12 buffer 順 = [gW4,gW2,gS,gB, uW4,uW2,uS,uB, dW4,dW2,dS,dB](MixedExpertArena.gatherBuffers12)。
+        //   swMix != nil の間、上の sw* 9 フィールドは読まれない(位置的 alias が入るが不使用)。
+        var swMix: [MTLBuffer]? = nil
+        var mixK4: Int32 = 0
     }
 
     /// expertOverride 非 nil 時は sw*(routed expert)フィールドをそこから取り、
     /// w.swGWq 等は一切 materialize しない(streaming 時は mmap-lazy 重みをメモリに展開しないため)。
     /// gate/shared/sharedGate は常に w から変換。
     static func prepareMoEBlockBufs(_ w: SeedlessVerifyForward.MoEBlockW, _ device: MTLDevice,
-                                     expertOverride: [MTLBuffer]? = nil) -> MoEBlockBufs? {
+                                     expertOverride: [MTLBuffer]? = nil, mixK4: Int = 0) -> MoEBlockBufs? {
         var keep: [MLXArray] = []
         func trio(_ q: MLXArray, _ s: MLXArray, _ b: MLXArray) -> (MTLBuffer, MTLBuffer, MTLBuffer)? {
             let sc = s.asType(.float16), bc = b.asType(.float16)
@@ -1566,7 +1624,19 @@ public enum SeedlessFusedVerify {
         let swGW: MTLBuffer, swGS: MTLBuffer, swGB: MTLBuffer
         let swUW: MTLBuffer, swUS: MTLBuffer, swUB: MTLBuffer
         let swDW: MTLBuffer, swDS: MTLBuffer, swDB: MTLBuffer
-        if let ov = expertOverride, ov.count >= 9 {
+        var swMix: [MTLBuffer]? = nil
+        if let ov = expertOverride, ov.count >= 12 {
+            // ★ W3a mixed: 12-buffer 順(gatherBuffers12)。sw* 9 フィールドは型上必須なので位置的に
+            //   alias するが、swMix != nil の間 encodeMoEGatherRowsRange は swMix しか読まない。
+            //   mix pipeline はここで事前 compile(encode statics は non-nil を前提)。
+            guard SeedlessMetalForward.ensureMixPipelines() else {
+                print("[prepareMoEBlockBufs] ERROR: ensureMixPipelines failed"); return nil
+            }
+            swMix = Array(ov[0 ..< 12])
+            (swGW, swGS, swGB) = (ov[0], ov[2], ov[3])
+            (swUW, swUS, swUB) = (ov[4], ov[6], ov[7])
+            (swDW, swDS, swDB) = (ov[8], ov[10], ov[11])
+        } else if let ov = expertOverride, ov.count >= 9 {
             (swGW, swGS, swGB) = (ov[0], ov[1], ov[2])
             (swUW, swUS, swUB) = (ov[3], ov[4], ov[5])
             (swDW, swDS, swDB) = (ov[6], ov[7], ov[8])
@@ -1591,7 +1661,8 @@ public enum SeedlessFusedVerify {
                             shUW: shU.0, shUS: shU.1, shUB: shU.2,
                             shDW: shD.0, shDS: shD.1, shDB: shD.2,
                             sgW: sg.0, sgS: sg.1, sgB: sg.2,
-                            retained: keep)
+                            retained: keep,
+                            swMix: swMix, mixK4: Int32(mixK4))
     }
 
     /// MoE block × M 行の全段(routing→routed experts→combine→shared→final)を **既存 encoder に
@@ -1652,6 +1723,38 @@ public enum SeedlessFusedVerify {
         if let st = slotTable {
             SeedlessMetalForward.encodeSlotRemapRows(enc, inds: sc.inds, indsByteOffset: indsOff,
                                                 table: st, count: Mc * Ktop)
+        }
+        // ★ W3a mixed residency(notes/18): swMix 非 nil なら routed gather を mix kernel で encode。
+        //   remap 済み inds は GLOBAL slot(0..<K4+M2、mix kernel が s<K4 で 4/2-bit を分岐)。
+        //   構造は既存経路と 1:1(fuseGU 分岐・down lhsPer・combine skip 条件とも同一)。
+        if let mix = w.swMix {
+            if SeedlessFusedForward.fuseGUActive(M: Mc) ?? false {
+                encodeGqmmMixSwigluRows(enc, gw4: mix[0], gw2: mix[1], gsc: mix[2], gbi: mix[3],
+                                        uw4: mix[4], uw2: mix[5], usc: mix[6], ubi: mix[7],
+                                        x: x, inds: sc.inds, h: sc.h,
+                                        M: Mc, Ktop: Ktop, K: H, N: I, k4: Int(w.mixK4),
+                                        xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+            } else {
+                encodeGqmmMixRows(enc, w4: mix[0], w2: mix[1], sc: mix[2], bi: mix[3],
+                                  x: x, inds: sc.inds, out: sc.g,
+                                  M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false, k4: Int(w.mixK4),
+                                  xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+                encodeGqmmMixRows(enc, w4: mix[4], w2: mix[5], sc: mix[6], bi: mix[7],
+                                  x: x, inds: sc.inds, out: sc.u,
+                                  M: Mc, Ktop: Ktop, K: H, N: I, lhsPer: false, k4: Int(w.mixK4),
+                                  xByteOffset: xOff, indsOffset: indsOff, outByteOffset: guOff)
+                encodeSwiglu(enc, g: sc.g, u: sc.u, h: sc.h, total: Mc * Ktop * I, byteOffset: guOff)
+            }
+            encodeGqmmMixRows(enc, w4: mix[8], w2: mix[9], sc: mix[10], bi: mix[11],
+                              x: sc.h, inds: sc.inds, out: sc.d,
+                              M: Mc, Ktop: Ktop, K: I, N: H, lhsPer: true, k4: Int(w.mixK4),
+                              xByteOffset: guOff, indsOffset: indsOff, outByteOffset: dOff)
+            if !(SeedlessFusedForward.fuseMOE2Enabled && SeedlessFusedForward.fuseSHEXP && Mc == 1) {
+                encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y,
+                                  Ktop: Ktop, N: H, M: Mc,
+                                  dByteOffset: dOff, scoresOffset: scOff, yByteOffset: yOff)
+            }
+            return
         }
         // gather g/u + swiglu: flag-on で 1-dispatch 融合(但し M=1 のみ=register 圧迫退行)、
         // flag-off or M>1 で既存 3-kernel 連鎖(byte 不変)。fuseGUActive(M) == (fuseGU && M==1)。
@@ -3166,7 +3269,8 @@ public enum SeedlessFusedVerify {
                 let ov = initProviders?[i].gatherBuffers(device: device)
                 guard let ln = SeedlessMetalForward.mtlBuf(lnA, device),
                       let pn = SeedlessMetalForward.mtlBuf(pnA, device),
-                      let moe = SeedlessFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov) else { return nil }
+                      let moe = SeedlessFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov,
+                                                                        mixK4: initProviders?[i].mixK4 ?? 0) else { return nil }
                 var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
                 var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
                 if s.isLinear, let gw = s.gdn {

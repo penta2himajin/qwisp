@@ -51,6 +51,11 @@ final class BoltServe {
     private let maxM: Int
 
     private var providers: [ArenaExpertProvider]? = nil
+    // ★ W3b mixed residency(notes/18): 非 nil なら混合精度モード。generic の providers は nil の
+    //   まま(型が異なる)。mixed v1 は SYNC refresh のみ — staging arena を作らないことで
+    //   refreshAsync が構造的に false になる(async swapChunk は LayerExpertCache 内部直書きで未対応)。
+    private let mixedTailDir: String?
+    private var mixedProviders: [MixedArenaExpertProvider]? = nil
     private var calibrated = false
     // Freeze basis: the routing window (counts/coact) the current residency was built
     // from — calib initially, then the latest recalib window.
@@ -84,12 +89,14 @@ final class BoltServe {
     private static let nE = 256
     private static let Ktop = 8
 
-    init(engine: SeedlessEngine, modelDir: String, C: Int, maxK: Int, maxM: Int) {
+    init(engine: SeedlessEngine, modelDir: String, C: Int, maxK: Int, maxM: Int,
+         mixedTailDir: String? = nil) {
         self.engine = engine
         self.modelDir = modelDir
         self.C = C
         self.maxK = maxK
         self.maxM = maxM
+        self.mixedTailDir = mixedTailDir
     }
 
     /// Freeze current residency to `fwd`: ensure top-C of the basis window, rebuild
@@ -109,7 +116,43 @@ final class BoltServe {
         return s
     }
 
+    /// ★ W3b mixed freeze: core は初回のみ static pin(calib basis top-K4)、以後の freeze は
+    /// tail の top-M2(非 core)ensure + 混合 slot 空間の buddyTable 再構築 + upload のみ。
+    /// dither(sync 診断)は generic 専用 — mixed では不適用。
+    private func freezeMixed(_ fwd: SeedlessFusedVerify.SeedlessFusedForward) {
+        guard let mixed = mixedProviders else { return }
+        var tables: [[Int32]] = []
+        var buddyExps: [[Int32]] = []
+        for (li, provider) in mixed.enumerated() {
+            let cache = provider.cache
+            let order = baseCounts[li].enumerated()
+                .sorted { $0.element != $1.element ? $0.element > $1.element : $0.offset < $1.offset }
+                .map { $0.offset }
+            if !cache.corePinned {
+                if !cache.pinCore(Array(order.prefix(cache.K4))) {
+                    FileHandle.standardError.write(Data("[boltserve] mixed pinCore failed at layer \(li)\n".utf8))
+                }
+            }
+            let core = Set(cache.coreOf.keys)
+            let tail = order.lazy.filter { !core.contains($0) }.prefix(cache.M2)
+            _ = cache.ensure(Array(tail))
+            // fallback slot = basis top-1 の現 slot(generic の fallbackSlot と同じ決定則)
+            let fb = order.first.flatMap { cache.slotOfExpert($0) } ?? 0
+            let (table, bexp) = cache.buddyTable(coact: baseCoact[li], nE: Self.nE, fallbackSlot: fb)
+            tables.append(table)
+            buddyExps.append(bexp)
+        }
+        fwd.setBoltTables(tables)
+        if biasEps > 0 {
+            let masks: [[Int32]] = buddyExps.map { bexp in
+                (0 ..< Self.nE).map { Int32(bexp[$0] == Int32($0) ? 1 : 0) }
+            }
+            fwd.setRouteBias(masks: masks, eps: biasEps)
+        }
+    }
+
     private func freeze(_ fwd: SeedlessFusedVerify.SeedlessFusedForward) {
+        if mixedTailDir != nil { freezeMixed(fwd); return }
         guard let providers else { return }
         for (li, provider) in providers.enumerated() {
             let top = baseCounts[li].enumerated()
@@ -175,9 +218,20 @@ final class BoltServe {
             // stderr like the server's perf log — keeps `qwisp benchtest > report.md` clean.
             FileHandle.standardError.write(Data("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict\n".utf8))
             FileHandle.standardError.write(Data("[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …\n".utf8))
-            guard let (backend1, fwd1, provs) = Tell.streamingBackend(
-                engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C)
-            else { return nil }
+            let backend1: Tell.SpecBackend
+            let fwd1: SeedlessFusedVerify.SeedlessFusedForward
+            if let tdir = mixedTailDir {
+                guard let (b, f, provs) = Tell.streamingBackendMixed(
+                    engine: engine, modelDir: modelDir, tailDir: tdir,
+                    maxM: maxM, maxSeqLen: maxSeqLen, budgetC: C)
+                else { return nil }
+                backend1 = b; fwd1 = f; mixedProviders = provs
+            } else {
+                guard let (b, f, provs) = Tell.streamingBackend(
+                    engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C)
+                else { return nil }
+                backend1 = b; fwd1 = f; providers = provs
+            }
             var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
             var coact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
                                   count: nLayers)
@@ -210,7 +264,6 @@ final class BoltServe {
                 u = evals[0]
             }
             fwd1.indsCaptureHook = nil
-            providers = provs
             baseCounts = counts
             baseCoact = coact
             winCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
@@ -218,7 +271,10 @@ final class BoltServe {
                                  count: nLayers)
             // Staging arenas for the async refresh pipeline (best-effort: on failure the
             // refreshAsync computed property stays false → sync refresh path).
-            if Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0, let first = provs.first {
+            // ★ W3b: mixed mode builds NO staging arenas → refreshAsync structurally false
+            //   (async staged swap is generic-only; mixed v1 is sync-refresh-only).
+            if mixedTailDir == nil, Tell.envInt("QWISP_BOLT_REFRESH_ASYNC", 1) != 0,
+               let first = providers?.first {
                 for _ in 0 ..< 2 {
                     if let a = try? ExpertArena(device: first.cache.arena.device,
                                                 source: first.cache.arena.source,
@@ -229,13 +285,28 @@ final class BoltServe {
             calibrated = true
             FileHandle.standardError.write(Data("[qwisp] calibration done — decoding at bolt speed from here\n".utf8))
         }
-        guard let providers else { return nil }
+        if self.providers == nil && self.mixedProviders == nil { return nil }
+        // ★ W3b: generic 経路の残りは `providers`(mixed 時は空配列 — 読むのは env-diag/async
+        //   ブロックだけで、いずれも isEmpty ガード or mixed で構造的に不活性)。
+        let providers = self.providers ?? []
 
         // ── Fresh forward for this segment (arena persists via providers) ──
-        guard let (backend, fwd, _) = Tell.streamingBackend(
-            engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
-            existingProviders: providers)
-        else { return nil }
+        let backend: Tell.SpecBackend
+        let fwd: SeedlessFusedVerify.SeedlessFusedForward
+        if let tdir = mixedTailDir {
+            guard let (b, f, _) = Tell.streamingBackendMixed(
+                engine: engine, modelDir: modelDir, tailDir: tdir,
+                maxM: maxM, maxSeqLen: maxSeqLen, budgetC: C,
+                existingProviders: mixedProviders)
+            else { return nil }
+            backend = b; fwd = f
+        } else {
+            guard let (b, f, _) = Tell.streamingBackend(
+                engine: engine, modelDir: modelDir, maxM: maxM, maxSeqLen: maxSeqLen, C: C,
+                existingProviders: providers)
+            else { return nil }
+            backend = b; fwd = f
+        }
         // Exact (strict) prefill FIRST — its ensures may move arena slots — then freeze.
         guard let lastNormed = Tell.prefill(promptIds: promptIds, backend: backend),
               let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
@@ -299,7 +370,7 @@ final class BoltServe {
                 let inds = Array(UnsafeBufferPointer(
                     start: ib.contents().advanced(by: off).assumingMemoryBound(to: Int32.self),
                     count: M * Ktop))
-                if missTracePath != nil || hazardOn {
+                if missTracePath != nil || hazardOn, !providers.isEmpty {
                     let s = providers[li].cache.slotOf
                     var lg: [(cold: Bool, g: Float)] = []   // this layer's routed raw gate logits
                     for e in inds where e >= 0 {
@@ -321,7 +392,7 @@ final class BoltServe {
                         }
                     }
                 }
-                if inRamp {
+                if inRamp, !providers.isEmpty {
                     let s = providers[li].cache.slotOf
                     for e in inds where e >= 0 && s[Int(e)] == nil { coldHist[li][Int(e), default: 0] += 1 }
                 }
