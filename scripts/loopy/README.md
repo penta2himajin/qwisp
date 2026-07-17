@@ -62,6 +62,26 @@ ground truth). Evidence: `p14/` (`p-*.toks`, `p-*.tsv` 10-col, `p-*.tf.tsv`); an
    non-LOOPY-fication is closed with evidence at every layer: prediction (12), timing
    (13), correction (14).
 
+## Probe 17 (oracle, `p17/mixprec.py`): mixed-precision residency — **GREEN, the first live lever**
+
+The capacity fix within the same RAM: keep the top-K4 experts (routing frequency) at 4-bit
+and requantize the tail through a 2-bit round trip (gs=64; the 4-bit gs=64 affine grid
+represents 2-bit gs=64 points exactly, so the model computes with true 2-bit tails). Python
+oracle, full coverage (no buddy) — isolates the PRECISION axis; the capacity axis is already
+measured in Swift (C=128 ⇒ 4/4 healthy).
+
+Verdict (K4=40, 216 experts at 2-bit, greedy 4 prompts, token-level): **no loops (4/4), sky
+terminates naturally at EOS, 8-gram repetition metrics ≈ full-4-bit baseline, text fully
+coherent** (correct quicksort code, nuanced story revision). Direct contrast with buddy
+(right-size WRONG function → 5/5 burn): a coarser version of the RIGHT function carries no
+attractors — `SubstituteCorrect`'s δ-comparison validated in the strongest form.
+
+8GB RAM math (64 4-bit-slot units/layer): K4 + M/2 ≤ 64 ⇒ coverage 96 (32+64) … 128
+(0+128) experts resident vs today's 64 — crossing or nearing the measured C=128 healthy
+line, with buddy only in the deep tail. Remaining engineering: 2-bit gqmm kernel variant,
+mixed-slot arena, offline tail requant; remaining design question: the K4/M split (oracle
+can sweep K4=0 to bound the all-2-bit corner).
+
 ## Probe 15 (`QWISP_BUDDY_DITHER=k`): buddy-table dithering — NO-GO, landscape beats bias
 
 Signal-processing framing: the loop is a limit cycle of a coarsely-quantized feedback system,
