@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 79
+        let total = 80
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -3203,6 +3203,74 @@ public enum SeedlessVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "gqmm3Rows M=\(M) bf16: \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 56b (W1, notes/18-mixed-precision-residency-spec.md): gqmm2 + gqmm2Rows
+        // bit-exact against MLX bits=2 oracle — float16 scales ONLY.
+        // The real 2-bit residency artifact is F16-scaled; the bf16 UD-model path does not
+        // exist for 2-bit, so (deliberate deviation from the gqmm3 pair) there is no bf16 case.
+        // Oracle: MLX.quantizedMatmul(bits:2) per (row,expert) slot — NOT a self-loop.
+        // Goes RED at first gqmm2 nil check (STUB — W1 RED).
+        run("gqmm2_rows_bitexact_f16") {
+            let E = 64, K = 2048, N = 512, Ktop = 4
+            // Same 50-entry expert-index pool as gqmm3 (all < E=64).
+            let gqmm2Pool: [Int32] = [3, 17, 40, 62,  0, 10, 25, 50, 33,  7,
+                                       55, 20, 41, 15,  2, 60,  8, 30, 11, 45,
+                                       22, 38, 61,  5, 18, 44, 29,  1, 36, 52,
+                                        6, 19,  9, 27, 48, 14, 37,  4, 23, 53,
+                                       12, 16, 31, 39, 47, 57, 13, 21, 32, 49]
+            // f16 weights → f16 scales/biases from MLX.quantized (bits=2 affine)
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (wq, sc, biOpt) = MLX.quantized(wf, groupSize: 64, bits: 2, mode: .affine)
+            guard let bi = biOpt else { return (false, "biases nil") }
+            MLX.eval([wq, sc, bi])
+
+            // ── gqmm2 (M=1) vs MLX oracle ──
+            let x1 = MLXRandom.normal([1, K]).asType(.float16); x1.eval()
+            let inds1Arr: [Int32] = [3, 17, 40, 62]   // Ktop=4, all < E
+            let inds1 = MLXArray(inds1Arr, [Ktop]); inds1.eval()
+            var oracle1Parts: [MLXArray] = []
+            for ki in 0..<Ktop {
+                let e = Int(inds1Arr[ki])
+                let r = MLX.quantizedMatmul(x1, wq[e], scales: sc[e], biases: bi[e],
+                                            transpose: true, groupSize: 64, bits: 2, mode: .affine)
+                r.eval(); oracle1Parts.append(r)
+            }
+            let oracle1 = MLX.concatenated(oracle1Parts, axis: 0); oracle1.eval()   // [Ktop, N]
+            // Stub — goes RED here (gqmm2 returns nil)
+            guard let got1 = SeedlessMetalForward.gqmm2(x1, wq, scales: sc, biases: bi,
+                                                     inds: inds1, Ktop: Ktop, K: K, N: N)
+            else { return (false, "gqmm2 not implemented (M=1 f16)") }
+            got1.eval()
+            let (ok1, d1) = bitEqual(got1, oracle1)
+            if !ok1 { return (false, "gqmm2 M=1 f16: \(d1)") }
+
+            // ── gqmm2Rows (M∈{1,2,9,17,25}) vs MLX oracle ──
+            for M in [1, 2, 9, 17, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0..<M*Ktop).map { gqmm2Pool[$0 % gqmm2Pool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                var refParts: [MLXArray] = []
+                for m in 0..<M {
+                    let xm = x[m ..< m+1]   // [1, K]
+                    xm.eval()
+                    for ki in 0..<Ktop {
+                        let e = Int(indsFlat[m * Ktop + ki])
+                        let r = MLX.quantizedMatmul(xm, wq[e], scales: sc[e], biases: bi[e],
+                                                    transpose: true, groupSize: 64, bits: 2, mode: .affine)
+                        r.eval(); refParts.append(r)   // [1, N]
+                    }
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()   // [M*Ktop, N]
+                guard let got = SeedlessMetalForward.gqmm2Rows(x, wq, scales: sc, biases: bi,
+                                                           inds: inds, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "gqmm2Rows not implemented (M=\(M) f16)") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "gqmm2Rows M=\(M) f16: \(d)") }
             }
             return (true, "ok")
         }
