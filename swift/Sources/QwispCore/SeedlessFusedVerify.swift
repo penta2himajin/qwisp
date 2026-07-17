@@ -1628,6 +1628,10 @@ public enum SeedlessFusedVerify {
         if let ov = expertOverride, ov.count >= 12 {
             // ★ W3a mixed: 12-buffer 順(gatherBuffers12)。sw* 9 フィールドは型上必須なので位置的に
             //   alias するが、swMix != nil の間 encodeMoEGatherRowsRange は swMix しか読まない。
+            //   mix pipeline はここで事前 compile(encode statics は non-nil を前提)。
+            guard SeedlessMetalForward.ensureMixPipelines() else {
+                print("[prepareMoEBlockBufs] ERROR: ensureMixPipelines failed"); return nil
+            }
             swMix = Array(ov[0 ..< 12])
             (swGW, swGS, swGB) = (ov[0], ov[2], ov[3])
             (swUW, swUS, swUB) = (ov[4], ov[6], ov[7])
@@ -3265,7 +3269,8 @@ public enum SeedlessFusedVerify {
                 let ov = initProviders?[i].gatherBuffers(device: device)
                 guard let ln = SeedlessMetalForward.mtlBuf(lnA, device),
                       let pn = SeedlessMetalForward.mtlBuf(pnA, device),
-                      let moe = SeedlessFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov) else { return nil }
+                      let moe = SeedlessFusedVerify.prepareMoEBlockBufs(s.moe, device, expertOverride: ov,
+                                                                        mixK4: initProviders?[i].mixK4 ?? 0) else { return nil }
                 var gdnB: GdnLayerBufs? = nil, attnB: AttnLayerBufs? = nil
                 var gdnC: GdnCacheBufs? = nil, kvC: KVCacheBufs? = nil
                 if s.isLinear, let gw = s.gdn {

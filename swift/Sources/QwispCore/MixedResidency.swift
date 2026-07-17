@@ -282,4 +282,50 @@ public final class MixedLayerExpertCache {
         }
         return true
     }
+
+    // ── W3b accessors (BoltServe mixed freeze) ──────────────────────────────
+    public var K4: Int { arena.K4 }
+    public var M2: Int { arena.M2 }
+    public var corePinned: Bool { !state.coreOf.isEmpty }
+    public var coreOf: [Int: Int] { state.coreOf }
+    /// Current GLOBAL slot of expert e (core or tail), nil if not resident.
+    public func slotOfExpert(_ e: Int) -> Int? { state.coreOf[e] ?? state.tailSlotOf[e] }
+    public func buddyTable(coact: [[Int]], nE: Int, fallbackSlot: Int) -> (table: [Int32], buddyExpert: [Int32]) {
+        state.buddyTable(coact: coact, nE: nE, fallbackSlot: fallbackSlot)
+    }
+}
+
+/// W3b: mixed provider for the fused engine. Conforms to SeedlessFusedExpertProvider so the
+/// forward init consumes it like ArenaExpertProvider — gatherBuffers returns the TWELVE-buffer
+/// mixed layout (prepareMoEBlockBufs branches on count>=12) and mixK4 the core width.
+/// `C` reports M2 (NOT K4+M2): the protocol's C is the ensure-capacity contract used by the
+/// strict-prefill chunk partitioner, and the worst case (zero core hits in a chunk) must still
+/// fit the tail LRU — core hits only reduce demand. Global slot ids still span 0..<K4+M2.
+public final class MixedArenaExpertProvider: SeedlessFusedExpertProvider {
+    public let cache: MixedLayerExpertCache
+    public var C: Int { cache.M2 }
+    public var mixK4: Int { cache.K4 }
+    private var cachedBuffers: [MTLBuffer]? = nil
+
+    public init(cache: MixedLayerExpertCache) { self.cache = cache }
+
+    public func gatherBuffers(device: MTLDevice) -> [MTLBuffer]? {
+        if let c = cachedBuffers { return c }
+        let bufs = cache.arena.gatherBuffers12(device: device)
+        cachedBuffers = bufs
+        return bufs
+    }
+
+    public func ensure(_ experts: [Int]) -> [Int: Int] {
+        if let m = cache.ensure(experts) { return m }
+        // Overflow (distinct tail > M2) cannot happen through the chunk partitioner (C = M2
+        // contract above); direct callers exceeding it get a loud clamp, never silent aliasing.
+        print("[MixedArenaExpertProvider] ensure overflow: \(experts.count) experts > tail capacity \(cache.M2) — clamping")
+        var seen = Set<Int>(), kept: [Int] = []
+        for e in experts where seen.insert(e).inserted {
+            if kept.count >= cache.M2 { break }
+            kept.append(e)
+        }
+        return cache.ensure(kept) ?? [:]
+    }
 }

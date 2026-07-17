@@ -13,6 +13,15 @@ public protocol SeedlessFusedExpertProvider: AnyObject {
     var C: Int { get }
     func gatherBuffers(device: MTLDevice) -> [MTLBuffer]?
     func ensure(_ experts: [Int]) -> [Int: Int]
+    /// W3b mixed residency: core width K4 (>0 = gatherBuffers returns the 12-buffer mixed
+    /// layout and the forward routes the gather through gqmm_mix kernels). Default 0 = 4-bit.
+    /// Declared as a requirement (not extension-only) so protocol-typed access dispatches
+    /// dynamically to MixedArenaExpertProvider's override.
+    var mixK4: Int { get }
+}
+
+public extension SeedlessFusedExpertProvider {
+    var mixK4: Int { 0 }
 }
 
 /// 本番 provider: LayerExpertCache(per-layer LRU + ExpertSource pread)を fused engine に接続。
