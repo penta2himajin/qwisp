@@ -148,6 +148,41 @@ qwisp-poc during productization; re-wire it or bench via a RAWTESTS-style entry)
 W1's front half — the speed sim and the first implementation step are the same work. Final
 tok/s only from the 8GB device sim (QWISP_DEVICE_RAM=8) after W1+W2.
 
+### W5 (deferred consideration, owner-requested 2026-07-17) — bolt-draft + batched strict verify = bit-exact "strict-turbo" on partial tiers
+
+Not part of this project's acceptance; recorded for after W1–W4.
+
+**Construction**: draft = the mixed-residency bolt (2.4 GB arena, io≈0, resident-class speed);
+verifier = strict streaming (C=128); verify pipeline = the SHIPPED SuffixSpec batched verify
+(f32 canonical, union-overflow guard + exact safe-prefix, seqMultiToken GDN exactness) with
+the draft SOURCE swapped/augmented: suffix hit → suffix draft (free), else bolt free-run
+draft. Committed tokens are always the verifier's argmax ⇒ **output is bit-exact strict L1**
+— this is a strict-tier speedup, not a bolt variant (naming: strict-turbo, not bolt).
+
+**Why the arithmetic works only on partial tiers**: draft-model spec is dead on 32GB+
+resident (latency-bound ⇒ t_draft ≈ 0.9·t_target ⇒ ≤1.1×; SuffixSpec/MTP-D1 already own the
+cheap-draft slots) and irrelevant where strict is resident. On 16–24GB the draft runs
+resident-class (~6 ms/tok) while the target pays per-token miss-IO + per-layer sync; batched
+verify amortizes both by the accept-run length. Measured acceptance a = TF-match 87–92%
+(sweep) / p14 background flip 6–16% ⇒ E[run] ≈ 8–12 tok/verify ⇒ ~8 ms/tok ≈ 120 tok/s-class
+bit-exact strict on prose where SuffixSpec is weak (est. 2–3× the nl streaming cell); hybrid
+draft keeps code/agentic monotone.
+
+**Soundness / LOOPY**: lever B died on GATING unsoundness (p14: flips at bolt-margin 8–16 —
+no gate covers them); here every token is verified, soundness by construction. LOOPY is
+structurally eliminated in this tier: context only ever contains strict tokens, so the
+polluted-prefix mechanism (p14's shared-greedy loop) never forms — bolt drift is cut every
+8–12 tokens.
+
+**RAM**: 8GB can't hold both arenas (solo mixed bolt remains the 8GB answer); 16GB ≈ 15 GB
+borderline (shrink strict C to fit — measure); 24GB comfortable; 32GB+ pointless.
+
+**De-risk order**: (1) oracle acceptance at coverage-108 + deep-tail buddy (the sweep was
+full-coverage; real draft a is somewhat lower — this sets the true run length); (2) after
+W1–W3, a small W5 spike: swap the draft source only, verifier untouched (Prohibition 3
+safe); (3) decision bar: 16/24GB nl cell must significantly beat today's strict streaming;
+code cell non-regression via hybrid draft.
+
 ## Design point
 
 **Primary: K4=8 / M=100 ⇒ coverage 108** — the K4=8 oracle point measured clean (0/4 loops,
