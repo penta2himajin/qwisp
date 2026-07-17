@@ -197,6 +197,43 @@ W1–W3, a small W5 spike: swap the draft source only, verifier untouched (Prohi
 safe); (3) decision bar: 16/24GB nl cell must significantly beat today's strict streaming;
 code cell non-regression via hybrid draft.
 
+## W4 results (2026-07-18, dev box M1 Max, QWISP_DEVICE_RAM=8 sim, evidence: scripts/loopy/w4/)
+
+LOOPY battery (4 canonical prompts, 1000–1500 tok, token-level detlag2, same build both arms):
+
+| prompt | generic bolt C=64 | mixed K4=8/M2=100 (coverage 108) |
+|---|---|---|
+| story | loop @185 (p16) | **clean** (coherent prose) |
+| tcp | loop @173 (p11) | loop @194 (p25) — residual |
+| qs | loop @570 (p8) | **clean** (correct code) |
+| sky | loop @87 (p1) | **clean, natural EOS** |
+
+**0/4 → 3/4.** The tcp residual is capacity-consistent: the C-spectrum measured tcp as the
+heaviest prompt (first healthy at C=128) and coverage 108 < 128 is unreachable in the same
+bytes (corrected RAM math above). Generic reproduces the p14 ground truth exactly (sky@87).
+
+TF-fidelity (QWISP_TF_REPLAY through strict, full-length maxSeqLen): mixed clean streams
+**story 78.1% / qs 86.7%** ≈ oracle full-coverage (82.0/90.4) minus ~4pt of deep-tail buddy
+— exactly the expected product-vs-oracle gap. Loop-containing streams read inflated
+(mixed-tcp 98.2%, generic 94.7–96.1%) because in-loop positions match at 98%+ (p14).
+
+Speed: mixed ≈ generic wall-time parity on the M1 Max (value-bound, as predicted by
+gqmm2-bench); the +20–40% low-BW claim remains unverifiable on this box — needs a base-chip
+device or a BW-throttle sim.
+
+Bugs found (neither mixed-specific): (a) flaky SIGSEGV/SIGTRAP at `qwisp chat` process exit
+in BOTH arms — MLX scheduler teardown race (`get_default_stream` on destructed singleton)
+against the detached decode thread's tail; file separately. (b) QWISP_TOK_DUMP not written
+on early-natural-EOS runs (mixed-sky verdict taken from text). (c) TF-replay pitfall: the
+replay chat invocation must pass `--max-tokens ≥ stream length` or the KV allocation
+truncates and predictions collapse to ~10% match (cost one debugging round — documented).
+
+**Verdict: GO as opt-in.** QWISP_MIXED=1 turns 8GB bolt LOOPY from an asymptotic fate
+(4/4, survival 87–1244 tok) into a residual risk on the heaviest prompts (1/4), at
+oracle-predicted fidelity. Default-ON decision deferred (owner): candidates for closing the
+tcp residual = rolling-refresh dynamics tuning, calibrated 2-bit tail (quality upside),
+or accepting + documenting with the LoopGuard opt-in as belt-and-braces.
+
 ## Design point
 
 **Primary: K4=8 / M=100 ⇒ coverage 108** — the K4=8 oracle point measured clean (0/4 loops,
