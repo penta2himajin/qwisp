@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""#47 lever Q plausibility check (probe 17, oracle): does a 2-bit TAIL reintroduce loops
-or wreck quality? Keeps top-K4 experts (by routing frequency on the experiment prompts)
-at 4-bit and requantizes ALL other experts' switch_mlp weights through a 2-bit round trip
-(gs=64 affine; 4-bit gs=64 grid represents 2-bit gs=64 points exactly, so the re-encode
-is lossless and the model computes with true 2-bit-valued tails).
+"""#47 lever Q design-point sweep (probe 17 extension, oracle): K4 ∈ {40, 20, 0} experts
+kept at 4-bit per layer (by routing frequency on the experiment prompts), ALL other experts'
+switch_mlp weights requantized through a 2-bit round trip (gs=64 affine; the 4-bit gs=64
+grid represents 2-bit gs=64 points exactly, so the model computes with true 2-bit tails).
+K4=0 is the all-2-bit corner.
 
-Isolates the PRECISION axis: full coverage (no buddy substitution). The capacity axis
-(which subset is resident) is already measured in Swift (C=128 => 4/4 healthy).
+Per design point: (a) greedy free-run battery (loops / 8-gram via detlag2.py + rollstab.py),
+(b) TF-fidelity — teacher-force the o0 (full-4-bit) token stream through the patched model
+and count argmax match %.
+
+Patching is INCREMENTAL (K4 40 → 20 → 0): each step demotes only the newly-tailed rows,
+which are still original 4-bit — so one model load serves all points, and the K4=40 weights
+are bit-identical to the original probe-17 run (its o1-* free-run outputs are reused as
+k40-* when present).
 
 Run: mlx-python mixprec.py <outdir>  (GPU exclusive)
 """
-import os, sys, json
+import os, sys, subprocess
 import mlx.core as mx
+import numpy as np
 from mlx_lm import load, stream_generate
+from mlx_lm.models.cache import make_prompt_cache
 
 MDL = os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16")
-K4 = 40          # experts kept at 4-bit per layer
+K4S = [40, 20, 0]   # descending — incremental demotion
 GS = 64
 PROMPTS = {
     "story": "Write a short story about a lighthouse keeper who discovers a message in a bottle.",
@@ -35,9 +43,8 @@ layers = root.model.layers if hasattr(root, "model") else root.layers
 moe = [l.mlp for l in layers if hasattr(l.mlp, "switch_mlp")]
 print(f"[mixprec] {len(moe)} MoE layers", flush=True)
 
-# ── routing frequency: no hook needed — run each layer's gate directly is fragile; instead
-# replace the ATTRIBUTE (the MoE forward looks up self.gate, so an attribute-level wrapper
-# intercepts; instance __call__ patching would NOT — Python calls type(obj).__call__).
+# ── routing frequency: replace the gate ATTRIBUTE (the MoE forward looks up self.gate;
+# instance __call__ patching would NOT intercept — Python calls type(obj).__call__) ──
 counts = [[0] * 256 for _ in moe]
 hooked = []
 for li, m in enumerate(moe):
@@ -63,9 +70,14 @@ tot = sum(counts[0])
 assert tot > 0, "gate hook did not fire — routing counts empty"
 print(f"[mixprec] calib routing counted (layer0 total={tot})", flush=True)
 
+orders = [sorted(range(256), key=lambda e: (-c[e], e)) for c in counts]
+
 
 def gen(tag):
     for name, p in PROMPTS.items():
+        if os.path.exists(f"{out}/{tag}-{name}.toks"):
+            print(f"[mixprec] {tag}-{name}: exists, skip", flush=True)
+            continue
         msgs = [{"role": "user", "content": p}]
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
         toks = []
@@ -78,34 +90,80 @@ def gen(tag):
         print(f"[mixprec] {tag}-{name}: {len(toks)} toks", flush=True)
 
 
-gen("o0")  # baseline, unpatched 4-bit
+def demote(rows_per_layer):
+    """2-bit round trip on the given (still original 4-bit) expert rows, per layer."""
+    for li, m in enumerate(moe):
+        rows = rows_per_layer[li]
+        if not rows:
+            continue
+        tsel = mx.array(rows)
+        sw = m.switch_mlp
+        for pname in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(sw, pname)
+            w, s, b = lin.weight, lin.scales, lin.biases
+            deq = mx.dequantize(mx.take(w, tsel, axis=0), mx.take(s, tsel, axis=0),
+                                mx.take(b, tsel, axis=0), group_size=GS, bits=4)
+            shp = deq.shape
+            q2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
+            d2 = mx.dequantize(*q2, group_size=GS, bits=2)
+            rq = mx.quantize(d2, group_size=GS, bits=4)
+            nw, ns, nb = (x.reshape(len(rows), shp[1], -1) for x in rq)
+            # numpy round trip for row assignment (mx fancy setitem is version-dependent)
+            wn, sn, bn = np.array(w), np.array(s), np.array(b)
+            wn[rows], sn[rows], bn[rows] = np.array(nw.astype(w.dtype)), np.array(ns.astype(s.dtype)), np.array(nb.astype(b.dtype))
+            lin.weight, lin.scales, lin.biases = mx.array(wn), mx.array(sn), mx.array(bn)
+        mx.eval(sw.gate_proj.weight, sw.up_proj.weight, sw.down_proj.weight)
+        if li % 10 == 0:
+            print(f"[mixprec] patched layer {li} (+{len(rows)} rows)", flush=True)
 
-# ── patch: 2-bit round trip on tail experts ──
-import numpy as np
-for li, m in enumerate(moe):
-    c = counts[li]
-    order = sorted(range(256), key=lambda e: (-c[e], e))
-    tail = sorted(order[K4:])
-    tsel = mx.array(tail)
-    sw = m.switch_mlp
-    for pname in ("gate_proj", "up_proj", "down_proj"):
-        lin = getattr(sw, pname)
-        w, s, b = lin.weight, lin.scales, lin.biases
-        deq = mx.dequantize(mx.take(w, tsel, axis=0), mx.take(s, tsel, axis=0),
-                            mx.take(b, tsel, axis=0), group_size=GS, bits=4)
-        shp = deq.shape
-        q2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
-        d2 = mx.dequantize(*q2, group_size=GS, bits=2)
-        rq = mx.quantize(d2, group_size=GS, bits=4)
-        nw, ns, nb = (x.reshape(len(tail), shp[1], -1) for x in rq)
-        # numpy round trip for row assignment (mx fancy setitem is version-dependent)
-        wn, sn, bn = np.array(w), np.array(s), np.array(b)
-        wn[tail], sn[tail], bn[tail] = np.array(nw.astype(w.dtype)), np.array(ns.astype(s.dtype)), np.array(nb.astype(b.dtype))
-        lin.weight, lin.scales, lin.biases = mx.array(wn), mx.array(sn), mx.array(bn)
-    mx.eval(sw.gate_proj.weight, sw.up_proj.weight, sw.down_proj.weight)
-    if li % 10 == 0:
-        print(f"[mixprec] patched layer {li}", flush=True)
-print(f"[mixprec] tail (256-{K4}) experts -> 2-bit in all layers", flush=True)
 
-gen("o1")  # mixed precision
-print("MIXPREC DONE", flush=True)
+def tf_match(name):
+    """Teacher-force o0's token stream through the current model; % argmax match."""
+    o0 = [int(x) for x in open(f"{out}/o0-{name}.toks").read().split()]
+    msgs = [{"role": "user", "content": PROMPTS[name]}]
+    pids = list(tok.apply_chat_template(msgs, add_generation_prompt=True))
+    seq = pids + o0
+    cache = make_prompt_cache(model)
+    preds = []
+    for s in range(0, len(seq), 512):
+        logits = model(mx.array([seq[s:s + 512]]), cache=cache)
+        preds.extend(mx.argmax(logits[0], axis=-1).tolist())
+    hit = sum(1 for i in range(len(pids) - 1, len(seq) - 1) if preds[i] == seq[i + 1])
+    return hit, len(o0)
+
+
+gen("o0")  # baseline, unpatched 4-bit (reused from probe 17 when present)
+
+# reuse probe-17 K4=40 free-run outputs (bit-identical patch) as k40-*
+for name in PROMPTS:
+    for ext in ("toks", "txt"):
+        src, dst = f"{out}/o1-{name}.{ext}", f"{out}/k40-{name}.{ext}"
+        if os.path.exists(src) and not os.path.exists(dst):
+            os.symlink(f"o1-{name}.{ext}", dst)
+
+tf = {}
+prev = 256  # demoted so far: ranks [K4, prev) are newly tailed at each step
+for k4 in K4S:
+    demote([sorted(o[k4:prev]) for o in orders])
+    prev = k4
+    print(f"[mixprec] === design point K4={k4} (tail {256 - k4} experts at 2-bit) ===", flush=True)
+    gen(f"k{k4}")
+    tf[k4] = {}
+    for name in PROMPTS:
+        hit, n = tf_match(name)
+        tf[k4][name] = (hit, n)
+        print(f"[mixprec] TF k{k4}-{name}: {hit}/{n} = {100*hit/n:.2f}%", flush=True)
+
+# ── summary: loops (detlag2), 8-gram min (rollstab), TF-match ──
+here = os.path.dirname(os.path.abspath(__file__))
+for k4 in K4S:
+    toks = [f"{out}/k{k4}-{n}.toks" for n in PROMPTS]
+    txts = [f"{out}/k{k4}-{n}.txt" for n in PROMPTS if os.path.exists(f"{out}/k{k4}-{n}.txt")]
+    print(f"\n=== K4={k4} ===", flush=True)
+    subprocess.run([sys.executable, f"{here}/../detlag2.py"] + toks)
+    if txts:
+        subprocess.run([sys.executable, f"{here}/../rollstab.py"] + txts)
+    for name in PROMPTS:
+        hit, n = tf[k4][name]
+        print(f"TF {name}: {100*hit/n:.2f}%", flush=True)
+print("MIXPREC SWEEP DONE", flush=True)

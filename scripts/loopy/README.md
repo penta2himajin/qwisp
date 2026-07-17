@@ -82,6 +82,26 @@ line, with buddy only in the deep tail. Remaining engineering: 2-bit gqmm kernel
 mixed-slot arena, offline tail requant; remaining design question: the K4/M split (oracle
 can sweep K4=0 to bound the all-2-bit corner).
 
+### Design-point sweep (2026-07-17): K4 ∈ {40, 20, 0} × {loops, 8-gram min, TF-match %}
+
+`mixprec.py` extended: incremental demotion (40→20→0, each step 2-bit-round-trips only the
+newly-tailed original 4-bit rows, one model load), plus a TF-fidelity grade — teacher-force
+the o0 (full-4-bit) token stream through the patched model, % argmax match. K4=40 free-run
+reuses the probe-17 `o1-*` outputs (bit-identical patch; `k40-*` are symlinks).
+
+| K4 | coverage @8GB (K4+M) | loops (detlag2) | 8-gram min (rollstab) | TF-match story/tcp/qs/sky |
+|----|----------------------|-----------------|----------------------|---------------------------|
+| 40 | 88 (40+48)  | 0/4 | 0.99–1.00 | 86.9 / 90.5 / 92.8 / 91.0 % |
+| 20 | 108 (20+88) | 0/4 | 0.99–1.00 | 83.4 / 89.3 / 91.7 / 89.5 % |
+| 0  | 128 (0+128) | 1/4 transient (tcp period-22 @236–306, self-escapes, tail clean) | 0.94–1.00 | 79.8 / 83.8 / 89.3 / 89.7 % |
+
+Reading: precision damage is monotone but gentle from 40→20 (TF −1..−3.5 pt, repetition
+metrics unchanged, 0/4 loops) and cracks at the all-2-bit corner — k0-tcp shows the first
+attractor sighting on the precision axis (a period-22 episode that ESCAPES, unlike buddy
+loops which are terminal — coarser-RIGHT-function attractors are weak). **Chosen design
+point: K4=20 / M=88 ⇒ coverage 108** — the largest coverage with clean loop/repetition
+metrics; conservative fallback K4=32 / M=64 (coverage 96) if Swift disagrees. K4=0 excluded.
+
 ## Probe 15 (`QWISP_BUDDY_DITHER=k`): buddy-table dithering — NO-GO, landscape beats bias
 
 Signal-processing framing: the loop is a limit cycle of a coarsely-quantized feedback system,
