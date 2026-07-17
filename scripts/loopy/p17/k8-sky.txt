@@ -1,0 +1,52 @@
+Here's a thinking process:
+
+1.  **Analyze User Request:**
+   - **Topic:** Why the sky appears blue
+   - **Language:** Plain English (simple, clear, accessible)
+   - **Length:** About three paragraphs
+   - **Key Concepts to Cover:** Sunlight, atmosphere, scattering, blue light, wavelength/interaction with air molecules
+
+2.  **Deconstruct the Scientific Explanation:**
+   - Sunlight appears white but contains all colors (rainbow spectrum).
+   - Earth's atmosphere contains gas molecules (mostly nitrogen and oxygen).
+   - When sunlight enters the atmosphere, it interacts with these molecules.
+   - Shorter wavelengths (blue/violet) scatter more easily than longer wavelengths (red/yellow) - Rayleigh scattering.
+   - Our eyes are more sensitive to blue than violet, and the sun emits more blue light, so we perceive the sky as blue.
+
+3.  **Draft - Paragraph 1: Introduction & Sunlight Basics**
+   Start with sunlight and its composition. Keep it simple.
+   *Draft:* Sunlight looks white, but it’s actually made up of all the colors of the rainbow. When this light reaches Earth, it has to pass through our atmosphere, which is filled with tiny gas molecules. As the light travels through these gases, it bumps into them and spreads out in different directions. This process is called scattering, and it’s what gives the sky its color.
+
+4.  **Draft - Paragraph 2: The Scattering Mechanism (Blue vs. Other Colors)**
+   Explain why blue specifically. Focus on wavelength/size comparison without getting too technical.
+   *Draft:* Not all colors scatter the same way. Shorter, tighter waves like blue and violet bounce around more easily, while longer, wider waves like red and yellow tend to pass straight through. Because the atmosphere is made of nitrogen and oxygen molecules, they scatter the blue light in all directions, filling the sky. Even though violet light scatters even more, our eyes are less sensitive to it, and the sun produces more blue light, so we end up seeing a bright blue sky.
+
+5.  **Draft - Paragraph 3: Context/Exceptions & Conclusion**
+   Briefly mention why it's not blue at sunset (optional but helpful for completeness) and wrap up simply.
+   *Draft:* This scattering only happens when the sun is high in the sky. At sunrise or sunset, sunlight has to travel through more atmosphere, so the blue light gets scattered away before it reaches your eyes. That’s why the sky turns orange or red at those times. In the end, the blue sky is just a simple result of sunlight interacting with Earth’s air, scattering the shorter blue waves in every direction for us to see.
+
+6.  **Review & Refine (Self-Correction/Check against constraints):**
+   - *Plain English?* Yes, avoided jargon like "Rayleigh scattering," "wavelengths," "molecules" explained simply.
+   - *Three paragraphs?* Yes.
+   - *Accurate?* Yes, covers sunlight composition, atmospheric scattering, blue dominance, and sunset context.
+   - *Length/Flow?* Reads naturally, each paragraph builds on the last.
+   - *Check technical accuracy vs simplicity:* "Shorter, tighter waves" is a good plain-English substitute for "shorter wavelengths." "Bounce around" for "scatter." "Gas molecules" for atmospheric composition. All good.
+
+   Let's read through the full draft to ensure it meets the prompt exactly:
+   "Sunlight looks white, but it’s actually made up of all the colors of the rainbow. When this light reaches Earth, it has to pass through our atmosphere, which is filled with tiny gas molecules. As the light travels through these gases, it bumps into them and spreads out in different directions. This process is called scattering, and it’s what gives the sky its color.
+
+   Not all colors scatter the same way. Shorter, tighter waves like blue and violet bounce around more easily, while longer, wider waves like red and yellow tend to pass straight through. Because the atmosphere is made of nitrogen and oxygen molecules, they scatter the blue light in all directions, filling the sky. Even though violet light scatters even more, our eyes are less sensitive to it, and the sun produces more blue light, so we end up seeing a bright blue sky.
+
+   This scattering only happens when the sun is high in the sky. At sunrise or sunset, sunlight has to travel through more atmosphere, so the blue light gets scattered away before it reaches your eyes. That’s why the sky turns orange or red at those times. In the end, the blue sky is just a simple result of sunlight interacting with Earth’s air, scattering the shorter blue waves in every direction for us to see."
+
+   It's solid. Matches all constraints. I'll output this.✅
+   One minor tweak: Ensure the transition between paragraphs is smooth and the language stays consistently plain. The draft is already very plain. I'll keep it as is. All good. Output matches response. 
+   Proceed. 
+   [Output Generation] -> *Proceeds to generate response*
+</think>
+
+Sunlight looks white, but it’s actually made up of all the colors of the rainbow. When this light reaches Earth, it has to pass through our atmosphere, which is filled with tiny gas molecules. As the light travels through these gases, it bumps into them and spreads out in different directions. This process is called scattering, and it’s what gives the sky its color.
+
+Not all colors scatter the same way. Shorter, tighter waves like blue and violet bounce around more easily, while longer, wider waves like red and yellow tend to pass straight through. Because the atmosphere is mostly made of nitrogen and oxygen, these molecules scatter the blue light in all directions, filling the sky. Even though violet light scatters even more, our eyes are less sensitive to it, and the sun naturally produces more blue light, so we end up seeing a bright blue sky.
+
+This effect only happens when the sun is high overhead. At sunrise or sunset, sunlight has to travel through a much thicker slice of atmosphere, so the blue light gets scattered away before it reaches your eyes. That’s why the sky turns orange or red at those times. In the end, the blue sky is just a simple result of sunlight interacting with Earth’s air, scattering the shorter blue waves in every direction for us to see.<|im_end|>

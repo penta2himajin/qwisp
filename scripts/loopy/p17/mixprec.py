@@ -23,7 +23,7 @@ from mlx_lm import load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 
 MDL = os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16")
-K4S = [40, 20, 0]   # descending — incremental demotion
+K4S = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "40,20,0").split(",")]  # descending — incremental demotion
 GS = 64
 PROMPTS = {
     "story": "Write a short story about a lighthouse keeper who discovers a message in a bottle.",
