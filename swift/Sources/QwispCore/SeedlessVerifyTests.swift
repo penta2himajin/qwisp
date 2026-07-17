@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 82
+        let total = 85
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4900,6 +4900,212 @@ public enum SeedlessVerifyTests {
                 if !ok { return (false, "M=\(M): \(d)") }
             }
             return (true, "ok")
+        }
+
+        // ── W2 (notes/18): MixedResidency — 4-bit core + 2-bit tail residency ─────
+        // Test 82 (W2-1): pure-CPU mixed-slot cache bookkeeping (chunk_swap_atomic style).
+        // K4=2 static-pinned core (global slots 0..<2), M2=3 LRU tail (global slots 2..<5).
+        // Hand-calc: core experts return their pinned slot and never touch the tail LRU; tail
+        // fills empties in call order then evicts least-recently-used (excluding slots touched
+        // THIS call); a mid-call tail HIT protects its slot from a later same-call eviction; a
+        // call with >M2 distinct tail experts returns nil (overflow) leaving state untouched so
+        // the caller can retry. Global tail slot = K4 + local index. Counters track TAIL only.
+        run("mixed_cache_bookkeeping") {
+            var state = MixedCacheState(K4: 2, M2: 3)
+            // pinCore sorts ASC → core slots {1:0, 5:1}.
+            guard state.pinCore([5, 1]) else { return (false, "pinCore returned false") }
+            if state.coreOf != [1: 0, 5: 1] { return (false, "coreOf \(state.coreOf) != [1:0,5:1]") }
+            // wrong-count / duplicate guards (fresh states)
+            var g2 = MixedCacheState(K4: 2, M2: 3)
+            if g2.pinCore([3, 3]) { return (false, "pinCore accepted duplicates") }
+            if g2.pinCore([3]) { return (false, "pinCore accepted count=1") }
+            if g2.pinCore([3, 4, 5]) { return (false, "pinCore accepted count=3") }
+
+            func chk(_ tag: String, _ got: (slots: [Int: Int], missJobs: [(e: Int, slot: Int)])?,
+                     _ eslots: [Int: Int], _ ejobs: [[Int]], _ eh: Int, _ em: Int) -> String? {
+                guard let g = got else { return "\(tag): ensure nil" }
+                if g.slots != eslots { return "\(tag): slots \(g.slots) != \(eslots)" }
+                let jobs = g.missJobs.map { [$0.e, $0.slot] }
+                if jobs != ejobs { return "\(tag): missJobs \(jobs) != \(ejobs)" }
+                if state.hits != eh { return "\(tag): hits \(state.hits) != \(eh)" }
+                if state.misses != em { return "\(tag): misses \(state.misses) != \(em)" }
+                return nil
+            }
+
+            // Call 1: 2 core hits + 2 tail misses fill empties local0,local1 (global 2,3).
+            if let e = chk("c1", state.ensure([1, 5, 3, 6]),
+                           [1: 0, 5: 1, 3: 2, 6: 3], [[3, 2], [6, 3]], 0, 2) { return (false, e) }
+            if state.tailExpertAt != [3, 6, -1] { return (false, "c1 tailExpertAt \(state.tailExpertAt)") }
+
+            // Call 2: core hit(1) + tail hit(3) + tail miss(7) fills last empty local2(global4).
+            if let e = chk("c2", state.ensure([1, 3, 7]),
+                           [1: 0, 3: 2, 7: 4], [[7, 4]], 1, 3) { return (false, e) }
+            if state.tailExpertAt != [3, 6, 7] { return (false, "c2 tailExpertAt \(state.tailExpertAt)") }
+
+            // Call 3: tail full → two misses evict LRU. e6(local1,oldest) evicted first; then
+            // e3(local0) is oldest among non-touched (local1 was just touched this call).
+            if let e = chk("c3", state.ensure([8, 2]),
+                           [8: 3, 2: 2], [[8, 3], [2, 2]], 1, 5) { return (false, e) }
+            if state.tailExpertAt != [2, 8, 7] { return (false, "c3 tailExpertAt \(state.tailExpertAt)") }
+
+            // Call 4: e7(local2) is the OLDEST tail but is HIT first this call → re-ticked, so
+            // the two following misses evict e8 then e2, NEVER the freshly-hit e7 (same-call rule).
+            if let e = chk("c4", state.ensure([7, 10, 11]),
+                           [7: 4, 10: 3, 11: 2], [[10, 3], [11, 2]], 2, 7) { return (false, e) }
+            if state.tailExpertAt != [11, 10, 7] {
+                return (false, "c4 tailExpertAt \(state.tailExpertAt) (same-call hit must protect e7@local2)")
+            }
+
+            // Call 5: 4 distinct tail experts > M2=3 → overflow → nil, state UNCHANGED.
+            let h0 = state.hits, m0 = state.misses, ta0 = state.tailExpertAt
+            if state.ensure([20, 21, 22, 23]) != nil { return (false, "overflow did not return nil") }
+            if state.hits != h0 || state.misses != m0 || state.tailExpertAt != ta0 {
+                return (false, "overflow mutated state: h=\(state.hits) m=\(state.misses) tail=\(state.tailExpertAt)")
+            }
+
+            // Call 6: retry with exactly M2=3 distinct tail experts → succeeds, evicts all three.
+            if let e = chk("c6", state.ensure([20, 21, 22]),
+                           [20: 4, 21: 3, 22: 2], [[20, 4], [21, 3], [22, 2]], 2, 10) { return (false, e) }
+            if state.tailExpertAt != [22, 21, 20] { return (false, "c6 tailExpertAt \(state.tailExpertAt)") }
+
+            // Call 7: core hit(5) + 3 tail hits (all resident) → no misses; a core expert does NOT
+            // count toward the M2 overflow bound (4 experts, only 3 are tail).
+            if let e = chk("c7", state.ensure([5, 20, 21, 22]),
+                           [5: 1, 20: 4, 21: 3, 22: 2], [], 5, 10) { return (false, e) }
+            if state.tailExpertAt != [22, 21, 20] { return (false, "c7 tailExpertAt \(state.tailExpertAt)") }
+            return (true, "ok")
+        }
+
+        // Test 83 (W2-2): buddyTable over the GLOBAL slot space (core + tail residents combined).
+        // State: K4=2 core {1:0, 5:1}; ensure([2,7]) → tail residents {2:2, 7:3} (global slots).
+        // Combined hot set (residents sorted ASC) = [1,2,5,7] at global slots [0,2,1,3].
+        // Cold experts (rotation (i+e)%n, strictly-greater tie-break, n=4):
+        //   e0: coact{5:3}       → prefers CORE resident 5 → core slot 1, buddy 5
+        //   e3: coact{7:4}       → prefers TAIL resident 7 → global tail slot 3, buddy 7
+        //   e6: coact{1:2,5:2} tie → e6 rotation scans [5,7,1,2] → 5 wins (seen first) → slot 1, buddy 5
+        //   e4: no coact          → fallbackSlot(1), buddy -1
+        run("mixed_buddy_global_slots") {
+            var state = MixedCacheState(K4: 2, M2: 3)
+            guard state.pinCore([5, 1]) else { return (false, "pinCore failed") }
+            guard state.ensure([2, 7]) != nil else { return (false, "ensure([2,7]) nil") }
+            if state.tailSlotOf != [2: 2, 7: 3] { return (false, "tailSlotOf \(state.tailSlotOf) != [2:2,7:3]") }
+            var coact = [[Int]](repeating: [Int](repeating: 0, count: 8), count: 8)
+            coact[0][5] = 3
+            coact[3][7] = 4
+            coact[6][1] = 2; coact[6][5] = 2
+            let (table, buddy) = state.buddyTable(coact: coact, nE: 8, fallbackSlot: 1)
+            let eTable: [Int32] = [1, 0, 2, 3, 1, 1, 1, 3]
+            let eBuddy: [Int32] = [5, 1, 2, 7, -1, 5, 5, 7]
+            if table != eTable { return (false, "table \(table) != \(eTable)") }
+            if buddy != eBuddy { return (false, "buddy \(buddy) != \(eBuddy)") }
+            return (true, "ok")
+        }
+
+        // Test 84 (W2-3): MixedExpertArena pread layout over synthetic safetensors (NO model,
+        // NO GPU compute). Two temp-dir checkpoints — 4-bit: weight [4,8,16] U32; 2-bit: weight
+        // [4,8,8] U32; scales/biases [4,8,2] F16 both — filled with a distinct constant byte per
+        // (dir, proj, part, expert). loadCore pulls 4-bit expert 3 → core slot 0; loadTailMany
+        // pulls 2-bit experts 1,2 → global slots 2,3 (local 0,1). Verify each arena slot holds the
+        // exact source expert's bytes, weight buffers split per class (w4[K4]/w2[M2]) and
+        // scales/biases uniform[K4+M2] indexed by GLOBAL slot; plus sliceBytes relations.
+        run("mixed_arena_pread_layout") {
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            let fm = FileManager.default
+            let base = fm.temporaryDirectory.appendingPathComponent("qwisp_w2_\(UUID().uuidString)")
+            let dir4 = base.appendingPathComponent("m4"), dir2 = base.appendingPathComponent("m2")
+            try? fm.createDirectory(at: dir4, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: dir2, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: base) }
+
+            let E = 4
+            let projs = ExpertSource.projs, parts = ExpertSource.parts   // [gate,up,down] × [weight,scales,biases]
+            // distinct constant byte per (dir, projIdx, partIdx, expert)
+            func fillByte(_ dir: Int, _ p: Int, _ q: Int, _ e: Int) -> UInt8 {
+                UInt8((dir &* 101 &+ (p &* 3 &+ q) &* 37 &+ e &* 7) & 0xFF)
+            }
+            // minimal safetensors writer: 8B LE header-len + JSON header + data (offsets relative
+            // to data start) + model.safetensors.index.json weight_map.
+            func writeCkpt(_ dir: URL, _ dirTag: Int, wCols: Int) throws {
+                var meta: [String: Any] = [:]
+                var blob = Data()
+                for (p, proj) in projs.enumerated() {
+                    for (q, part) in parts.enumerated() {
+                        let isW = (part == "weight")
+                        let shape = isW ? [E, 8, wCols] : [E, 8, 2]
+                        let itemSize = isW ? 4 : 2                       // U32 vs F16
+                        let per = shape.dropFirst().reduce(1, *) * itemSize
+                        let begin = blob.count
+                        for e in 0 ..< E {
+                            blob.append(contentsOf: [UInt8](repeating: fillByte(dirTag, p, q, e), count: per))
+                        }
+                        meta["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] =
+                            ["dtype": isW ? "U32" : "F16", "shape": shape, "data_offsets": [begin, blob.count]]
+                    }
+                }
+                let hdr = try JSONSerialization.data(withJSONObject: meta)
+                var out = Data(); var hlen = UInt64(hdr.count).littleEndian
+                withUnsafeBytes(of: &hlen) { out.append(contentsOf: $0) }
+                out.append(hdr); out.append(blob)
+                try out.write(to: dir.appendingPathComponent("model.safetensors"))
+                var wm: [String: String] = [:]
+                for proj in projs {
+                    for part in parts { wm["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] = "model.safetensors" }
+                }
+                let idx = try JSONSerialization.data(withJSONObject: ["weight_map": wm])
+                try idx.write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+            }
+
+            do {
+                try writeCkpt(dir4, 0, wCols: 16)   // 4-bit: weight [4,8,16] U32
+                try writeCkpt(dir2, 1, wCols: 8)    // 2-bit: weight [4,8,8]  U32
+                let src4 = try ExpertSource(modelDir: dir4.path)
+                let src2 = try ExpertSource(modelDir: dir2.path)
+                let arena = try MixedExpertArena(device: device, source4: src4, source2: src2,
+                                                 K4: 2, M2: 2, refLayer: 0)
+                arena.loadCore(0, 3, slot: 0)                               // 4-bit expert 3 → core slot 0
+                arena.loadTailMany(0, [(e: 1, slot: 2), (e: 2, slot: 3)])   // 2-bit experts 1,2 → global slots 2,3
+
+                guard let bufs = arena.gatherBuffers12(device: device), bufs.count == 12 else {
+                    return (false, "gatherBuffers12 nil / count != 12")
+                }
+                // source-side sliceBytes parity (the arena enforces this as a precondition)
+                if try src4.sliceBytes(0, "gate_proj", "scales") != src2.sliceBytes(0, "gate_proj", "scales") {
+                    return (false, "src4/src2 scales sliceBytes differ")
+                }
+
+                func slotAllEqual(_ buf: MTLBuffer, _ off: Int, _ n: Int, _ want: UInt8) -> Bool {
+                    let p = buf.contents().advanced(by: off).bindMemory(to: UInt8.self, capacity: n)
+                    for i in 0 ..< n where p[i] != want { return false }
+                    return true
+                }
+
+                // per proj: buffers [w4, w2, scales, biases] at indices p*4+{0,1,2,3}
+                for p in 0 ..< 3 {
+                    let proj = projs[p]
+                    let w4 = bufs[p * 4 + 0], w2 = bufs[p * 4 + 1], sc = bufs[p * 4 + 2], bi = bufs[p * 4 + 3]
+                    let sbW4 = arena.sliceBytes(proj, "w4"), sbW2 = arena.sliceBytes(proj, "w2")
+                    let sbS = arena.sliceBytes(proj, "scales"), sbB = arena.sliceBytes(proj, "biases")
+                    if sbW4 != 512 || sbW2 != 256 { return (false, "proj\(p) weight sliceBytes w4=\(sbW4) w2=\(sbW2)") }
+                    if sbW2 != sbW4 / 2 { return (false, "proj\(p) w2 != w4/2") }
+                    if sbS != 32 || sbB != 32 || sbS != sbB { return (false, "proj\(p) s/b sliceBytes \(sbS)/\(sbB)") }
+                    // w4 core slot 0 ← src4 expert 3 (partIdx 0)
+                    if !slotAllEqual(w4, 0, sbW4, fillByte(0, p, 0, 3)) { return (false, "w4 slot0 proj\(p)") }
+                    // w2 local 0/1 ← src2 experts 1/2
+                    if !slotAllEqual(w2, 0 * sbW2, sbW2, fillByte(1, p, 0, 1)) { return (false, "w2 local0 proj\(p)") }
+                    if !slotAllEqual(w2, 1 * sbW2, sbW2, fillByte(1, p, 0, 2)) { return (false, "w2 local1 proj\(p)") }
+                    // uniform scales (partIdx 1): global slot0 ← src4 e3; slots 2,3 ← src2 e1,e2
+                    if !slotAllEqual(sc, 0 * sbS, sbS, fillByte(0, p, 1, 3)) { return (false, "scales slot0 proj\(p)") }
+                    if !slotAllEqual(sc, 2 * sbS, sbS, fillByte(1, p, 1, 1)) { return (false, "scales slot2 proj\(p)") }
+                    if !slotAllEqual(sc, 3 * sbS, sbS, fillByte(1, p, 1, 2)) { return (false, "scales slot3 proj\(p)") }
+                    // uniform biases (partIdx 2)
+                    if !slotAllEqual(bi, 0 * sbB, sbB, fillByte(0, p, 2, 3)) { return (false, "biases slot0 proj\(p)") }
+                    if !slotAllEqual(bi, 2 * sbB, sbB, fillByte(1, p, 2, 1)) { return (false, "biases slot2 proj\(p)") }
+                    if !slotAllEqual(bi, 3 * sbB, sbB, fillByte(1, p, 2, 2)) { return (false, "biases slot3 proj\(p)") }
+                }
+                return (true, "ok")
+            } catch {
+                return (false, "arena setup threw: \(error)")
+            }
         }
 
         // ── Summary ───────────────────────────────────────────────────────

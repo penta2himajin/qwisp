@@ -88,9 +88,10 @@ Consequences:
   (core rows / tail rows) with row masking — decide on measurement.
 
 ### W2 — mixed-slot arena + cache policy
-- Arena layout per proj: **weight buffer = [K4 slots × slice4][M slots × slice2] contiguous**
-  (one buffer, offset math in kernel); scales/biases buffers stay uniform `[K4+M, …]`
-  (identical slice size both pools) ⇒ provider still returns 9 buffers + binds K4.
+- Arena layout per proj: **weight buffers SPLIT per class** — w4 `[K4, …]` + w2 `[M, …]`
+  (as shipped in the W1b kernels: separate buffer args, w2 indexed by slot−K4); scales/biases
+  stay ONE uniform buffer `[K4+M, …]` (identical slice size both pools) ⇒ 12 gather buffers
+  + K4 constant. (Earlier contiguous-single-buffer idea superseded by the kernel contract.)
 - `LayerExpertCache` extension (or `MixedLayerExpertCache`): slots `0..<K4` = core (pinned,
   freeze-basis top-K4 by routing frequency — same basis buildBuddyTable already uses);
   slots `K4..<K4+M` = tail LRU. Tail misses pread from the 2-bit ExpertSource.
