@@ -138,6 +138,16 @@ on fast-SSD 8GB** (today ~166), floor parity. Second-order: tail miss/refresh/B3
 −44%/expert (main Neo slow-NAND win), fewer buddy events at coverage 108. Strict tier
 unaffected. All numbers to be confirmed by W4 measurement (doctrine).
 
+**Sim-measurement caveat (2026-07-17)**: an MLX `gather_qmm` bits=2-vs-4 microbench at
+production shapes reads r≈0.92–1.0 — INVALID as a proxy: MLX gather at these shapes runs at
+~3% of the byte roofline (M=1 gate 364 µs for ~4 MiB), i.e. launch/overhead-bound — the very
+reason the raw engine exists. The meaningful pre-wiring speed sim is the **gqmm2_rows kernel
+prototype benched against gqmm4_rows** (persistent buffers, single-CB GPU timestamps, the
+gatherBench pattern — note: the `QWISP_RUN=raw-gather-bench` dispatch was pruned from
+qwisp-poc during productization; re-wire it or bench via a RAWTESTS-style entry). That is
+W1's front half — the speed sim and the first implementation step are the same work. Final
+tok/s only from the 8GB device sim (QWISP_DEVICE_RAM=8) after W1+W2.
+
 ## Design point
 
 **Primary: K4=8 / M=100 ⇒ coverage 108** — the K4=8 oracle point measured clean (0/4 loops,
