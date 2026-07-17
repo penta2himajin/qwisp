@@ -4742,4 +4742,83 @@ public enum SeedlessMetalForward {
                                     M: Int, eps: Float, D: Int, promoteF32: Bool = false) -> MLXArray? {
         return rmsNorm(x, weight, eps: eps, D: D, promoteF32: promoteF32)
     }
+
+    /// ★ 診断(QWISP_RUN=gqmm2-bench, notes/18 W1 speed sim): gqmm4_rows vs gqmm2_rows の
+    ///   純 GPU 時間比を production 形状で測る。gatherBench 方式(永続 buffer、reps を単一 CB に
+    ///   encode、gpuEnd−gpuStart)。inds は rep 毎に buffer offset で回転し L2 再利用の楽観を避ける。
+    ///   これが byte-bound なら t2/t4 → 0.56 に近づき、latency-bound なら → 1.0。
+    public static func gqmm2Bench() -> String {
+        guard let (device, queue) = ensure() else { return "[gqmm2Bench] no device" }
+        let C = 108, Ktop = 8, reps = 300
+        // pipeline compile(小さな API 呼び出しで両 kernel を lazy compile)
+        do {
+            let E = 8, K = 512, N = 8
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (w4, s4, b4o) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            let (w2, s2, b2o) = MLX.quantized(wf, groupSize: 64, bits: 2, mode: .affine)
+            guard let b4 = b4o, let b2 = b2o else { return "[gqmm2Bench] quantize failed" }
+            let x = MLXRandom.normal([1, K]).asType(.float16)
+            let inds = MLXArray([Int32(0)], [1])
+            MLX.eval([w4, s4, b4, w2, s2, b2, x, inds])
+            _ = gatherQmmRows(x, w4, scales: s4, biases: b4, inds: inds, M: 1, Ktop: 1, K: K, N: N)
+            _ = gqmm2Rows(x, w2, scales: s2, biases: b2, inds: inds, M: 1, Ktop: 1, K: K, N: N)
+        }
+        guard let p4 = _gqmmRowsPipeline, let p2 = _gqmm2RowsPipeline else { return "[gqmm2Bench] pipelines 未compile" }
+
+        var out = "[gqmm2Bench] gqmm4_rows vs gqmm2_rows (C=\(C) Ktop=\(Ktop) reps=\(reps), 単一CB GPU時間, inds回転):\n"
+        for (proj, N, K) in [("gate/up", 512, 2048), ("down", 2048, 512)] {
+            // 永続 weight/scale/bias buffer(乱数; 値は速度に無関係、bit 正しさは locked test 側)
+            let w4 = MLXRandom.randInt(0 ..< Int32.max, [C, N, K / 8]).asType(.uint32)
+            let w2 = MLXRandom.randInt(0 ..< Int32.max, [C, N, K / 16]).asType(.uint32)
+            let sc = (MLXRandom.normal([C, N, K / 64]) * 0.02).asType(.float16)
+            let bi = (MLXRandom.normal([C, N, K / 64]) * 0.02).asType(.float16)
+            MLX.eval([w4, w2, sc, bi])
+            guard let bw4 = w4.asMTLBuffer(device: device, noCopy: true),
+                  let bw2 = w2.asMTLBuffer(device: device, noCopy: true),
+                  let bsc = sc.asMTLBuffer(device: device, noCopy: true),
+                  let bbi = bi.asMTLBuffer(device: device, noCopy: true) else { continue }
+            for M in [1, 8, 16, 32] {
+                let x = (MLXRandom.normal([M, K]) * 0.1).asType(.float16)
+                MLX.eval(x)
+                guard let bx = x.asMTLBuffer(device: device, noCopy: true) else { continue }
+                // rep 毎に別 inds(offset 回転)— 全 rep 同一 inds だと L2 再利用で byte-bound を過小評価
+                var indsAll = [Int32](); indsAll.reserveCapacity(reps * M * Ktop)
+                var seed: UInt64 = 0x9E3779B97F4A7C15
+                for _ in 0 ..< (reps * M * Ktop) {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    indsAll.append(Int32((seed >> 33) % UInt64(C)))
+                }
+                let bin = device.makeBuffer(bytes: &indsAll, length: indsAll.count * 4, options: .storageModeShared)!
+                let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+                var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop), lp = UInt32(0)
+                func runCB(_ pipe: MTLComputePipelineState, _ bw: MTLBuffer, _ count: Int) -> Double {
+                    let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                    for r in 0 ..< count {
+                        enc.setComputePipelineState(pipe)
+                        enc.setBuffer(bw, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
+                        enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3)
+                        enc.setBuffer(bin, offset: (r % reps) * M * Ktop * 4, index: 4)
+                        enc.setBuffer(outBuf, offset: 0, index: 5)
+                        enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7)
+                        enc.setBytes(&kt, length: 4, index: 8)
+                        bindStop(enc, 9)
+                        enc.setBytes(&lp, length: 4, index: 10)
+                        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                    }
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    return (cb.gpuEndTime - cb.gpuStartTime) * 1e6 / Double(count)   // µs/dispatch
+                }
+                _ = runCB(p4, bw4, 20); _ = runCB(p2, bw2, 20)   // warm
+                let t4 = runCB(p4, bw4, reps)
+                let t2 = runCB(p2, bw2, reps)
+                // 参考 roofline: 4bit weight bytes/dispatch(scales/biases/x/y 除く)
+                let gb4 = Double(M * Ktop) * Double(N) * Double(K) / 2.0 / t4 / 1e3   // GB/s 実効
+                out += String(format: "  %@ M=%2d: t4=%8.1fµs t2=%8.1fµs  r=t2/t4=%.3f  (4bit実効 %.0f GB/s)\n",
+                              proj, M, t4, t2, t2 / t4, gb4)
+            }
+        }
+        out += "  → r≈0.56=byte-bound(2bit フル勝ち) / r≈1.0=latency-bound(勝ちなし)。mixed 係数 = h + (1−h)·r, h≈0.08-0.15。"
+        return out
+    }
 }

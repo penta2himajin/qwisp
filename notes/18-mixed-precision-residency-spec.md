@@ -148,6 +148,19 @@ qwisp-poc during productization; re-wire it or bench via a RAWTESTS-style entry)
 W1's front half — the speed sim and the first implementation step are the same work. Final
 tok/s only from the 8GB device sim (QWISP_DEVICE_RAM=8) after W1+W2.
 
+**Kernel sim measured (2026-07-17, `QWISP_RUN=gqmm2-bench`, W1 landed)**: on the M1 Max
+(400 GB/s) dev box, gqmm2_rows vs gqmm4_rows reads **r = 0.91–1.0** at all production
+shapes/M. Mechanism: at M≥16 the 4-bit kernel sits AT the DRAM roof (measured 376–378 GB/s
+effective on weight bytes) while the 2-bit kernel moves half the bytes in the same time —
+i.e. qd2/qd4 have near-identical instruction streams (same load count, same FMA-per-value),
+so the 2-bit kernel is **value/issue-bound**, and on a Max-class part both walls coincide.
+Consequence for the product: on the 8GB TARGET tier (base chips, ~100 GB/s) the 4-bit
+kernel's 350+ GB/s DRAM demand is 3.5× oversubscribed ⇒ deeply byte-bound ⇒ the 2-bit
+issue-limit time stays well below the DRAM time and **r→~0.56 applies there** — the +20–40%
+estimate survives, but ONLY on low-BW devices. On Pro/Max-class machines mixed residency
+buys ~no kernel speed (it still buys the LOOPY fix + RAM). Exactly the right shape: the
+tier that needs the fix is the tier that gets the speedup. Confirm on-device in W4.
+
 ### W5 (deferred consideration, owner-requested 2026-07-17) — bolt-draft + batched strict verify = bit-exact "strict-turbo" on partial tiers
 
 Not part of this project's acceptance; recorded for after W1–W4.
