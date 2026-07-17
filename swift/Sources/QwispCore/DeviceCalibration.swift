@@ -92,6 +92,24 @@ public enum DeviceCalibration {
     }
 
 
+    /// (K4,M2) byte-budget rule for the mixed 4-bit-core / 2-bit-tail residency (notes/18 W3).
+    /// Pure: clamp k4 to [0, budget/slot4], then m2 = remaining budget / slot2 (never negative).
+    /// Byte sizes are PARAMETERS (derived from ExpertSource.sliceBytes by W3b) — no constants here.
+    public static func mixedKM(budgetBytes: Int, slot4Bytes: Int, slot2Bytes: Int, k4: Int) -> (k4: Int, m2: Int) {
+        let maxK4 = slot4Bytes > 0 ? budgetBytes / slot4Bytes : 0
+        let k4c = Swift.max(0, Swift.min(k4, maxK4))
+        let remaining = budgetBytes - k4c * slot4Bytes
+        let m2 = slot2Bytes > 0 ? Swift.max(0, remaining / slot2Bytes) : 0
+        return (k4c, m2)
+    }
+
+    /// Default K4 (4-bit core slot count) for the mixed residency, env-overridable
+    /// (QWISP_MIX_K4). Design point notes/18 W1 Part-A: K4=8/M2=100 (coverage 108).
+    public static func mixedDefaultK4() -> Int {
+        if let v = ProcessInfo.processInfo.environment["QWISP_MIX_K4"], let k = Int(v), k >= 0 { return k }
+        return 8
+    }
+
     /// device-config インスペクタ（モデル不要）。現機 + 各 RAM tier の構成を表示。
     public static func describeAll() -> String {
         var lines = ["[DeviceConfig] 本機: " + recommend().summary, "  tier 表:"]

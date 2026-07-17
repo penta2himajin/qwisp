@@ -4359,19 +4359,12 @@ public enum SeedlessMetalForward {
 
     nonisolated(unsafe) static var _gqmmMixRowsPipeline: MTLComputePipelineState?
 
-    /// Mixed 4-bit/2-bit MoE gather-qmv rows (M≥1). One dispatch, tid.z-uniform branch
-    /// on slot s: s<K4 → 4-bit path (w4[s], gqmm4_rows loop verbatim), s>=K4 → 2-bit path
-    /// (w2[s-K4], gqmm2_rows loop verbatim). scales/biases indexed by GLOBAL slot s in
-    /// both branches. x[M,K] (or [M*Ktop,K] if lhsPerExpert), w4[K4,N,K/8], w2[M2,N,K/16],
-    /// scales/biases[K4+M2,N,K/64], inds[M*Ktop] → out[M*Ktop,N].
-    public static func gqmmMixRows(_ x: MLXArray, w4: MLXArray, w2: MLXArray,
-                                    scales: MLXArray, biases: MLXArray, inds: MLXArray,
-                                    K4: Int, M: Int, Ktop: Int, K: Int, N: Int,
-                                    gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
-        guard let (device, queue) = ensure() else { return nil }
-        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
-            print("[raw-gqmm-mix-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
-        }
+    /// Compiles both mix pipelines (gqmm_mix_rows, gqmm_mix_swiglu_rows) without dispatching.
+    /// Idempotent (skips a pipeline already compiled). Encode-only callers (SeedlessFusedVerify)
+    /// call this before their first encode so the pipelines exist without going through the
+    /// one-shot wrappers below (which now just call this too).
+    static func ensureMixPipelines() -> Bool {
+        guard let (device, _) = ensure() else { return false }
         if _gqmmMixRowsPipeline == nil {
             let src = """
             #include <metal_stdlib>
@@ -4507,48 +4500,7 @@ public enum SeedlessMetalForward {
             """
             do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
                  _gqmmMixRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm_mix_rows")!)
-            } catch { print("[raw-gqmm-mix-rows] compile: \(error)"); return nil }
-        }
-        guard let bx = mtlBuf(x.asType(.float16), device),
-              let bw4 = mtlBuf(w4, device),
-              let bw2 = mtlBuf(w2, device),
-              let bsc = mtlBuf(scales.asType(.float16), device),
-              let bbi = mtlBuf(biases.asType(.float16), device),
-              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
-        let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
-        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_gqmmMixRowsPipeline!)
-        enc.setBuffer(bw4, offset: 0, index: 0); enc.setBuffer(bw2, offset: 0, index: 1)
-        enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3)
-        enc.setBuffer(bx, offset: 0, index: 4); enc.setBuffer(bin, offset: 0, index: 5)
-        enc.setBuffer(outBuf, offset: 0, index: 6)
-        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
-        enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&nn, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
-        bindStop(enc, 10)
-        var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 11)
-        var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 12)
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
-                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
-        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
-    }
-
-    nonisolated(unsafe) static var _gqmmMixSwigluRowsPipeline: MTLComputePipelineState?
-
-    /// Fused mixed-precision gate·up swiglu rows (M≥1). Mirrors gqmm4_swiglu_rows's fused
-    /// form (x loaded once per block, shared by gate+up) with the same slot<K4 branch as
-    /// gqmmMixRows, duplicated for gate and up accumulators. scales/biases indexed by GLOBAL
-    /// slot s. x[M,K], gate/up weights split per class, inds[M*Ktop] → h[M*Ktop,N] = swiglu(gate, up).
-    /// x offset uses mk/Ktop (gate/up form; no lhsPer).
-    public static func gqmmMixSwigluRows(_ x: MLXArray, gw4: MLXArray, gw2: MLXArray,
-                                          gsc: MLXArray, gbi: MLXArray,
-                                          uw4: MLXArray, uw2: MLXArray,
-                                          usc: MLXArray, ubi: MLXArray, inds: MLXArray,
-                                          K4: Int, M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
-        guard let (device, queue) = ensure() else { return nil }
-        guard N % 8 == 0, K % 512 == 0 else {
-            print("[raw-gqmm-mix-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil
+            } catch { print("[raw-gqmm-mix-rows] compile: \(error)"); return false }
         }
         if _gqmmMixSwigluRowsPipeline == nil {
             let src = """
@@ -4683,8 +4635,67 @@ public enum SeedlessMetalForward {
             """
             do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
                  _gqmmMixSwigluRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "gqmm_mix_swiglu_rows")!)
-            } catch { print("[raw-gqmm-mix-swiglu-rows] compile: \(error)"); return nil }
+            } catch { print("[raw-gqmm-mix-swiglu-rows] compile: \(error)"); return false }
         }
+        return _gqmmMixRowsPipeline != nil && _gqmmMixSwigluRowsPipeline != nil
+    }
+
+    /// Mixed 4-bit/2-bit MoE gather-qmv rows (M≥1). One dispatch, tid.z-uniform branch
+    /// on slot s: s<K4 → 4-bit path (w4[s], gqmm4_rows loop verbatim), s>=K4 → 2-bit path
+    /// (w2[s-K4], gqmm2_rows loop verbatim). scales/biases indexed by GLOBAL slot s in
+    /// both branches. x[M,K] (or [M*Ktop,K] if lhsPerExpert), w4[K4,N,K/8], w2[M2,N,K/16],
+    /// scales/biases[K4+M2,N,K/64], inds[M*Ktop] → out[M*Ktop,N].
+    public static func gqmmMixRows(_ x: MLXArray, w4: MLXArray, w2: MLXArray,
+                                    scales: MLXArray, biases: MLXArray, inds: MLXArray,
+                                    K4: Int, M: Int, Ktop: Int, K: Int, N: Int,
+                                    gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
+            print("[raw-gqmm-mix-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
+        }
+        guard ensureMixPipelines() else { return nil }
+        guard let bx = mtlBuf(x.asType(.float16), device),
+              let bw4 = mtlBuf(w4, device),
+              let bw2 = mtlBuf(w2, device),
+              let bsc = mtlBuf(scales.asType(.float16), device),
+              let bbi = mtlBuf(biases.asType(.float16), device),
+              let bin = mtlBuf(inds.asType(.int32), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_gqmmMixRowsPipeline!)
+        enc.setBuffer(bw4, offset: 0, index: 0); enc.setBuffer(bw2, offset: 0, index: 1)
+        enc.setBuffer(bsc, offset: 0, index: 2); enc.setBuffer(bbi, offset: 0, index: 3)
+        enc.setBuffer(bx, offset: 0, index: 4); enc.setBuffer(bin, offset: 0, index: 5)
+        enc.setBuffer(outBuf, offset: 0, index: 6)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&nn, length: 4, index: 8); enc.setBytes(&kt, length: 4, index: 9)
+        bindStop(enc, 10)
+        var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 11)
+        var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 12)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * Ktop * N)), [M * Ktop, N])
+    }
+
+    nonisolated(unsafe) static var _gqmmMixSwigluRowsPipeline: MTLComputePipelineState?
+
+    /// Fused mixed-precision gate·up swiglu rows (M≥1). Mirrors gqmm4_swiglu_rows's fused
+    /// form (x loaded once per block, shared by gate+up) with the same slot<K4 branch as
+    /// gqmmMixRows, duplicated for gate and up accumulators. scales/biases indexed by GLOBAL
+    /// slot s. x[M,K], gate/up weights split per class, inds[M*Ktop] → h[M*Ktop,N] = swiglu(gate, up).
+    /// x offset uses mk/Ktop (gate/up form; no lhsPer).
+    public static func gqmmMixSwigluRows(_ x: MLXArray, gw4: MLXArray, gw2: MLXArray,
+                                          gsc: MLXArray, gbi: MLXArray,
+                                          uw4: MLXArray, uw2: MLXArray,
+                                          usc: MLXArray, ubi: MLXArray, inds: MLXArray,
+                                          K4: Int, M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard N % 8 == 0, K % 512 == 0 else {
+            print("[raw-gqmm-mix-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil
+        }
+        guard ensureMixPipelines() else { return nil }
         guard let bx = mtlBuf(x.asType(.float16), device),
               let bgw4 = mtlBuf(gw4, device), let bgw2 = mtlBuf(gw2, device),
               let bgsc = mtlBuf(gsc.asType(.float16), device), let bgbi = mtlBuf(gbi.asType(.float16), device),

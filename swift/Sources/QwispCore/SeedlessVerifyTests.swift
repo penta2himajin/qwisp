@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 85
+        let total = 87
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5106,6 +5106,139 @@ public enum SeedlessVerifyTests {
             } catch {
                 return (false, "arena setup threw: \(error)")
             }
+        }
+
+        // ── W3a (notes/18): mixed-precision encode path + (K4,M2) byte-budget rule ─────
+        // Test 86 (W3a-1): the NEW encode-only statics encodeGqmmMixRows/encodeGqmmMixSwigluRows
+        // reproduce the shipped one-shot gqmmMixRows/gqmmMixSwigluRows bit-for-bit when driven in a
+        // self-contained CB (device buffers built here, same mtlBuf conversions the wrappers use).
+        // This locks the encode-only bind order/indices to the production kernels. RED: the stubs
+        // encode nothing (ensureMixPipelines()==false / zero out) so bitEqual fails.
+        run("mix_encode_parity") {
+            let E = 64, K4 = 16, K = 2048, N = 512, Ktop = 4
+            guard let (device, queue) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+
+            // Split fixture: 4-bit core (0..<K4) + 2-bit tail (K4..<E); global-slot-indexed sc/bi.
+            func mixWeights(_ seed: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+                let (q4, s4, b4o) = MLX.quantized(seed[0 ..< K4], groupSize: 64, bits: 4, mode: .affine)
+                let (q2, s2, b2o) = MLX.quantized(seed[K4 ..< E], groupSize: 64, bits: 2, mode: .affine)
+                let sc = MLX.concatenated([s4, s2], axis: 0).asType(.float16)
+                let bi = MLX.concatenated([b4o!, b2o!], axis: 0).asType(.float16)
+                MLX.eval([q4, q2, sc, bi])
+                return (q4, q2, sc, bi)
+            }
+            // Readback a shared-storage F16 out buffer as [rows, N].
+            func readback(_ buf: MTLBuffer, _ rows: Int) -> MLXArray {
+                let ptr = buf.contents().bindMemory(to: Float16.self, capacity: rows * N)
+                return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: rows * N)), [rows, N])
+            }
+
+            // ── gqmmMixRows encode parity (M in {1,9}, incl. one lhsPer:true) ──
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (w4, w2, scales, biases) = mixWeights(wf)
+            func rowsCase(_ M: Int, lhsPer: Bool) -> (Bool, String) {
+                let rows = lhsPer ? M * Ktop : M
+                let x = MLXRandom.normal([rows, K]).asType(.float16); x.eval()
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop]); inds.eval()
+                // Reference: shipped one-shot kernel (also compiles the mix pipeline lazily).
+                guard let ref = SeedlessMetalForward.gqmmMixRows(x, w4: w4, w2: w2,
+                                    scales: scales, biases: biases, inds: inds, K4: K4,
+                                    M: M, Ktop: Ktop, K: K, N: N, lhsPerExpert: lhsPer)
+                else { return (false, "ref nil M=\(M) lhsPer=\(lhsPer)") }
+                ref.eval()
+                // Encode-only path: pipelines must be ready without a dispatch of their own.
+                guard SeedlessMetalForward.ensureMixPipelines()
+                else { return (false, "ensureMixPipelines false (M=\(M) lhsPer=\(lhsPer))") }
+                guard let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+                      let bw4 = SeedlessMetalForward.mtlBuf(w4, device),
+                      let bw2 = SeedlessMetalForward.mtlBuf(w2, device),
+                      let bsc = SeedlessMetalForward.mtlBuf(scales.asType(.float16), device),
+                      let bbi = SeedlessMetalForward.mtlBuf(biases.asType(.float16), device),
+                      let bin = SeedlessMetalForward.mtlBuf(inds.asType(.int32), device)
+                else { return (false, "rows buf nil (M=\(M))") }
+                let outBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+                let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                SeedlessFusedVerify.encodeGqmmMixRows(enc, w4: bw4, w2: bw2, sc: bsc, bi: bbi,
+                                    x: bx, inds: bin, out: outBuf,
+                                    M: M, Ktop: Ktop, K: K, N: N, lhsPer: lhsPer, k4: K4)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                let got = readback(outBuf, M * Ktop); got.eval()
+                return bitEqual(got, ref)
+            }
+            for (M, lp) in [(1, false), (9, false), (9, true)] {
+                let (ok, d) = rowsCase(M, lhsPer: lp)
+                if !ok { return (false, "rows M=\(M) lhsPer=\(lp): \(d)") }
+            }
+
+            // ── gqmmMixSwigluRows encode parity (M in {1,9}) ──
+            let gf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let uf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (gw4, gw2, gsc, gbi) = mixWeights(gf)
+            let (uw4, uw2, usc, ubi) = mixWeights(uf)
+            func swigluCase(_ M: Int) -> (Bool, String) {
+                let x = MLXRandom.normal([M, K]).asType(.float16); x.eval()
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop]); inds.eval()
+                guard let ref = SeedlessMetalForward.gqmmMixSwigluRows(x,
+                                    gw4: gw4, gw2: gw2, gsc: gsc, gbi: gbi,
+                                    uw4: uw4, uw2: uw2, usc: usc, ubi: ubi, inds: inds,
+                                    K4: K4, M: M, Ktop: Ktop, K: K, N: N)
+                else { return (false, "ref swiglu nil M=\(M)") }
+                ref.eval()
+                guard SeedlessMetalForward.ensureMixPipelines()
+                else { return (false, "ensureMixPipelines false swiglu (M=\(M))") }
+                guard let bx = SeedlessMetalForward.mtlBuf(x.asType(.float16), device),
+                      let bgw4 = SeedlessMetalForward.mtlBuf(gw4, device),
+                      let bgw2 = SeedlessMetalForward.mtlBuf(gw2, device),
+                      let bgsc = SeedlessMetalForward.mtlBuf(gsc.asType(.float16), device),
+                      let bgbi = SeedlessMetalForward.mtlBuf(gbi.asType(.float16), device),
+                      let buw4 = SeedlessMetalForward.mtlBuf(uw4, device),
+                      let buw2 = SeedlessMetalForward.mtlBuf(uw2, device),
+                      let busc = SeedlessMetalForward.mtlBuf(usc.asType(.float16), device),
+                      let bubi = SeedlessMetalForward.mtlBuf(ubi.asType(.float16), device),
+                      let bin = SeedlessMetalForward.mtlBuf(inds.asType(.int32), device)
+                else { return (false, "swiglu buf nil (M=\(M))") }
+                let hBuf = device.makeBuffer(length: M * Ktop * N * 2, options: .storageModeShared)!
+                let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+                SeedlessFusedVerify.encodeGqmmMixSwigluRows(enc,
+                                    gw4: bgw4, gw2: bgw2, gsc: bgsc, gbi: bgbi,
+                                    uw4: buw4, uw2: buw2, usc: busc, ubi: bubi,
+                                    x: bx, inds: bin, h: hBuf,
+                                    M: M, Ktop: Ktop, K: K, N: N, k4: K4)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                let got = readback(hBuf, M * Ktop); got.eval()
+                return bitEqual(got, ref)
+            }
+            for M in [1, 9] {
+                let (ok, d) = swigluCase(M)
+                if !ok { return (false, "swiglu M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 87 (W3a-2): pure-CPU (K4,M2) byte-budget rule. slot4=1728 KiB, slot2=960 KiB,
+        // budget = 64·slot4. Hand-calc: m2 = floor((budget − k4·slot4)/slot2), k4 clamped to
+        // [0, budget/slot4], m2 never negative. RED: stub returns (k4, -1).
+        run("mixed_km_budget") {
+            let slot4 = 1728 * 1024, slot2 = 960 * 1024, budget = 64 * slot4
+            func km(_ k4: Int) -> (Int, Int) {
+                let r = DeviceCalibration.mixedKM(budgetBytes: budget, slot4Bytes: slot4, slot2Bytes: slot2, k4: k4)
+                return (r.k4, r.m2)
+            }
+            // Design points (notes/18 W1 Part-A): K4 8/20/32/0 → M2 100/79/57/115.
+            if km(8)  != (8, 100)  { return (false, "k4=8 → \(km(8)) != (8,100)") }
+            if km(20) != (20, 79)  { return (false, "k4=20 → \(km(20)) != (20,79)") }
+            if km(32) != (32, 57)  { return (false, "k4=32 → \(km(32)) != (32,57)") }
+            if km(0)  != (0, 115)  { return (false, "k4=0 → \(km(0)) != (0,115)") }
+            // Adversarial: budget < one slot4, k4=1 must clamp k4 to 0 and never go negative m2.
+            let small = DeviceCalibration.mixedKM(budgetBytes: slot4 / 2, slot4Bytes: slot4, slot2Bytes: slot2, k4: 1)
+            if small.k4 != 0 { return (false, "tiny budget k4=1 did not clamp to 0: \(small)") }
+            if small.m2 < 0  { return (false, "m2 negative: \(small)") }
+            // k4 far beyond budget clamps to budget/slot4=64, leaving m2=0.
+            let over = DeviceCalibration.mixedKM(budgetBytes: budget, slot4Bytes: slot4, slot2Bytes: slot2, k4: 999)
+            if over.k4 != 64 || over.m2 != 0 { return (false, "k4=999 → \(over) != (64,0)") }
+            return (true, "ok")
         }
 
         // ── Summary ───────────────────────────────────────────────────────
