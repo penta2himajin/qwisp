@@ -147,7 +147,10 @@ public final class MixedExpertArena {
             let restW4 = try source4.restShape(refLayer, proj, "weight")
             let dtW4 = try source4.partDType(refLayer, proj, "weight")
             let sbW4 = try source4.sliceBytes(refLayer, proj, "weight")
-            let arrW4 = MLXArray.zeros([K4] + restW4, dtype: dtW4)
+            // K4=0 (all-2-bit, cov 115): zero-row MLXArray crashes inside mlx-swift's
+            // asMTLBuffer (force-unwrapped nil data ptr) — allocate 1 dummy row; core
+            // slots are 0..<K4 so it is never addressed.
+            let arrW4 = MLXArray.zeros([Swift.max(K4, 1)] + restW4, dtype: dtW4)
             arrW4.eval()
             guard let bufW4 = arrW4.asMTLBuffer(device: device, noCopy: true) else {
                 throw NSError(domain: "MixedExpertArena", code: 1,
@@ -158,7 +161,7 @@ public final class MixedExpertArena {
             let restW2 = try source2.restShape(refLayer, proj, "weight")
             let dtW2 = try source2.partDType(refLayer, proj, "weight")
             let sbW2 = try source2.sliceBytes(refLayer, proj, "weight")
-            let arrW2 = MLXArray.zeros([M2] + restW2, dtype: dtW2)
+            let arrW2 = MLXArray.zeros([Swift.max(M2, 1)] + restW2, dtype: dtW2)
             arrW2.eval()
             guard let bufW2 = arrW2.asMTLBuffer(device: device, noCopy: true) else {
                 throw NSError(domain: "MixedExpertArena", code: 1,

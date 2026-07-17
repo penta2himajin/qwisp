@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 87
+        let total = 88
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5105,6 +5105,87 @@ public enum SeedlessVerifyTests {
                 return (true, "ok")
             } catch {
                 return (false, "arena setup threw: \(error)")
+            }
+        }
+
+        // Test 85b (Phase A(a)): MixedExpertArena with K4=0 (all-2-bit tail, cov-115 design
+        // point). Regression for the SIGTRAP found in the W4c battery: MLXArray.zeros([0]+shape)
+        // → asMTLBuffer force-unwraps a nil data ptr inside mlx-swift. Init must succeed (dummy
+        // 1-row w4, never addressed) and tail preads must land at GLOBAL slot = local index.
+        run("mixed_arena_k4_zero") {
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            let fm = FileManager.default
+            let base = fm.temporaryDirectory.appendingPathComponent("qwisp_k40_\(UUID().uuidString)")
+            let dir4 = base.appendingPathComponent("m4"), dir2 = base.appendingPathComponent("m2")
+            try? fm.createDirectory(at: dir4, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: dir2, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: base) }
+
+            let E = 4
+            let projs = ExpertSource.projs, parts = ExpertSource.parts
+            func fillByte(_ dir: Int, _ p: Int, _ q: Int, _ e: Int) -> UInt8 {
+                UInt8((dir &* 101 &+ (p &* 3 &+ q) &* 37 &+ e &* 7) & 0xFF)
+            }
+            func writeCkpt(_ dir: URL, _ dirTag: Int, wCols: Int) throws {
+                var meta: [String: Any] = [:]
+                var blob = Data()
+                for (p, proj) in projs.enumerated() {
+                    for (q, part) in parts.enumerated() {
+                        let isW = (part == "weight")
+                        let shape = isW ? [E, 8, wCols] : [E, 8, 2]
+                        let per = shape.dropFirst().reduce(1, *) * (isW ? 4 : 2)
+                        let begin = blob.count
+                        for e in 0 ..< E {
+                            blob.append(contentsOf: [UInt8](repeating: fillByte(dirTag, p, q, e), count: per))
+                        }
+                        meta["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] =
+                            ["dtype": isW ? "U32" : "F16", "shape": shape, "data_offsets": [begin, blob.count]]
+                    }
+                }
+                let hdr = try JSONSerialization.data(withJSONObject: meta)
+                var out = Data(); var hlen = UInt64(hdr.count).littleEndian
+                withUnsafeBytes(of: &hlen) { out.append(contentsOf: $0) }
+                out.append(hdr); out.append(blob)
+                try out.write(to: dir.appendingPathComponent("model.safetensors"))
+                var wm: [String: String] = [:]
+                for proj in projs {
+                    for part in parts { wm["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] = "model.safetensors" }
+                }
+                try JSONSerialization.data(withJSONObject: ["weight_map": wm])
+                    .write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+            }
+
+            do {
+                try writeCkpt(dir4, 0, wCols: 16)
+                try writeCkpt(dir2, 1, wCols: 8)
+                let src4 = try ExpertSource(modelDir: dir4.path)
+                let src2 = try ExpertSource(modelDir: dir2.path)
+                let arena = try MixedExpertArena(device: device, source4: src4, source2: src2,
+                                                 K4: 0, M2: 3, refLayer: 0)   // ← K4=0: crashed pre-fix
+                arena.loadTailMany(0, [(e: 1, slot: 0), (e: 3, slot: 2)])     // global slot = local idx
+                guard let bufs = arena.gatherBuffers12(device: device), bufs.count == 12 else {
+                    return (false, "gatherBuffers12 nil / count != 12")
+                }
+                func slotAllEqual(_ buf: MTLBuffer, _ off: Int, _ n: Int, _ want: UInt8) -> Bool {
+                    let p = buf.contents().advanced(by: off).bindMemory(to: UInt8.self, capacity: n)
+                    for i in 0 ..< n where p[i] != want { return false }
+                    return true
+                }
+                for p in 0 ..< 3 {
+                    let proj = projs[p]
+                    let w2 = bufs[p * 4 + 1], sc = bufs[p * 4 + 2], bi = bufs[p * 4 + 3]
+                    let sbW2 = arena.sliceBytes(proj, "w2")
+                    let sbS = arena.sliceBytes(proj, "scales"), sbB = arena.sliceBytes(proj, "biases")
+                    if !slotAllEqual(w2, 0 * sbW2, sbW2, fillByte(1, p, 0, 1)) { return (false, "w2 local0 proj\(p)") }
+                    if !slotAllEqual(w2, 2 * sbW2, sbW2, fillByte(1, p, 0, 3)) { return (false, "w2 local2 proj\(p)") }
+                    if !slotAllEqual(sc, 0 * sbS, sbS, fillByte(1, p, 1, 1)) { return (false, "scales slot0 proj\(p)") }
+                    if !slotAllEqual(sc, 2 * sbS, sbS, fillByte(1, p, 1, 3)) { return (false, "scales slot2 proj\(p)") }
+                    if !slotAllEqual(bi, 0 * sbB, sbB, fillByte(1, p, 2, 1)) { return (false, "biases slot0 proj\(p)") }
+                    if !slotAllEqual(bi, 2 * sbB, sbB, fillByte(1, p, 2, 3)) { return (false, "biases slot2 proj\(p)") }
+                }
+                return (true, "ok")
+            } catch {
+                return (false, "K4=0 arena threw: \(error)")
             }
         }
 
