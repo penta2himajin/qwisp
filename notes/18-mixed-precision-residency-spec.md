@@ -114,8 +114,29 @@ Consequences:
   (today's C=64 bolt: 0/4). This is the project's reason to exist.
 - TF-fidelity (QWISP_TF_REPLAY): within the sweep band (≈88–92% at the chosen K4) — no worse
   than today's 8GB bolt fid 88.7.
-- Speed: bolt 8GB tok/s within ~5% of today's C=64 bolt (2-bit dequant is cheaper per byte;
-  miss IO −44%; risk is mixed-kernel overhead).
+- Speed: floor = parity with today's C=64 bolt; roofline estimate is a GAIN (below).
+
+## Speed roofline (h measured 2026-07-17, `p17/mixh.py`)
+
+M=1/M-row decode is weight-byte-bound on the routed gather (GEMV reads each weight once;
+rows kernels read per (row, ki) pair, so verify forwards make routed-gather the dominant
+byte term). Mixed bytes factor vs all-4-bit = `0.556 + 0.444·h`, where h = routed-slot share
+landing in the per-layer top-K4 core. Measured on the o0 traces (4 prompts, 5000 tok):
+
+| K4 | h calib-basis | h self-basis (≈rolling recalib) | bytes factor |
+|----|---------------|---------------------------------|--------------|
+| 8  | 0.079 | 0.150 | **0.59–0.62** |
+| 20 | 0.187 | 0.298 | 0.64–0.69 |
+| 40 | 0.343 | 0.477 | 0.71–0.77 |
+
+Routing mass is flat (top-8 experts carry only 15% of routed slots — consistent with the
+probe-7 diffuse cold set), so at K4=8 nearly all routed reads are 2-bit: **routed weight
+traffic −38..41%**. With routed gather at fraction g of bolt step time, speedup ≈
+1/(1−0.39g): g=0.5 → +24%, g=0.7 → +38%. Byte accounting of the verify forward suggests g
+is high (M rows × 8 experts × 1728 KiB × 40 layers dominates); expect **+20–40% bolt tok/s
+on fast-SSD 8GB** (today ~166), floor parity. Second-order: tail miss/refresh/B3-fetch IO
+−44%/expert (main Neo slow-NAND win), fewer buddy events at coverage 108. Strict tier
+unaffected. All numbers to be confirmed by W4 measurement (doctrine).
 
 ## Design point
 
