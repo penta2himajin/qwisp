@@ -326,6 +326,40 @@ extension Tell {
             backend.stepArgmax = biased
             backend.chainedStepArgmax = nil   // force per-token biased argmax (no unbiased GPU chain)
         }
+        // Bolt sampled decode PROTOTYPE (#47 Part A probe 16, QWISP_BOLT_SAMPLE=<temp>): LOOPY
+        // is a greedy pathology (a deterministic argmax cycle); temperature sampling breaks the
+        // lock-in stochastically. bolt is greedy-only in the product (sampling falls back to
+        // strict), so 8GB users never get bolt speed on normal chat settings — this probes
+        // whether sampled bolt survives the horizon that burns greedy bolt (5/5). Gumbel-max
+        // per row = exact categorical sampling in one pass; the spec-verify contract stays
+        // sound (a committed token is always the sample conditioned on its true prefix; draft
+        // mismatches just reject → lower accept rate, not bias). Seeded (QWISP_BOLT_SAMPLE_SEED,
+        // default 42) so runs are reproducible. Slow (full-vocab readback); measure, don't ship.
+        else if let tempS = ProcessInfo.processInfo.environment["QWISP_BOLT_SAMPLE"],
+                let temp = Float(tempS), temp > 0, let logitsRows = backend.stepLogitsRows {
+            var rngState = UInt64(Tell.envInt("QWISP_BOLT_SAMPLE_SEED", 42)) &* 0x9E3779B97F4A7C15
+            let sampled: ([Int32]) -> [Int]? = { tokens in
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.map { row in
+                    var best = 0
+                    var bestV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        // SplitMix64 step → uniform (0,1) → Gumbel noise.
+                        rngState &+= 0x9E3779B97F4A7C15
+                        var z = rngState
+                        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+                        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+                        z ^= z >> 31
+                        let u = max(Float(z >> 40) * (1.0 / Float(1 << 24)), 1e-9)
+                        let v = row[t] / temp - log(-log(u))
+                        if v > bestV { bestV = v; best = t }
+                    }
+                    return best
+                }
+            }
+            backend.stepArgmax = sampled
+            backend.chainedStepArgmax = nil   // per-token sampling; the GPU chain is argmax-only
+        }
         // Margin trace (#47 Part A, QWISP_MARGIN_TRACE): CPU-logits stepArgmax that records the
         // row-0 top-1 − top-2 gap (the argmax_stable_of_margin quantity) into Tell.marginTrace.
         // Chain disabled so every token is measured. Slow (full-vocab readback); measurement only.
