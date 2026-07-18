@@ -72,11 +72,17 @@ final class QwispEngine: @unchecked Sendable {
     let backend: any LLMBackend
     let modelID: String
     private let lock = AsyncLock()
+    // false in continuous-batching mode (issue #6): concurrent requests are the point —
+    // the scheduler batches them; serializing here would defeat it. Everything about the
+    // shared-engine safety argument then lives inside ContinuousScheduler's single
+    // decode thread instead of this lock.
+    let serialize: Bool
 
-    init(tokenizer: QwispTokenizer, backend: any LLMBackend, modelID: String) {
+    init(tokenizer: QwispTokenizer, backend: any LLMBackend, modelID: String, serialize: Bool = true) {
         self.tokenizer = tokenizer
         self.backend = backend
         self.modelID = modelID
+        self.serialize = serialize
         PrefillLog.install()
     }
 
@@ -134,14 +140,14 @@ final class QwispEngine: @unchecked Sendable {
     func complete(_ req: ChatCompletionRequest) async throws -> ChatCompletionResponse {
         let p = try prompt(req)
         let s = sampling(req)
-        await lock.acquire()
+        if serialize { await lock.acquire() }
         let t0 = Date(); var tFirst: Date? = nil
         let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
                                     decode: { tokenizer.decode($0) }, backend: backend,
                                     temperature: s.temperature, topP: s.topP, seed: s.seed,
                                     frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
                                     logitBias: s.logitBias, promptContentLen: p.contentLen) { _ in if tFirst == nil { tFirst = Date() } }
-        await lock.release()
+        if serialize { await lock.release() }
         logPerf("complete", prompt: p.ids.count, gen: r.completionTokens, t0: t0, tFirst: tFirst)
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let (reasoning, afterThink) = splitOutput(r.text, thinkingDisabled: req.thinkingDisabled)
@@ -171,8 +177,8 @@ final class QwispEngine: @unchecked Sendable {
             try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
         }
 
-        await lock.acquire()
-        defer { Task { await lock.release() } }
+        if serialize { await lock.acquire() }
+        defer { if serialize { Task { await self.lock.release() } } }
 
         try await send(Delta(role: "assistant"), nil)
         var outIds: [Int] = [], sentR = "", sentC = "", finish = "stop"
@@ -225,6 +231,9 @@ func makeRouter(engine: QwispEngine, modelID: String) -> Router<BasicRequestCont
         var headers = HTTPFields()
         if engine.samplingRequested(req) {
             headers[warnHeader] = "n > 1 ignored (single completion); temperature/top_p/seed are honored"
+        }
+        if !engine.serialize, (req.temperature ?? 0) > 0 || (req.top_p ?? 1) < 1 {
+            headers[warnHeader] = "continuous-batching mode (QWISP_BATCH) is greedy-only — sampling params ignored"
         }
         if req.stream == true {
             headers[.contentType] = "text/event-stream"
