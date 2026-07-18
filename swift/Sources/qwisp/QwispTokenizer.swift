@@ -37,12 +37,16 @@ struct QwispTokenizer {
 
     /// Render chat messages (+ optional tool specs) → token ids (chat_template + generation prompt).
     /// Messages/tools are `[String: any Sendable]` so they can carry tool_calls, tool results, and
-    /// arbitrary tool JSON schemas through to the Jinja template.
+    /// arbitrary tool JSON schemas through to the Jinja template. `additionalContext` feeds extra
+    /// Jinja variables (issue #77: chat_template_kwargs, e.g. enable_thinking=false); nil renders
+    /// byte-identically to the previous signature.
     func render(messages: [[String: any Sendable]], tools: [[String: any Sendable]]? = nil,
-                addGenerationPrompt: Bool = true) throws -> [Int] {
+                addGenerationPrompt: Bool = true,
+                additionalContext: [String: any Sendable]? = nil) throws -> [Int] {
         let ct: ChatTemplateArgument? = chatTemplate.map { .literal($0) }
         return try tokenizer.applyChatTemplate(messages: messages, chatTemplate: ct,
                                                addGenerationPrompt: addGenerationPrompt, truncation: false,
-                                               maxLength: nil, tools: tools)
+                                               maxLength: nil, tools: tools,
+                                               additionalContext: additionalContext)
     }
 }
