@@ -37,6 +37,9 @@ environment:
   note: temperature > 0 on a streaming tier (<32GB) decodes via strict — bolt is greedy-only
   QWISP_UPDATE_CHECK=0               disable the update notice (a single GET to GitHub
                                      releases/latest, ≤once/day on chat/serve; no payload)
+  QWISP_BATCH=<B>                    serve only: continuous batching with B slots (multi-user
+                                     aggregate throughput; resident ≥32GB, greedy-only, not
+                                     bit-exact with single-stream — opt-in)
 
 first run: `qwisp pull` downloads ~20GB. The first chat/serve request loads the model, and
 on <32GB machines runs a one-time bolt calibration (a few minutes; progress goes to stderr).
@@ -61,9 +64,17 @@ case "serve":
     let modelID = URL(fileURLWithPath: model).lastPathComponent
     let tok = try await QwispTokenizer(modelDir: model)
     let backend: any LLMBackend
+    var batchMode = false
     if ProcessInfo.processInfo.environment["QWISP_FAKE"] == "1" {
         print("[qwisp serve] FAKE backend (no engine load) — wire-format testing only")
         backend = FakeBackend(script: tok.encode("Hello! This is qwisp with a fake backend for wire-format testing."))
+    } else if let bs = Int(ProcessInfo.processInfo.environment["QWISP_BATCH"] ?? ""), bs >= 2 {
+        // Continuous batching (issue #6, opt-in): multi-user aggregate-throughput mode.
+        // Resident tier only, greedy only, and NOT bit-exact with single-stream decode
+        // (batch near-tie flips) — hence never the default.
+        print("[qwisp serve] continuous batching: B=\(bs) slots (resident MLX path, greedy; requests batch instead of queueing)")
+        backend = try BatchBackend(modelDir: model, slots: bs)
+        batchMode = true
     } else {
         print("[qwisp serve] loading Seedless engine (loads the model) …")
         let sb = try SeedlessBackend(modelDir: model)
@@ -73,7 +84,7 @@ case "serve":
             || Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig)
         backend = sb
     }
-    let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID)
+    let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID, serialize: !batchMode)
     try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
     // `--max-tokens N` | `--max-tokens=N` (matches mlx-lm); the rest of the args are the prompt.
