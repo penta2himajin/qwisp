@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 88
+        let total = 89
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4898,6 +4898,100 @@ public enum SeedlessVerifyTests {
                 hGot.eval()
                 let (ok, d) = bitEqual(hGot, hRef)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 81b (lever-A, notes/18): gs=128 2-bit tail — all three kernels at tail gs=128.
+        // (a) gqmm2Rows(gs:128) vs MLX quantizedMatmul(gs:128, bits:2) per-row oracle bit-exact;
+        // (b) gqmmMixRows(K4:0, gs:128) ≡ gqmm2Rows(gs:128) (all-tail: dummy 1-row w4 never read);
+        // (c) gqmmMixSwigluRows(K4:0, gs:128) ≡ mix gather ×2 + swigluRaw.
+        run("gqmm2_gs128_mix_bitexact") {
+            let E = 64, K = 2048, N = 512, Ktop = 4
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (w2, s2o, b2o) = MLX.quantized(wf, groupSize: 128, bits: 2, mode: .affine)
+            guard let b2p = b2o else { return (false, "biases nil") }
+            let s2 = s2o.asType(.float16), b2 = b2p.asType(.float16)
+            MLX.eval([w2, s2, b2])
+
+            // (a) gqmm2Rows(gs:128) vs MLX oracle
+            for M in [1, 9, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                var refParts: [MLXArray] = []
+                for m in 0 ..< M {
+                    let xm = x[m ..< m + 1]; xm.eval()
+                    for ki in 0 ..< Ktop {
+                        let e = Int(indsFlat[m * Ktop + ki])
+                        let r = MLX.quantizedMatmul(xm, w2[e], scales: s2[e], biases: b2[e],
+                                                    transpose: true, groupSize: 128, bits: 2, mode: .affine)
+                        r.eval(); refParts.append(r)
+                    }
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                guard let got = SeedlessMetalForward.gqmm2Rows(x, w2, scales: s2, biases: b2,
+                                                               inds: inds, M: M, Ktop: Ktop, K: K, N: N,
+                                                               gs: 128)
+                else { return (false, "gqmm2Rows gs=128 nil (M=\(M))") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "gqmm2Rows gs=128 M=\(M): \(d)") }
+            }
+
+            // (b) gqmmMixRows K4=0 gs=128 ≡ gqmm2Rows gs=128 (incl. lhsPer)
+            let w4d = MLXArray.zeros([1, N, K / 8], dtype: .uint32); w4d.eval()   // never read at K4=0
+            for (M, lhsPer) in [(1, false), (9, false), (9, true)] {
+                let rows = lhsPer ? M * Ktop : M
+                let x = MLXRandom.normal([rows, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                guard let ref = SeedlessMetalForward.gqmm2Rows(x, w2, scales: s2, biases: b2,
+                                                               inds: inds, M: M, Ktop: Ktop, K: K, N: N,
+                                                               gs: 128, lhsPerExpert: lhsPer)
+                else { return (false, "ref gqmm2Rows nil (M=\(M) lhsPer=\(lhsPer))") }
+                ref.eval()
+                guard let got = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: w2,
+                                                                 scales: s2, biases: b2, inds: inds,
+                                                                 K4: 0, M: M, Ktop: Ktop, K: K, N: N,
+                                                                 gs: 128, lhsPerExpert: lhsPer)
+                else { return (false, "gqmmMixRows K4=0 gs=128 nil (M=\(M) lhsPer=\(lhsPer))") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "mixRows K4=0 gs=128 M=\(M) lhsPer=\(lhsPer): \(d)") }
+            }
+
+            // (c) mix swiglu K4=0 gs=128 ≡ mix gather ×2 + swigluRaw
+            let uf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (uw2, us2o, ub2o) = MLX.quantized(uf, groupSize: 128, bits: 2, mode: .affine)
+            guard let ub2p = ub2o else { return (false, "up biases nil") }
+            let us2 = us2o.asType(.float16), ub2 = ub2p.asType(.float16)
+            MLX.eval([uw2, us2, ub2])
+            for M in [1, 9] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                guard let g = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: w2,
+                                                               scales: s2, biases: b2, inds: inds,
+                                                               K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128),
+                      let u = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: uw2,
+                                                               scales: us2, biases: ub2, inds: inds,
+                                                               K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128)
+                else { return (false, "swiglu ref gather nil (M=\(M))") }
+                g.eval(); u.eval()
+                guard let hRef = SeedlessMetalForward.swigluRaw(g, u) else { return (false, "swigluRaw nil") }
+                hRef.eval()
+                guard let hGot = SeedlessMetalForward.gqmmMixSwigluRows(x,
+                                    gw4: w4d, gw2: w2, gsc: s2, gbi: b2,
+                                    uw4: w4d, uw2: uw2, usc: us2, ubi: ub2, inds: inds,
+                                    K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128)
+                else { return (false, "mixSwiglu K4=0 gs=128 nil (M=\(M))") }
+                hGot.eval()
+                let (ok, d) = bitEqual(hGot, hRef)
+                if !ok { return (false, "mixSwiglu K4=0 gs=128 M=\(M): \(d)") }
             }
             return (true, "ok")
         }

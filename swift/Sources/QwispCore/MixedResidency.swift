@@ -128,6 +128,8 @@ public final class MixedExpertArena {
     let source2: ExpertSource
     public let K4: Int
     public let M2: Int
+    /// lever-A: tail (2-bit) group size detected from source2's shapes (64 or 128; 128 ⇒ K4==0).
+    public private(set) var tailGS: Int = 64
     var w4Slots: [String: Slot] = [:]          // proj -> Slot (weight, K4 rows, GLOBAL-slot indexed)
     var w2Slots: [String: Slot] = [:]          // proj -> Slot (weight, M2 rows, LOCAL-tail indexed)
     var uniformSlots: [String: Slot] = [:]     // "proj.scales"/"proj.biases" -> Slot (K4+M2 rows, GLOBAL-slot indexed)
@@ -169,25 +171,41 @@ public final class MixedExpertArena {
             }
             w2Slots[proj] = Slot(arr: arrW2, buf: bufW2, ptr: bufW2.contents(), sliceBytes: sbW2)
 
+            // lever-A (notes/18): tail group size from source2's weight/scales shapes.
+            // K = weightCols(u32) × 16 values; gs2 = K / scalesCols. gs2=128 halves the tail
+            // s/b bytes (slot 960→864 KiB ⇒ cov 128) but breaks the shared-uniform layout with
+            // gs=64 core rows — allowed only when K4 == 0 (all-tail, uniform holds tail layout).
+            let scCols2 = try source2.restShape(refLayer, proj, "scales").last ?? 0
+            let gs2p = scCols2 > 0 ? (restW2.last ?? 0) * 16 / scCols2 : 0
+            guard gs2p == 64 || (gs2p == 128 && K4 == 0) else {
+                throw NSError(domain: "MixedExpertArena", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(proj): unsupported tail gs=\(gs2p) (64, or 128 with K4==0, required)",
+                ])
+            }
+            tailGS = gs2p
             for part in ["scales", "biases"] {
                 let rest4 = try source4.restShape(refLayer, proj, part)
                 let rest2 = try source2.restShape(refLayer, proj, part)
                 let sb4 = try source4.sliceBytes(refLayer, proj, part)
                 let sb2 = try source2.sliceBytes(refLayer, proj, part)
-                guard rest4 == rest2, sb4 == sb2 else {
+                guard (rest4 == rest2 && sb4 == sb2) || K4 == 0 else {
                     throw NSError(domain: "MixedExpertArena", code: 2, userInfo: [
                         NSLocalizedDescriptionKey:
-                            "\(proj).\(part): source4/source2 shape mismatch (\(rest4)/\(sb4) vs \(rest2)/\(sb2))",
+                            "\(proj).\(part): source4/source2 shape mismatch (\(rest4)/\(sb4) vs \(rest2)/\(sb2)) with K4>0",
                     ])
                 }
                 let dt = try source4.partDType(refLayer, proj, part)
-                let arr = MLXArray.zeros([K4 + M2] + rest4, dtype: dt)
+                // K4==0: uniform buffer holds ONLY tail rows → tail (source2) layout.
+                let restU = K4 == 0 ? rest2 : rest4
+                let sbU = K4 == 0 ? sb2 : sb4
+                let arr = MLXArray.zeros([K4 + M2] + restU, dtype: dt)
                 arr.eval()
                 guard let buf = arr.asMTLBuffer(device: device, noCopy: true) else {
                     throw NSError(domain: "MixedExpertArena", code: 1,
                                   userInfo: [NSLocalizedDescriptionKey: "asMTLBuffer failed: \(proj).\(part)"])
                 }
-                uniformSlots["\(proj).\(part)"] = Slot(arr: arr, buf: buf, ptr: buf.contents(), sliceBytes: sb4)
+                uniformSlots["\(proj).\(part)"] = Slot(arr: arr, buf: buf, ptr: buf.contents(), sliceBytes: sbU)
             }
         }
     }
@@ -308,6 +326,7 @@ public final class MixedArenaExpertProvider: SeedlessFusedExpertProvider {
     public let cache: MixedLayerExpertCache
     public var C: Int { cache.M2 }
     public var mixK4: Int { cache.K4 }
+    public var mixGS2: Int { cache.arena.tailGS }
     private var cachedBuffers: [MTLBuffer]? = nil
 
     public init(cache: MixedLayerExpertCache) { self.cache = cache }

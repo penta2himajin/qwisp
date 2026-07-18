@@ -267,15 +267,26 @@ public struct SeedlessEngine {
                 print("[makeFusedStreamingMixed] ERROR: implausible slot bytes (slot4=\(slot4) slot2=\(slot2))")
                 return nil
             }
+            // lever-A: gs=128 tail artifact (s/b halved, slot 960→864 KiB ⇒ cov 128) is
+            // all-tail only — the shared-uniform s/b layout can't mix gs=64 core rows.
+            let wCols2 = (try? source2.restShape(0, "gate_proj", "weight"))?.last ?? 0
+            let scCols2 = (try? source2.restShape(0, "gate_proj", "scales"))?.last ?? 0
+            let tailGS = scCols2 > 0 ? wCols2 * 16 / scCols2 : 64
+            var k4Req = DeviceCalibration.mixedDefaultK4()
+            if tailGS != 64 && k4Req != 0 {
+                FileHandle.standardError.write(Data(
+                    "[qwisp] mixed residency: gs=\(tailGS) tail artifact → K4 \(k4Req)→0 (all-2-bit)\n".utf8))
+                k4Req = 0
+            }
             let (k4, m2) = DeviceCalibration.mixedKM(budgetBytes: budgetC * slot4,
                                                      slot4Bytes: slot4, slot2Bytes: slot2,
-                                                     k4: DeviceCalibration.mixedDefaultK4())
+                                                     k4: k4Req)
             guard m2 > 0 else {
                 print("[makeFusedStreamingMixed] ERROR: budget too small (K4=\(k4), M2=\(m2))")
                 return nil
             }
             FileHandle.standardError.write(Data(
-                "[qwisp] mixed residency: K4=\(k4) (4-bit core) + M2=\(m2) (2-bit tail) = coverage \(k4 + m2)/layer (budgetC=\(budgetC))\n".utf8))
+                "[qwisp] mixed residency: K4=\(k4) (4-bit core) + M2=\(m2) (2-bit tail, gs=\(tailGS)) = coverage \(k4 + m2)/layer (budgetC=\(budgetC))\n".utf8))
             var ps: [MixedArenaExpertProvider] = []
             for i in 0 ..< Self.numLayers {
                 guard let cache = try? MixedLayerExpertCache(device: device, source4: source4,

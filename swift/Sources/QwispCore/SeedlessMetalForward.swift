@@ -4230,7 +4230,7 @@ public enum SeedlessMetalForward {
                                   M: Int, Ktop: Int, K: Int, N: Int,
                                   gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
-        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
+        guard N % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
             print("[raw-gqmm2-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
         }
         let useF32 = gqmm2UseF32(x.dtype, scales.dtype)
@@ -4276,19 +4276,21 @@ public enum SeedlessMetalForward {
                               constant int& ktop         [[buffer(8)]],
                               device const int* stopFlag [[buffer(9)]],
                               constant uint& lhsPer      [[buffer(10)]],
+                              constant int&  gsz         [[buffer(11)]],   // group size: 64 or 128
                               uint3 tid      [[threadgroup_position_in_grid]],
                               uint  simd_gid [[simdgroup_index_in_threadgroup]],
                               uint  simd_lid [[thread_index_in_simdgroup]]) {
                 if (stopFlag[0] != 0) return;
                 constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
                 constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
-                constexpr int block_size = 512, scale_step_per_thread = 4;
+                constexpr int block_size = 512;
+                const int scale_step_per_thread = gsz / values_per_thread;   // 64→4, 128→8
                 const device uint8_t* ws = (const device uint8_t*)w;
                 typedef float U;
                 thread U x_thread[16];
                 thread U result[4] = {0};
                 const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;   // K/4 bytes
-                const int in_vec_size_g = in_vec_size / 64;
+                const int in_vec_size_g = in_vec_size / gsz;
                 uint mk = tid.z;
                 uint e = (uint)inds[mk];
                 ws     += (size_t)e * out_vec_size * in_vec_size_w;
@@ -4310,7 +4312,7 @@ public enum SeedlessMetalForward {
                         result[row] += qd2(wl, x_thread, s, b, sum);
                     }
                     ws += block_size * bytes_per_pack / pack_factor;   // +128 bytes
-                    scales += block_size / 64; biases += block_size / 64; x += block_size;
+                    scales += block_size / gsz; biases += block_size / gsz; x += block_size;
                 }
                 for (int row = 0; row < results_per_simdgroup; row++) {
                     result[row] = simd_sum(result[row]);
@@ -4340,6 +4342,7 @@ public enum SeedlessMetalForward {
         enc.setBytes(&kk, length: 4, index: 6); enc.setBytes(&nn, length: 4, index: 7); enc.setBytes(&kt, length: 4, index: 8)
         bindStop(enc, 9)
         var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 10)
+        var gsv = Int32(gs); enc.setBytes(&gsv, length: 4, index: 11)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -4426,35 +4429,37 @@ public enum SeedlessMetalForward {
                               device const int* stopFlag [[buffer(10)]],
                               constant uint& lhsPer      [[buffer(11)]],
                               constant int& k4           [[buffer(12)]],
+                              constant int& gs2          [[buffer(13)]],   // tail (2-bit) group size: 64 or 128
                               uint3 tid      [[threadgroup_position_in_grid]],
                               uint  simd_gid [[simdgroup_index_in_threadgroup]],
                               uint  simd_lid [[thread_index_in_simdgroup]]) {
                 if (stopFlag[0] != 0) return;
                 constexpr int num_simdgroups = 2, results_per_simdgroup = 4;
                 constexpr int values_per_thread = 16;
-                constexpr int block_size = 512, scale_step_per_thread = 4;
+                constexpr int block_size = 512;
                 typedef float U;
                 thread U result[4] = {0};
-                const int in_vec_size_g = in_vec_size / 64;
                 uint mk = tid.z;
                 int slot = inds[mk];
                 const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
-                device const half* scalesBase = scales + (size_t)slot * out_vec_size * in_vec_size_g
-                                                        + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                device const half* biasesBase = biases + (size_t)slot * out_vec_size * in_vec_size_g
-                                                        + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                 device const half* xBase = x + (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
                 device half* yr = y + (size_t)mk * out_vec_size + out_row;
+                // scales/biases layout is per-class: core rows use gs=64, tail rows gs=gs2.
+                // gs2 != 64 requires k4 == 0 (enforced at load) so the uniform buffer is single-gs.
                 if (slot < k4) {
                     constexpr int packs_per_thread = 2, pack_factor = 8, bytes_per_pack = 4;
+                    constexpr int scale_step_per_thread = 4;
+                    const int in_vec_size_g = in_vec_size / 64;
                     const device uint8_t* ws = (const device uint8_t*)w4;
                     thread U x_thread[16];
                     const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
                     uint e = (uint)slot;
                     ws += (size_t)e * out_vec_size * in_vec_size_w;
                     ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-                    device const half* scalesL = scalesBase;
-                    device const half* biasesL = biasesBase;
+                    device const half* scalesL = scales + (size_t)slot * out_vec_size * in_vec_size_g
+                                                         + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                    device const half* biasesL = biases + (size_t)slot * out_vec_size * in_vec_size_g
+                                                         + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                     device const half* xL = xBase;
                     for (int k = 0; k < in_vec_size; k += block_size) {
                         U sum = ld16(xL, x_thread);
@@ -4470,14 +4475,18 @@ public enum SeedlessMetalForward {
                     }
                 } else {
                     constexpr int packs_per_thread = 1, pack_factor = 16, bytes_per_pack = 4;
+                    const int scale_step_per_thread = gs2 / values_per_thread;   // 64→4, 128→8
+                    const int in_vec_size_g = in_vec_size / gs2;
                     const device uint8_t* ws = (const device uint8_t*)w2;
                     thread U x_thread[16];
                     const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
                     uint e = (uint)(slot - k4);
                     ws += (size_t)e * out_vec_size * in_vec_size_w;
                     ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-                    device const half* scalesL = scalesBase;
-                    device const half* biasesL = biasesBase;
+                    device const half* scalesL = scales + (size_t)slot * out_vec_size * in_vec_size_g
+                                                         + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                    device const half* biasesL = biases + (size_t)slot * out_vec_size * in_vec_size_g
+                                                         + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                     device const half* xL = xBase;
                     for (int k = 0; k < in_vec_size; k += block_size) {
                         U sum = ld16_b2(xL, x_thread);
@@ -4489,7 +4498,7 @@ public enum SeedlessMetalForward {
                             result[row] += qd2(wl, x_thread, s, b, sum);
                         }
                         ws += block_size * bytes_per_pack / pack_factor;
-                        scalesL += block_size / 64; biasesL += block_size / 64; xL += block_size;
+                        scalesL += block_size / gs2; biasesL += block_size / gs2; xL += block_size;
                     }
                 }
                 for (int row = 0; row < results_per_simdgroup; row++) {
@@ -4557,31 +4566,26 @@ public enum SeedlessMetalForward {
                                           constant int& ktop [[buffer(13)]],
                                           device const int* stopFlag [[buffer(14)]],
                                           constant int& k4 [[buffer(15)]],
+                                          constant int& gs2 [[buffer(16)]],   // tail (2-bit) group size: 64 or 128
                                           uint3 tid [[threadgroup_position_in_grid]],
                                           uint simd_gid [[simdgroup_index_in_threadgroup]],
                                           uint simd_lid [[thread_index_in_simdgroup]]) {
                 if (stopFlag[0] != 0) return;
                 constexpr int num_simdgroups = 2, results_per_simdgroup = 4;
                 constexpr int values_per_thread = 16;
-                constexpr int block_size = 512, scale_step_per_thread = 4;
+                constexpr int block_size = 512;
                 typedef float U;
                 thread U gres[4] = {0}, ures[4] = {0};
-                const int in_vec_size_g = in_vec_size / 64;
                 uint mk = tid.z;
                 int slot = inds[mk];
                 const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
-                device const half* gscBase = gsc + (size_t)slot * out_vec_size * in_vec_size_g
-                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                device const half* gbiBase = gbi + (size_t)slot * out_vec_size * in_vec_size_g
-                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                device const half* uscBase = usc + (size_t)slot * out_vec_size * in_vec_size_g
-                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-                device const half* ubiBase = ubi + (size_t)slot * out_vec_size * in_vec_size_g
-                                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
                 device const half* xBase = x + (size_t)(mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
                 device half* hr = h + (size_t)mk * out_vec_size + out_row;
+                // per-class scales layout (core gs=64 / tail gs=gs2); gs2 != 64 requires k4 == 0.
                 if (slot < k4) {
                     constexpr int packs_per_thread = 2, pack_factor = 8, bytes_per_pack = 4;
+                    constexpr int scale_step_per_thread = 4;
+                    const int in_vec_size_g = in_vec_size / 64;
                     const device uint8_t* gws = (const device uint8_t*)gw4;
                     const device uint8_t* uws = (const device uint8_t*)uw4;
                     thread U x_thread[16];
@@ -4591,8 +4595,10 @@ public enum SeedlessMetalForward {
                     gws += eOffW; uws += eOffW;
                     gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
                     uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
-                    device const half* gscL = gscBase; device const half* gbiL = gbiBase;
-                    device const half* uscL = uscBase; device const half* ubiL = ubiBase;
+                    size_t sOff = (size_t)slot * out_vec_size * in_vec_size_g
+                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                    device const half* gscL = gsc + sOff; device const half* gbiL = gbi + sOff;
+                    device const half* uscL = usc + sOff; device const half* ubiL = ubi + sOff;
                     device const half* xL = xBase;
                     for (int k = 0; k < in_vec_size; k += block_size) {
                         U sum = ld16(xL, x_thread);   // x ロードは 1 回（gate/up で共有）
@@ -4605,6 +4611,8 @@ public enum SeedlessMetalForward {
                     }
                 } else {
                     constexpr int packs_per_thread = 1, pack_factor = 16, bytes_per_pack = 4;
+                    const int scale_step_per_thread = gs2 / values_per_thread;   // 64→4, 128→8
+                    const int in_vec_size_g = in_vec_size / gs2;
                     const device uint8_t* gws = (const device uint8_t*)gw2;
                     const device uint8_t* uws = (const device uint8_t*)uw2;
                     thread U x_thread[16];
@@ -4614,8 +4622,10 @@ public enum SeedlessMetalForward {
                     gws += eOffW; uws += eOffW;
                     gws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
                     uws += out_row*in_vec_size_w + simd_lid*packs_per_thread*bytes_per_pack;
-                    device const half* gscL = gscBase; device const half* gbiL = gbiBase;
-                    device const half* uscL = uscBase; device const half* ubiL = ubiBase;
+                    size_t sOff = (size_t)slot * out_vec_size * in_vec_size_g
+                                  + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                    device const half* gscL = gsc + sOff; device const half* gbiL = gbi + sOff;
+                    device const half* uscL = usc + sOff; device const half* ubiL = ubi + sOff;
                     device const half* xL = xBase;
                     for (int k = 0; k < in_vec_size; k += block_size) {
                         U sum = ld16_b2(xL, x_thread);   // x ロードは 1 回（gate/up で共有）
@@ -4624,7 +4634,7 @@ public enum SeedlessMetalForward {
                             ures[row] += qd2((const device uint8_t*)(uws + row*in_vec_size_w), x_thread, uscL[row*in_vec_size_g], ubiL[row*in_vec_size_g], sum);
                         }
                         gws += block_size*bytes_per_pack/pack_factor; uws += block_size*bytes_per_pack/pack_factor;
-                        gscL += block_size/64; gbiL += block_size/64; uscL += block_size/64; ubiL += block_size/64; xL += block_size;
+                        gscL += block_size/gs2; gbiL += block_size/gs2; uscL += block_size/gs2; ubiL += block_size/gs2; xL += block_size;
                     }
                 }
                 for (int row = 0; row < results_per_simdgroup; row++) {
@@ -4650,8 +4660,8 @@ public enum SeedlessMetalForward {
                                     K4: Int, M: Int, Ktop: Int, K: Int, N: Int,
                                     gs: Int = 64, lhsPerExpert: Bool = false) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
-        guard N % 8 == 0, K % 512 == 0, gs == 64 else {
-            print("[raw-gqmm-mix-rows] 非fast (N=\(N) K=\(K) gs=\(gs)) 未対応"); return nil
+        guard N % 8 == 0, K % 512 == 0, gs == 64 || (gs == 128 && K4 == 0) else {
+            print("[raw-gqmm-mix-rows] 非fast (N=\(N) K=\(K) gs=\(gs) K4=\(K4)) 未対応"); return nil
         }
         guard ensureMixPipelines() else { return nil }
         guard let bx = mtlBuf(x.asType(.float16), device),
@@ -4672,6 +4682,7 @@ public enum SeedlessMetalForward {
         bindStop(enc, 10)
         var lp = UInt32(lhsPerExpert ? 1 : 0); enc.setBytes(&lp, length: 4, index: 11)
         var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 12)
+        var gsv = Int32(gs); enc.setBytes(&gsv, length: 4, index: 13)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -4690,10 +4701,11 @@ public enum SeedlessMetalForward {
                                           gsc: MLXArray, gbi: MLXArray,
                                           uw4: MLXArray, uw2: MLXArray,
                                           usc: MLXArray, ubi: MLXArray, inds: MLXArray,
-                                          K4: Int, M: Int, Ktop: Int, K: Int, N: Int) -> MLXArray? {
+                                          K4: Int, M: Int, Ktop: Int, K: Int, N: Int,
+                                          gs: Int = 64) -> MLXArray? {
         guard let (device, queue) = ensure() else { return nil }
-        guard N % 8 == 0, K % 512 == 0 else {
-            print("[raw-gqmm-mix-swiglu-rows] 非fast (N=\(N) K=\(K)) 未対応"); return nil
+        guard N % 8 == 0, K % 512 == 0, gs == 64 || (gs == 128 && K4 == 0) else {
+            print("[raw-gqmm-mix-swiglu-rows] 非fast (N=\(N) K=\(K) gs=\(gs) K4=\(K4)) 未対応"); return nil
         }
         guard ensureMixPipelines() else { return nil }
         guard let bx = mtlBuf(x.asType(.float16), device),
@@ -4715,6 +4727,7 @@ public enum SeedlessMetalForward {
         enc.setBytes(&kk, length: 4, index: 11); enc.setBytes(&nn, length: 4, index: 12); enc.setBytes(&kt, length: 4, index: 13)
         bindStop(enc, 14)
         var k4v = Int32(K4); enc.setBytes(&k4v, length: 4, index: 15)
+        var gsv = Int32(gs); enc.setBytes(&gsv, length: 4, index: 16)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: M * Ktop),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()

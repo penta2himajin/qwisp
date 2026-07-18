@@ -17,6 +17,10 @@ Modes:
           through mx.quantize would min/max-refit and distort any group not
           spanning all 4 codes.
 
+Optional 3rd arg = tail group size (default 64; 128 halves scales/biases → slot 960→864 KiB,
+coverage 128 at K4=0 — notes/18 lever A):
+  ~/.venvs/mlx/bin/python3 oracle/requant_experts_2bit.py ~/.mtplx/models/qwisp-experts-2bit-cal128 cal 128
+
 Run (GPU-exclusive — `brew services stop qwisp` first):
   ~/.venvs/mlx/bin/python3 oracle/requant_experts_2bit.py ~/.mtplx/models/qwisp-experts-2bit-cal cal
 """
@@ -27,7 +31,9 @@ import sys
 import mlx.core as mx
 import numpy as np
 
-GS = 64
+GS = 64                                                 # source (4-bit model) group size — fixed
+TGS = int(sys.argv[3]) if len(sys.argv) > 3 else 64     # tail (output 2-bit) group size
+assert TGS in (64, 128), TGS
 MDL = os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16")
 OUT = os.path.expanduser(sys.argv[1])
 MODE = sys.argv[2] if len(sys.argv) > 2 else "cal"
@@ -37,7 +43,7 @@ PROJS = ("gate_proj", "up_proj", "down_proj")
 
 def cal2bit_codes(g):
     """mixprec.py#cal2bit, returning the fitted (q, s, b) instead of the
-    dequantized grid. g: [G, 64] f32 groups."""
+    dequantized grid. g: [G, TGS] f32 groups."""
     mn = g.min(axis=1, keepdims=True)
     mxv = g.max(axis=1, keepdims=True)
     s = (mxv - mn) / 3
@@ -74,7 +80,7 @@ idx = json.load(open(f"{MDL}/model.safetensors.index.json"))["weight_map"]
 shards = {f: mx.load(f"{MDL}/{f}") for f in sorted(set(idx.values()))}
 moe_keys = sorted({k.rsplit(".", 1)[0] for k in idx if ".switch_mlp." in k})
 layers = sorted({int(k.split(".layers.")[1].split(".")[0]) for k in moe_keys})
-print(f"[requant] {len(layers)} MoE layers, mode={MODE}", flush=True)
+print(f"[requant] {len(layers)} MoE layers, mode={MODE}, tail gs={TGS}", flush=True)
 
 tensors = {}
 for li in layers:
@@ -85,13 +91,13 @@ for li in layers:
         deq = mx.dequantize(w4, s4, b4, group_size=GS, bits=4)  # [256, R, IN] f16
         shp = deq.shape
         if MODE == "naive":
-            w2, s2, b2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
+            w2, s2, b2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=TGS, bits=2)
             w2 = w2.reshape(shp[0], shp[1], -1)
             s2 = s2.reshape(shp[0], shp[1], -1).astype(mx.float16)
             b2 = b2.reshape(shp[0], shp[1], -1).astype(mx.float16)
             mx.eval(w2, s2, b2)
         else:
-            g = deq.reshape(-1, GS).astype(mx.float32)
+            g = deq.reshape(-1, TGS).astype(mx.float32)
             q, s, b = cal2bit_codes(g)
             mx.eval(q, s, b)
             w2 = mx.array(pack2bit(np.array(q, dtype=np.uint8).reshape(shp[0], shp[1], -1)))
@@ -99,7 +105,7 @@ for li in layers:
             b2 = b.reshape(shp[0], shp[1], -1).astype(mx.float16)
             mx.eval(w2, s2, b2)
             # per-tensor sanity: stored dequant reproduces the fitted grid
-            chk = mx.dequantize(w2[0], s2[0], b2[0], group_size=GS, bits=2).astype(mx.float32)
+            chk = mx.dequantize(w2[0], s2[0], b2[0], group_size=TGS, bits=2).astype(mx.float32)
             ref = (s * q + b).reshape(shp)[0].astype(mx.float32)
             err = mx.abs(chk - ref).max().item()
             tol = 2e-3 * mx.abs(s).max().item()  # f16 rounding of s,b only
