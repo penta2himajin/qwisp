@@ -133,6 +133,10 @@ All implementation work proceeds in this cycle:
 
 When a test fails, fix the production code — do not delete, skip, or weaken the test.
 
+### Measure, Don't Conjecture
+
+Base decisions on observed data, not assumptions. Before optimising, claiming a bottleneck, or asserting that something is slow or broken, measure it — profile, benchmark, log, or reproduce. When you report a cause, cite the measurement that supports it.
+
 ### Git Conventions
 
 - **Conventional Commits**: `feat:` `fix:` `docs:` `refactor:` `test:` `ci:` `chore:`. Project-specific prefixes (e.g. `data:`, `experiments:`) live in the project's `AGENTS.md`.

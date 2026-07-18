@@ -219,14 +219,24 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 FileHandle.standardError.write(Data(
                     "[qwisp] sampling (temperature/top_p/…) on a streaming tier decodes via strict streaming — bolt is greedy-only, expect strict speed; temperature 0 restores bolt\n".utf8))
             }
-            // Loop guard (#47 Part A, opt-in QWISP_BOLT_STABILITY_GUARD=1): only the bolt
-            // greedy path can enter the C=64 free-run repetition attractor. When it does,
-            // rewind the degenerate tail to its clean onset and re-decode on strict; on the
-            // re-arm policy (QWISP_LOOP_REARM=M > 0) return to bolt after M strict tokens
+            // Loop guard (#47 Part A, DEFAULT ON; QWISP_BOLT_STABILITY_GUARD=0 disables):
+            // only the bolt greedy path can enter the free-run repetition attractor. When it
+            // does, rewind the degenerate tail to its clean onset and re-decode on strict; on
+            // the re-arm policy (QWISP_LOOP_REARM=M > 0) return to bolt after M strict tokens
             // (0 = stay strict for the rest of the request). All greedy tokens flow through
             // the guard so seq/produced derive from it and rewind auto-reconciles.
-            let guardOn = useBolt && Tell.envInt("QWISP_BOLT_STABILITY_GUARD", 0) != 0
-            let rearmM = Tell.envInt("QWISP_LOOP_REARM", 0)
+            // Belt-and-braces with mixed cov128 (lever A): the soak showed cov128 makes loops
+            // rare and late (3/10 incl. a 3000-tok run) but not impossible — the guard heals
+            // period ≤64 invisibly (64-token hold-back); long-period semantic loops remain
+            // the documented residual.
+            let guardOn = useBolt && Tell.envInt("QWISP_BOLT_STABILITY_GUARD", 1) != 0
+            // Re-arm default 128: "cliff passed" is NOT detectable (p14: ignition clusters
+            // recover mid-run; rho hazard detectors FP-ridden; agreement rate discriminates
+            // nothing) — so return to bolt mechanically after M strict tokens and let the
+            // still-armed guard bound the cost of a wrong re-entry (≤ detection lag, unsent).
+            // Each re-trip doubles the window (backoff) so pathological prompts converge to
+            // strict. QWISP_LOOP_REARM=0 = stay strict after the first trip.
+            let rearmM = Tell.envInt("QWISP_LOOP_REARM", 128)
             let guardDbg = Tell.envFlag("QWISP_LOOP_DEBUG")
             Thread.detachNewThread {
                 self.segGate.wait()           // join the previous segment's decode thread (issue #47)
@@ -237,6 +247,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 var budget = Swift.min(baseline, Swift.max(1, ceiling))
                 var boltActive = useBolt
                 var strictSinceTrip = 0
+                var rearmCur = rearmM          // per-request re-arm window; doubles on each re-trip
+                var trips = 0
                 // Guarded greedy tokens flow through the rollback buffer; everything else
                 // (sampling) streams directly. reconcile() re-derives seq/produced from the
                 // guard's authoritative token list (auto-truncated on rewind).
@@ -251,25 +263,31 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 }
                 while produced < ceiling && !cancel.isCancelled {
                     // In a strict re-arm window, cap the segment at M so we can return to bolt.
-                    let inRearmWindow = lguard != nil && !boltActive && rearmM > 0
-                    let segN = inRearmWindow ? Swift.min(rearmM, ceiling - produced)
+                    let inRearmWindow = lguard != nil && !boltActive && rearmCur > 0
+                    let segN = inRearmWindow ? Swift.min(rearmCur, ceiling - produced)
                                              : Swift.min(budget, ceiling - produced)
                     let maxSeqLen = seq.count + segN + cfg.maxK + 64
                     if boltActive {
                         if self.boltServe == nil {
-                            // ★ W3b mixed residency (notes/18, opt-in QWISP_MIXED=1): bolt tier swaps the
-                            //   C-slot 4-bit arena for K4 4-bit core + M2 2-bit tail (coverage ≈ C×1.7 in
-                            //   the same bytes). Needs the 2-bit experts checkpoint; missing dir → fall
-                            //   back to generic bolt with a note (never silently change the model).
+                            // ★ W3b mixed residency (notes/18): bolt tier swaps the C-slot 4-bit arena
+                            //   for K4 4-bit core + M2 2-bit tail (coverage 128 = the measured healthy
+                            //   line, in the same bytes — lever A, 4/4 loop-free battery). DEFAULT ON
+                            //   when a 2-bit experts checkpoint is present (cal128 preferred; QWISP_MIXED=0
+                            //   disables). No checkpoint → generic bolt (warn only on explicit opt-in —
+                            //   never silently change the model).
                             var tailDir: String? = nil
-                            if Tell.envInt("QWISP_MIXED", 0) != 0 {
-                                let d = ProcessInfo.processInfo.environment["QWISP_EXPERTS_2BIT"]
-                                    ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/qwisp-experts-2bit"
-                                if FileManager.default.fileExists(atPath: d + "/model.safetensors.index.json") {
-                                    tailDir = d
-                                } else {
+                            if Tell.envInt("QWISP_MIXED", 1) != 0 {
+                                let home = FileManager.default.homeDirectoryForCurrentUser.path
+                                let candidates = ProcessInfo.processInfo.environment["QWISP_EXPERTS_2BIT"].map { [$0] }
+                                    ?? ["\(home)/.mtplx/models/qwisp-experts-2bit-cal128",
+                                        "\(home)/.mtplx/models/qwisp-experts-2bit-cal",
+                                        "\(home)/.mtplx/models/qwisp-experts-2bit"]
+                                tailDir = candidates.first {
+                                    FileManager.default.fileExists(atPath: $0 + "/model.safetensors.index.json")
+                                }
+                                if tailDir == nil, ProcessInfo.processInfo.environment["QWISP_MIXED"] != nil {
                                     FileHandle.standardError.write(Data(
-                                        "[qwisp] QWISP_MIXED=1 but 2-bit experts checkpoint not found at \(d) (set QWISP_EXPERTS_2BIT) — using generic bolt\n".utf8))
+                                        "[qwisp] QWISP_MIXED=1 but no 2-bit experts checkpoint found (tried: \(candidates.joined(separator: ", "))) — using generic bolt\n".utf8))
                                 }
                             }
                             self.boltServe = BoltServe(engine: self.engine, modelDir: self.modelDir,
@@ -285,6 +303,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             reconcile()
                             boltActive = false
                             strictSinceTrip = 0
+                            trips += 1
+                            if trips > 1 { rearmCur = Swift.min(rearmCur * 2, 65536) }   // backoff
                             if guardDbg { FileHandle.standardError.write(Data(
                                 "[qwisp] loop guard: rewind to onset \(tr.onset) (period \(tr.period), span \(tr.span)) → strict\n".utf8)) }
                             continue
@@ -344,7 +364,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         reconcile()
                         strictSinceTrip += seg.count
                         if seg.count < segN { break }        // EOS → done
-                        if rearmM > 0 && strictSinceTrip >= rearmM {
+                        if rearmCur > 0 && strictSinceTrip >= rearmCur {
                             boltActive = true                // re-arm: return to bolt
                             if guardDbg { FileHandle.standardError.write(Data(
                                 "[qwisp] loop guard: re-arm → bolt after \(strictSinceTrip) strict tok\n".utf8)) }

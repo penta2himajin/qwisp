@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 87
+        let total = 89
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -4902,6 +4902,100 @@ public enum SeedlessVerifyTests {
             return (true, "ok")
         }
 
+        // Test 81b (lever-A, notes/18): gs=128 2-bit tail — all three kernels at tail gs=128.
+        // (a) gqmm2Rows(gs:128) vs MLX quantizedMatmul(gs:128, bits:2) per-row oracle bit-exact;
+        // (b) gqmmMixRows(K4:0, gs:128) ≡ gqmm2Rows(gs:128) (all-tail: dummy 1-row w4 never read);
+        // (c) gqmmMixSwigluRows(K4:0, gs:128) ≡ mix gather ×2 + swigluRaw.
+        run("gqmm2_gs128_mix_bitexact") {
+            let E = 64, K = 2048, N = 512, Ktop = 4
+            let wf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (w2, s2o, b2o) = MLX.quantized(wf, groupSize: 128, bits: 2, mode: .affine)
+            guard let b2p = b2o else { return (false, "biases nil") }
+            let s2 = s2o.asType(.float16), b2 = b2p.asType(.float16)
+            MLX.eval([w2, s2, b2])
+
+            // (a) gqmm2Rows(gs:128) vs MLX oracle
+            for M in [1, 9, 25] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                var refParts: [MLXArray] = []
+                for m in 0 ..< M {
+                    let xm = x[m ..< m + 1]; xm.eval()
+                    for ki in 0 ..< Ktop {
+                        let e = Int(indsFlat[m * Ktop + ki])
+                        let r = MLX.quantizedMatmul(xm, w2[e], scales: s2[e], biases: b2[e],
+                                                    transpose: true, groupSize: 128, bits: 2, mode: .affine)
+                        r.eval(); refParts.append(r)
+                    }
+                }
+                let ref = MLX.concatenated(refParts, axis: 0); ref.eval()
+                guard let got = SeedlessMetalForward.gqmm2Rows(x, w2, scales: s2, biases: b2,
+                                                               inds: inds, M: M, Ktop: Ktop, K: K, N: N,
+                                                               gs: 128)
+                else { return (false, "gqmm2Rows gs=128 nil (M=\(M))") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "gqmm2Rows gs=128 M=\(M): \(d)") }
+            }
+
+            // (b) gqmmMixRows K4=0 gs=128 ≡ gqmm2Rows gs=128 (incl. lhsPer)
+            let w4d = MLXArray.zeros([1, N, K / 8], dtype: .uint32); w4d.eval()   // never read at K4=0
+            for (M, lhsPer) in [(1, false), (9, false), (9, true)] {
+                let rows = lhsPer ? M * Ktop : M
+                let x = MLXRandom.normal([rows, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                guard let ref = SeedlessMetalForward.gqmm2Rows(x, w2, scales: s2, biases: b2,
+                                                               inds: inds, M: M, Ktop: Ktop, K: K, N: N,
+                                                               gs: 128, lhsPerExpert: lhsPer)
+                else { return (false, "ref gqmm2Rows nil (M=\(M) lhsPer=\(lhsPer))") }
+                ref.eval()
+                guard let got = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: w2,
+                                                                 scales: s2, biases: b2, inds: inds,
+                                                                 K4: 0, M: M, Ktop: Ktop, K: K, N: N,
+                                                                 gs: 128, lhsPerExpert: lhsPer)
+                else { return (false, "gqmmMixRows K4=0 gs=128 nil (M=\(M) lhsPer=\(lhsPer))") }
+                got.eval()
+                let (ok, d) = bitEqual(got, ref)
+                if !ok { return (false, "mixRows K4=0 gs=128 M=\(M) lhsPer=\(lhsPer): \(d)") }
+            }
+
+            // (c) mix swiglu K4=0 gs=128 ≡ mix gather ×2 + swigluRaw
+            let uf = MLXRandom.normal([E, N, K]).asType(.float16)
+            let (uw2, us2o, ub2o) = MLX.quantized(uf, groupSize: 128, bits: 2, mode: .affine)
+            guard let ub2p = ub2o else { return (false, "up biases nil") }
+            let us2 = us2o.asType(.float16), ub2 = ub2p.asType(.float16)
+            MLX.eval([uw2, us2, ub2])
+            for M in [1, 9] {
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                let indsFlat = (0 ..< M * Ktop).map { mixPool[$0 % mixPool.count] }
+                let inds = MLXArray(indsFlat, [M * Ktop])
+                MLX.eval([x, inds])
+                guard let g = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: w2,
+                                                               scales: s2, biases: b2, inds: inds,
+                                                               K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128),
+                      let u = SeedlessMetalForward.gqmmMixRows(x, w4: w4d, w2: uw2,
+                                                               scales: us2, biases: ub2, inds: inds,
+                                                               K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128)
+                else { return (false, "swiglu ref gather nil (M=\(M))") }
+                g.eval(); u.eval()
+                guard let hRef = SeedlessMetalForward.swigluRaw(g, u) else { return (false, "swigluRaw nil") }
+                hRef.eval()
+                guard let hGot = SeedlessMetalForward.gqmmMixSwigluRows(x,
+                                    gw4: w4d, gw2: w2, gsc: s2, gbi: b2,
+                                    uw4: w4d, uw2: uw2, usc: us2, ubi: ub2, inds: inds,
+                                    K4: 0, M: M, Ktop: Ktop, K: K, N: N, gs: 128)
+                else { return (false, "mixSwiglu K4=0 gs=128 nil (M=\(M))") }
+                hGot.eval()
+                let (ok, d) = bitEqual(hGot, hRef)
+                if !ok { return (false, "mixSwiglu K4=0 gs=128 M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
         // ── W2 (notes/18): MixedResidency — 4-bit core + 2-bit tail residency ─────
         // Test 82 (W2-1): pure-CPU mixed-slot cache bookkeeping (chunk_swap_atomic style).
         // K4=2 static-pinned core (global slots 0..<2), M2=3 LRU tail (global slots 2..<5).
@@ -5105,6 +5199,87 @@ public enum SeedlessVerifyTests {
                 return (true, "ok")
             } catch {
                 return (false, "arena setup threw: \(error)")
+            }
+        }
+
+        // Test 85b (Phase A(a)): MixedExpertArena with K4=0 (all-2-bit tail, cov-115 design
+        // point). Regression for the SIGTRAP found in the W4c battery: MLXArray.zeros([0]+shape)
+        // → asMTLBuffer force-unwraps a nil data ptr inside mlx-swift. Init must succeed (dummy
+        // 1-row w4, never addressed) and tail preads must land at GLOBAL slot = local index.
+        run("mixed_arena_k4_zero") {
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            let fm = FileManager.default
+            let base = fm.temporaryDirectory.appendingPathComponent("qwisp_k40_\(UUID().uuidString)")
+            let dir4 = base.appendingPathComponent("m4"), dir2 = base.appendingPathComponent("m2")
+            try? fm.createDirectory(at: dir4, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: dir2, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: base) }
+
+            let E = 4
+            let projs = ExpertSource.projs, parts = ExpertSource.parts
+            func fillByte(_ dir: Int, _ p: Int, _ q: Int, _ e: Int) -> UInt8 {
+                UInt8((dir &* 101 &+ (p &* 3 &+ q) &* 37 &+ e &* 7) & 0xFF)
+            }
+            func writeCkpt(_ dir: URL, _ dirTag: Int, wCols: Int) throws {
+                var meta: [String: Any] = [:]
+                var blob = Data()
+                for (p, proj) in projs.enumerated() {
+                    for (q, part) in parts.enumerated() {
+                        let isW = (part == "weight")
+                        let shape = isW ? [E, 8, wCols] : [E, 8, 2]
+                        let per = shape.dropFirst().reduce(1, *) * (isW ? 4 : 2)
+                        let begin = blob.count
+                        for e in 0 ..< E {
+                            blob.append(contentsOf: [UInt8](repeating: fillByte(dirTag, p, q, e), count: per))
+                        }
+                        meta["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] =
+                            ["dtype": isW ? "U32" : "F16", "shape": shape, "data_offsets": [begin, blob.count]]
+                    }
+                }
+                let hdr = try JSONSerialization.data(withJSONObject: meta)
+                var out = Data(); var hlen = UInt64(hdr.count).littleEndian
+                withUnsafeBytes(of: &hlen) { out.append(contentsOf: $0) }
+                out.append(hdr); out.append(blob)
+                try out.write(to: dir.appendingPathComponent("model.safetensors"))
+                var wm: [String: String] = [:]
+                for proj in projs {
+                    for part in parts { wm["\(ExpertSource.prefix).0.mlp.switch_mlp.\(proj).\(part)"] = "model.safetensors" }
+                }
+                try JSONSerialization.data(withJSONObject: ["weight_map": wm])
+                    .write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+            }
+
+            do {
+                try writeCkpt(dir4, 0, wCols: 16)
+                try writeCkpt(dir2, 1, wCols: 8)
+                let src4 = try ExpertSource(modelDir: dir4.path)
+                let src2 = try ExpertSource(modelDir: dir2.path)
+                let arena = try MixedExpertArena(device: device, source4: src4, source2: src2,
+                                                 K4: 0, M2: 3, refLayer: 0)   // ← K4=0: crashed pre-fix
+                arena.loadTailMany(0, [(e: 1, slot: 0), (e: 3, slot: 2)])     // global slot = local idx
+                guard let bufs = arena.gatherBuffers12(device: device), bufs.count == 12 else {
+                    return (false, "gatherBuffers12 nil / count != 12")
+                }
+                func slotAllEqual(_ buf: MTLBuffer, _ off: Int, _ n: Int, _ want: UInt8) -> Bool {
+                    let p = buf.contents().advanced(by: off).bindMemory(to: UInt8.self, capacity: n)
+                    for i in 0 ..< n where p[i] != want { return false }
+                    return true
+                }
+                for p in 0 ..< 3 {
+                    let proj = projs[p]
+                    let w2 = bufs[p * 4 + 1], sc = bufs[p * 4 + 2], bi = bufs[p * 4 + 3]
+                    let sbW2 = arena.sliceBytes(proj, "w2")
+                    let sbS = arena.sliceBytes(proj, "scales"), sbB = arena.sliceBytes(proj, "biases")
+                    if !slotAllEqual(w2, 0 * sbW2, sbW2, fillByte(1, p, 0, 1)) { return (false, "w2 local0 proj\(p)") }
+                    if !slotAllEqual(w2, 2 * sbW2, sbW2, fillByte(1, p, 0, 3)) { return (false, "w2 local2 proj\(p)") }
+                    if !slotAllEqual(sc, 0 * sbS, sbS, fillByte(1, p, 1, 1)) { return (false, "scales slot0 proj\(p)") }
+                    if !slotAllEqual(sc, 2 * sbS, sbS, fillByte(1, p, 1, 3)) { return (false, "scales slot2 proj\(p)") }
+                    if !slotAllEqual(bi, 0 * sbB, sbB, fillByte(1, p, 2, 1)) { return (false, "biases slot0 proj\(p)") }
+                    if !slotAllEqual(bi, 2 * sbB, sbB, fillByte(1, p, 2, 3)) { return (false, "biases slot2 proj\(p)") }
+                }
+                return (true, "ok")
+            } catch {
+                return (false, "K4=0 arena threw: \(error)")
             }
         }
 

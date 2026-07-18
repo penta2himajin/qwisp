@@ -18,10 +18,14 @@ public protocol SeedlessFusedExpertProvider: AnyObject {
     /// Declared as a requirement (not extension-only) so protocol-typed access dispatches
     /// dynamically to MixedArenaExpertProvider's override.
     var mixK4: Int { get }
+    /// W3 lever-A: tail (2-bit) group size of the mixed arena's scales/biases layout.
+    /// 64 (default) or 128 (gs=128 artifact, requires mixK4 == 0).
+    var mixGS2: Int { get }
 }
 
 public extension SeedlessFusedExpertProvider {
     var mixK4: Int { 0 }
+    var mixGS2: Int { 64 }
 }
 
 /// 本番 provider: LayerExpertCache(per-layer LRU + ExpertSource pread)を fused engine に接続。

@@ -56,9 +56,17 @@ Consequences:
    scales F16, biases F16}, affine gs=64, same tensor names/index format as the model).
    **Provenance verified bit-exact**: slice(L7,E123) == `mx.quantize(mx.dequantize(4bit), bits=2)`
    — i.e. exactly what the oracle sweep computed with. Workstream ③ (offline tail requant) is
-   effectively DONE; remaining: archive the regeneration script in `oracle/`, and a load-time
-   shape/gs sanity check.
-2. **Kernel precedent**: `gqmm3`/`gqmm3Rows` (notes/11, in `SeedlessMetalForward.swift`) —
+   effectively DONE; regeneration script archived: `oracle/requant_experts_2bit.py`
+   (naive + cal modes). Remaining: a load-time shape/gs sanity check.
+   **Calibrated artifact** (2026-07-18): `~/.mtplx/models/qwisp-experts-2bit-cal/` — same
+   360 tensor names/shapes/dtypes (header-identical), MSE-optimal affine fit
+   (mixprec.py#cal2bit, sweep-validated 0/4 loops at K4∈{8,0}); the fitted (q,s,b) are
+   packed directly (a `mx.quantize` re-encode would min/max-refit and distort groups not
+   spanning all 4 codes). Verified: L7/E123 gate MSE −31.0% vs naive.
+2. **Kernel precedent**: `gqmm3`/`gqmm3Rows` (in `SeedlessMetalForward.swift`; the notes/11
+   3-bit UD-tier product spec is RETIRED 2026-07-18 — mixed residency supersedes that
+   lower-RAM direction, owner decision; the gqmm3 kernel + its locked tests remain as
+   shipped reference, spec text lives in git history) —
    the additive sub-4-bit port pattern (MLX `qdot<bits>` verbatim, bit-exact locked test
    against the MLX oracle, gqmm4 untouched) is proven. bits=2 is *simpler* than bits=3:
    pack_factor 16/u32, no byte-straddle terms.
@@ -233,6 +241,41 @@ truncates and predictions collapse to ~10% match (cost one debugging round — d
 oracle-predicted fidelity. Default-ON decision deferred (owner): candidates for closing the
 tcp residual = rolling-refresh dynamics tuning, calibrated 2-bit tail (quality upside),
 or accepting + documenting with the LoopGuard opt-in as belt-and-braces.
+
+## Lever A (2026-07-18): gs=128 calibrated tail ⇒ coverage 128 — DEFAULT ON (with LoopGuard)
+
+Phase A(a) results superseding the residual above (evidence `scripts/loopy/w4c/`):
+
+- **cal gs=64 artifact** (`qwisp-experts-2bit-cal`, MSE −31% vs naive): TF up but loops
+  MOVED, not fixed — cov 108 story@893/sky@1234 (2/4), cov 115 tcp@240/story-p83 (2/4).
+  Confirms the loop driver is COVERAGE (deep-tail buddy), not tail precision.
+- **cal gs=128 artifact** (`qwisp-experts-2bit-cal128`): halved scales/biases ⇒ slot
+  960→864 KiB ⇒ **M2 = 110592/864 = exactly 128 at K4=0** — the measured C=128 healthy
+  line in the same C=64 byte budget. Calibration pays for the coarser grouping
+  (cal-gs128 MSE still −29.6% vs naive-gs64; oracle 0/4, TF parity with cal-gs64).
+- **Product battery cov 128 (canonical 4): 4/4 CLEAN** — detlag2 0/4, long-period tail
+  scan clean to p≤300, no internal transient loop (span ≥24). TF strict-replay
+  84.6/82.1/86.3/90.1.
+- **Soak (10 diverse runs incl. 2×3000 tok): 7/10 clean, 3 loops** — gc p2@~894,
+  bash p18@~1400, story3000 **p262**@~949 (long-period semantic cycle). Verdict
+  correction: cov 128 makes loops RARE AND LATE (vs generic bolt 4/4 @87–1244), not
+  impossible — LOOPY stays the asymptotic fate of approximate decode; coverage moves
+  the horizon. The C=128 "healthy line" itself was only ever measured on the canonical
+  4 prompts.
+- **Shipping posture**: mixed cov128 default-ON **plus LoopGuard default-ON**
+  (belt-and-braces): guard heals period ≤64 invisibly (64-token hold-back, 0 FP on
+  2300 clean tokens); documented residual = long-period (>64) semantic loops, which
+  would need a ~800-token stream delay to buffer — not viable for interactive
+  streaming. Both env-disable-able (QWISP_MIXED=0 / QWISP_BOLT_STABILITY_GUARD=0).
+- Kernel/product wiring: gqmm2_rows takes gsz; gqmm_mix kernels take gs2 (tail branch
+  only; gs=128 requires K4=0 — the shared-uniform s/b layout can't mix group sizes).
+  Locked test `gqmm2_gs128_mix_bitexact` (RAWTESTS 89). Detector lesson: detlag2
+  PMAX=64 missed a period-83 loop (found by eye) — long-period scan is now part of
+  the verdict procedure.
+- **DEFAULT ON**: QWISP_MIXED defaults to 1; artifact auto-detected
+  (cal128 → cal → legacy naive, or QWISP_EXPERTS_2BIT); QWISP_MIXED=0 disables;
+  no artifact → generic bolt (warn only on explicit opt-in).
+  QWISP_BOLT_STABILITY_GUARD defaults to 1 (see soak verdict above).
 
 ## Design point
 
