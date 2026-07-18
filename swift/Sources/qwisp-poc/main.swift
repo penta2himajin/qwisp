@@ -33,6 +33,7 @@ if CommandLine.arguments.contains("stream") {
         ("hybrid-prefill-bench", { md, _ in Tell.hybridPrefillBench(modelDir: md) }),
         ("prefix-cache-e2e", { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
         ("prefix-persist-e2e", { md, _ in Tell.prefixPersistE2E(modelDir: md) }),   // #89 restart gate
+        ("prefix-bolt-e2e", { md, _ in Tell.prefixBoltE2E(modelDir: md) }),         // #76 bolt-side gate
         ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
         ("gqmm2-bench", { _, _ in SeedlessMetalForward.gqmm2Bench() }),   // notes/18 W1 speed sim

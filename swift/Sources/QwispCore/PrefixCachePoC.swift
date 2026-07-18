@@ -237,6 +237,47 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // #76 gate (bolt side): bolt-mode decode with the in-RAM prompt-prefix blob
+    // (QWISP_BOLT_PREFIX) vs without must be byte-identical. Two INDEPENDENT backends
+    // (own BoltServe, own arena) are fed the same request sequence so per-process calib
+    // and rolling recalib evolve identically; only the prefix reuse differs. The restored
+    // KV/GDN bytes equal a fresh strict prefill's by construction; freeze() re-ensures
+    // top-C of the same basis either way — divergence would indicate a slot-state leak.
+    public static func prefixBoltE2E(modelDir: String) -> String {
+        let c = Tell.envInt("QWISP_PREFIX_E2E_C", 64)
+        guard let bRef = try? SeedlessBackend(modelDir: modelDir, tier: .streaming(c: c)),
+              let bCached = try? SeedlessBackend(modelDir: modelDir, tier: .streaming(c: c))
+        else { return "[prefix-bolt-e2e] load fail\nPREFIXBOLTE2E FAIL" }
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let A = toks(300, 13), genSuffix = toks(8, 777)
+        // 3-request extend chain (agentic shape): each request extends the previous content.
+        let reqs = [A + genSuffix,
+                    A + toks(40, 2) + genSuffix,
+                    A + toks(40, 2) + toks(40, 5) + genSuffix]
+        final class Box: @unchecked Sendable { var v: [Int] = [] }
+        func gen(_ b: SeedlessBackend, _ p: [Int], prefix: Bool) -> [Int] {
+            setenv("QWISP_BOLT_PREFIX", prefix ? "1" : "0", 1)
+            let box = Box(); let sem = DispatchSemaphore(value: 0)
+            let s = b.generate(p, options: GenerateOptions(maxTokens: 24, promptContentLen: p.count - 8))
+            Task.detached { for await t in s { box.v.append(t) }; sem.signal() }
+            sem.wait()
+            return box.v
+        }
+        var lines = ["[prefix-bolt-e2e] streaming C=\(c), bolt default mode, 3-request extend chain"]
+        var pass = true
+        for (i, p) in reqs.enumerated() {
+            let r = gen(bRef, p, prefix: false)
+            let g = gen(bCached, p, prefix: true)
+            let ok = r == g && !r.isEmpty
+            pass = pass && ok
+            lines.append("  R\(i + 1) prompt=\(p.count)  ref=\(r.count)tok cached=\(g.count)tok  \(ok ? "IDENTICAL ✅" : "DIVERGE ❌")")
+            if !ok { lines.append("    ref:    \(r.prefix(12))"); lines.append("    cached: \(g.prefix(12))") }
+        }
+        unsetenv("QWISP_BOLT_PREFIX")
+        lines.append("PREFIXBOLTE2E \(pass ? "PASS" : "FAIL")")
+        return lines.joined(separator: "\n")
+    }
+
     // Speed probe for the multi-slot cache: TTFT (time-to-first-token) for a cold request vs a
     // cross-conversation request that shares a large prefix vs an intra-conversation extend.
     // Shows the multi-slot win = skipping re-prefill of the shared system+tools prefix on a NEW convo.

@@ -320,6 +320,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         }
                         guard let seg = self.boltServe?.runSegment(
                             promptIds: seq, N: segN, maxSeqLen: maxSeqLen,
+                            contentLen: options.promptContentLen,   // #76: bolt prefix-reuse boundary
                             isCancelled: { cancel.isCancelled || lguard?.trip != nil }, onToken: onTok),
                             !seg.isEmpty else { break }
                         if let g = lguard, let tr = g.trip {
