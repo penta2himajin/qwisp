@@ -458,13 +458,26 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // conversation sharing the system+tools prefix restores a sub-content boundary instead
                 // of re-prefilling it. Boundaries past the divergence point are stale → drop them.
                 let lcp = SeedlessBackend.commonPrefixLen(content, self.arenaContent)
-                let restoreLen = self.prefixSlots.last(where: { $0.len <= lcp })?.len ?? 0
+                var restoreLen = self.prefixSlots.last(where: { $0.len <= lcp })?.len ?? 0
                 if restoreLen > 0, let s = self.prefixSlots.last(where: { $0.len == restoreLen })?.snap {
                     backend.fullRestore?(s)
+                } else if PrefixPersist.enabled,
+                          let hit = PrefixPersist.bestMatch(modelDir: self.modelDir, content: content),
+                          backend.restorePersistentState?(hit.state) == true {
+                    // #89 (opt-in): no in-memory restore point — cross-process warm start from
+                    // disk. The restore wrote the KV bytes + GDN state into THIS arena, so the
+                    // arena path IS hit.tokens now; seed one in-memory slot at that boundary.
+                    self.arenaContent = Array(hit.tokens)
+                    self.prefixSlots = []
+                    if let snap = backend.fullSnapshot?() {
+                        self.prefixSlots = [(len: hit.tokens.count, snap: snap)]
+                    }
+                    restoreLen = hit.tokens.count
+                    PrefixPersist.restoreHits += 1
                 } else if let e = self.prefixEmptySnap {
                     backend.fullRestore?(e)
                 }
-                self.prefixSlots.removeAll { $0.len > lcp }
+                self.prefixSlots.removeAll { $0.len > Swift.max(lcp, restoreLen) }
 
                 // Re-prefill the delta [restoreLen ..< contentLen], snapshotting at stride-aligned
                 // boundaries (so different conversations that share a prefix snapshot at the SAME
@@ -482,6 +495,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 self.prefixSlots.sort { $0.len < $1.len }
                 self.evictSlots()
                 self.arenaContent = content
+                // #89 (opt-in): persist the content-boundary state for cross-process reuse.
+                // The state is exactly at the boundary here (gen-suffix prefill comes next);
+                // persistentState() is a CPU copy of shared buffers, the file write is async.
+                if PrefixPersist.enabled, let blob = backend.persistentState?() {
+                    let model = self.modelDir
+                    DispatchQueue.global(qos: .utility).async {
+                        PrefixPersist.save(modelDir: model, tokens: content, state: blob)
+                    }
+                }
 
                 // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
                 // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.

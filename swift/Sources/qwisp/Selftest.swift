@@ -77,6 +77,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     check("prefill_line", prefillLine(done: 4096, total: 14490, secs: 151.7) == "prefill 4096/14490 (28%) · 27 tok/s")
     check("prefill_line_norate", prefillLine(done: 64, total: 128, secs: 0) == "prefill 64/128 (50%)")
 
+    // prefix-cache disk persistence (issue #89; pure tmp-dir store checks, no GPU).
+    for (name, ok) in PrefixPersist.selfCheck() { check("prefixpersist_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 

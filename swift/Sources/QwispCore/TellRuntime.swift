@@ -89,6 +89,10 @@ extension Tell {
         // Distinct from snapshot/rollback (1-step spec). nil if the backend doesn't support it.
         var fullSnapshot: (() -> Any)? = nil
         var fullRestore: ((Any) -> Void)? = nil
+        // Disk-persistable state (issue #89): serialize/restore the CURRENT decode state
+        // (KV used slice + GDN) as a blob a fresh process can restore. nil = unsupported.
+        var persistentState: (() -> Data)? = nil
+        var restorePersistentState: ((Data) -> Bool)? = nil
         // Steel-prefill hybrid (QWISP_HYBRID_PREFILL=1): prefill-scoped forward with GDN dense
         // matmuls via MLX steel. nil → prefill uses `forward`. Decode/verify NEVER use this.
         var forwardHybrid: (([Int32]) -> MLXArray?)? = nil
@@ -175,6 +179,8 @@ extension Tell {
         backend.fullRestore = { snap in
             if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
         }
+        backend.persistentState = { fwd.persistentStateData() }              // issue #89
+        backend.restorePersistentState = { fwd.restorePersistentState($0) }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
@@ -271,6 +277,8 @@ extension Tell {
         backend.fullRestore = { snap in
             if let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.FullSnapshot { fwd.fullRestore(s) }
         }
+        backend.persistentState = { fwd.persistentStateData() }              // issue #89
+        backend.restorePersistentState = { fwd.restorePersistentState($0) }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
