@@ -113,6 +113,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // and shared staging arenas (measured: run-to-run nondeterminism, stale-slice arena
     // corruption, buildBuddyTable force-unwrap crash).
     private let segGate = DispatchSemaphore(value: 1)
+
+    /// Join the in-flight decode thread, if any. A consumer that breaks out of the stream
+    /// (EOS is detected consumer-side only) leaves the detached thread running — possibly a
+    /// whole segment rebuild + re-prefill with no cancellation checks — and a CLI that then
+    /// returns from main races C++ static teardown of the MLX scheduler singleton
+    /// (rc 133/139 SIGTRAP/SIGSEGV in get_default_stream, #47 handoff). Call before exit.
+    public func drain() {
+        segGate.wait()
+        segGate.signal()
+    }
     let modelDir: String
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
