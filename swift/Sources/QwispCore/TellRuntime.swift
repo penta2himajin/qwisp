@@ -487,6 +487,12 @@ extension Tell {
 
     // ── Prefill helper ────────────────────────────────────────────────────
 
+    /// Prefill progress hook (issue #86): called with (done, total) prompt positions —
+    /// (0, total) marks a prefill run's start, then once per chunk. Long prompts on
+    /// streaming tiers prefill for minutes; the CLI/server surface this. nil = silent.
+    /// Single decode thread (segGate) → no synchronization needed.
+    nonisolated(unsafe) public static var prefillProgress: ((Int, Int) -> Void)? = nil
+
     /// Chunked prefill: runs all prompt tokens through the backend, chunk=64.
     /// Returns normed hidden of the very last position [1, H], or nil on error.
     /// mtpHead/mtpFwd (①③ Step 5): ingest prompt pairs (h_i, id_{i+1}) per chunk —
@@ -502,6 +508,7 @@ extension Tell {
         let chunkSize = backend.forwardHybrid != nil ? backend.hybridChunk : 64
         var lastNormed: MLXArray? = nil
         var pos = 0
+        prefillProgress?(0, pLen)
         while pos < pLen {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
@@ -518,6 +525,7 @@ extension Tell {
             // Keep last row [H] — will be overwritten each chunk until the final one.
             lastNormed = normed[chunk.count - 1]    // [H]
             pos = end
+            prefillProgress?(pos, pLen)
         }
         return lastNormed.map { $0.reshaped([1, SeedlessEngine.H]) }   // [1, H]
     }

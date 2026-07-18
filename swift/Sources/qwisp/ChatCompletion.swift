@@ -96,6 +96,14 @@ struct ChatCompletionChunk: Codable {
     let choices: [ChunkChoice]
 }
 
+/// One prefill progress line (issue #86): "prefill 4096/14490 (28%) · 27 tok/s".
+/// Shared by the chat CLI (\r-overwritten) and the server log (one line / 10s).
+func prefillLine(done: Int, total: Int, secs: Double) -> String {
+    let pct = total > 0 ? done * 100 / total : 0
+    let rate = secs > 0 ? String(format: " · %.0f tok/s", Double(done) / secs) : ""
+    return "prefill \(done)/\(total) (\(pct)%)\(rate)"
+}
+
 // ── CLI (`qwisp chat`) — thin in-process wrapper over the same core ──────────
 func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend, maxTokens: Int,
              temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
@@ -103,14 +111,32 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
     let promptIds: [Int]
     do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]]) }
     catch { fputs("chat: render error: \(error)\n", stderr); return }
+    // Prefill progress → stderr (issue #86): a long prompt on a streaming tier prefills for
+    // minutes, previously in silence. \r-overwritten; shown once a prefill run exceeds 1s.
+    // The hook runs on the (single) decode thread; stats are read after drain() below.
+    var pfRunStart: Date? = nil, pfShown = false, pfTok = 0, pfSecs = 0.0
+    Tell.prefillProgress = { done, total in
+        let now = Date()
+        if done == 0 { pfRunStart = now; return }
+        guard let t0 = pfRunStart else { return }
+        let secs = now.timeIntervalSince(t0)
+        if done == total { pfTok += total; pfSecs += secs; pfRunStart = nil }
+        if secs >= 1 {
+            pfShown = true
+            FileHandle.standardError.write(Data("\r[qwisp] \(prefillLine(done: done, total: total, secs: secs))   ".utf8))
+        }
+        if done == total && pfShown { pfShown = false; FileHandle.standardError.write(Data("\n".utf8)) }
+    }
     // Route the reasoning to stderr and the answer to stdout, so `qwisp chat … > file` captures
     // only the answer while the thinking still streams to the terminal.
     var full = "", sentR = "", sentC = ""
-    _ = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
+    var tFirst: Date? = nil
+    let r = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
                             decode: { tokenizer.decode($0) }, backend: backend,
                             temperature: temperature, topP: topP, seed: seed,
                             frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
                             logitBias: logitBias) { delta in
+        if tFirst == nil { tFirst = Date() }
         full += delta
         let (r, c) = splitThink(full)
         if r.count > sentR.count, r.hasPrefix(sentR) {
@@ -124,6 +150,13 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
     // Exit-teardown fix (#47 handoff): join the decode thread before main returns —
     // it outlives the EOS break above and its MLX evals race static teardown.
     (backend as? SeedlessBackend)?.drain()
+    // Speed summary (issue #86 ask 3): prompt-processing speed alongside generation speed.
+    let pfRate = pfSecs > 0 ? Double(pfTok) / pfSecs : 0
+    let decSecs = tFirst.map { Date().timeIntervalSince($0) } ?? 0
+    let decRate = decSecs > 0 ? Double(max(0, r.completionTokens - 1)) / decSecs : 0
+    // Leading \n: the reasoning stream (stderr) ends mid-line.
+    fputs(String(format: "\n[qwisp] prompt %d tok (%.0f tok/s) · gen %d tok (%.1f tok/s)\n",
+                 promptIds.count, pfRate, r.completionTokens, decRate), stderr)
 }
 
 // ── Core ─────────────────────────────────────────────────────────────────────
