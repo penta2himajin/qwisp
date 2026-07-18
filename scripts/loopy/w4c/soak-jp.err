@@ -1,0 +1,68 @@
+[qwisp] loading model from Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 …
+[qwisp] bolt tier active (near-lossless, streaming default): C=64 — pass --lossless for bit-exact strict
+[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …
+[qwisp] mixed residency: gs=128 tail artifact → K4 8→0 (all-2-bit)
+[qwisp] mixed residency: K4=0 (4-bit core) + M2=128 (2-bit tail, gs=128) = coverage 128/layer (budgetC=64)
+[qwisp] calibration done — decoding at bolt speed from here
+Here's a thinking process:
+
+1.  **Analyze User Request:**
+   - **Topic:** Quantum computer (量子コンピュータ)
+   - **Target Audience:** High school students (高校生)
+   - **Language:** Japanese (日本語)
+   - **Requirement:** Detailed explanation (詳しく説明)
+   - **Key Constraint:** Make it understandable for high school students (高校生にも分かるように)
+
+2.  **Identify Key Concepts to Cover:**
+   - What is a quantum computer? (Definition/Basic idea)
+   - How does it differ from classical computers? (Bits vs. Qubits)
+   - Core principles: Superposition (重ね状態), Entanglement (量子もつれ), Interference (干法)
+   - How it works/structure (Qubits, quantum gates, algorithms)
+   - Applications/Examples (Optimization, simulation, cryptography)
+   - Current state/Challenges (Error rates, scalability, cooling)
+   - Analogy/Examples suitable for high school level
+
+3.  **Structure the Explanation:**
+   - Introduction: What is a quantum computer?
+   - Core Concept 1: Qubits vs. Bits (Superposition)
+   - Core Concept 2: Entanglement
+   - Core Concept 3: Quantum Interference (Algorithm execution)
+   - How it works (Hardware/Process)
+   - Applications & Why it matters
+   - Current challenges & Future outlook
+   - Summary/Conclusion
+   - Use analogies, clear language, avoid jargon where possible, explain jargon simply.
+
+4.  **Draft - Section by Section (Mental Refinement in Japanese):**
+
+   *Introduction:*
+   量子コンピュータは、従来のコンピュータとは全く異なる原理で動作する「未来の計算機」です。従来のコンピュータが「0か1か」で情報を処理するのに対し、量子コンピュータは「0と1の両方の状態を同時に持つ」という量子力学の特性を利用します。
+
+   *Qubits vs Bits (Superposition):*
+   従来のコンピュータでは、情報を「ビット」と呼ばれる小さな単位で扱います。ビットは「0」か「1」のどちらか一方しか取りません。例えば、電灯のスイッチが「OFF(0)」か「ON(1)」か。
+   一方、量子コンピュータでは「量子ビット（Qubit）」を使います。Qubitは、量子力学の「重ね状態（Superposition）」という原理により、「0と1の両方の状態を同時に持っている」ことができます。これは、コインを投げている途中の「表にも裏にもならない状態」に似ています。これにより、1つのQubitで大量の情報を同時に表現できます。
+
+   *Entanglement:*
+   複数のQubitを連結すると、「量子もつれ（Entanglement）」という現象が起きます。これは、2つのQubitが強く結び付き、一方の状態を操作すると、もう一方も瞬時に連動して変化する現象です。これにより、Qubitの数を増やすしても、計算能力が指数関数的に増大します。従来のコンピュータが「2^n」で計算能力が線形に増えるのに対し、量子コンピュータは「2^n^2^n」で能力が爆発的に増大します。
+
+   *Quantum Interference (Algorithm/Execution):*
+   量子コンピュータは、この「重ね状態」と「量子もつれ」を巧妙に利用して、答えを「増幅」し、間違いを「減幅」する「量子干法（Interference）」という手法で計算を行います。これは、波の干法に似ています。正解の波を強め、負解の波を弱めることで、最終的に正しい答えだけが残ります。この原理により、従来のコンピュータでは数十年かかる計算を、数秒で終わらせることができます。
+
+   *Hardware/Structure:*
+   量子コンピュータのハード面では、Qubitを物理的に実現する方法が複数あります。代表的なものは「超導回路（Superconducting circuits）」や「イオントラップ（Ion trap）」、近年注目されている「光量子（Photonic quantum）」などです。これらは極低温（約-100℃）で安定させる必要があり、環境制御が難しいです。また、計算過程では「量子ゲート（Quantum gate）」という操作でQubitの状態を制御し、最終的に「測定（Measurement）」で重ね状態を崩し、0か1かを読み取ります。
+
+   *Applications:*
+   量子コンピュータが特に強いのは、「組み合わせ最適化問題」「分子シミュレーション」「暗号解読」などです。例えば、物流の配送最適化、新薬の開発、気候変動シミュレーション、金融シミュレーションなどが挙げられます。これらは従来のコンピュータでは「探索空間」が指数関数的に増大し、現実的に解けない問題ですが、量子コンピュータは「重ね状態」で全探索を並行に行えるため、効率的に解けます。
+
+   *Challenges/Future:*
+   現状では、Qubitの数がまだ少なく（数十〜百程度）、計算エラー率（Error rate）が高いです。また、極低温環境維持や「量子誤差訂正（Quantum error correction）」技術がまだ発展段階です。しかし、IBMやGoogle、各国のスタートアップ企業が急速に開発を進めており、10〜10年後には「量子優位性（Quantum supremacy）」を実証する段階に達すると予想されます。
+
+   *Summary:*
+   量子コンピュータは、量子力学の「重ね状態」「量子もつれ」「量子干法」を計算原理として利用する、従来のコンピュータとは異なるパラドの計算機です。まだ発展段階ですが、物流、創薬、気候シミュレーションなど、社会に大きな影響を与える可能性を秘めています。理解するには、量子力学の基礎（波、状態、干法）を少し学ぶ必要がありますが、その原理は「複数の可能性を同時に処理し、正しい答えだけを残す」というシンプルな思想で理解できます。
+
+5.  **Self-Crection/Refinement (Check against High School Level):**
+   - *Terminology:* 重ね状態 (Superposition), 量子もつれ (Entanglement), 量子干法 (Interference), 量子ビット (Qubit), 量子ゲート (Quantum gate), 量子優位性 (Quantum supremacy), 量子誤差訂正 (Quantum error correction).
+   - *Clarity:* Need to explain these terms simply. Use analogies: coin toss, light waves, lock/unlock.
+   - *Structure:* Logical flow: Basic concept -> Core principles -> How it works -> Applications -> Challenges -> Summary.
+   - *Language:* Japanese, appropriate for high school students (avoid overly academic jargon, use clear sentences, explain necessary terms).
+   - *Accuracy:* Ensure scientific accuracy while keeping it accessible. Superposition is not "both 0 and 1 simultaneously" in a sense, but "probability amplitude". Entanglement is correlation, not "

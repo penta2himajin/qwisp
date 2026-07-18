@@ -1,0 +1,67 @@
+[qwisp] loading model from Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 …
+[qwisp] bolt tier active (near-lossless, streaming default): C=64 — pass --lossless for bit-exact strict
+[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …
+[qwisp] mixed residency: gs=128 tail artifact → K4 8→0 (all-2-bit)
+[qwisp] mixed residency: K4=0 (4-bit core) + M2=128 (2-bit tail, gs=128) = coverage 128/layer (budgetC=64)
+[qwisp] calibration done — decoding at bolt speed from here
+Here's a thinking process:
+
+1.  **Understand User Request:** The user wants a detailed summary of the causes and consequences of the French Revolution. This requires a structured, comprehensive explanation covering both the underlying factors that led to the revolution and the outcomes that followed it.
+
+2.  **Identify Key Components:**
+   - *Causes:* Economic, social, political, ideological, and immediate triggers.
+   - *Consequences:* Political, social, economic, international, and long-term historical impacts.
+   - *Structure:* Logical flow, clear headings, detailed but concise explanations, historical accuracy.
+
+3.  **Brainstorming/Research (Internal Knowledge):**
+   - *Causes:*
+     - Economic: Financial crisis, debt from wars (American Revolution, Seven Seven Years War), regressive taxation, poor harvests/f famines.
+     - Social: Three Estate system (First: clergy, Second: nobility, Third: commoners), inequality, rising bourgeoisie, peasant poverty.
+     - Political: Absolute monarchy, Louis XVI's weak leadership, lack of representation, corruption.
+     - Ideological: Enlightenment ideas (equality, liberty, reason, secularism), Rousseau, Voltaire, Montesqu.
+     - Immediate Trigger: Estates-General 1789, Third Estate's demands, Tennis Oath, Bastille July 14.
+   - *Consequences:*
+     - Political: End of absolute monarchy, rise of republic, Constitution, Declaration of Rights of Man, secularization, political instability (Jacobins, Girondins, Thermidor, Napoleon).
+     - Social: Abolition of feudal privileges, secularization of church, rise of middle class, women's rights (Olympe de Gouges), but also backlash.
+     - Economic: Land redistribution, secularization of church lands, industrialization later, but short-term chaos.
+     - International: Spread of revolutionary ideas, Napoleonic Wars, redrawing map of Europe, rise of nationalism, colonial impact.
+     - Long-term: Modern democracy, secular state, human rights, secularism, industrial capitalism, secular education.
+
+4.  **Structure the Response:**
+   - Introduction: Brief overview of the French Revolution (1789-1799/1804).
+   - Causes: Group into categories (Economic, Social/Structural, Political, Ideological, Immediate Trigger).
+   - Consequences: Group into categories (Political/Institutional, Social/Class, Economic, International/Global, Long-term/Historical).
+   - Conclusion: Synthesize impact.
+   - Ensure detail, accuracy, and clarity.
+
+5.  **Draft - Section by Section (Mental Refinement):**
+   *Introduction:* The French Revolution (1789–1799) was a watershed event in modern history, transforming France from an absolute monarchy into a republic and spreading revolutionary ideals worldwide. It was driven by deep structural inequalities, economic crisis, and Enlightenment ideas, and its consequences reshaped politics, society, and global order.
+
+   *Causes:*
+   - *Economic Crisis:* France’s treasury was bankrupt due to decades of costly wars (Seven Years War, American Revolution support), regressive taxation (only peasants paid), and poor harvests (1788–89 famines). The state couldn’t borrow, leading to fiscal collapse.
+   - *Social Inequality (Three Estate System):* Society was divided into First (clergy), Second (nobility), Third (commoners). The Third Estate bore all taxes, had no political voice, and faced rising bourgeoisie resentment. Peasants were impoverished.
+   - *Political Weakness:* Louis XVI’s indecisive rule, lack of representative institutions, corruption, and inability to reform. The Estates-General was called in 1789, but voting by estate (not by head) favored the privileged.
+   - *Ideological Shift:* Enlightenment thinkers (Voltaire, Rousseau, Montesqu) promoted reason, equality, liberty, secularism, and popular sovereignty. These ideas undermined divine-right monarchy and inspired demands for constitutional government.
+   - *Immediate Trigger:* The Estates-General’s failure to address grievances led the Third Estate to declare itself the National Assembly (June 1789). The Tennis Oath, storming of Bastille (July 14), and peasant revolts (Great Fear) pushed the revolution forward.
+
+   *Consequences:*
+   - *Political/Institutional:* Absolute monarchy ended. Declaration of Rights of Man and Citizen (1789) established equality, liberty, popular sovereignty. France became a republic (1792), then empire (Napoleon). Political factions (Jacobins, Girondins) led to radicalization, Terror, and eventual stability under Napoleon.
+   - *Social/Class:* Feudal privileges abolished (August 4, 1789). Church lands secularized (biens national). Rise of bourgeoisie and middle class. Women’s rights debated (Olympe de Gouges) but not fully realized. Peasants gained land. Social mobility increased, but backlash occurred (conservative backlash).
+   - *Economic:* Church lands sold to pay debt, creating new landowners. Industrialization later, but short-term chaos. Secularization of economy. Rise of capitalism, but also inflation and food shortages initially.
+   - *International/Global:* Revolutionary ideas spread (American, Latin American, European revolutions). Napoleonic Wars redrew map of Europe, ended feudalism in many regions. Rise of nationalism, secular state model. Colonial impact (Haiti revolution inspired by French ideals).
+   - *Long-term/Historical:* Modern democracy, secular state, human rights, secular education, industrial capitalism, secular law. The revolution became a blueprint for modern state-building, secularism, and popular sovereignty.
+
+   *Conclusion:* The French Revolution was caused by economic collapse, social inequality, political weakness, and Enlightenment ideals, and its consequences reshaped politics, society, economics, and global order, laying the foundation for modern democracy, secularism, and human rights.
+
+6.  **Check Accuracy & Detail:**
+   - Ensure historical terms are correct (Estates-General, Tennis Oath, Bastille, Great Fear, Declaration of Rights, Jacobins, Girondins, Terror, Napoleon, Biens National, Olympe de Gouges).
+   - Avoid oversimplification. Provide nuanced explanations (e.g., how economic crisis wasn't just debt but also regressive taxation + harvests).
+   - Clarify that consequences weren't immediate but long-term.
+   - Use clear headings, bullet points or structured paragraphs for readability.
+   - Maintain academic tone but accessible.
+
+   *Self-Correction/Refinement during drafting:*
+   - I need to ensure "causes" and "consequences" are detailed but not overly verbose.
+   - I should explicitly link causes to consequences where relevant (e.g., economic crisis → land redistribution → new bourgeoisie).
+   - I should mention the radicalization phase (Terror) as a consequence of political instability.
+  

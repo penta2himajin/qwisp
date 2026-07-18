@@ -1,0 +1,151 @@
+[qwisp] loading model from Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 …
+[qwisp] bolt tier active (near-lossless, streaming default): C=64 — pass --lossless for bit-exact strict
+[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …
+[qwisp] mixed residency: gs=128 tail artifact → K4 8→0 (all-2-bit)
+[qwisp] mixed residency: K4=0 (4-bit core) + M2=128 (2-bit tail, gs=128) = coverage 128/layer (budgetC=64)
+[qwisp] calibration done — decoding at bolt speed from here
+Here's a thinking process that leads to the suggested solution:
+
+1.  **Understand the Goal:** The user wants a Python class implementing an Least Recently Used (LRU) cache. The key constraint is that operations (put/get) must be $O(1)$ (constant time). Finally, I need to explain the design.
+
+2.  **Analyze the Constraints:**
+    *   **LRU Cache:** Needs to track usage order. When capacity is reached, the oldest (least recently used) item must be evicted.
+    *   **$O(1)$ Operations:**
+        *   `get(key)`: Retrieve value. Must update usage order.
+        *   `put(key, value)`: Insert or update value. Must update usage order.
+    *   *Challenge:* Standard arrays/lists allow fast lookup but slow insertion/deletion (shifting elements). Standard linked lists allow fast insertion/deletion but slow lookup.
+    *   *Solution:* Combine a Hash Map (for fast lookup) and a Doubly Linked List (for fast reordering).
+
+3.  **Design the Data Structures:**
+    *   **Hash Map (Dictionary):** Maps `key -> node`. This allows finding the node in $O(1)$ time.
+    *   **Doubly Linked List:** Maintains the order of keys.
+        *   `head`: Represents the most recently used (MRU) end.
+        *   `tail`: Represents the least recently used (LRU) end.
+    *   **Sentinel Nodes:** To handle edge cases (empty list, single element) without checking `None` constantly.
+
+4.  **Drafting the Implementation (Mental or Scratchpad):**
+
+    *   *Class Structure:* `LRUCache`
+    *   *Attributes:* `capacity`, `size`, `map` (dict), `head`, `tail`.
+    *   *Helper Class:* `Node` (key, value, prev, next).
+
+    *   *Logic for `get(key)`:*
+        1.  Check if key exists in map.
+        2.  If yes:
+            *   Get node.
+            *   Remove node from list (unlink prev/next).
+            *   Add node to head (update head/prev/next).
+            *   Return value.
+        3.  If no: Return -1 (or None).
+
+    *   *Logic for `put(key, value)`:*
+        1.  Check if key exists in map.
+        2.  If yes:
+            *   Update node value.
+            *   Move node to head (same logic as `get`).
+        3.  If no:
+            *   Create new node.
+            *   Add to head.
+            *   Check capacity.
+            *   If full: Remove node from tail (unlink).
+            *   Update map.
+
+5.  **Refining the Code (Python specifics):**
+    *   Need to handle pointers carefully.
+    *   `head.next` points to the first real node.
+    *   `tail.prev` points to the last real node.
+    *   *Edge case:* When capacity is 1, head and tail might be the same node (or distinct sentinels).
+
+    *   *Drafting Code:*
+        ```python
+        class Node:
+            def __init__(self, key, val):
+                self.key = key
+                self.val = val
+                self.prev = None
+                self.next = None
+
+        class LRUCache:
+            def __init__(self, capacity):
+                self.capacity = capacity
+                self.size = 0
+                self.map = {}
+                self.head = Node(0, 0) # Sentinel
+                self.tail = Node(0, 0) # Sentinel
+                self.head.next = self.tail
+                self.tail.prev = self.head
+        ```
+
+    *   *Move to Head Logic:*
+        ```python
+        def move_to_head(self, node):
+            # Remove from current pos
+            node.prev.next = node.next
+            node.next.prev = node.prev
+            # Add to head
+            node.next = self.head.next
+            self.head.next.prev = node
+            node.prev = self.head
+            self.head.next = node
+        ```
+
+    *   *Get Logic:*
+        ```python
+        def get(self, key):
+            if key in self.map:
+                node = self.map[key]
+                self.move_to_head(node)
+                return node.val
+            return -1
+        ```
+
+    *   *Put Logic:*
+        ```python
+        def put(self, key, value):
+            if key in self.map:
+                node = self.map[key]
+                node.val = value
+                self.move_to_head(node)
+            else:
+                new_node = Node(key, value)
+                self.move_to_head(new_node)
+                self.map[key] = new_node
+                self.size += 1
+                if self.size > self.capacity:
+                    # Remove tail
+                    tail_node = self.tail.prev
+                    self.map.pop(tail_node.key)
+                    self.size -= 1
+                    # Unlink tail_node
+                    tail_node.prev.next = self.tail
+                    self.tail.prev = tail_node.prev
+        ```
+
+6.  **Reviewing the Design Explanation:**
+    *   Why Hash Map? -> Lookup.
+    *   Why Linked List? -> Reordering.
+    *   Why Doubly? -> Both directions needed (move to head, remove from tail).
+    *   Why Sentinels? -> Simplifies logic (no need to check `None`).
+    *   Complexity analysis:
+        *   Map lookup: $O(1)$.
+        *   List unlink/add: $O(1)$ (constant number of pointer updates).
+        *   Total: $O(1).
+
+7.  **Final Polish:**
+    *   Add comments.
+    *   Ensure variable naming is clear.
+    *   Check for potential bugs (e.g., capacity 0? usually ignored, but good to handle).
+    *   Make the explanation clear and structured.
+
+8.  **Constructing the Output:**
+    *   Start with the code block.
+    *   Follow with the "Design Explanation" section.
+    *   Break down the "Why" (Hash Map + Linked List).
+    *   Explain the "Sentinel Nodes" trick.
+    *   Explain the "Move to Head" logic.
+
+9.  **Self-Correction/Edge Case Check during drafting:**
+    *   *Scenario:* Capacity = 1. Put 1. Put 2.
+    *   List: Head <-> Node1 <-> Tail.
+    *   Put 2: New Node2. Move to Head. List: Head <-> Node2 <-> Node1 <-> Tail.
+    *   Evict: Remove Node1 (Tail.prev
