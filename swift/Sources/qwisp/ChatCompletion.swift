@@ -121,6 +121,9 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
         }
     }
     fputs("\n", stdout)
+    // Exit-teardown fix (#47 handoff): join the decode thread before main returns —
+    // it outlives the EOS break above and its MLX evals race static teardown.
+    (backend as? SeedlessBackend)?.drain()
 }
 
 // ── Core ─────────────────────────────────────────────────────────────────────
