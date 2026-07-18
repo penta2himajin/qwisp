@@ -5,7 +5,9 @@
 set -u
 cd "$(dirname "$0")"
 BIN=../../../swift/.xcode-build-rel/Build/Products/Release/qwisp
-CAL=$HOME/.mtplx/models/qwisp-experts-2bit-cal
+CAL=${W4C_ARTIFACT:-$HOME/.mtplx/models/qwisp-experts-2bit-cal}
+ARMS=${W4C_ARMS:-"8 0"}          # K4 design points
+PFX=${W4C_PFX:-c}                # evidence tag prefix: <PFX><k4>-<prompt>
 PY=$HOME/.venvs/mlx/bin/python3
 NAMES="story tcp qs sky"
 
@@ -18,9 +20,9 @@ prompt_for() {
   esac
 }
 
-for k4 in 8 0; do
+for k4 in $ARMS; do
   for n in $NAMES; do
-    tag="c${k4}-${n}"
+    tag="${PFX}${k4}-${n}"
     [ -s "$tag.toks" ] && { echo "[w4c] $tag exists, skip"; continue; }
     echo "[w4c] free-run $tag start"
     QWISP_MIXED=1 QWISP_DEVICE_RAM=8 QWISP_EXPERTS_2BIT="$CAL" QWISP_MIX_K4=$k4 \
@@ -31,9 +33,9 @@ for k4 in 8 0; do
   done
 done
 
-for k4 in 8 0; do
+for k4 in $ARMS; do
   for n in $NAMES; do
-    tag="c${k4}-${n}"
+    tag="${PFX}${k4}-${n}"
     [ -s "$tag.toks" ] || { echo "[w4c] $tag: no toks (early-EOS?), skip TF"; continue; }
     [ -s "$tag.tf.tsv" ] && continue
     echo "[w4c] TF replay $tag"
@@ -43,12 +45,12 @@ for k4 in 8 0; do
   done
 done
 
-for k4 in 8 0; do
+for k4 in $ARMS; do
   echo "=== K4=$k4 ==="
-  $PY ../detlag2.py c${k4}-story.toks c${k4}-tcp.toks c${k4}-qs.toks c${k4}-sky.toks
-  $PY ../rollstab.py c${k4}-story.txt c${k4}-tcp.txt c${k4}-qs.txt c${k4}-sky.txt
+  $PY ../detlag2.py ${PFX}${k4}-story.toks ${PFX}${k4}-tcp.toks ${PFX}${k4}-qs.toks ${PFX}${k4}-sky.toks
+  $PY ../rollstab.py ${PFX}${k4}-story.txt ${PFX}${k4}-tcp.txt ${PFX}${k4}-qs.txt ${PFX}${k4}-sky.txt
   for n in $NAMES; do
-    f="c${k4}-${n}.tf.tsv"
+    f="${PFX}${k4}-${n}.tf.tsv"
     [ -s "$f" ] && awk -F'\t' -v n="$n" 'NR>1{m+=$4; c++} END{if(c) printf "TF %s: %d/%d = %.2f%%\n", n, m, c, 100*m/c}' "$f"
   done
 done

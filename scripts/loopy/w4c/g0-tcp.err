@@ -1,0 +1,107 @@
+[qwisp] loading model from Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16 …
+[qwisp] bolt tier active (near-lossless, streaming default): C=64 — pass --lossless for bit-exact strict
+[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …
+[qwisp] mixed residency: K4=0 (4-bit core) + M2=128 (2-bit tail, gs=128) = coverage 128/layer (budgetC=64)
+[qwisp] calibration done — decoding at bolt speed from here
+Here's a thinking process:
+
+1.  **Understand User Request:**
+   - Topic: TCP congestion control
+   - Required components: Slow Start, Congestion Avoidance, Fast Retransmit, Fast Recovery
+   - Level: Detailed explanation
+   - Goal: Explain how TCP congestion control works, covering these four mechanisms in detail.
+
+2.  **Identify Key Concepts:**
+   - TCP congestion control is a mechanism to prevent network overload by adjusting the transmission rate based on network conditions.
+   - It operates in two phases: Slow Start and Congestion Avoidance (sometimes called Congestion Recovery).
+   - It uses two recovery mechanisms: Fast Retransmit and Fast Recovery (part of TCP's loss recovery algorithm).
+   - Key variables: Congestion Window (cwnd), Slow Start threshold (ssth), Slow Start window (ssw), Recovery window (rwnd), Duplicate ACKs, SACKs, etc.
+   - RFC 908 (TCP Congestion Control) is the standard reference.
+
+3.  **Structure the Explanation:**
+   - Introduction: Purpose and basic concept
+   - Phase 1: Slow Start (mechanism, growth, threshold)
+   - Phase 2: Congestion Avoidance (mechanism, growth, threshold)
+   - Loss Detection: Fast Retransmit (trigger, conditions)
+   - Recovery: Fast Recovery (mechanism, window management, recovery process)
+   - Summary/Flow: How they interact
+   - Technical details: RFC references, modern variations (optional but keep it focused on the requested parts)
+
+4.  **Draft - Section by Section (Mental Refinement):**
+
+   *Introduction:*
+   TCP congestion control dynamically adjusts the amount of data sent into the network to prevent congestion. It uses a "congestion window" (cwnd) to limit outstanding unacknowledged data. The algorithm operates in two main phases: Slow Start and Congestion Avoidance, and uses two loss recovery mechanisms: Fast Retransmit and Fast Recovery.
+
+   *Slow Start:*
+   - Starts with a small cwnd (typically 1-4 bytes or 1 segment).
+   - Increases cwnd exponentially (doubling per ACK) until it reaches a threshold (ssth).
+   - Why? To quickly find available bandwidth without wasting time on small probes.
+   - When ssth is reached, transitions to Congestion Avoidance.
+   - Note: Modern TCP may start with larger cwnd (RFC 5698), but classic is 1 MSS.
+
+   *Congestion Avoidance:*
+   - Linear growth: cwnd increases by 1 MSS per ACK (or per RTT).
+   - Why? To avoid sudden bursts that could cause congestion.
+   - When loss is detected, cwnd drops to half (plus 1 MSS), and ssth is set to the cwnd before loss.
+   - Transitions back to Slow Start if cwnd < ssth.
+
+   *Fast Retransmit:*
+   - Trigger: 3 duplicate ACKs (dupACKs) for the same segment.
+   - Why? Indicates loss without waiting for timeout (RTO).
+   - Action: Retransmit the lost segment immediately.
+   - State: Enters "Fast Recovery" state.
+   - Note: RFC 5660 defines dupACK threshold (3 is standard).
+
+   *Fast Recovery:*
+   - Goal: Recover from loss without dropping cwnd to 1 (which would slow down recovery).
+   - Mechanism: Uses "recovery window" (rwnd) instead of cwnd.
+   - rwnd starts at half cwnd (plus 1 MSS).
+   - During recovery, cwnd is frozen (or set to 1), but rwnd increases linearly (1 MSS per ACK) to allow sending new data.
+   - When the retransmitted segment is ACKed, cwnd is restored to the value before loss (ssth), and transitions back to Congestion Avoidance.
+   - Note: Modern TCP (RFC 5660) uses SACKs for faster recovery, but classic Fast Recovery relies on dupACKs.
+
+   *Integration/Flow:*
+   - Normal operation: Slow Start → Congestion Avoidance
+   - Loss detected via 3 dupACKs → Fast Retransmit → Fast Recovery → Back to Congestion Avoidance
+   - Timeout loss → cwnd = 1, ssth = cwnd/2, back to Slow Start
+   - Key variables: cwnd, ssth, rwnd, dupACKs, SACKs (optional mention)
+
+5.  **Check Technical Accuracy & RFC References:**
+   - RFC 908 (1999) defines the classic algorithm.
+   - RFC 5660 (2010) defines Fast Recovery with SACKs.
+   - RFC 5698 (2010) defines Slow Start initial window.
+   - I should mention these where relevant, but keep the explanation focused on the requested mechanisms.
+   - Clarify: cwnd vs ssth vs rwnd.
+   - Clarify: exponential vs linear growth.
+   - Clarify: dupACK threshold (3).
+   - Clarify: recovery window behavior.
+   - Clarify: transition conditions.
+
+   Let's structure the response clearly:
+   - Overview
+   - Slow Start (detailed)
+   - Congestion Avoidance (detailed)
+   - Fast Retransmit (detailed)
+   - Fast Recovery (detailed)
+   - How they work together (state machine)
+   - Modern enhancements (brief note)
+   - Summary
+
+6.  **Draft Generation (Mental to Text):**
+   I'll write it systematically, ensuring technical precision, clear definitions, and logical flow.
+
+   *Structure:*
+   1. Introduction & Core Concept (cwnd)
+   2. Slow Start (mechanism, growth, threshold, transition)
+   3. Congestion Avoidance (mechanism, growth, threshold, transition)
+   4. Fast Retransmit (trigger, conditions, state transition)
+   5. Fast Recovery (mechanism, rwnd, cwnd handling, recovery completion)
+   6. State Machine / Flow Summary
+   7. Modern TCP Notes (SACK, initial window)
+   8. Conclusion
+
+   *Content Check:*
+   - Slow Start: starts at 1 MSS, doubles per ACK, stops at ssth, transitions to CA.
+   - CA: increases 1 MSS per ACK, stops at ssth, on loss: cwnd = half + 1 MSS, ssth = cwnd before loss, transitions to SS if cwnd < ssth.
+   - Fast Retransmit: 3 dupACKs, retransmit, enter FR state.
+   - Fast Recovery: rwnd = half cwnd + 1 MSS, cwnd frozen/1, rwnd increases 1 MSS per ACK, when retransmit ACKed:

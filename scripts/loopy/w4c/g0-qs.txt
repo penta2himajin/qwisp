@@ -1,0 +1,18 @@
+### The Conceptual Breakdown: How Quicksort Works
+
+Quicksort (Quick Sort) is a **Divide and Conquer** algorithm. It works by recursively breaking a large problem into smaller, manageable sub-problems until the entire list is sorted.
+
+Here is the step-by-step logic:
+
+#### Step 1: Choose a "Pivot"
+The algorithm selects one element from the array to act as a reference point. This element is called the **Pivot**.
+*   *Common choices:* The first element, the last element, or a random element.
+*   *Goal:* The pivot determines where the rest of the elements will go.
+
+#### Step 2: Partitioning (The Split)
+The algorithm iterates through the rest of the array and compares every element to the Pivot.
+*   **Elements smaller than the Pivot** are moved to the **Left** side.
+*   **Elements larger than the Pivot** are moved to the **Right** side.
+*   *Note:* Elements equal to the pivot can go to either side (usually handled with the pivot itself).
+
+At this stage, the Pivot is in
