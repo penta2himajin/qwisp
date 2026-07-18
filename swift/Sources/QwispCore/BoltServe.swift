@@ -99,6 +99,15 @@ final class BoltServe {
         self.mixedTailDir = mixedTailDir
     }
 
+    /// Persist the current freeze basis as the warm-start artifact (issue #73) — the basis
+    /// tracks the latest recalib window, so this is last-known-good. Called on graceful
+    /// shutdown (SeedlessBackend.drain); no-op unless QWISP_CALIB_CACHE=1 and calibrated.
+    func saveArtifact() {
+        guard CalibArtifact.enabled, calibrated else { return }
+        CalibArtifact.save(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
+                           counts: baseCounts, coact: baseCoact)
+    }
+
     /// Freeze current residency to `fwd`: ensure top-C of the basis window, rebuild
     /// buddy tables against the CURRENT slot state, upload tables + residency bias.
     /// Must run AFTER any ensure-moving operation (prefill, refresh) — see header.
@@ -217,7 +226,18 @@ final class BoltServe {
         if !calibrated {
             // stderr like the server's perf log — keeps `qwisp benchtest > report.md` clean.
             FileHandle.standardError.write(Data("[qwisp] bolt tier active (near-lossless, streaming default): C=\(C) — pass --lossless for bit-exact strict\n".utf8))
-            FileHandle.standardError.write(Data("[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …\n".utf8))
+            // Warm-start (issue #73, opt-in QWISP_CALIB_CACHE=1): a valid artifact seeds the
+            // freeze basis and skips the strict-speed calib pass; rolling recalib adapts it
+            // from live traffic (the artifact seeds, never rules — calib-poisoning doctrine).
+            let warm: (counts: [[Int]], coact: [[[Int]]])? = CalibArtifact.enabled
+                ? CalibArtifact.load(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
+                                     nLayers: nLayers, nE: nE)
+                : nil
+            if warm != nil {
+                FileHandle.standardError.write(Data("[qwisp] calibration warm-start from artifact (rolling recalib adapts from here; QWISP_CALIB_CACHE=0 for cold calib)\n".utf8))
+            } else {
+                FileHandle.standardError.write(Data("[qwisp] calibrating expert routing (one-time per process, runs at strict speed — can take a few minutes on this tier) …\n".utf8))
+            }
             let backend1: Tell.SpecBackend
             let fwd1: SeedlessFusedVerify.SeedlessFusedForward
             if let tdir = mixedTailDir {
@@ -232,6 +252,12 @@ final class BoltServe {
                 else { return nil }
                 backend1 = b; fwd1 = f; providers = provs
             }
+            if let w = warm {
+                // Basis from the artifact; the calib forward/prefill is skipped entirely —
+                // the per-segment code below prefills this request as usual before freeze.
+                baseCounts = w.counts
+                baseCoact = w.coact
+            } else {
             var counts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
             var coact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
                                   count: nLayers)
@@ -266,6 +292,12 @@ final class BoltServe {
             fwd1.indsCaptureHook = nil
             baseCounts = counts
             baseCoact = coact
+            // Fresh calib is worth keeping even if this process dies ungracefully.
+            if CalibArtifact.enabled {
+                CalibArtifact.save(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
+                                   counts: baseCounts, coact: baseCoact)
+            }
+            }
             winCounts = [[Int]](repeating: [Int](repeating: 0, count: nE), count: nLayers)
             winCoact = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: 0, count: nE), count: nE),
                                  count: nLayers)
@@ -283,7 +315,9 @@ final class BoltServe {
                 if stagingArenas.count < 2 { stagingArenas = [] }
             }
             calibrated = true
-            FileHandle.standardError.write(Data("[qwisp] calibration done — decoding at bolt speed from here\n".utf8))
+            if warm == nil {
+                FileHandle.standardError.write(Data("[qwisp] calibration done — decoding at bolt speed from here\n".utf8))
+            }
         }
         if self.providers == nil && self.mixedProviders == nil { return nil }
         // ★ W3b: generic 経路の残りは `providers`(mixed 時は空配列 — 読むのは env-diag/async

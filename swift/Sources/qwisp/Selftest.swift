@@ -89,6 +89,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     let so2 = splitOutput("pondering</think>\nAnswer.", thinkingDisabled: false)
     check("split_think_unchanged", so2.reasoning == "pondering" && so2.content == "Answer.")
 
+    // calib warm-start artifact (issue #73; pure tmp-dir round trip, no GPU).
+    for (name, ok) in CalibArtifact.selfCheck() { check("calib_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
