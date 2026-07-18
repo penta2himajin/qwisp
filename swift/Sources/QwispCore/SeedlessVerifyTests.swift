@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 89
+        let total = 91
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5413,6 +5413,158 @@ public enum SeedlessVerifyTests {
             // k4 far beyond budget clamps to budget/slot4=64, leaving m2=0.
             let over = DeviceCalibration.mixedKM(budgetBytes: budget, slot4Bytes: slot4, slot2Bytes: slot2, k4: 999)
             if over.k4 != 64 || over.m2 != 0 { return (false, "k4=999 → \(over) != (64,0)") }
+            return (true, "ok")
+        }
+
+        // ── #98 DFlash phase 1: target-hidden tap locked tests (90-91) ──────
+        //
+        // WRITE-LOCKED: implementer MUST NOT modify these tests.
+        // Encodes the DFlash drafter's ctx-feature tap: attachTap(layerIds:) installs a
+        // persistent f16 side-buffer that, after every forward, holds hBuf (residual
+        // stream) right after each tapped layer's post-MoE residAdd. dflash reference
+        // (model.py extract_context_feature, offset=1): ctx for target_layer_id L ==
+        // HF hidden_states[L+1] == hBuf immediately after layer L's residAdd.
+        //
+        // Test 90 (G-tap-bitexact): tap slot i == a FRESH engine built from the truncated
+        // spec prefix specs[0...tapLayerIds[i]] run on the same input. This holds because
+        // forwardRows(finalNormW:nil) returns hBuf after the LAST layer's residAdd, which
+        // for the truncated engine IS the tap value of that layer in the full engine
+        // (layers 0..L identical + deterministic + same init caches → identical hBuf).
+        // Taps at first/middle/last layer (0, 2, 5). RED: attachTap STUB returns nil.
+        run("dflash_tap_bitexact") {
+            guard SeedlessMetalForward.ensure() != nil else { return (false, "no device") }
+            let nLayers = 6, M = 4, maxSeq = 32
+            let tapIds = [0, 2, 5]   // first, middle, last layer
+            // 6 alternating GDN(even)/attn(odd) layers.
+            var specs: [SeedlessVerifyForward.LayerSpec] = []
+            for li in 0 ..< nLayers {
+                let isLin = (li % 2 == 0)
+                specs.append(SeedlessVerifyForward.LayerSpec(
+                    isLinear: isLin,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16),
+                    postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: isLin ? stMkGdnW() : nil,
+                    attn: isLin ? nil : stMkAttnW(),
+                    moe: stMkMoE().w, moeE: stE, moeI: stI))
+            }
+            // Shared initial cache state (same objects → full & truncated engines identical).
+            let cs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([cs0, rs0, kc0, vc0])
+            func freshCachesFor(_ count: Int) -> [SeedlessVerifyForward.LayerCaches] {
+                (0 ..< count).map { li in
+                    (li % 2 == 0)
+                        ? SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0)
+                        : SeedlessVerifyForward.LayerCaches(kCache: kc0, vCache: vc0)
+                }
+            }
+            guard let eng = SeedlessFusedVerify.SeedlessFusedForward(
+                    layers: specs, caches: freshCachesFor(nLayers),
+                    maxM: M, H: stH, maxSeqLen: maxSeq)
+            else { return (false, "engine nil") }
+            guard let tapBuf = eng.attachTap(layerIds: tapIds)
+            else { return (false, "attachTap nil (STUB not implemented)") }
+            if eng.tapLayerIds != tapIds { return (false, "tapLayerIds=\(eng.tapLayerIds) want=\(tapIds)") }
+            let x = MLXRandom.normal([M, stH]).asType(.float16); x.eval()
+            guard eng.forwardRows(x, M: M) != nil else { return (false, "forwardRows nil") }
+            // Reference: fresh truncated engine per tap id; its returned hBuf == the tap value.
+            let slotStride = M * stH   // maxM == M here
+            for (ti, L) in tapIds.enumerated() {
+                let prefix = Array(specs[0 ... L])
+                guard let refEng = SeedlessFusedVerify.SeedlessFusedForward(
+                        layers: prefix, caches: freshCachesFor(L + 1),
+                        maxM: M, H: stH, maxSeqLen: maxSeq)
+                else { return (false, "ref engine nil L=\(L)") }
+                guard let ref = refEng.forwardRows(x, M: M) else { return (false, "ref fwd nil L=\(L)") }
+                ref.eval()
+                let ptr = tapBuf.contents().bindMemory(to: Float16.self, capacity: tapIds.count * slotStride)
+                let slot = MLXArray(Array(UnsafeBufferPointer(
+                    start: ptr.advanced(by: ti * slotStride), count: M * stH)), [M, stH])
+                let (ok, d) = bitEqual(slot, ref)
+                if !ok { return (false, "tap L=\(L): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // Test 91 (G-tap-off-invariant): tap-on does NOT perturb the numeric path, AND the
+        // stepArgmax path actually executes the tap encode. Two identical engines (shared
+        // weights + head): A attachTap([0,2,5]), B no tap. Feed each output token back as
+        // the next input for 6 sequential stepArgmax steps from the same start token — the
+        // two token streams MUST be identical at every step (tap adds encodes but never
+        // reads/mutates the numeric path). Additionally, A's tap slot for layer 5 must be
+        // non-zero after the steps (proof the copy fired). RED: attachTap STUB → nil.
+        run("dflash_tap_off_invariant") {
+            guard SeedlessMetalForward.ensure() != nil else { return (false, "no device") }
+            let V = 256, nLayers = 6, maxSeq = 32
+            let tapIds = [0, 2, 5]
+            let firstToken = Int32(7)
+            // Shared layer weights (same objects → both engines are the identical model).
+            var specs: [SeedlessVerifyForward.LayerSpec] = []
+            for li in 0 ..< nLayers {
+                let isLin = (li % 2 == 0)
+                specs.append(SeedlessVerifyForward.LayerSpec(
+                    isLinear: isLin,
+                    inputLN: MLXRandom.normal([stH]).asType(.float16),
+                    postLN: MLXRandom.normal([stH]).asType(.float16),
+                    gdn: isLin ? stMkGdnW() : nil,
+                    attn: isLin ? nil : stMkAttnW(),
+                    moe: stMkMoE().w, moeE: stE, moeI: stI))
+            }
+            let cs0 = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vc0 = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([cs0, rs0, kc0, vc0])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                (0 ..< nLayers).map { li in
+                    (li % 2 == 0)
+                        ? SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0)
+                        : SeedlessVerifyForward.LayerCaches(kCache: kc0, vCache: vc0)
+                }
+            }
+            // Shared head weights (embed = lm_head = 4-bit q), same objects for both engines.
+            let ewf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewq, esc, ebiOpt) = MLX.quantized(ewf, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebi = ebiOpt else { return (false, "embed biases nil") }
+            let lwf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwq, lsc, lbiOpt) = MLX.quantized(lwf, groupSize: 64, bits: 4, mode: .affine)
+            guard let lbi = lbiOpt else { return (false, "lm biases nil") }
+            let fnW = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewq, esc, ebi, lwq, lsc, lbi, fnW])
+            let maxM = 4
+            func mkEng() -> SeedlessFusedVerify.SeedlessFusedForward? {
+                guard let e = SeedlessFusedVerify.SeedlessFusedForward(
+                        layers: specs, caches: freshCaches(),
+                        maxM: maxM, H: stH, maxSeqLen: maxSeq) else { return nil }
+                guard e.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                   lmW: lwq, lmS: lsc, lmB: lbi,
+                                   fnW: fnW, vocab: V) else { return nil }
+                return e
+            }
+            guard let engA = mkEng() else { return (false, "engA nil") }
+            guard let engB = mkEng() else { return (false, "engB nil") }
+            guard let tapBuf = engA.attachTap(layerIds: tapIds)
+            else { return (false, "attachTap nil (STUB not implemented)") }
+            // 6 sequential stepArgmax, feeding each output token back.
+            var curA = firstToken, curB = firstToken
+            for step in 0 ..< 6 {
+                guard let tA = engA.stepArgmax([curA]) else { return (false, "engA step \(step) nil") }
+                guard let tB = engB.stepArgmax([curB]) else { return (false, "engB step \(step) nil") }
+                if tA[0] != tB[0] {
+                    return (false, "token divergence step \(step): tap-on=\(tA[0]) tap-off=\(tB[0])")
+                }
+                curA = Int32(tA[0]); curB = Int32(tB[0])
+            }
+            // The tap copy must have fired: slot for layer 5 (tapIds index 2), row 0, not all zero.
+            let slotStride = maxM * stH
+            let li5 = tapIds.firstIndex(of: 5)!
+            let ptr = tapBuf.contents().bindMemory(to: Float16.self, capacity: tapIds.count * slotStride)
+            let row0 = UnsafeBufferPointer(start: ptr.advanced(by: li5 * slotStride), count: stH)
+            if !row0.contains(where: { $0 != Float16(0) }) {
+                return (false, "tap slot for layer 5 all-zeros — copy did not fire")
+            }
             return (true, "ok")
         }
 
