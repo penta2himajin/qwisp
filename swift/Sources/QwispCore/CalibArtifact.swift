@@ -12,15 +12,20 @@ import Foundation
 // from live traffic; on graceful shutdown the latest basis is written back
 // (last-known-good). Any key mismatch (model, mixed tail, C, dims, format) invalidates.
 //
-// Opt-in: QWISP_CALIB_CACHE=1. Default OFF until the warm-vs-cold A/B (TF fidelity +
-// LOOPY rate, free-run gate per the attractor doctrine) lands — see #73.
+// Default (warm-vs-cold A/B, 2026-07-19, #73): ON for MIXED residency, opt-in for generic.
+// Mixed cal128 has coverage 256/layer — every expert resident — so the freeze basis cannot
+// change which experts are available: warm decode measured BYTE-IDENTICAL to cold
+// (599/599 tokens × 2 mismatched prompts). Generic bolt (C of 256 resident) showed a
+// transient −5..−10pt TF-fidelity dip over the first ~2-3 recalib windows before
+// converging to cold parity (LOOPY 0/4 both arms) — a visible early-answer quality cost,
+// so generic stays opt-in. QWISP_CALIB_CACHE=1 forces on, =0 forces off (both modes).
 public enum CalibArtifact {
 
     static let magic: UInt32 = 0x3143_5751          // "QWC1" little-endian
     /// Bump on any layout/semantics change — old files then simply miss.
     static let format: UInt32 = 1
 
-    public static var enabled: Bool { Tell.envInt("QWISP_CALIB_CACHE", 0) != 0 }
+    public static func enabled(mixed: Bool) -> Bool { Tell.envInt("QWISP_CALIB_CACHE", mixed ? 1 : 0) != 0 }
 
     /// FNV-1a 64 — stable across processes (Swift's Hasher is per-process seeded).
     static func fnv1a(_ s: String) -> UInt64 {

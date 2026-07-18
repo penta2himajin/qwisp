@@ -89,6 +89,19 @@ final class BoltServe {
     private static let nE = 256
     private static let Ktop = 8
 
+    // ── #76 bolt-side prefix reuse (in-RAM; QWISP_BOLT_PREFIX=0 opts out) ─────────
+    // The forward is rebuilt per segment, so a len-only FullSnapshot cannot carry KV
+    // across requests — instead the ACTUAL prompt-end state (persistentStateData: KV
+    // used slice + GDN) is kept as a byte blob and restored into the next segment's
+    // fresh forward. One slot, extend-only (agentic loops / segment growth both extend).
+    // ORDER INVARIANT preserved: restore writes state bytes only (no arena ensures) →
+    // delta strict prefill (ensures move slots) → freeze rebuilds tables after, as always.
+    private var prefixToks: [Int32] = []
+    private var prefixBlob: Data? = nil
+    private var prefixEnabled: Bool { Tell.envInt("QWISP_BOLT_PREFIX", 1) != 0 }
+    private let prefixMinToks = 256          // small prompts re-prefill faster than a blob save
+    private var prefixMaxBytes: Int { Swift.max(1, Tell.envInt("QWISP_BOLT_PREFIX_MAX_MB", 512)) * 1_048_576 }
+
     init(engine: SeedlessEngine, modelDir: String, C: Int, maxK: Int, maxM: Int,
          mixedTailDir: String? = nil) {
         self.engine = engine
@@ -103,7 +116,7 @@ final class BoltServe {
     /// tracks the latest recalib window, so this is last-known-good. Called on graceful
     /// shutdown (SeedlessBackend.drain); no-op unless QWISP_CALIB_CACHE=1 and calibrated.
     func saveArtifact() {
-        guard CalibArtifact.enabled, calibrated else { return }
+        guard CalibArtifact.enabled(mixed: mixedTailDir != nil), calibrated else { return }
         CalibArtifact.save(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
                            counts: baseCounts, coact: baseCoact)
     }
@@ -217,6 +230,7 @@ final class BoltServe {
     /// One generation segment (mirror of Tell.runSpecLoop's contract: returns out[0..<N],
     /// streams via onToken, stops early on isCancelled). nil on backend error.
     func runSegment(promptIds: [Int32], N: Int, maxSeqLen: Int,
+                    contentLen: Int? = nil,
                     isCancelled: (() -> Bool)? = nil,
                     onToken: ((Int) -> Void)? = nil) -> [Int]? {
         let nLayers = SeedlessEngine.numLayers
@@ -229,7 +243,7 @@ final class BoltServe {
             // Warm-start (issue #73, opt-in QWISP_CALIB_CACHE=1): a valid artifact seeds the
             // freeze basis and skips the strict-speed calib pass; rolling recalib adapts it
             // from live traffic (the artifact seeds, never rules — calib-poisoning doctrine).
-            let warm: (counts: [[Int]], coact: [[[Int]]])? = CalibArtifact.enabled
+            let warm: (counts: [[Int]], coact: [[[Int]]])? = CalibArtifact.enabled(mixed: mixedTailDir != nil)
                 ? CalibArtifact.load(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
                                      nLayers: nLayers, nE: nE)
                 : nil
@@ -293,7 +307,7 @@ final class BoltServe {
             baseCounts = counts
             baseCoact = coact
             // Fresh calib is worth keeping even if this process dies ungracefully.
-            if CalibArtifact.enabled {
+            if CalibArtifact.enabled(mixed: mixedTailDir != nil) {
                 CalibArtifact.save(modelDir: modelDir, mixedTailDir: mixedTailDir, C: C,
                                    counts: baseCounts, coact: baseCoact)
             }
@@ -342,8 +356,36 @@ final class BoltServe {
             backend = b; fwd = f
         }
         // Exact (strict) prefill FIRST — its ensures may move arena slots — then freeze.
-        guard let lastNormed = Tell.prefill(promptIds: promptIds, backend: backend),
-              let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
+        // #76: the reuse boundary is the CONTENT boundary (prompt without the trailing
+        // generation-prompt suffix — the suffix tokens differ once the next turn re-renders
+        // the assistant message, so a prompt-end boundary never prefix-matches). If the
+        // stored content-prefix matches, byte-restore it (no ensures; KV positions resume
+        // at the restored len) and prefill only the delta; capture the new content-boundary
+        // state between the two prefill halves.
+        let cl = Swift.min(contentLen ?? promptIds.count, promptIds.count)
+        var start = 0
+        if prefixEnabled, !prefixToks.isEmpty, prefixToks.count < cl,
+           Array(promptIds[0 ..< prefixToks.count]) == prefixToks,
+           let blob = prefixBlob, fwd.restorePersistentState(blob) {
+            start = prefixToks.count
+        }
+        // Content half [start ..< cl] → capture → suffix half [cl ...]. Either half may be
+        // empty; lastNormed must come from the LAST non-empty half.
+        var lastNormed: MLXArray? = nil
+        if start < cl {
+            guard let n = Tell.prefill(promptIds: Array(promptIds[start ..< cl]), backend: backend) else { return nil }
+            lastNormed = n
+        }
+        if prefixEnabled, cl >= prefixMinToks, cl < promptIds.count {
+            // CPU memcpy of shared buffers — the content prefill's CBs completed above.
+            let blob = fwd.persistentStateData()
+            if blob.count <= prefixMaxBytes { prefixBlob = blob; prefixToks = Array(promptIds[0 ..< cl]) }
+        }
+        if cl < promptIds.count {
+            guard let n = Tell.prefill(promptIds: Array(promptIds[cl...]), backend: backend) else { return nil }
+            lastNormed = n
+        }
+        guard let lastNormed, let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
         freeze(fwd)
