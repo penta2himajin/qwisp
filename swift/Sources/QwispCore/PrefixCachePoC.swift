@@ -177,6 +177,66 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // #89 gate: PREFIXE2E with a simulated process restart. R1 warms the cache and persists
+    // the content boundary to disk; resetPrefixCache() is the fresh-process equivalent (arena,
+    // providers, in-memory slots all dropped — only the DISK store survives); R2 (extends R1)
+    // must then restore from disk and produce a stream byte-identical to the cache-off path.
+    // restoreHits asserts the disk restore actually fired (byte-identity alone can't tell
+    // "restored" from "silently re-prefilled cold"). QWISP_PREFIX_E2E_C as in prefixCacheE2E.
+    public static func prefixPersistE2E(modelDir: String) -> String {
+        let ec = Tell.envInt("QWISP_PREFIX_E2E_C", 0)
+        let tier: SeedlessTier = ec > 0 ? .streaming(c: ec) : .auto
+        guard let backend = try? SeedlessBackend(modelDir: modelDir, tier: tier) else { return "[prefix-persist-e2e] load fail\nPREFIXPERSISTE2E FAIL" }
+        if ec > 0 { backend.losslessForced = true }
+        let store = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("qwisp-prefix-persist-e2e-\(ProcessInfo.processInfo.processIdentifier)")
+        setenv("QWISP_PREFIX_PERSIST_DIR", store.path, 1)
+        defer { unsetenv("QWISP_PREFIX_PERSIST_DIR"); try? FileManager.default.removeItem(at: store) }
+
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let c1 = toks(256, 13) + toks(32, 1)
+        let c2 = c1 + toks(40, 2)                    // continues the conversation across the "restart"
+        func req(_ content: [Int]) -> (prompt: [Int], cl: Int) { (content + toks(8, 777), content.count) }
+        let (p1, cl1) = req(c1), (p2, cl2) = req(c2)
+        let maxTok = 24
+
+        final class Box: @unchecked Sendable { var v: [Int] = [] }
+        func gen(_ p: [Int], _ cl: Int) -> [Int] {
+            let box = Box()
+            let sem = DispatchSemaphore(value: 0)
+            let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
+            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            sem.wait()
+            return box.v
+        }
+
+        // Reference: cache OFF (segmented cold path).
+        backend.prefixCacheForced = false
+        let ref2 = gen(p2, cl2)
+        // Persisted run: R1 (cache on + persist writes disk async) → wait for the file →
+        // reset (= restart) → R2 restores from disk.
+        setenv("QWISP_PREFIX_PERSIST", "1", 1)
+        defer { unsetenv("QWISP_PREFIX_PERSIST") }
+        backend.prefixCacheForced = true
+        backend.resetPrefixCache()
+        _ = gen(p1, cl1)
+        var waited = 0.0
+        while waited < 15 {                          // async save → poll for the artifact
+            if let n = try? FileManager.default.contentsOfDirectory(atPath: store.path).count, n > 0 { break }
+            Thread.sleep(forTimeInterval: 0.2); waited += 0.2
+        }
+        backend.resetPrefixCache()                   // "restart": only the disk store survives
+        let hits0 = PrefixPersist.restoreHits
+        let got2 = gen(p2, cl2)
+        let restored = PrefixPersist.restoreHits > hits0
+        let identical = got2 == ref2
+        var lines = ["[prefix-persist-e2e] tier=\(ec > 0 ? "streaming C=\(ec)" : "resident"), maxTok=\(maxTok)"]
+        lines.append("  restart-continue  ref=\(ref2.count)tok  restored=\(got2.count)tok  \(identical ? "IDENTICAL ✅" : "DIVERGE ❌")  diskRestore=\(restored ? "HIT" : "MISS ❌")")
+        if !identical { lines.append("    ref: \(ref2.prefix(12))"); lines.append("    got: \(got2.prefix(12))") }
+        lines.append("PREFIXPERSISTE2E \(identical && restored ? "PASS" : "FAIL")")
+        return lines.joined(separator: "\n")
+    }
+
     // Speed probe for the multi-slot cache: TTFT (time-to-first-token) for a cold request vs a
     // cross-conversation request that shares a large prefix vs an intra-conversation extend.
     // Shows the multi-slot win = skipping re-prefill of the shared system+tools prefix on a NEW convo.

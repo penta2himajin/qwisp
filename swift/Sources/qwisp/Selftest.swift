@@ -92,6 +92,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // calib warm-start artifact (issue #73; pure tmp-dir round trip, no GPU).
     for (name, ok) in CalibArtifact.selfCheck() { check("calib_\(name)", ok) }
 
+    // prefix-cache disk persistence (issue #89; pure tmp-dir store checks, no GPU).
+    for (name, ok) in PrefixPersist.selfCheck() { check("prefixpersist_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
