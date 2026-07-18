@@ -24,6 +24,11 @@ extension Tell {
         let prompt = (0 ..< prefillLen).map { Int32((($0 &* 7 &+ 13) % 5000) + 100) }
         var lines = ["[seqmt-m] resident C=256, prefill=\(prefillLen), ~\(totalAppend) appended tokens per M"]
 
+        // QWISP_SEQMT_STEP=1: measure stepArgmax (forward + lm_head + argmax readback — the
+        // ACTUAL verify wall consumers pay) instead of forwardRows only. #98 arithmetic input.
+        let useStep = Tell.envInt("QWISP_SEQMT_STEP", 0) != 0
+        if useStep { lines[0] += "  [stepArgmax = verify wall incl. lm_head]" }
+
         // One measurement pass: fresh backend, prefill, then N M-row forwards.
         // Returns (mean wall ms, mean GPU-busy ms) per forward.
         func run(M: Int, skipRecur: Bool = false, skipMixer: Bool = false, skipMoE: Bool = false) -> (wall: Double, gpu: Double)? {
@@ -34,7 +39,7 @@ extension Tell {
             var tok: Int32 = 1000
             func step() -> Bool {
                 let ids = (0 ..< M).map { _ -> Int32 in tok += 1; return 1000 + (tok % 4000) }
-                return b.forward(ids) != nil
+                return useStep ? b.stepArgmax(ids) != nil : b.forward(ids) != nil
             }
             for _ in 0 ..< 3 { _ = step() }                       // warmup (pipeline compile etc.)
             SeedlessMetalForward.profSkipGDNRecur = skipRecur
