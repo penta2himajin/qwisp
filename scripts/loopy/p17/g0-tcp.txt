@@ -1,0 +1,56 @@
+Here's a thinking process that leads to the explanation of TCP congestion control:
+
+1.  **Understand the Goal:** The user wants a detailed explanation of TCP congestion control, specifically covering four key mechanisms: Slow Start, Congestion Avoidance, Fast Retransmit, and Fast Recovery.
+
+2.  **Target Audience:** The request implies a technical audience (likely a student, developer, or network engineer) looking for a "detailed" explanation. Therefore, I need to use precise terminology (cwnd, ssthresh, RTT, etc.) and explain the logic behind the algorithms.
+
+3.  **Structure the Response:**
+    *   **Introduction:** Define what TCP congestion control is and why it exists (preventing network overload).
+    *   **The Core Concept:** Explain the "Congestion Window" (cwnd) and "Slow Start Threshold" (ssthresh).
+    *   **Phase 1: Slow Start:** Explain the exponential growth and the transition to Congestion Avoidance.
+    *   **Phase 2: Congestion Avoidance:** Explain the linear growth (additive increase).
+    *   **Phase 3: Handling Loss (Fast Retransmit):** Explain how the algorithm detects loss without waiting for timeouts.
+    *   **Phase 4: Handling Recovery (Fast Recovery):** Explain how the algorithm recovers from loss without resetting the window.
+    *   **Summary/Visual Aid:** A text-based flowchart or summary table to tie it all together.
+
+4.  **Drafting Content - Section by Section:**
+
+    *   **Introduction:**
+        *   TCP needs to share bandwidth fairly and avoid dropping packets.
+        *   Key variable: `cwnd` (Congestion Window). It dictates how many bytes can be in flight.
+
+    *   **Slow Start:**
+        *   *Why?* To find the available bandwidth quickly without probing too aggressively.
+        *   *Mechanism:* Exponential growth.
+        *   *Start:* `cwnd` starts at 1 segment (or 10 bytes in modern implementations).
+        *   *Action:* When an ACK arrives, `cwnd` increases by 1 segment (MSS).
+        *   *Result:* 1 -> 2 -> 4 -> 8 -> 16... (doubling per RTT).
+        *   *Termination:* When `cwnd` reaches `ssthresh` (Slow Start Threshold), it switches to Congestion Avoidance.
+
+    *   **Congestion Avoidance (Linear Growth):**
+        *   *Why?* To be "gentle" once we know the rough capacity.
+        *   *Mechanism:* Additive Increase.
+        *   *Action:* Increase `cwnd` by 1 segment per RTT (per ACK).
+        *   *Result:* 16 -> 17 -> 18... (linear).
+        *   *Termination:* If a loss is detected, `cwnd` drops to 1 (or half), and we go back to Slow Start.
+
+    *   **Fast Retransmit (The "3x" Rule):**
+        *   *Problem:* Standard timeout (RTO) is too slow (seconds).
+        *   *Solution:* Detect loss faster.
+        *   *Mechanism:* Duplex ACKs (Duplicate ACKs).
+        *   *Rule:* If 3 duplicate ACKs arrive for the same sequence number, assume the packet was lost (not just reordered).
+        *   *Action:* Retransmit the lost segment immediately.
+        *   *State Change:* Enters "Fast Recovery" state.
+
+    *   **Fast Recovery (The "Recovery" Phase):**
+        *   *Problem:* Standard recovery resets `cwnd` to 1 (Slow Start). This is inefficient.
+        *   *Solution:* Keep `cwnd` high but "safe".
+        *   *Mechanism:*
+        *   *State:* Fast Recovery.
+        *   *Action:* When sending new data (piggybacked on ACKs), increase `cwnd` by 1 segment per ACK (like Congestion Avoidance).
+        *   *Termination:* When the lost segment is retransmitted and acknowledged, exit Fast Recovery.
+        *   *Reset:* Set `ssthresh` to `cwnd / 2` (halving the window). Restart Slow Start.
+
+5.  **Refining and Polishing:**
+    *   *Terminology Check:* Ensure I use "MSS" (Maximum Segment Size), "RTT" (Round Trip Time), "cwnd", "ssthresh".
+    *   *Clarity:*

@@ -25,17 +25,18 @@ from mlx_lm.models.cache import make_prompt_cache
 MDL = os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16")
 K4S = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "40,20,0").split(",")]  # descending — incremental demotion
 CAL = len(sys.argv) > 3 and sys.argv[3] == "cal"   # calibrated-affine 2-bit (MSE-optimal) instead of min/max
-PFX = "ck" if CAL else "k"                          # output tag prefix (ck8-* vs k8-*)
+TGS = int(sys.argv[4]) if len(sys.argv) > 4 else 64  # tail group size (gs=128: slot 960→864 KiB ⇒ cov 128 @K4=0)
+PFX = ("g" if TGS == 128 else "ck") if CAL else "k"  # output tag prefix (g0-* / ck8-* / k8-*)
 
 
 def cal2bit(deq):
-    """MSE-optimal affine 2-bit per gs=64 group: alternating code-assignment / least-squares
+    """MSE-optimal affine 2-bit per gs=TGS group: alternating code-assignment / least-squares
     (s,b) fit, init = min/max affine (the naive baseline — so result is never worse in MSE).
     Returns dequantized values on the fitted grid. Levels stay equally spaced (b + s*q),
     so the exact 4-bit gs=64 re-encode property is preserved (spacing s -> s4 = span/15
     always divides the level offsets)."""
     shp = deq.shape
-    g = deq.reshape(-1, 64).astype(mx.float32)
+    g = deq.reshape(-1, TGS).astype(mx.float32)
     mn = g.min(axis=1, keepdims=True)
     mxv = g.max(axis=1, keepdims=True)
     s = (mxv - mn) / 3
@@ -141,7 +142,7 @@ def demote(rows_per_layer):
                     df = deq.reshape(-1, shp[-1]).astype(mx.float32)
                     en = ((df - d2n.astype(mx.float32)) ** 2).mean().item()
                     ec = ((df - d2.astype(mx.float32)) ** 2).mean().item()
-                    print(f"[mixprec] cal sanity L0 gate: MSE naive={en:.3e} cal={ec:.3e} ({100*(1-ec/max(en,1e-30)):.1f}% lower)", flush=True)
+                    print(f"[mixprec] cal sanity L0 gate (tail gs={TGS}): MSE naive-gs64={en:.3e} cal={ec:.3e} ({100*(1-ec/max(en,1e-30)):.1f}% lower)", flush=True)
             else:
                 q2 = mx.quantize(deq.reshape(-1, shp[-1]), group_size=GS, bits=2)
                 d2 = mx.dequantize(*q2, group_size=GS, bits=2)

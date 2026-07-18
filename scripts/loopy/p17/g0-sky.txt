@@ -1,0 +1,50 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   Topic: Explain why the sky appears blue.
+    *   Language: Plain English (simple, clear, accessible).
+    *   Length: About three paragraphs.
+
+2.  **Drafting - Paragraph 1: The Basics (Sunlight and Atmosphere):**
+    *   *Concept:* Sunlight is white but contains all colors. The atmosphere acts like a filter.
+    *   *Drafting:* Sunlight looks white, but it actually contains all the colors of the rainbow mixed together. When this light reaches Earth, it passes through the air, which is made of gases and tiny particles. As the light travels through the air, it hits these particles and gets scattered in different directions. This scattering process is the key reason why we see colors in the sky.
+
+3.  **Drafting - Paragraph 2: The Mechanism (Blue vs. Other Colors):**
+    *   *Concept:* Blue light scatters more than other colors because it has shorter wavelengths.
+    *   *Drafting:* Not all colors scatter the same way. Blue light has shorter waves, which means it gets scattered by air molecules much more than longer colors like red or yellow. Because blue light is scattered everywhere in the atmosphere, it reaches our eyes from all directions. This makes the sky look blue to us, while the other colors pass through more easily and don't dominate the view.
+
+4.  **Drafting - Paragraph 3: The Result (Why we see it):**
+    *   *Concept:* Our eyes perceive this scattered blue light.
+    *   *Drafting:* Finally, because this scattered blue light fills the sky, our eyes pick it up as the dominant color. If the air were thicker or had different particles, the sky might look different, but under normal conditions, the constant scattering of blue light creates the bright blue color we see during the day. This is why the sky is blue, and why it changes to orange or red during sunset when the light travels through more air.
+
+5.  **Review and Refine (Self-Correction/Polishing):**
+    *   *Check against constraints:*
+        *   Plain English? Yes, avoided terms like "Rayleigh scattering," "wavelengths" (used "shorter waves" or explained simply), "spectral composition."
+        *   Three paragraphs? Yes.
+        *   Explanation accurate? Yes.
+
+    *   *Refinement:*
+        *   *Para 1:* "Sunlight looks white, but it actually contains all the colors of the rainbow mixed together. When this light reaches Earth, it passes through the air, which is made of gases and tiny particles. As the light travels through the air, it hits these particles and gets scattered in different directions. This scattering process is the key reason why we see colors in the sky." -> Good.
+        *   *Para 2:* "Not all colors scatter the same way. Blue light has shorter waves, which means it gets scattered by air molecules much more than longer colors like red or yellow. Because blue light is scattered everywhere in the atmosphere, it reaches our eyes from all directions. This makes the sky look blue to us, while the other colors pass through more easily and don't dominate the view." -> Good.
+        *   *Para 3:* "Finally, because this scattered blue light fills the sky, our eyes pick it up as the dominant color. If the air were thicker or had different particles, the sky might look different, but under normal conditions, the constant scattering of blue light creates the bright blue color we see during the day. This is why the sky is blue, and why it changes to orange or red during sunset when the light travels through more air." -> Good.
+
+    *   *Final Polish:* Ensure flow between paragraphs.
+        *   Para 1: Sunlight composition + interaction with air.
+        *   Para 2: Why blue wins (short waves vs long waves).
+        *   Para 3: Conclusion + context (sunset mention adds clarity but isn't strictly necessary, keep it simple).
+
+    *   *Result:*
+        Sunlight looks white, but it actually contains all the colors of the rainbow mixed together. When this light reaches Earth, it passes through the air, which is made of gases and tiny particles. As the light travels through the air, it hits these particles and gets scattered in different directions. This scattering process is the key reason why we see colors in the sky.
+
+        Not all colors scatter the same way. Blue light has shorter waves, which means it gets scattered by air molecules much more than longer colors like red or yellow. Because blue light is scattered everywhere in the atmosphere, it reaches our eyes from all directions. This makes the sky look blue to us, while the other colors pass through more easily and don't dominate the view.
+
+        Finally, because this scattered blue light fills the sky, our eyes pick it up as the dominant color. Under normal conditions, the constant scattering of blue light creates the bright blue color we see during the day. This is why the sky is blue, and why it changes to orange or red during sunset when the light travels through more air.
+
+6.  **Final Output Generation.** (Matches the drafted text).
+</think>
+
+Sunlight looks white, but it actually contains all the colors of the rainbow mixed together. When this light reaches Earth, it passes through the air, which is made of gases and tiny particles. As the light travels through the air, it hits these particles and gets scattered in different directions. This scattering process is the key reason why we see colors in the sky.
+
+Not all colors scatter the same way. Blue light has shorter waves, which means it gets scattered by air molecules much more than longer colors like red or yellow. Because blue light is scattered everywhere in the atmosphere, it reaches our eyes from all directions. This makes the sky look blue to us, while the other colors pass through more easily and don't dominate the view.
+
+Finally, because this scattered blue light fills the sky, our eyes pick it up as the dominant color. Under normal conditions, the constant scattering of blue light creates the bright blue color we see during the day. This is why the sky is blue, and why it changes to orange or red during sunset when the light travels through more air.<|im_end|>
