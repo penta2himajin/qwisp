@@ -34,6 +34,36 @@ actor AsyncLock {
     }
 }
 
+// ── Prefill progress → service log (issue #86) ───────────────────────────────
+// A long prompt (e.g. an agentic client's ~15K-token system prompt) prefills for minutes on a
+// streaming tier with a silent log. Emit one progress line per ≥10s, and accumulate per-request
+// prefill tok+secs for logPerf's prefill= field. Generation is serialized (AsyncLock) and the
+// hook runs on the single decode thread, so plain statics suffice.
+enum PrefillLog {
+    nonisolated(unsafe) static var runStart: Date? = nil
+    nonisolated(unsafe) static var lastPrint = Date.distantPast
+    nonisolated(unsafe) static var tok = 0
+    nonisolated(unsafe) static var secs = 0.0
+    static func install() {
+        Tell.prefillProgress = { done, total in
+            let now = Date()
+            if done == 0 { runStart = now; return }
+            guard let t0 = runStart else { return }
+            let runSecs = now.timeIntervalSince(t0)
+            if done == total { tok += total; secs += runSecs; runStart = nil }
+            if done < total && now.timeIntervalSince(lastPrint) >= 10 {
+                lastPrint = now
+                fputs("[qwisp] \(prefillLine(done: done, total: total, secs: runSecs))\n", stderr)
+            }
+        }
+    }
+    /// Per-request read + reset (called from logPerf, after generation completes).
+    static func take() -> (tok: Int, secs: Double) {
+        defer { tok = 0; secs = 0 }
+        return (tok, secs)
+    }
+}
+
 // ── Engine: tokenizer + token-id backend, generation serialized ───────────────
 // @unchecked Sendable is justified: every path that touches the backend's mutable
 // engine/KV state runs under `lock`, so there is never concurrent access.
@@ -47,6 +77,7 @@ final class QwispEngine: @unchecked Sendable {
         self.tokenizer = tokenizer
         self.backend = backend
         self.modelID = modelID
+        PrefillLog.install()
     }
 
     /// True when the client sent a param that is still unsupported (n > 1 only —
@@ -89,8 +120,11 @@ final class QwispEngine: @unchecked Sendable {
         let st = Tell.lastSpecStats
         let tokPerStep = st.steps > 0 ? Double(st.accepted + st.steps) / Double(st.steps) : 0
         let acc = st.drafted > 0 ? 100.0 * Double(st.accepted) / Double(st.drafted) : 0
-        fputs(String(format: "[qwisp] %@ prompt=%d gen=%d ttft=%@ decode=%.1f tok/s (%.2fs) spec[steps=%d tok/step=%.2f accept=%.0f%% d0=%d rej=%d alt=%d]\n",
-                     tag, prompt, gen, ttft, rate, now.timeIntervalSince(t0), st.steps, tokPerStep, acc, st.d0, st.rejects, st.altHits), stderr)
+        // prompt-processing speed (issue #86 ask 3), summed over the request's prefill runs.
+        let pf = PrefillLog.take()
+        let pfRate = pf.secs > 0 ? String(format: "%.0f", Double(pf.tok) / pf.secs) : "-"
+        fputs(String(format: "[qwisp] %@ prompt=%d prefill=%@ tok/s gen=%d ttft=%@ decode=%.1f tok/s (%.2fs) spec[steps=%d tok/step=%.2f accept=%.0f%% d0=%d rej=%d alt=%d]\n",
+                     tag, prompt, pfRate, gen, ttft, rate, now.timeIntervalSince(t0), st.steps, tokPerStep, acc, st.d0, st.rejects, st.altHits), stderr)
     }
 
     /// Non-streaming completion.

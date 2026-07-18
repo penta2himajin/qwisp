@@ -73,6 +73,10 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // 8+. tool-call parsing (pure; Qwen3.6 <tool_call> → OpenAI tool_calls).
     for (name, ok) in ToolParse.selfCheck() { check("tool_\(name)", ok) }
 
+    // prefill progress line (issue #86; pure formatting).
+    check("prefill_line", prefillLine(done: 4096, total: 14490, secs: 151.7) == "prefill 4096/14490 (28%) · 27 tok/s")
+    check("prefill_line_norate", prefillLine(done: 64, total: 128, secs: 0) == "prefill 64/128 (50%)")
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
