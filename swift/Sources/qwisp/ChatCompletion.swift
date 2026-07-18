@@ -54,6 +54,24 @@ struct ChatCompletionRequest: Codable {
     let logit_bias: [String: Double]?   // OpenAI: token-id string → bias
     var tools: [Tool]? = nil            // function-calling tool specs
     var tool_choice: JSONValue? = nil   // accepted; the model decides (auto)
+    // Extra Jinja variables for the chat template (issue #77), e.g.
+    // {"enable_thinking": false} — the Qwen3.6 template then pre-closes the think block.
+    var chat_template_kwargs: [String: JSONValue]? = nil
+}
+
+extension ChatCompletionRequest {
+    /// chat_template_kwargs.enable_thinking == false (issue #77): the template emits an empty
+    /// `<think>\n\n</think>` in the generation prompt, so the model's output IS the answer —
+    /// splitThink must be bypassed (no `</think>` will ever appear in the output).
+    var thinkingDisabled: Bool {
+        if case .bool(false) = chat_template_kwargs?["enable_thinking"] { return true }
+        return false
+    }
+}
+
+/// splitThink, unless thinking is disabled for this request — then all output is content.
+func splitOutput(_ s: String, thinkingDisabled: Bool) -> (reasoning: String, content: String) {
+    thinkingDisabled ? ("", s) : splitThink(s)
 }
 
 // Qwen3.6 is a reasoning model: the chat template injects `<think>` into the generation prompt,
@@ -107,9 +125,11 @@ func prefillLine(done: Int, total: Int, secs: Double) -> String {
 // ── CLI (`qwisp chat`) — thin in-process wrapper over the same core ──────────
 func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend, maxTokens: Int,
              temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
-             frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:]) async {
+             frequencyPenalty: Double = 0, presencePenalty: Double = 0, logitBias: [Int: Double] = [:],
+             noThinking: Bool = false) async {
     let promptIds: [Int]
-    do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]]) }
+    do { promptIds = try tokenizer.render(messages: [["role": "user", "content": prompt]],
+                                          additionalContext: noThinking ? ["enable_thinking": false] : nil) }
     catch { fputs("chat: render error: \(error)\n", stderr); return }
     // Prefill progress → stderr (issue #86): a long prompt on a streaming tier prefills for
     // minutes, previously in silence. \r-overwritten; shown once a prefill run exceeds 1s.
@@ -138,7 +158,7 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
                             logitBias: logitBias) { delta in
         if tFirst == nil { tFirst = Date() }
         full += delta
-        let (r, c) = splitThink(full)
+        let (r, c) = splitOutput(full, thinkingDisabled: noThinking)
         if r.count > sentR.count, r.hasPrefix(sentR) {
             FileHandle.standardError.write(Data(String(r.dropFirst(sentR.count)).utf8)); sentR = r
         }

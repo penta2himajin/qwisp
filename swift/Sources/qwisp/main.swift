@@ -20,6 +20,7 @@ usage: qwisp <command> [options]
   chat [opts] <prompt>   one-shot chat; reads stdin if no prompt is given
       --max-tokens N     cap generation (default: until EOS / context)
       --lossless         force strict bit-exact mode (streaming tiers default to bolt)
+      --no-thinking      skip the <think> phase (enable_thinking=false; answers start immediately)
   pull [hf-repo-id]      download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) + write config
   config [--defaults]    show effective settings / the full default set
   benchtest              community benchmark → markdown report + one-click submit URL
@@ -81,6 +82,8 @@ case "chat":
     var maxTokens = -1
     var chatLossless = Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig)
     if let i = rest.firstIndex(of: "--lossless") { chatLossless = true; rest.remove(at: i) }
+    var noThinking = false   // issue #77: enable_thinking=false via the chat template
+    if let i = rest.firstIndex(of: "--no-thinking") { noThinking = true; rest.remove(at: i) }
     if let i = rest.firstIndex(where: { $0 == "--max-tokens" || $0.hasPrefix("--max-tokens=") }) {
         let flag = rest[i]
         if let eq = flag.firstIndex(of: "=") {
@@ -134,7 +137,8 @@ case "chat":
         }
         await runChat(prompt: prompt, tokenizer: tok, backend: backend, maxTokens: maxTokens,
                       temperature: temp, topP: topP, seed: seed,
-                      frequencyPenalty: freqPen, presencePenalty: presPen, logitBias: bias)
+                      frequencyPenalty: freqPen, presencePenalty: presPen, logitBias: bias,
+                      noThinking: noThinking)
     }
 case "benchtest":
     // Community benchmark (call-for-testers): env + tiered speed/stability, markdown to stdout.

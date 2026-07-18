@@ -103,9 +103,12 @@ final class QwispEngine: @unchecked Sendable {
     private func prompt(_ req: ChatCompletionRequest) throws -> (ids: [Int], maxTokens: Int, stop: [Int], contentLen: Int) {
         let msgs = req.messages.map { $0.renderDict }
         let tools = req.tools?.map { $0.spec }
-        let ids = try tokenizer.render(messages: msgs, tools: tools)
+        // chat_template_kwargs (issue #77) → extra Jinja variables, e.g. enable_thinking:false.
+        let kwargs = req.chat_template_kwargs.map { $0.mapValues { $0.sendable } }
+        let ids = try tokenizer.render(messages: msgs, tools: tools, additionalContext: kwargs)
         // Content boundary (prompt WITHOUT the generation-prompt suffix) → the prefix-cache reuse point.
-        let contentLen = (try? tokenizer.render(messages: msgs, tools: tools, addGenerationPrompt: false).count) ?? ids.count
+        let contentLen = (try? tokenizer.render(messages: msgs, tools: tools, addGenerationPrompt: false,
+                                                additionalContext: kwargs).count) ?? ids.count
         return (ids, req.max_tokens ?? -1, tokenizer.stopTokenIds, contentLen)   // omitted → until EOS/context
     }
 
@@ -141,7 +144,7 @@ final class QwispEngine: @unchecked Sendable {
         await lock.release()
         logPerf("complete", prompt: p.ids.count, gen: r.completionTokens, t0: t0, tFirst: tFirst)
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
-        let (reasoning, afterThink) = splitThink(r.text)
+        let (reasoning, afterThink) = splitOutput(r.text, thinkingDisabled: req.thinkingDisabled)
         let (content, toolCalls) = ToolParse.parse(afterThink)
         let finish = toolCalls.isEmpty ? r.finishReason : "tool_calls"
         return ChatCompletionResponse(
@@ -184,7 +187,7 @@ final class QwispEngine: @unchecked Sendable {
             outIds.append(tok)
             if tFirst == nil { tFirst = Date() }
             // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
-            let (r, afterThink) = splitThink(tokenizer.decode(outIds))
+            let (r, afterThink) = splitOutput(tokenizer.decode(outIds), thinkingDisabled: req.thinkingDisabled)
             if r.count > sentR.count, r.hasPrefix(sentR) {
                 try await send(Delta(reasoning_content: String(r.dropFirst(sentR.count))), nil); sentR = r
             }
@@ -196,7 +199,7 @@ final class QwispEngine: @unchecked Sendable {
             if p.maxTokens >= 0 && outIds.count >= p.maxTokens { finish = "length"; break }  // <0 = until EOS/context
         }
         // Buffered tool calls: parse the completed output and emit them as tool_calls deltas.
-        let (_, toolCalls) = ToolParse.parse(splitThink(tokenizer.decode(outIds)).content)
+        let (_, toolCalls) = ToolParse.parse(splitOutput(tokenizer.decode(outIds), thinkingDisabled: req.thinkingDisabled).content)
         for (i, tc) in toolCalls.enumerated() {
             try await send(Delta(tool_calls: [ToolCallDelta(index: i, id: tc.id, type: "function", function: tc.function)]), nil)
         }

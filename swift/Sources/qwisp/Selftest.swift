@@ -77,6 +77,18 @@ func runCompletionSelftest(modelDir: String) async -> String {
     check("prefill_line", prefillLine(done: 4096, total: 14490, secs: 151.7) == "prefill 4096/14490 (28%) · 27 tok/s")
     check("prefill_line_norate", prefillLine(done: 64, total: 128, secs: 0) == "prefill 64/128 (50%)")
 
+    // chat_template_kwargs (issue #77; pure decode + split routing).
+    let kwReq = try? JSONDecoder().decode(ChatCompletionRequest.self, from: Data(
+        #"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false}}"#.utf8))
+    check("kwargs_thinking_disabled", kwReq?.thinkingDisabled == true)
+    let plainReq = try? JSONDecoder().decode(ChatCompletionRequest.self, from: Data(
+        #"{"messages":[{"role":"user","content":"hi"}]}"#.utf8))
+    check("kwargs_omitted_thinking_on", plainReq?.thinkingDisabled == false)
+    let so = splitOutput("The direct answer.", thinkingDisabled: true)
+    check("split_nothink_all_content", so.content == "The direct answer." && so.reasoning.isEmpty)
+    let so2 = splitOutput("pondering</think>\nAnswer.", thinkingDisabled: false)
+    check("split_think_unchanged", so2.reasoning == "pondering" && so2.content == "Answer.")
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
@@ -117,6 +129,20 @@ func runTokenizerSelftest(modelDir: String) async -> String {
     check("chat_template_preserves_content") {
         let ids = try tok.render(messages: [["role": "user", "content": "MAGICWORD42"]])
         return tok.decode(ids).contains("MAGICWORD42")
+    }
+    // issue #77: enable_thinking=false pre-closes the think block in the generation prompt;
+    // nil additionalContext must render byte-identically to the plain signature.
+    check("template_enable_thinking_false") {
+        let msgs: [[String: any Sendable]] = [["role": "user", "content": "Hi"]]
+        let off = try tok.render(messages: msgs, additionalContext: ["enable_thinking": false])
+        let raw = tok.tokenizer.decode(tokens: off, skipSpecialTokens: false)
+        return raw.hasSuffix("<think>\n\n</think>\n\n")
+    }
+    check("template_default_thinking_on") {
+        // Omitted kwargs keep the old behavior: generation prompt opens an unclosed think block.
+        let msgs: [[String: any Sendable]] = [["role": "user", "content": "Hi"]]
+        let ids = try tok.render(messages: msgs)
+        return tok.tokenizer.decode(tokens: ids, skipSpecialTokens: false).hasSuffix("<think>\n")
     }
 
     return lines.joined(separator: "\n") + "\nTOKTEST \(passed)/\(total)"
