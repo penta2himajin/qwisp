@@ -122,6 +122,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public func drain() {
         segGate.wait()
         segGate.signal()
+        // Graceful-shutdown write-back of the calib warm-start artifact (issue #73):
+        // the basis tracked the latest recalib window — persist last-known-good.
+        boltServe?.saveArtifact()
     }
     let modelDir: String
     let tier: SeedlessTier
