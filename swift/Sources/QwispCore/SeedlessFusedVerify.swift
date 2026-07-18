@@ -3832,6 +3832,92 @@ public enum SeedlessFusedVerify {
             }
         }
 
+        // ── Disk-persistable state (issue #89) ────────────────────────────────────────
+        // Unlike FullSnapshot (kv LEN only — the bytes live in this forward's arena), this
+        // serializes the actual per-layer decode state so a NEW process can restore it into
+        // a freshly built forward: attention KV used slice (per-head gather from the
+        // head-major arena; maxLen may differ between save and restore) + GDN convHist/state
+        // (current ping-pong side, mirroring writeGdnCache). All buffers are
+        // .storageModeShared → plain CPU memcpy, no GPU work. Additive — decode untouched.
+        // Layout: "QWS1" u32 ∥ format u32 ∥ nLayers u32, then per layer:
+        //   flags u32 (bit0 KV, bit1 GDN)
+        //   KV:  u32 KV,D,len ∥ k bytes (KV·len·D·2) ∥ v bytes
+        //   GDN: u32 convCount,stateCount ∥ convHist bytes (·2) ∥ state bytes (·4)
+        static let persistMagic: UInt32 = 0x3153_5751   // "QWS1" LE
+        static let persistFormat: UInt32 = 1
+
+        public func persistentStateData() -> Data {
+            var d = Data()
+            func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+            u32(Self.persistMagic); u32(Self.persistFormat); u32(UInt32(layers.count))
+            for L in layers {
+                let flags: UInt32 = (L.kvCache != nil ? 1 : 0) | (L.gdnCache != nil ? 2 : 0)
+                u32(flags)
+                if let kv = L.kvCache {
+                    u32(UInt32(kv.KV)); u32(UInt32(kv.D)); u32(UInt32(kv.len))
+                    let rowBytes = kv.len * kv.D * 2
+                    for buf in [kv.kCache, kv.vCache] {
+                        let base = buf.contents()
+                        for h in 0 ..< kv.KV {
+                            d.append(Data(bytes: base + h * kv.maxLen * kv.D * 2, count: rowBytes))
+                        }
+                    }
+                }
+                if let gc = L.gdnCache {
+                    let convCount = (gc.K - 1) * gc.C, stateCount = gc.Hv * gc.Dv * gc.Dk
+                    u32(UInt32(convCount)); u32(UInt32(stateCount))
+                    d.append(Data(bytes: gc.convHist.contents(), count: convCount * 2))
+                    d.append(Data(bytes: gc.state.contents(), count: stateCount * 4))
+                }
+            }
+            return d
+        }
+
+        /// Restore a persisted blob into THIS forward. false on any shape/format mismatch —
+        /// the caller must then fall back to a cold prefill and MUST NOT trust partial state
+        /// (shapes are validated per layer, but earlier layers may already be written).
+        public func restorePersistentState(_ d: Data) -> Bool {
+            var off = 0
+            func u32() -> UInt32? {
+                guard d.count >= off + 4 else { return nil }
+                let v = d.subdata(in: off ..< off + 4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+                off += 4
+                return UInt32(littleEndian: v)
+            }
+            func bytes(into dst: UnsafeMutableRawPointer, count: Int) -> Bool {
+                guard d.count >= off + count else { return false }
+                d.subdata(in: off ..< off + count).withUnsafeBytes { dst.copyMemory(from: $0.baseAddress!, byteCount: count) }
+                off += count
+                return true
+            }
+            guard u32() == Self.persistMagic, u32() == Self.persistFormat,
+                  u32() == UInt32(layers.count) else { return false }
+            for L in layers {
+                guard let flags = u32() else { return false }
+                let expect: UInt32 = (L.kvCache != nil ? 1 : 0) | (L.gdnCache != nil ? 2 : 0)
+                guard flags == expect else { return false }
+                if let kv = L.kvCache {
+                    guard u32() == UInt32(kv.KV), u32() == UInt32(kv.D),
+                          let len = u32().map(Int.init), len <= kv.maxLen else { return false }
+                    let rowBytes = len * kv.D * 2
+                    for buf in [kv.kCache, kv.vCache] {
+                        let base = buf.contents()
+                        for h in 0 ..< kv.KV {
+                            guard bytes(into: base + h * kv.maxLen * kv.D * 2, count: rowBytes) else { return false }
+                        }
+                    }
+                    kv.len = len
+                }
+                if let gc = L.gdnCache {
+                    let convCount = (gc.K - 1) * gc.C, stateCount = gc.Hv * gc.Dv * gc.Dk
+                    guard u32() == UInt32(convCount), u32() == UInt32(stateCount),
+                          bytes(into: gc.convHist.contents(), count: convCount * 2),
+                          bytes(into: gc.state.contents(), count: stateCount * 4) else { return false }
+                }
+            }
+            return off == d.count
+        }
+
         // ── Steel-prefill hybrid (claude/prefill-kernel): GDN dense matmuls via MLX steel ──────
         // Per-layer MLX weight triples (qkv / z / out_proj), keyed by layer array index. Set by the
         // backend builder when QWISP_HYBRID_PREFILL=1; empty → forwardRowsHybrid == forwardRows.
