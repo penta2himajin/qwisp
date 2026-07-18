@@ -125,7 +125,13 @@ extension Tell {
     // compares each token stream to the same request generated with the cache OFF (segmented cold path).
     // Byte-identical everywhere ⇒ the multi-slot restore + stride re-prefill + arena growth are lossless.
     public static func prefixCacheE2E(modelDir: String) -> String {
-        guard let backend = try? SeedlessBackend(modelDir: modelDir) else { return "[prefix-e2e] load fail\nPREFIXE2E FAIL" }
+        // #76: QWISP_PREFIX_E2E_C=<c> runs this same gate on a strict-streaming backend
+        // (unset/0 = resident, the original gate). Streaming cached mode requires the
+        // lossless (strict) posture — bolt keeps the segmented path by design.
+        let ec = Tell.envInt("QWISP_PREFIX_E2E_C", 0)
+        let tier: SeedlessTier = ec > 0 ? .streaming(c: ec) : .auto
+        guard let backend = try? SeedlessBackend(modelDir: modelDir, tier: tier) else { return "[prefix-e2e] load fail\nPREFIXE2E FAIL" }
+        if ec > 0 { backend.losslessForced = true }
         // stride small so a shared 256-token prefix produces reusable sub-content boundaries.
         setenv("QWISP_PREFIX_SNAP_STRIDE", "64", 1)
 
@@ -158,7 +164,7 @@ extension Tell {
         backend.resetPrefixCache()
         let got = reqs.map { gen($0.prompt, $0.cl) }
 
-        var lines = ["[prefix-e2e] 4 requests (reuse/extend/cross-branch/reset), maxTok=\(maxTok)"]
+        var lines = ["[prefix-e2e] 4 requests (reuse/extend/cross-branch/reset), maxTok=\(maxTok), tier=\(ec > 0 ? "streaming C=\(ec)" : "resident")"]
         var pass = true
         let labels = ["R1 cold      ", "R2 extend    ", "R3 cross-conv", "R4 reset     "]
         for i in 0..<reqs.count {

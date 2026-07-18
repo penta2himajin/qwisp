@@ -128,8 +128,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
 
     // ── Cross-request prefix cache (default ON; QWISP_PREFIX_CACHE=0 opts out) ──────────
-    // Persistent per-instance fused backend + a content-boundary fullSnapshot, so consecutive
-    // requests (agentic loops) re-prefill only the new suffix. Serialized by the server lock.
+    // Persistent per-instance backend (fused on resident; strict streaming since #76) + a
+    // content-boundary fullSnapshot, so consecutive requests (agentic loops) re-prefill only
+    // the new suffix. Serialized by the server lock.
     // Design B: the arena grows monotonically to fit each request (prompt+generation) instead of a
     // fixed generation cap, so cached mode never truncates a long answer the segmented path would allow.
     // Multi-slot: several stride-aligned restore points along the current path let a NEW conversation
@@ -142,6 +143,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
+    // Streaming tier (#76): the C-slot expert arena persists across cached-backend rebuilds
+    // (only the KV/GDN arena is rebuilt on growth) — rebuilding providers would re-stream GBs.
+    private var prefixProviders: [ArenaExpertProvider]? = nil
     private var prefixArenaLen = 0                          // current backend's maxSeqLen (0 = not built)
     private var prefixEmptySnap: Any?                       // fullSnapshot of the fresh arena, for reset
     private var arenaContent: [Int32] = []                  // tokens currently prefilled into the arena (one path)
@@ -181,9 +185,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         // context; else the caller's cap. Both clamped to the context headroom.
         let headroom = Swift.max(0, contextLen - prompt.count)
         let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
-        // Prefix cache path: resident/fused, greedy, gen-prompt present, prompt fits the arena with
-        // room to decode. Everything else falls through to the segmented-growth path below.
-        if prefixCacheEnabled, !cfg.isStreaming, !options.sampling,
+        // Prefix cache path: greedy, gen-prompt present, prompt fits the arena with room to
+        // decode. Tiers (#76): resident, or strict streaming (--lossless / sampling-free) —
+        // the snapshot is attention KV + GDN state, independent of expert residency. Bolt
+        // keeps the segmented path: its per-segment strict-prefill→freeze order is
+        // load-bearing (buddy tables map experts to arena SLOTS), so restore-skipping-prefill
+        // is a separate follow-up. QWISP_PREFIX_STREAMING=0 opts the extension out.
+        // Everything else falls through to the segmented-growth path below.
+        let streamingCacheOK = !cfg.isStreaming
+            || (lossless && Tell.envInt("QWISP_PREFIX_STREAMING", 1) != 0)
+        if prefixCacheEnabled, streamingCacheOK, !options.sampling,
            let cl = options.promptContentLen, cl < prompt.count, prompt.count + 64 <= prefixArenaMax {
             return generateCached(prompt: prompt, contentLen: cl, ceiling: ceiling, cfg: cfg)
         }
@@ -414,9 +425,24 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     while newLen < needed { newLen *= 2 }
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
-                    // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
-                    let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
-                    guard let b = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen) else {
+                    let built: Tell.SpecBackend?
+                    if cfg.isStreaming {
+                        // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
+                        // existingProviders survive KV-arena growth rebuilds.
+                        let strictC = DeviceCalibration.strictStreamingC(tierC: cfg.c)
+                        if let (sb, _, provs) = Tell.streamingBackend(
+                            engine: self.engine, modelDir: self.modelDir,
+                            maxM: cfg.maxM, maxSeqLen: newLen, C: strictC,
+                            existingProviders: self.prefixProviders) {
+                            self.prefixProviders = provs
+                            built = sb
+                        } else { built = nil }
+                    } else {
+                        // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
+                        let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
+                        built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen)
+                    }
+                    guard let b = built else {
                         continuation.finish(); return
                     }
                     self.prefixBackend = b; self.prefixArenaLen = newLen
@@ -460,8 +486,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
                 // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
                 let genSuffix = Array(full[contentLen...])
+                // Streaming (#76): maxK follows the budget-fit C actually driving the backend,
+                // not the tier C (mirrors generate()'s strictMaxK).
+                let maxK = cfg.isStreaming
+                    ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
+                    : cfg.maxK
                 _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
-                                     N: genBudget, maxK: cfg.maxK, prefillTokens: genSuffix,
+                                     N: genBudget, maxK: maxK, prefillTokens: genSuffix,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 continuation.finish()
@@ -471,7 +502,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
 
     /// Test/override hook: drop the persistent arena + all restore points (start cold).
     public func resetPrefixCache() {
-        prefixBackend = nil; prefixArenaLen = 0; prefixEmptySnap = nil
+        prefixBackend = nil; prefixProviders = nil; prefixArenaLen = 0; prefixEmptySnap = nil
         arenaContent = []; prefixSlots = []
     }
 
