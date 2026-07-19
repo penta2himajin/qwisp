@@ -3684,8 +3684,18 @@ public enum SeedlessFusedVerify {
 
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
-        public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
+        ///
+        /// #98 A1 fused draft+verify (additive seam, default nil = byte-identical): resident
+        /// のみ、drafter prologue を同一 CB の先頭に encode し、その argmax 出力
+        /// `draftTokensBuf` の rows 1..<M を blit で tokensIn rows 1..<M へ GPU-copy して
+        /// から通常の M 行 verify を走らせる(tokens の rows 1.. は placeholder)。draft と
+        /// verify の CPU 往復を 1 CB に畳む。prologue は CB を受ける(MPS が自前の encoder
+        /// を開くため encoder 単位では渡せない)。
+        public func stepArgmax(_ tokens: [Int32],
+                               draftPrologue: ((MTLCommandBuffer) -> Void)? = nil,
+                               draftTokensBuf: MTLBuffer? = nil) -> [Int]? {
             guard let hd = head, tokens.count <= maxM else { return nil }
+            if draftPrologue != nil, streamMode != .resident { return nil }   // fused seam: resident-only
             let M = tokens.count
             hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
 
@@ -3733,6 +3743,15 @@ public enum SeedlessFusedVerify {
             switch streamMode {
             case .resident:
                 let cb = queue.makeCommandBuffer()!
+                // #98 A1: drafter prologue + blit(draft argmax ids → tokensIn rows 1..<M)。
+                // encoder 境界の implicit barrier が embed の read を blit の後に順序付ける。
+                if let prologue = draftPrologue, let dt = draftTokensBuf, M > 1 {
+                    prologue(cb)
+                    let blit = cb.makeBlitCommandEncoder()!
+                    blit.copy(from: dt, sourceOffset: 4, to: hd.tokensIn, destinationOffset: 4,
+                              size: (M - 1) * 4)
+                    blit.endEncoding()
+                }
                 let enc = cb.makeComputeCommandEncoder()!
                 encodeEmbed(enc)
                 for (li, L) in layers.enumerated() { encodeLayer(enc, L, li: li, M: M) }

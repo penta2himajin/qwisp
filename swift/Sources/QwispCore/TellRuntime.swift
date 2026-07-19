@@ -662,13 +662,24 @@ extension Tell {
             // #98 DFlash: only when SuffixSpec found nothing (draftless span) and not under A3
             // (dflash is inactive there — see dflashHarvest). Falls back to the old per-step
             // path on nil (cold start / any failure), unchanged behavior.
-            if drafts.isEmpty, !useA3, let dd = dflash, let ds = dd.draft(u: u), !ds.isEmpty {
-                drafts = ds
+            // #98 A1 fused-first: draft+verify in ONE CB on dflashFwd. Snapshot is taken
+            // BEFORE the fused step (the verify inside it advances the cache; the drafter
+            // itself never touches the target cache, so pre-draft == pre-verify state).
+            var fusedEvals: [Int]? = nil
+            var fusedSnap: Any? = nil
+            if drafts.isEmpty, !useA3, let dd = dflash {
+                if let fwd = dflashFwd {
+                    let s = backend.snapshot()
+                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
+                        drafts = r.drafts; fusedEvals = r.evals; fusedSnap = s
+                    }
+                }
+                if fusedEvals == nil, let ds = dd.draft(u: u), !ds.isEmpty { drafts = ds }
             }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
-            var snap = backend.snapshot()
+            let snap = fusedSnap ?? backend.snapshot()
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -739,9 +750,15 @@ extension Tell {
                     }
                 }
             } else {
-                // Non-A3 path (unchanged)
-                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
+                // Non-A3 path (unchanged; fused path already ran the verify in the draft CB)
+                let evals: [Int]
+                if let fe = fusedEvals {
+                    evals = fe
+                } else {
+                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                    guard let e = backend.stepArgmax(verifyTokens) else { return nil }
+                    evals = e
+                }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
@@ -1212,10 +1229,24 @@ extension Tell {
 
             // #98 DFlash: same slot as mtpDraftSpan above (dflash replaces it when active —
             // the two flags are mutually exclusive by construction, dflash takes priority).
+            // A1 fused-first: draft+verify in ONE CB (snapshot BEFORE — the fused verify
+            // advances the cache). Guards: mtpHead feeds pre-verify normed rows and rerank
+            // needs the verify tokens up-front — both fall back to the split path.
             var dflashDrafted = false
-            if D == 0, let dd = dflash, !useA3, let ds = dd.draft(u: u), !ds.isEmpty {
-                drafts = ds; D = drafts.count
-                dflashDrafted = true
+            var fusedEvals: [Int]? = nil
+            var fusedSnap: Any? = nil
+            if D == 0, let dd = dflash, !useA3 {
+                if mtpHead == nil, !_useRerank, let fwd = _residentFwd {
+                    let s = backend.snapshot()
+                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
+                        drafts = r.drafts; D = drafts.count; dflashDrafted = true
+                        fusedEvals = r.evals; fusedSnap = s
+                    }
+                }
+                if !dflashDrafted, let ds = dd.draft(u: u), !ds.isEmpty {
+                    drafts = ds; D = drafts.count
+                    dflashDrafted = true
+                }
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
@@ -1234,7 +1265,8 @@ extension Tell {
             }
 
             // Snapshot before the batched verify (backend-specific representation).
-            var snap = backend.snapshot()
+            // Fused dflash step: the verify already ran → use the pre-fused snapshot.
+            let snap = fusedSnap ?? backend.snapshot()
 
             if D == 0 {
                 // No draft available
@@ -1333,11 +1365,17 @@ extension Tell {
                     }
                 }
             } else {
-                // ── Non-A3 path (unchanged) ──────────────────────────────
-                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
-                guard let evals = backend.stepArgmax(verifyTokens)
-                else { return "[raw-spec] ERROR: verify step nil" }
+                // ── Non-A3 path (unchanged; fused path already ran the verify) ──
+                let evals: [Int]
+                if let fe = fusedEvals {
+                    evals = fe
+                } else {
+                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                    if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
+                    guard let e = backend.stepArgmax(verifyTokens)
+                    else { return "[raw-spec] ERROR: verify step nil" }
+                    evals = e
+                }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }

@@ -90,7 +90,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 97
+        let total = 98
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5953,6 +5953,129 @@ public enum SeedlessVerifyTests {
             guard hAfterCap.count == hTwoCall.count else { return (false, "post-cap count mismatch") }
             for i in 0..<hTwoCall.count where hAfterCap[i].bitPattern != hTwoCall[i].bitPattern {
                 return (false, "state poisoned after over-cap: mismatch @\(i)")
+            }
+            return (true, "ok")
+        }
+
+        // ── DFlash fused draft+verify (#98 A1 fused CB) locked test ───────
+        // WRITE-LOCKED (guarded by total = 98). Do not weaken/skip/delete.
+
+        // Test 98: dflash_fused_draft_verify
+        // The fused path (raw drafter encoded as a prologue of the verify CB + GPU blit of its
+        // argmax ids into tokensIn rows 1..<M) must be BIT-EQUAL to the split path
+        // (raw.forward → stepArgmax([u]+drafts)) in ALL of: draft ids, verify argmax rows,
+        // and post-step target cache state (KV lens/contents + GDN conv/rec state).
+        // Fixtures: test-47 2-layer mini verify engine (identical initial caches + shared
+        // head) × test-96 synthetic drafter (blockSize=4 → verify M=4=maxM).
+        run("dflash_fused_draft_verify") {
+            let V = 256
+            // ── verify mini-model (test-47 idiom: shared layer weights, per-engine cache copies)
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let iLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let iLN1 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN1 = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([iLN0, pLN0, iLN1, pLN1])
+            let specs = [
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0, postLN: pLN0,
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1, postLN: pLN1,
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            let cs = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rs = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kc = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vc = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([cs, rs, kc, vc])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs, recState: rs),
+                 SeedlessVerifyForward.LayerCaches(kCache: kc, vCache: vc)]
+            }
+            let ewf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewq, esc, ebiOpt) = MLX.quantized(ewf, groupSize: 64, bits: 4, mode: .affine)
+            let lwf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwq, lsc, lbiOpt) = MLX.quantized(lwf, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebi = ebiOpt, let lbi = lbiOpt else { return (false, "head biases nil") }
+            let fnW = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewq, esc, ebi, lwq, lsc, lbi, fnW])
+            func mkEng() -> SeedlessFusedVerify.SeedlessFusedForward? {
+                guard let e = SeedlessFusedVerify.SeedlessFusedForward(
+                        layers: specs, caches: freshCaches(), maxM: 4, H: stH, maxSeqLen: 32),
+                      e.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                   lmW: lwq, lmS: lsc, lmB: lbi, fnW: fnW, vocab: V)
+                else { return nil }
+                return e
+            }
+
+            // ── drafter (test-96 idiom: blockSize=4 so verify M = 4 = maxM)
+            var cfg = dflashTestConfig()
+            cfg.blockSize = 4
+            let dW = dflashTestWeights(cfg)
+            let dH = cfg.hiddenSize, dV = cfg.vocabSize
+            let deF = MLXRandom.normal([dV, dH]).asType(.float16)
+            let (deq, des, debOpt) = MLX.quantized(deF, groupSize: 64, bits: 4, mode: .affine)
+            let dlF = MLXRandom.normal([dV, dH]).asType(.float16)
+            let (dlq, dls, dlbOpt) = MLX.quantized(dlF, groupSize: 64, bits: 4, mode: .affine)
+            guard let deb = debOpt, let dlb = dlbOpt else { return (false, "drafter head biases nil") }
+            MLX.eval([deq, des, deb, dlq, dls, dlb])
+            func mkRaw() -> DFlashRawDrafter? {
+                guard let d = DFlashRawDrafter(config: cfg, weights: dW),
+                      d.attachTargetHead(embedW: deq, embedS: des, embedB: deb,
+                                         lmW: dlq, lmS: dls, lmB: dlb, vocab: dV) else { return nil }
+                return d
+            }
+            let u: Int32 = 7
+            let ctx = MLXRandom.normal([3, cfg.ctxFeatureDim]).asType(.float16)
+            MLX.eval([ctx])
+            let ctxRows = ctx.reshaped([-1]).asArray(Float16.self)
+
+            // ── reference: split draft → verify
+            guard let engR = mkEng() else { return (false, "ref engine init/attach nil") }
+            guard let rawR = mkRaw() else { return (false, "ref drafter init/attach nil") }
+            guard let draftsR = rawR.forward(u: u, ctxRows: ctxRows, ctxCount: 3)
+            else { return (false, "ref raw forward nil") }
+            guard let evalsR = engR.stepArgmax([u] + draftsR.map { Int32($0) })
+            else { return (false, "ref stepArgmax nil") }
+
+            // ── fused: prologue + blit + verify in ONE CB
+            guard let engF = mkEng() else { return (false, "fused engine init/attach nil") }
+            guard let rawF = mkRaw() else { return (false, "fused drafter init/attach nil") }
+            guard rawF.prepare(u: u, ctxRows: ctxRows, ctxCount: 3)
+            else { return (false, "prepare failed (STUB)") }
+            var toks = [Int32](repeating: 0, count: cfg.blockSize)   // rows 1.. blit-overwritten
+            toks[0] = u
+            guard let evalsF = engF.stepArgmax(toks, draftPrologue: { rawF.encode(cb: $0) },
+                                               draftTokensBuf: rawF.tokenOutBuffer)
+            else { return (false, "fused stepArgmax nil (STUB)") }
+            let draftsF = rawF.finish()
+
+            // (a) draft ids bit-equal (deterministic kernels, identical weights/inputs).
+            if draftsF != draftsR { return (false, "drafts fused=\(draftsF) ref=\(draftsR)") }
+            // (b) verify argmax rows bit-equal — the blit really fed the draft ids.
+            if evalsF != evalsR { return (false, "evals fused=\(evalsF) ref=\(evalsR)") }
+            // (c) post-step target cache state bit-equal (test-47 idiom).
+            let snF = engF.snapshot(), snR = engR.snapshot()
+            for li in 0..<specs.count where snF.kvLens[li] != snR.kvLens[li] {
+                return (false, "kvLen layer=\(li) fused=\(snF.kvLens[li]) ref=\(snR.kvLens[li])")
+            }
+            let (kF, vF) = engF.readLayerCache(1)
+            let (kR, vR) = engR.readLayerCache(1)
+            for (nm, ca, cb) in [("kCache", kF, kR), ("vCache", vF, vR)] {
+                guard let aa = ca, let bb = cb else { return (false, "KV cache nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "\(nm): \(d)") }
+            }
+            let (cF, rF) = engF.readLayerCache(0)
+            let (cR, rR) = engR.readLayerCache(0)
+            for (nm, ca, cb) in [("convState", cF, cR), ("recState", rF, rR)] {
+                guard let aa = ca, let bb = cb else { return (false, "GDN state nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "\(nm): \(d)") }
             }
             return (true, "ok")
         }
