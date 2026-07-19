@@ -1,24 +1,24 @@
 import Foundation
 import MLX
 import Metal
-import MetalPerformanceShaders
 
 // #98 DFlash phase A1 — raw-Metal drafter forward (spec: scratchpad/dflash-phaseA1-spec.md).
 //
 // ONE command buffer per block: persistent f16 MTLBuffer weights (COPIED into Metal-owned
 // buffers at init — no noCopy lifetime obligation), persistent per-layer KV MTLBuffers.
-// GEMMs (q/k/v/o, MLP, fc, lm_head) are MPSMatrixMultiplication — the hand-rolled
-// fmm/qmm4 kernels measured 75-100ms/block at drafter shapes (M=8, 6 thin layers; ~2-3ms
-// roofline), overhead-dominated across 3 kernel designs (#98 A1 record). Small ops reuse
+// GEMMs (q/k/v/o, MLP, fc, lm_head) use dflash_fmm16 (below) — a qmv_fast-derived f16
+// M-row kernel measured at 170-190GB/s on the large drafter shapes. Falsified earlier
+// (#98 A1 record, do not re-propose): fmm_rows/fmm_tiled hand kernels (35GB/s class),
+// qmm4_tiled here (barrier-tree, 33ms), MPSMatrixMultiplication (~0.5-1ms per encode =
+// granularity floor at ~44 calls/block). Small ops reuse
 // the frozen SeedlessFusedVerify/SeedlessMetalForward statics (rmsNormRows, ropeRows,
 // embed_rows_q4, argmax_rows, swiglu, resid_add, write_kv_rows). The ONLY new Metal source
 // is the drafter's own SDPA kernel (below) — the drafter has no gate path and no
 // partial-rotary rope, so the existing gated-attention prep kernels don't fit and the
 // existing D=256-hardcoded sdpa_rows kernel doesn't fit a runtime headDim.
 //
-// Fused draft+verify (#98 A1 round 3): prepare() → encode(cb:) → finish() lets the verify
-// CB carry the drafter as a prologue (MPS opens its own internal encoders, so the seam is
-// CB-level); forward() composes the three standalone.
+// Fused draft+verify (#98 A1): prepare() → encode(cb:) → finish() lets the verify CB
+// carry the drafter as a prologue; forward() composes the three standalone.
 //
 // v1 scope (pinned): NO sliding eviction. ctxCap = slidingWindow - 1 for ALL layers; forward
 // returns nil once ctxLen+ctxCount would exceed it (caller falls back to the MLX drafter).
@@ -55,20 +55,16 @@ public final class DFlashRawDrafter {
     private let finalNorm: MTLBuffer      // [H]  (drafter's OWN final norm — not the target's)
 
     // ── Target head (attached post-init; embed for noise, lm_head for logits) ──
-    // lm_head is DEQUANTIZED to f16 (V×H×2 ≈ 0.6GB for the real head): the drafter is
-    // resident-tier-only + opt-in, and the 4-bit qmm4_tiled path measured 33ms at drafter
-    // shapes (overhead-dominated) vs ~3ms roofline for an MPS f16 GEMM. Embed stays 4-bit
-    // (per-row gather is cheap).
+    // lm_head is DEQUANTIZED to f16 (V×H×2 ≈ 0.6GB for the real head; resident-tier-only
+    // + opt-in): the 4-bit qmm4_tiled path measured 33ms at drafter shapes, dflash_fmm16
+    // on the f16 head measured 3.2ms (192GB/s). Embed stays 4-bit (per-row gather is cheap).
     private var embedWBuf: MTLBuffer?, embedSBuf: MTLBuffer?, embedBBuf: MTLBuffer?
     private var lmF16Buf: MTLBuffer?
     private var vocab: Int = 0
     private var logitsBuf: MTLBuffer?
 
-    // ── MPS GEMM plumbing (#98 A1 round 3): the hand-rolled fmm/qmm kernels measured
-    // 75-100ms/block at drafter shapes (M=8, 6 thin layers) vs ~2-3ms roofline — the pinned
-    // fallback lever is MPSMatrixMultiplication, which encodes into the SAME command buffer
-    // (its own internal encoders), so the fused draft+verify CB structure is preserved.
-    private var mpsMulCache: [String: MPSMatrixMultiplication] = [:]
+    // ── Encoder plumbing for encode(cb:) (single compute encoder; the CB-level seam
+    // remains because the fused verify CB hands us the CB, not an encoder) ──
     private var _cb: MTLCommandBuffer?
     private var _enc: MTLComputeCommandEncoder?
     private func enc() -> MTLComputeCommandEncoder {
@@ -76,34 +72,6 @@ public final class DFlashRawDrafter {
         return _enc!
     }
     private func closeEnc() { _enc?.endEncoding(); _enc = nil }
-    private func mpsMat(_ buf: MTLBuffer, _ rows: Int, _ cols: Int, off: Int = 0) -> MPSMatrix {
-        MPSMatrix(buffer: buf, offset: off, descriptor: MPSMatrixDescriptor(
-            rows: rows, columns: cols, rowBytes: cols * 2, dataType: .float16))
-    }
-    /// out[M,N] = x[M,K] @ W[N,K]^T, all f16 (f32 accumulate inside MPS).
-    private func gemm(w: MTLBuffer, x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int,
-                      xOff: Int = 0, outOff: Int = 0) {
-        closeEnc()
-        let key = "\(M)/\(K)/\(N)"
-        let mul: MPSMatrixMultiplication
-        if let m = mpsMulCache[key] { mul = m } else {
-            mul = MPSMatrixMultiplication(device: device, transposeLeft: false, transposeRight: true,
-                                          resultRows: M, resultColumns: N, interiorColumns: K,
-                                          alpha: 1.0, beta: 0.0)
-            mpsMulCache[key] = mul
-        }
-        mul.encode(commandBuffer: _cb!, leftMatrix: mpsMat(x, M, K, off: xOff),
-                   rightMatrix: mpsMat(w, N, K), resultMatrix: mpsMat(out, M, N, off: outOff))
-    }
-    /// ctx-path GEMM: one M=1 GEMM PER ROW. ctxCount varies call-to-call and batched MPS
-    /// output is not M-invariant at the byte level — but the drafter KV cache must be
-    /// byte-stable across call splits (two-call vs one-shot, locked test 97). Per-row M=1
-    /// makes every row an identical subproblem regardless of batching.
-    private func gemmPerRow(w: MTLBuffer, x: MTLBuffer, out: MTLBuffer, rows: Int, K: Int, N: Int) {
-        for r in 0 ..< rows {
-            gemm(w: w, x: x, out: out, M: 1, K: K, N: N, xOff: r * K * 2, outOff: r * N * 2)
-        }
-    }
 
     // ── Shared committed context length (v1: every layer advances together) ──
     private var ctxLen: Int = 0
@@ -268,7 +236,7 @@ public final class DFlashRawDrafter {
             return dst
         }
         func f16b(_ a: MLXArray) -> MTLBuffer? { copyb(a.asType(.float16)) }
-        // lm_head → dequantized f16 [V, H] for the MPS GEMM (see field comment).
+        // lm_head → dequantized f16 [V, H] for the dflash_fmm16 GEMM (see field comment).
         let lmF16 = MLX.dequantized(lmW, scales: lmS, biases: lmB,
                                     groupSize: 64, bits: 4, mode: .affine).asType(.float16)
         guard let ew = copyb(embedW), let es = f16b(embedS), let eb = f16b(embedB),
@@ -336,10 +304,9 @@ public final class DFlashRawDrafter {
     }
 
     /// GPU-side stage: encodes the whole drafter block (embed → ctx fc → layers → lm_head →
-    /// argmax → tokenOutBuf) into the caller's command buffer. GEMMs go through MPS (which
-    /// opens its own internal encoders — hence the CB-level seam, not an encoder-level one);
-    /// the small ops (norm/rope/SDPA/swiglu/residAdd/writeKV/argmax) use the existing raw
-    /// pipelines on interleaved compute encoders. Requires a successful prepare().
+    /// argmax → tokenOutBuf) into the caller's command buffer, on ONE compute encoder
+    /// (dflash_fmm16 GEMMs + the existing raw small-op pipelines). Requires a successful
+    /// prepare().
     public func encode(cb: MTLCommandBuffer) {
         guard pendingCount >= 0 else { return }
         let ctxCount = pendingCount
@@ -356,7 +323,8 @@ public final class DFlashRawDrafter {
 
         // ctx feature path (computed ONCE, shared by every layer's k/v proj)
         if ctxCount > 0 {
-            gemmPerRow(w: fcW, x: ctxInputBuf, out: fcOutBuf, rows: ctxCount, K: ctxFeatureDim, N: H)
+            DFlashRawKernels.encodeFmm16(enc(), w: fcW, x: ctxInputBuf, out: fcOutBuf,
+                                         M: ctxCount, K: ctxFeatureDim, N: H)
             SeedlessFusedVerify.encodeRmsNormRows(enc(), x: fcOutBuf, w: hiddenNorm, out: hCtxBuf,
                                                   rows: ctxCount, D: H, eps: eps)
         }
@@ -365,14 +333,19 @@ public final class DFlashRawDrafter {
             // attn input norm (block rows only — ctx k/v project straight from hCtx, no inputLN)
             SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: layer.inputLN, out: anLNBuf,
                                                   rows: blockSize, D: H, eps: eps)
-            // q / propK / propV projections (+ ctx k/v from hCtx — grouped into ONE MPS run)
-            gemm(w: layer.qW, x: anLNBuf, out: qRawBuf, M: blockSize, K: H, N: numHeads * headDim)
-            gemm(w: layer.kW, x: anLNBuf, out: pkRawBuf, M: blockSize, K: H, N: numKV * headDim)
-            gemm(w: layer.vW, x: anLNBuf, out: pvBuf, M: blockSize, K: H, N: numKV * headDim)
+            // q / propK / propV projections
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.qW, x: anLNBuf, out: qRawBuf,
+                                         M: blockSize, K: H, N: numHeads * headDim)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.kW, x: anLNBuf, out: pkRawBuf,
+                                         M: blockSize, K: H, N: numKV * headDim)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.vW, x: anLNBuf, out: pvBuf,
+                                         M: blockSize, K: H, N: numKV * headDim)
             if ctxCount > 0 {
                 // ctx k/v (this layer's own k/v proj — NOT re-normed by inputLN)
-                gemmPerRow(w: layer.kW, x: hCtxBuf, out: ckRawBuf, rows: ctxCount, K: H, N: numKV * headDim)
-                gemmPerRow(w: layer.vW, x: hCtxBuf, out: cvBuf, rows: ctxCount, K: H, N: numKV * headDim)
+                DFlashRawKernels.encodeFmm16(enc(), w: layer.kW, x: hCtxBuf, out: ckRawBuf,
+                                             M: ctxCount, K: H, N: numKV * headDim)
+                DFlashRawKernels.encodeFmm16(enc(), w: layer.vW, x: hCtxBuf, out: cvBuf,
+                                             M: ctxCount, K: H, N: numKV * headDim)
             }
             // q/k rmsNorm (last-dim headDim, treating each (row,head) as an independent chunk)
             SeedlessFusedVerify.encodeRmsNormRows(enc(), x: qRawBuf, w: layer.qNorm, out: qNormedBuf,
@@ -411,16 +384,20 @@ public final class DFlashRawDrafter {
                                    scale: scale, causalOffset: layer.isSliding)
 
             // o_proj — NO gate (unlike the target's attention)
-            gemm(w: layer.oW, x: attnOutBuf, out: attnResBuf, M: blockSize, K: numHeads * headDim, N: H)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.oW, x: attnOutBuf, out: attnResBuf,
+                                         M: blockSize, K: numHeads * headDim, N: H)
             SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: attnResBuf, total: blockSize * H)
 
             // MLP (swiglu)
             SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: layer.postLN, out: mnBuf,
                                                   rows: blockSize, D: H, eps: eps)
-            gemm(w: layer.gateW, x: mnBuf, out: gateBuf, M: blockSize, K: H, N: mlpDim)
-            gemm(w: layer.upW, x: mnBuf, out: upBuf, M: blockSize, K: H, N: mlpDim)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.gateW, x: mnBuf, out: gateBuf,
+                                         M: blockSize, K: H, N: mlpDim)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.upW, x: mnBuf, out: upBuf,
+                                         M: blockSize, K: H, N: mlpDim)
             SeedlessFusedVerify.encodeSwiglu(enc(), g: gateBuf, u: upBuf, h: actBuf, total: blockSize * mlpDim)
-            gemm(w: layer.downW, x: actBuf, out: downBuf, M: blockSize, K: mlpDim, N: H)
+            DFlashRawKernels.encodeFmm16(enc(), w: layer.downW, x: actBuf, out: downBuf,
+                                         M: blockSize, K: mlpDim, N: H)
             SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: downBuf, total: blockSize * H)
         }
 
@@ -428,9 +405,10 @@ public final class DFlashRawDrafter {
         SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: finalNorm, out: normedBuf,
                                               rows: blockSize, D: H, eps: eps)
         // target lm_head over ALL rows (row 0 discarded on readback — simpler than an x-offset
-        // variant, at the cost of one extra row of compute). f16 MPS GEMM on the dequantized
-        // head (see lmF16Buf comment).
-        gemm(w: lf, x: normedBuf, out: logits, M: blockSize, K: H, N: vocab)
+        // variant, at the cost of one extra row of compute). dflash_fmm16 on the dequantized
+        // f16 head (see lmF16Buf comment).
+        DFlashRawKernels.encodeFmm16(enc(), w: lf, x: normedBuf, out: logits,
+                                     M: blockSize, K: H, N: vocab)
         encodeArgmax(enc(), logits: logits, V: vocab)
     }
 
@@ -477,6 +455,124 @@ public final class DFlashRawDrafter {
         guard hasRun else { return nil }
         let ptr = normedBuf.contents().bindMemory(to: Float16.self, capacity: blockSize * H)
         return Array(UnsafeBufferPointer(start: ptr, count: blockSize * H))
+    }
+
+    // ── f16 GEMM kernel micro-bench (QWISP_RUN=dflash-gemm-bench): correctness (vs MLX
+    //    matmul, rel err) + effective bandwidth at the drafter's production shapes, measured
+    //    standalone BEFORE integration (measure-first doctrine). ──
+    public static func gemmBench() -> String {
+        guard let (dev, queue) = SeedlessMetalForward.ensure(),
+              DFlashRawKernels.ensureSdpaPipeline(dev) else { return "[dflash-gemm-bench] no device/pipeline" }
+        var lines: [String] = ["[dflash-gemm-bench] dflash_fmm16 y[M,N]=x[M,K]@W[N,K]^T (M=8)"]
+        let M = 8
+        for (k, n, tag) in [(2048, 2048, "q/o"), (2048, 256, "kv"), (2048, 9216, "gate/up"),
+                            (9216, 2048, "down"), (16384, 2048, "fc"), (2048, 151936, "lm_head")] {
+            let wA = MLXRandom.normal([n, k]).asType(.float16)
+            let xA = MLXRandom.normal([M, k]).asType(.float16)
+            MLX.eval([wA, xA])
+            guard let wSrc = SeedlessMetalForward.mtlBuf(wA, dev),
+                  let xSrc = SeedlessMetalForward.mtlBuf(xA, dev),
+                  let wB = dev.makeBuffer(length: wSrc.length, options: .storageModeShared),
+                  let xB = dev.makeBuffer(length: xSrc.length, options: .storageModeShared),
+                  let yB = dev.makeBuffer(length: M * n * 2, options: .storageModeShared)
+            else { return "[dflash-gemm-bench] buffers nil" }
+            memcpy(wB.contents(), wSrc.contents(), wSrc.length)
+            memcpy(xB.contents(), xSrc.contents(), xSrc.length)
+            // correctness vs MLX (f32 reference)
+            let cb0 = queue.makeCommandBuffer()!
+            let e0 = cb0.makeComputeCommandEncoder()!
+            DFlashRawKernels.encodeFmm16(e0, w: wB, x: xB, out: yB, M: M, K: k, N: n)
+            e0.endEncoding(); cb0.commit(); cb0.waitUntilCompleted()
+            let ref = MLX.matmul(xA.asType(.float32), wA.asType(.float32).transposed())
+            ref.eval()
+            let refArr = ref.asArray(Float.self)
+            let got = yB.contents().bindMemory(to: Float16.self, capacity: M * n)
+            var num: Float = 0, den: Float = 0
+            for i in 0 ..< M * n { let d = Float(got[i]) - refArr[i]; num += d * d; den += refArr[i] * refArr[i] }
+            let rel = den > 0 ? (num / den).squareRoot() : -1
+            // bandwidth: reps in one CB (same out buffer → hazard-serialized like the real chain)
+            let reps = 20
+            let cb = queue.makeCommandBuffer()!
+            let e = cb.makeComputeCommandEncoder()!
+            for _ in 0 ..< reps { DFlashRawKernels.encodeFmm16(e, w: wB, x: xB, out: yB, M: M, K: k, N: n) }
+            e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 / Double(reps)
+            let gbs = Double(n * k * 2) / (ms / 1000.0) / 1e9
+            lines.append(String(format: "  %-8@ K=%-5d N=%-6d  %.3fms  W-bw=%.0fGB/s  rel=%.2e",
+                                tag as NSString, k, n, ms, gbs, rel))
+        }
+        // ── dependent-chain calibration: y = x@W ping-pong (x↔y, N=K=2048) is a TRUE
+        // read-after-write chain — the reps loop above is write-after-write on one out
+        // buffer, which the driver may overlap. This row is the honest per-GEMM cost
+        // inside a dependent chain (what the drafter actually pays).
+        do {
+            let k = 2048, n = 2048
+            let wA = MLXRandom.normal([n, k]).asType(.float16)
+            let xA = MLXRandom.normal([M, k]).asType(.float16)
+            MLX.eval([wA, xA])
+            guard let wSrc = SeedlessMetalForward.mtlBuf(wA, dev),
+                  let xSrc = SeedlessMetalForward.mtlBuf(xA, dev),
+                  let wB = dev.makeBuffer(length: wSrc.length, options: .storageModeShared),
+                  let aB = dev.makeBuffer(length: M * k * 2, options: .storageModeShared),
+                  let bB = dev.makeBuffer(length: M * n * 2, options: .storageModeShared)
+            else { return lines.joined(separator: "\n") }
+            memcpy(wB.contents(), wSrc.contents(), wSrc.length)
+            memcpy(aB.contents(), xSrc.contents(), xSrc.length)
+            let reps = 40
+            let cb = queue.makeCommandBuffer()!
+            let e = cb.makeComputeCommandEncoder()!
+            for i in 0 ..< reps {
+                let (src, dst) = i % 2 == 0 ? (aB, bB) : (bB, aB)
+                DFlashRawKernels.encodeFmm16(e, w: wB, x: src, out: dst, M: M, K: k, N: n)
+            }
+            e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            let ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 / Double(reps)
+            lines.append(String(format: "  chain    K=2048 N=2048   %.3fms  W-bw=%.0fGB/s  (dependent ping-pong)",
+                                ms, Double(n * k * 2) / (ms / 1000.0) / 1e9))
+        }
+        // ── cold-W probe: cycle a 192MB weight set (exceeds SLC) so every GEMM reads W
+        // from DRAM, (a) 24 separate 8MB allocations (like the drafter's 61 per-tensor
+        // buffers), (b) ONE 192MB slab addressed by offset. Discriminates allocation
+        // granularity / mapping cost from pure DRAM streaming for the in-loop 3x tax.
+        do {
+            let k = 2048, n = 2048, count = 24
+            let wA = MLXRandom.normal([n, k]).asType(.float16)
+            MLX.eval([wA])
+            guard let wSrc = SeedlessMetalForward.mtlBuf(wA, dev),
+                  let aB = dev.makeBuffer(length: M * k * 2, options: .storageModeShared),
+                  let bB = dev.makeBuffer(length: M * n * 2, options: .storageModeShared),
+                  let slab = dev.makeBuffer(length: count * n * k * 2, options: .storageModeShared)
+            else { return lines.joined(separator: "\n") }
+            var seps: [MTLBuffer] = []
+            for i in 0 ..< count {
+                guard let b = dev.makeBuffer(length: n * k * 2, options: .storageModeShared)
+                else { return lines.joined(separator: "\n") }
+                memcpy(b.contents(), wSrc.contents(), n * k * 2)
+                memcpy(slab.contents() + i * n * k * 2, wSrc.contents(), n * k * 2)
+                seps.append(b)
+            }
+            let rounds = 5
+            for mode in ["separate", "slab"] {
+                let cb = queue.makeCommandBuffer()!
+                let e = cb.makeComputeCommandEncoder()!
+                for r in 0 ..< rounds {
+                    for i in 0 ..< count {
+                        let (src, dst) = (r * count + i) % 2 == 0 ? (aB, bB) : (bB, aB)
+                        if mode == "separate" {
+                            DFlashRawKernels.encodeFmm16(e, w: seps[i], x: src, out: dst, M: M, K: k, N: n)
+                        } else {
+                            DFlashRawKernels.encodeFmm16(e, w: slab, x: src, out: dst, M: M, K: k, N: n,
+                                                         wOff: i * n * k * 2)
+                        }
+                    }
+                }
+                e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                let ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 / Double(rounds * count)
+                lines.append(String(format: "  coldW-%@  K=2048 N=2048  %.3fms  W-bw=%.0fGB/s  (192MB set, DRAM-cold)",
+                                    mode as NSString, ms, Double(n * k * 2) / (ms / 1000.0) / 1e9))
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     // ── Steady-state micro-bench (QWISP_RUN=dflash-raw-bench): back-to-back forwards on the
@@ -558,14 +654,86 @@ public final class DFlashRawDrafter {
 // threadgroups (numHeads*M threadgroups of 32 vs previously ceil(numHeads/32)*M groups), ~32x
 // less serial depth per lane. Key→lane assignment depends only on absolute key position, so the
 // two-call-vs-one-call byte-exact cache-consistency contract (locked test 97) is unaffected.
-private enum DFlashRawKernels {
+enum DFlashRawKernels {
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var fmm16Pipeline: MTLComputePipelineState?
 
     static func ensureSdpaPipeline(_ device: MTLDevice) -> Bool {
         if sdpaPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
+        // dflash_fmm16: y[M,N] = x[M,K] @ W[N,K]^T, f16 in/out, f32 accumulate.
+        // qmv_fast-derived (#98 A1 round 4): 2 simdgroups per TG, ROWS=2 output rows per
+        // simdgroup, lanes stride K in 16-half chunks, simd_sum reduce — NO threadgroup
+        // memory, NO barriers (the barrier-tree qmm4_tiled shape measured 33ms at drafter
+        // context; qmv-class shapes are the engine's proven-fast family). W chunk registers
+        // are shared across the M-loop, so W is read ONCE total (the per-row qmv re-read
+        // and the fmm_rows re-read were the earlier falsified shapes). x is 32KB and stays
+        // SLC-hot.
+        // M-INVARIANCE (locked test 97 contract): each output element (m,n) accumulates in
+        // a fixed K-serial chunk order partitioned by lane only, then one simd_sum — the
+        // batch size M never enters any per-element order, so results are byte-stable
+        // across call splits BY CONSTRUCTION (ctx rows may batch freely).
+        // Constraints: N % 4 == 0; M <= 16 per dispatch (caller slices).
+        kernel void dflash_fmm16(
+            device const half* W [[buffer(0)]],    // [N, K]
+            device const half* x [[buffer(1)]],    // [M, K]
+            device half* y       [[buffer(2)]],    // [M, N]
+            constant int& K      [[buffer(3)]],
+            constant int& N      [[buffer(4)]],
+            constant int& M      [[buffer(5)]],
+            uint3 tid     [[threadgroup_position_in_grid]],
+            uint simd_gid [[simdgroup_index_in_threadgroup]],
+            uint simd_lid [[thread_index_in_simdgroup]])
+        {
+            constexpr int ROWS = 2;
+            constexpr int VPT  = 16;
+            constexpr int BLOCK = VPT * 32;        // 512 halfs of K per iteration
+            constexpr int MAXM = 16;
+            const int outRow = (int)tid.y * (2 * ROWS) + (int)simd_gid * ROWS;
+            const device half* w0 = W + (size_t)outRow * (size_t)K;
+            float acc[ROWS][MAXM];
+            for (int r = 0; r < ROWS; r++) for (int m = 0; m < MAXM; m++) acc[r][m] = 0.0f;
+            for (int k = 0; k < K; k += BLOCK) {
+                const int base = k + (int)simd_lid * VPT;
+                half wv[ROWS][VPT];
+                float xv[VPT];
+                if (base + VPT <= K) {              // fast path: whole 16-half chunk in range
+                    for (int r = 0; r < ROWS; r++) {
+                        const device half* wp = w0 + (size_t)r * (size_t)K + base;
+                        for (int i = 0; i < VPT; i++) wv[r][i] = wp[i];
+                    }
+                    for (int m = 0; m < M; m++) {
+                        const device half* xp = x + (size_t)m * (size_t)K + base;
+                        for (int i = 0; i < VPT; i++) xv[i] = xp[i];
+                        for (int r = 0; r < ROWS; r++) {
+                            float p = 0.0f;
+                            for (int i = 0; i < VPT; i++) p += xv[i] * (float)wv[r][i];
+                            acc[r][m] += p;
+                        }
+                    }
+                } else {                             // tail (test shapes: K=64/96/128)
+                    for (int r = 0; r < ROWS; r++)
+                        for (int i = 0; i < VPT; i++)
+                            wv[r][i] = (base + i < K) ? w0[(size_t)r * (size_t)K + base + i] : (half)0.0h;
+                    for (int m = 0; m < M; m++) {
+                        for (int i = 0; i < VPT; i++)
+                            xv[i] = (base + i < K) ? (float)x[(size_t)m * (size_t)K + base + i] : 0.0f;
+                        for (int r = 0; r < ROWS; r++) {
+                            float p = 0.0f;
+                            for (int i = 0; i < VPT; i++) p += xv[i] * (float)wv[r][i];
+                            acc[r][m] += p;
+                        }
+                    }
+                }
+            }
+            for (int r = 0; r < ROWS; r++)
+                for (int m = 0; m < M; m++) {
+                    float v = simd_sum(acc[r][m]);
+                    if (simd_lid == 0) y[(size_t)m * (size_t)N + outRow + r] = (half)v;
+                }
+        }
         // dflash_sdpa_rows: keys/values = cache[0..<cachedLen] ‖ prop[0..<propKeys(m)].
         // causalOffset!=0: propKeys(m) = m+1 (causal-with-offset). causalOffset==0: propKeys(m) = M
         // (no mask, bidirectional within the block). Cached keys are ALWAYS fully visible.
@@ -650,8 +818,32 @@ private enum DFlashRawKernels {
         do {
             let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             sdpaPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "dflash_sdpa_rows")!)
+            fmm16Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "dflash_fmm16")!)
         } catch { print("[dflash-raw-sdpa] compile: \(error)"); return false }
-        return sdpaPipeline != nil
+        return sdpaPipeline != nil && fmm16Pipeline != nil
+    }
+
+    /// f16 M-row GEMM: y[M,N] = x[M,K] @ W[N,K]^T. Slices M at 16 per dispatch (per-row
+    /// results are M-invariant, so slicing is byte-transparent). Requires N % 4 == 0.
+    static func encodeFmm16(_ enc: MTLComputeCommandEncoder,
+                            w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
+                            M: Int, K: Int, N: Int, wOff: Int = 0) {
+        let p = fmm16Pipeline!
+        var m0 = 0
+        while m0 < M {
+            let mc = min(16, M - m0)
+            enc.setComputePipelineState(p)
+            enc.setBuffer(w, offset: wOff, index: 0)
+            enc.setBuffer(x, offset: m0 * K * 2, index: 1)
+            enc.setBuffer(out, offset: m0 * N * 2, index: 2)
+            var kk = Int32(K), nn = Int32(N), mm = Int32(mc)
+            enc.setBytes(&kk, length: 4, index: 3)
+            enc.setBytes(&nn, length: 4, index: 4)
+            enc.setBytes(&mm, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 4, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+            m0 += mc
+        }
     }
 
     static func encode(_ enc: MTLComputeCommandEncoder,
