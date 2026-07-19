@@ -38,6 +38,7 @@ if CommandLine.arguments.contains("stream") {
         ("prefix-cache-speed", { md, _ in Tell.prefixCacheSpeedProbe(modelDir: md) }),
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
         ("gqmm2-bench", { _, _ in SeedlessMetalForward.gqmm2Bench() }),   // notes/18 W1 speed sim
+        ("dflash-parity", { _, _ in DFlashParityProbe.run() }),           // #98 phase 2b oracle parity
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {
