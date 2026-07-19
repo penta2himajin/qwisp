@@ -16,6 +16,25 @@ import MLXFast
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
 extension Tell {
 
+    /// #98 phase A1: config.json + safetensors load, mirroring DFlashDrafter.load(dir:)'s
+    /// internals (that frozen helper doesn't expose the parsed config/weights, and both the
+    /// MLX and raw drafters need to share the identical weights dict). Public-API-only —
+    /// does not touch DFlashDrafter.swift.
+    static func loadDFlashConfigAndWeights(dir: URL) -> (DFlashDrafterConfig, [String: MLXArray])? {
+        guard let cfg = try? DFlashDrafterConfig.load(configJSON: dir.appendingPathComponent("config.json")),
+              let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return nil }
+        var weights: [String: MLXArray] = [:]
+        for url in entries where url.pathExtension == "safetensors" {
+            guard let m = try? loadArrays(url: url) else { return nil }
+            for (k, v) in m {
+                let stripped = k.hasPrefix("model.") ? String(k.dropFirst("model.".count)) : k
+                weights[stripped] = v
+            }
+        }
+        return (cfg, weights)
+    }
+
     /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
     /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
     /// 明示 env(QWISP_BOLT_RECALIB_R/QWISP_BOLT_REFRESH_B)が常にこの preset を上書きする。
@@ -643,13 +662,24 @@ extension Tell {
             // #98 DFlash: only when SuffixSpec found nothing (draftless span) and not under A3
             // (dflash is inactive there — see dflashHarvest). Falls back to the old per-step
             // path on nil (cold start / any failure), unchanged behavior.
-            if drafts.isEmpty, !useA3, let dd = dflash, let ds = dd.draft(u: u), !ds.isEmpty {
-                drafts = ds
+            // #98 A1 fused-first: draft+verify in ONE CB on dflashFwd. Snapshot is taken
+            // BEFORE the fused step (the verify inside it advances the cache; the drafter
+            // itself never touches the target cache, so pre-draft == pre-verify state).
+            var fusedEvals: [Int]? = nil
+            var fusedSnap: Any? = nil
+            if drafts.isEmpty, !useA3, let dd = dflash {
+                if let fwd = dflashFwd {
+                    let s = backend.snapshot()
+                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
+                        drafts = r.drafts; fusedEvals = r.evals; fusedSnap = s
+                    }
+                }
+                if fusedEvals == nil, let ds = dd.draft(u: u), !ds.isEmpty { drafts = ds }
             }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
-            var snap = backend.snapshot()
+            let snap = fusedSnap ?? backend.snapshot()
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -720,9 +750,15 @@ extension Tell {
                     }
                 }
             } else {
-                // Non-A3 path (unchanged)
-                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
+                // Non-A3 path (unchanged; fused path already ran the verify in the draft CB)
+                let evals: [Int]
+                if let fe = fusedEvals {
+                    evals = fe
+                } else {
+                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                    guard let e = backend.stepArgmax(verifyTokens) else { return nil }
+                    evals = e
+                }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
@@ -1077,10 +1113,21 @@ extension Tell {
         if Tell.envFlag("QWISP_DFLASH"), let fwd = _residentFwd, fwd.streamMode == .resident, !useA3 {
             let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
                 ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
-            if let drafter = DFlashDrafter.load(dir: URL(fileURLWithPath: dir)) {
+            // #98 phase A1: load config+weights once (public-API-only re-derivation of what
+            // DFlashDrafter.load(dir:) does internally — that frozen helper doesn't expose
+            // them, and both the MLX and raw drafters need to share the same weights dict).
+            if let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)),
+               let drafter = DFlashDrafter(config: cfg, weights: weights) {
                 let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
+                var rawCfg = cfg
+                rawCfg.blockSize = blockSize
+                var raw = DFlashRawDrafter(config: rawCfg, weights: weights)
+                if let r = raw, !r.attachTargetHead(embedW: engine.embedW, embedS: engine.embedS, embedB: engine.embedB,
+                                                    lmW: engine.lmW, lmS: engine.lmS, lmB: engine.lmB, vocab: engine.vocab) {
+                    raw = nil
+                }
                 let dd = DFlashDispatch(
-                    drafter: drafter, blockSize: blockSize,
+                    drafter: drafter, raw: raw, blockSize: blockSize,
                     embedFn: { engine.embed(tokens: $0) },
                     logitsArgmaxFn: { h in
                         // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax —
@@ -1093,7 +1140,7 @@ extension Tell {
                     })
                 _ = fwd.attachTap(layerIds: drafter.config.targetLayerIds)
                 dflash = dd
-                print("[raw-spec] DFlash dispatch active (block=\(blockSize))")
+                print("[raw-spec] DFlash dispatch active (block=\(blockSize), raw=\(raw != nil))")
             } else {
                 print("[raw-spec] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash")
             }
@@ -1182,10 +1229,24 @@ extension Tell {
 
             // #98 DFlash: same slot as mtpDraftSpan above (dflash replaces it when active —
             // the two flags are mutually exclusive by construction, dflash takes priority).
+            // A1 fused-first: draft+verify in ONE CB (snapshot BEFORE — the fused verify
+            // advances the cache). Guards: mtpHead feeds pre-verify normed rows and rerank
+            // needs the verify tokens up-front — both fall back to the split path.
             var dflashDrafted = false
-            if D == 0, let dd = dflash, !useA3, let ds = dd.draft(u: u), !ds.isEmpty {
-                drafts = ds; D = drafts.count
-                dflashDrafted = true
+            var fusedEvals: [Int]? = nil
+            var fusedSnap: Any? = nil
+            if D == 0, let dd = dflash, !useA3 {
+                if mtpHead == nil, !_useRerank, let fwd = _residentFwd {
+                    let s = backend.snapshot()
+                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
+                        drafts = r.drafts; D = drafts.count; dflashDrafted = true
+                        fusedEvals = r.evals; fusedSnap = s
+                    }
+                }
+                if !dflashDrafted, let ds = dd.draft(u: u), !ds.isEmpty {
+                    drafts = ds; D = drafts.count
+                    dflashDrafted = true
+                }
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
@@ -1204,7 +1265,8 @@ extension Tell {
             }
 
             // Snapshot before the batched verify (backend-specific representation).
-            var snap = backend.snapshot()
+            // Fused dflash step: the verify already ran → use the pre-fused snapshot.
+            let snap = fusedSnap ?? backend.snapshot()
 
             if D == 0 {
                 // No draft available
@@ -1303,11 +1365,17 @@ extension Tell {
                     }
                 }
             } else {
-                // ── Non-A3 path (unchanged) ──────────────────────────────
-                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
-                guard let evals = backend.stepArgmax(verifyTokens)
-                else { return "[raw-spec] ERROR: verify step nil" }
+                // ── Non-A3 path (unchanged; fused path already ran the verify) ──
+                let evals: [Int]
+                if let fe = fusedEvals {
+                    evals = fe
+                } else {
+                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                    if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
+                    guard let e = backend.stepArgmax(verifyTokens)
+                    else { return "[raw-spec] ERROR: verify step nil" }
+                    evals = e
+                }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }

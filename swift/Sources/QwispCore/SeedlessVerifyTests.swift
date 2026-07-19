@@ -90,7 +90,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 95
+        let total = 98
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5778,6 +5778,305 @@ public enum SeedlessVerifyTests {
             // (c) reset → fresh-instance state (draft → nil again).
             disp.reset()
             if disp.draft(u: 7) != nil { return (false, "post-reset draft should be nil") }
+            return (true, "ok")
+        }
+
+        // ── DFlash RAW drafter (#98 phase A1) locked tests ────────────────
+        // WRITE-LOCKED (guarded by total = 97). Do not weaken/skip/delete.
+
+        // Test 96: dflash_raw_vs_mlx
+        // The raw-Metal drafter forward must match the MLX drafter (DFlashDrafter) on the
+        // final-normed hidden. We compare HIDDEN, not token ids — argmax over near-tie f16
+        // logits can flip between kernel implementations. Both sides get byte-identical inputs:
+        //   • noise: tokens [u] ++ [maskId × (block-1)] embedded via the PRODUCTION embed_rows_q4
+        //     path (SeedlessFusedVerify.embedRowsRaw) over a synthetic 4-bit TARGET embed
+        //     fixture — the MLX side's noise IS that dequantised embed, so no input drift.
+        //   • ctx: the same synthetic [ctxCount, ctxFeatureDim] rows.
+        // block is reduced to 4 so that ctxCount(3)+block(4)=7 <= slidingWindow(8): the MLX
+        // drafter then takes the plain `.causal` branch (not the windowed-mask branch), which is
+        // exactly the raw path's causal-with-offset semantics — a like-for-like comparison.
+        // Asserts (a) Frobenius rel error < 2e-2 AND both hiddens non-zero; (b) reset + re-run →
+        // byte-identical hidden (raw bit-repro determinism).
+        run("dflash_raw_vs_mlx") {
+            var cfg = dflashTestConfig()
+            cfg.blockSize = 4
+            let weights = dflashTestWeights(cfg)
+            let H = cfg.hiddenSize, V = cfg.vocabSize, block = cfg.blockSize
+            let ctxCount = 3
+
+            // Synthetic 4-bit TARGET embed + lm_head fixtures (test-91 MLX.quantized idiom).
+            let embedF = MLXRandom.normal([V, H]).asType(.float16)
+            let (eq, es, ebOpt) = MLX.quantized(embedF, groupSize: 64, bits: 4, mode: .affine)
+            let lmF = MLXRandom.normal([V, H]).asType(.float16)
+            let (lq, ls, lbOpt) = MLX.quantized(lmF, groupSize: 64, bits: 4, mode: .affine)
+            guard let eb = ebOpt, let lb = lbOpt else { return (false, "quantize biases nil") }
+            MLX.eval([eq, es, eb, lq, ls, lb])
+
+            // Fixed inputs.
+            let u: Int32 = 7
+            let ctx2d = MLXRandom.normal([ctxCount, cfg.ctxFeatureDim]).asType(.float16)
+            MLX.eval([ctx2d])
+            let ctxRows = ctx2d.reshaped([-1]).asArray(Float16.self)
+            let ctxMLX  = ctx2d.reshaped([1, ctxCount, cfg.ctxFeatureDim])
+
+            // Build both drafters from IDENTICAL weights.
+            guard let raw = DFlashRawDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashRawDrafter init returned nil (STUB)") }
+            guard raw.attachTargetHead(embedW: eq, embedS: es, embedB: eb,
+                                       lmW: lq, lmS: ls, lmB: lb, vocab: V)
+            else { return (false, "attachTargetHead failed (STUB)") }
+            guard let mlx = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil") }
+
+            // Identical noise: production embed_rows_q4 over the synthetic target embed.
+            let tokens: [Int32] = [u] + Array(repeating: Int32(cfg.maskTokenId), count: block - 1)
+            guard let noiseRows = SeedlessFusedVerify.embedRowsRaw(tokens, w: eq, scales: es, biases: eb, H: H)
+            else { return (false, "embedRowsRaw nil") }
+            let noise = noiseRows.reshaped([1, block, H])
+            MLX.eval([noise])
+
+            // Raw forward (fresh state) → final-normed hidden [block, H].
+            _ = raw.forward(u: u, ctxRows: ctxRows, ctxCount: ctxCount)
+            guard let hRawFlat = raw.lastFinalHidden()
+            else { return (false, "lastFinalHidden nil (STUB)") }
+            guard hRawFlat.count == block * H
+            else { return (false, "raw hidden count \(hRawFlat.count) != \(block * H)") }
+
+            // MLX reference hidden [1, block, H] → [block, H].
+            let hMLX = mlx.forward(noise: noise, ctx: ctxMLX, caches: mlx.makeCaches())
+                .reshaped([block, H]).asType(.float32)
+            MLX.eval([hMLX])
+            let rawArr = MLXArray(hRawFlat, [block, H]).asType(.float32).asArray(Float.self)
+            let mlxArr = hMLX.asArray(Float.self)
+
+            // (a) both non-zero + Frobenius rel error < 2e-2.
+            var num: Float = 0, den: Float = 0
+            for i in 0..<mlxArr.count {
+                let d = rawArr[i] - mlxArr[i]
+                num += d * d
+                den += mlxArr[i] * mlxArr[i]
+            }
+            if den == 0 { return (false, "MLX hidden all-zero") }
+            if !rawArr.contains(where: { $0 != 0 }) { return (false, "raw hidden all-zero") }
+            let rel = (num / den).squareRoot()
+            if !(rel < 2e-2) { return (false, "rel error \(rel) >= 2e-2") }
+
+            // (b) reset + re-run same inputs → byte-identical hidden (bit-repro determinism).
+            raw.reset()
+            _ = raw.forward(u: u, ctxRows: ctxRows, ctxCount: ctxCount)
+            guard let hRaw2 = raw.lastFinalHidden() else { return (false, "second lastFinalHidden nil") }
+            guard hRaw2.count == hRawFlat.count else { return (false, "hidden count changed \(hRaw2.count)") }
+            for i in 0..<hRawFlat.count where hRaw2[i].bitPattern != hRawFlat[i].bitPattern {
+                return (false, "bit-repro mismatch @\(i) \(hRaw2[i]) vs \(hRawFlat[i])")
+            }
+            return (true, "ok")
+        }
+
+        // Test 97: dflash_raw_cache_consistency
+        // Raw-internal cache invariants (no MLX comparison — the raw path is self-referential):
+        // (a) two-call accumulation (ctx 3 rows then 2 rows) → final-normed hidden byte-equals a
+        //     fresh instance's single call over the 5 concatenated ctx rows (same invariant as
+        //     locked test 93, but byte-exact within the raw engine);
+        // (b) trimTo(3) rollback + replay the 2-row call → byte-identical to the pre-trim hidden;
+        // (c) ctxCap contract: with ctxLen at 5, a call whose ctxCount would push past
+        //     ctxCap = slidingWindow-1 = 7 returns nil, and the instance is unpoisoned (trim + a
+        //     legal replay still reproduces the pre-cap hidden byte-for-byte).
+        // block = 4 (raw path is causal-with-offset regardless of the MLX mask branch; total ctx
+        // stays <= ctxCap 7 in every legal call).
+        run("dflash_raw_cache_consistency") {
+            var cfg = dflashTestConfig()
+            cfg.blockSize = 4
+            let weights = dflashTestWeights(cfg)
+            let H = cfg.hiddenSize, V = cfg.vocabSize
+
+            // Target head fixture (needed for the noise embed inside forward).
+            let embedF = MLXRandom.normal([V, H]).asType(.float16)
+            let (eq, es, ebOpt) = MLX.quantized(embedF, groupSize: 64, bits: 4, mode: .affine)
+            let lmF = MLXRandom.normal([V, H]).asType(.float16)
+            let (lq, ls, lbOpt) = MLX.quantized(lmF, groupSize: 64, bits: 4, mode: .affine)
+            guard let eb = ebOpt, let lb = lbOpt else { return (false, "quantize biases nil") }
+            MLX.eval([eq, es, eb, lq, ls, lb])
+
+            let u: Int32 = 5
+            let ctx1 = MLXRandom.normal([3, cfg.ctxFeatureDim]).asType(.float16)
+            let ctx2 = MLXRandom.normal([2, cfg.ctxFeatureDim]).asType(.float16)
+            MLX.eval([ctx1, ctx2])
+            let r1 = ctx1.reshaped([-1]).asArray(Float16.self)
+            let r2 = ctx2.reshaped([-1]).asArray(Float16.self)
+            let rFull = MLX.concatenated([ctx1, ctx2], axis: 0).reshaped([-1]).asArray(Float16.self)
+
+            func mkRaw() -> DFlashRawDrafter? {
+                guard let d = DFlashRawDrafter(config: cfg, weights: weights) else { return nil }
+                guard d.attachTargetHead(embedW: eq, embedS: es, embedB: eb,
+                                         lmW: lq, lmS: ls, lmB: lb, vocab: V) else { return nil }
+                return d
+            }
+
+            // (a) two-call accumulation vs one-shot concatenated ctx → byte-exact hidden.
+            guard let dA = mkRaw() else { return (false, "DFlashRawDrafter init/attach nil (STUB)") }
+            _ = dA.forward(u: u, ctxRows: r1, ctxCount: 3)                 // primes ctxLen 0→3
+            guard dA.forward(u: u, ctxRows: r2, ctxCount: 2) != nil        // ctxLen 3→5
+            else { return (false, "second forward nil (STUB)") }
+            guard let hTwoCall = dA.lastFinalHidden() else { return (false, "lastFinalHidden nil (STUB)") }
+
+            guard let dB = mkRaw() else { return (false, "init/attach nil") }
+            guard dB.forward(u: u, ctxRows: rFull, ctxCount: 5) != nil
+            else { return (false, "one-shot forward nil") }
+            guard let hOneShot = dB.lastFinalHidden() else { return (false, "one-shot hidden nil") }
+            guard hTwoCall.count == hOneShot.count else { return (false, "hidden count mismatch") }
+            for i in 0..<hTwoCall.count where hTwoCall[i].bitPattern != hOneShot[i].bitPattern {
+                return (false, "two-call vs one-shot mismatch @\(i)")
+            }
+
+            // (b) trimTo rollback replay: from ctxLen 5 trim back to 3, re-run the 2-row call.
+            dA.trimTo(committed: 3)
+            guard dA.forward(u: u, ctxRows: r2, ctxCount: 2) != nil
+            else { return (false, "post-trim forward nil") }
+            guard let hReplay = dA.lastFinalHidden() else { return (false, "replay hidden nil") }
+            guard hReplay.count == hTwoCall.count else { return (false, "replay count mismatch") }
+            for i in 0..<hTwoCall.count where hReplay[i].bitPattern != hTwoCall[i].bitPattern {
+                return (false, "trim rollback replay mismatch @\(i)")
+            }
+
+            // (c) ctxCap contract: dA is at ctxLen 5; a 3-row call would reach 8 > ctxCap 7 → nil.
+            let cap3 = MLXRandom.normal([3, cfg.ctxFeatureDim]).asType(.float16)
+            MLX.eval([cap3])
+            let capRows = cap3.reshaped([-1]).asArray(Float16.self)
+            if dA.forward(u: u, ctxRows: capRows, ctxCount: 3) != nil {
+                return (false, "over-cap forward should return nil")
+            }
+            // state unpoisoned: trim to 3 and replay the legal 2-row call → still byte-equal.
+            dA.trimTo(committed: 3)
+            guard dA.forward(u: u, ctxRows: r2, ctxCount: 2) != nil
+            else { return (false, "post-cap forward nil") }
+            guard let hAfterCap = dA.lastFinalHidden() else { return (false, "post-cap hidden nil") }
+            guard hAfterCap.count == hTwoCall.count else { return (false, "post-cap count mismatch") }
+            for i in 0..<hTwoCall.count where hAfterCap[i].bitPattern != hTwoCall[i].bitPattern {
+                return (false, "state poisoned after over-cap: mismatch @\(i)")
+            }
+            return (true, "ok")
+        }
+
+        // ── DFlash fused draft+verify (#98 A1 fused CB) locked test ───────
+        // WRITE-LOCKED (guarded by total = 98). Do not weaken/skip/delete.
+
+        // Test 98: dflash_fused_draft_verify
+        // The fused path (raw drafter encoded as a prologue of the verify CB + GPU blit of its
+        // argmax ids into tokensIn rows 1..<M) must be BIT-EQUAL to the split path
+        // (raw.forward → stepArgmax([u]+drafts)) in ALL of: draft ids, verify argmax rows,
+        // and post-step target cache state (KV lens/contents + GDN conv/rec state).
+        // Fixtures: test-47 2-layer mini verify engine (identical initial caches + shared
+        // head) × test-96 synthetic drafter (blockSize=4 → verify M=4=maxM).
+        run("dflash_fused_draft_verify") {
+            let V = 256
+            // ── verify mini-model (test-47 idiom: shared layer weights, per-engine cache copies)
+            let moe0 = stMkMoE(), moe1 = stMkMoE()
+            let gdnW = stMkGdnW(), attnW = stMkAttnW()
+            let iLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN0 = MLXRandom.normal([stH]).asType(.float16)
+            let iLN1 = MLXRandom.normal([stH]).asType(.float16)
+            let pLN1 = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([iLN0, pLN0, iLN1, pLN1])
+            let specs = [
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: iLN0, postLN: pLN0,
+                    gdn: gdnW, attn: nil, moe: moe0.w, moeE: stE, moeI: stI),
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: iLN1, postLN: pLN1,
+                    gdn: nil, attn: attnW, moe: moe1.w, moeE: stE, moeI: stI),
+            ]
+            let cs = MLXRandom.normal([stCK - 1, stConvDim]).asType(.float16)
+            let rs = MLXRandom.normal([1, stHv, stDv, stDk]).asType(.float32)
+            let kc = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            let vc = MLXRandom.normal([stNkv, 8, stHd]).asType(.float16)
+            MLX.eval([cs, rs, kc, vc])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs, recState: rs),
+                 SeedlessVerifyForward.LayerCaches(kCache: kc, vCache: vc)]
+            }
+            let ewf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (ewq, esc, ebiOpt) = MLX.quantized(ewf, groupSize: 64, bits: 4, mode: .affine)
+            let lwf = MLXRandom.normal([V, stH]).asType(.float16)
+            let (lwq, lsc, lbiOpt) = MLX.quantized(lwf, groupSize: 64, bits: 4, mode: .affine)
+            guard let ebi = ebiOpt, let lbi = lbiOpt else { return (false, "head biases nil") }
+            let fnW = MLXRandom.normal([stH]).asType(.float16)
+            MLX.eval([ewq, esc, ebi, lwq, lsc, lbi, fnW])
+            func mkEng() -> SeedlessFusedVerify.SeedlessFusedForward? {
+                guard let e = SeedlessFusedVerify.SeedlessFusedForward(
+                        layers: specs, caches: freshCaches(), maxM: 4, H: stH, maxSeqLen: 32),
+                      e.attachHead(embedW: ewq, embedS: esc, embedB: ebi,
+                                   lmW: lwq, lmS: lsc, lmB: lbi, fnW: fnW, vocab: V)
+                else { return nil }
+                return e
+            }
+
+            // ── drafter (test-96 idiom: blockSize=4 so verify M = 4 = maxM)
+            var cfg = dflashTestConfig()
+            cfg.blockSize = 4
+            let dW = dflashTestWeights(cfg)
+            let dH = cfg.hiddenSize, dV = cfg.vocabSize
+            let deF = MLXRandom.normal([dV, dH]).asType(.float16)
+            let (deq, des, debOpt) = MLX.quantized(deF, groupSize: 64, bits: 4, mode: .affine)
+            let dlF = MLXRandom.normal([dV, dH]).asType(.float16)
+            let (dlq, dls, dlbOpt) = MLX.quantized(dlF, groupSize: 64, bits: 4, mode: .affine)
+            guard let deb = debOpt, let dlb = dlbOpt else { return (false, "drafter head biases nil") }
+            MLX.eval([deq, des, deb, dlq, dls, dlb])
+            func mkRaw() -> DFlashRawDrafter? {
+                guard let d = DFlashRawDrafter(config: cfg, weights: dW),
+                      d.attachTargetHead(embedW: deq, embedS: des, embedB: deb,
+                                         lmW: dlq, lmS: dls, lmB: dlb, vocab: dV) else { return nil }
+                return d
+            }
+            let u: Int32 = 7
+            let ctx = MLXRandom.normal([3, cfg.ctxFeatureDim]).asType(.float16)
+            MLX.eval([ctx])
+            let ctxRows = ctx.reshaped([-1]).asArray(Float16.self)
+
+            // ── reference: split draft → verify
+            guard let engR = mkEng() else { return (false, "ref engine init/attach nil") }
+            guard let rawR = mkRaw() else { return (false, "ref drafter init/attach nil") }
+            guard let draftsR = rawR.forward(u: u, ctxRows: ctxRows, ctxCount: 3)
+            else { return (false, "ref raw forward nil") }
+            guard let evalsR = engR.stepArgmax([u] + draftsR.map { Int32($0) })
+            else { return (false, "ref stepArgmax nil") }
+
+            // ── fused: prologue + blit + verify in ONE CB
+            guard let engF = mkEng() else { return (false, "fused engine init/attach nil") }
+            guard let rawF = mkRaw() else { return (false, "fused drafter init/attach nil") }
+            guard rawF.prepare(u: u, ctxRows: ctxRows, ctxCount: 3)
+            else { return (false, "prepare failed (STUB)") }
+            var toks = [Int32](repeating: 0, count: cfg.blockSize)   // rows 1.. blit-overwritten
+            toks[0] = u
+            guard let evalsF = engF.stepArgmax(toks, draftPrologue: { rawF.encode(cb: $0) },
+                                               draftTokensBuf: rawF.tokenOutBuffer)
+            else { return (false, "fused stepArgmax nil (STUB)") }
+            let draftsF = rawF.finish()
+
+            // (a) draft ids bit-equal (deterministic kernels, identical weights/inputs).
+            if draftsF != draftsR { return (false, "drafts fused=\(draftsF) ref=\(draftsR)") }
+            // (b) verify argmax rows bit-equal — the blit really fed the draft ids.
+            if evalsF != evalsR { return (false, "evals fused=\(evalsF) ref=\(evalsR)") }
+            // (c) post-step target cache state bit-equal (test-47 idiom).
+            let snF = engF.snapshot(), snR = engR.snapshot()
+            for li in 0..<specs.count where snF.kvLens[li] != snR.kvLens[li] {
+                return (false, "kvLen layer=\(li) fused=\(snF.kvLens[li]) ref=\(snR.kvLens[li])")
+            }
+            let (kF, vF) = engF.readLayerCache(1)
+            let (kR, vR) = engR.readLayerCache(1)
+            for (nm, ca, cb) in [("kCache", kF, kR), ("vCache", vF, vR)] {
+                guard let aa = ca, let bb = cb else { return (false, "KV cache nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "\(nm): \(d)") }
+            }
+            let (cF, rF) = engF.readLayerCache(0)
+            let (cR, rR) = engR.readLayerCache(0)
+            for (nm, ca, cb) in [("convState", cF, cR), ("recState", rF, rR)] {
+                guard let aa = ca, let bb = cb else { return (false, "GDN state nil \(nm)") }
+                aa.eval(); bb.eval()
+                let (ok, d) = bitEqual(aa, bb)
+                if !ok { return (false, "\(nm): \(d)") }
+            }
             return (true, "ok")
         }
 

@@ -39,6 +39,8 @@ if CommandLine.arguments.contains("stream") {
         ("prefill-probe", { md, _ in Tell.prefillThroughputProbe(modelDir: md) }),
         ("gqmm2-bench", { _, _ in SeedlessMetalForward.gqmm2Bench() }),   // notes/18 W1 speed sim
         ("dflash-parity", { _, _ in DFlashParityProbe.run() }),           // #98 phase 2b oracle parity
+        ("dflash-raw-bench", { _, _ in DFlashRawDrafter.bench() }),       // #98 A1 c_draft micro-bench
+        ("dflash-gemm-bench", { _, _ in DFlashRawDrafter.gemmBench() }),  // #98 A1 f16 GEMM kernel probe
     ]
     if let name = env["QWISP_RUN"] {
         if let r = runners.first(where: { $0.0 == name }) {
