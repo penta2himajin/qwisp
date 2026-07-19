@@ -1083,9 +1083,13 @@ extension Tell {
                     drafter: drafter, blockSize: blockSize,
                     embedFn: { engine.embed(tokens: $0) },
                     logitsArgmaxFn: { h in
-                        engine.logits(h, M: h.dim(0)).map { lg in
-                            (0 ..< h.dim(0)).map { MLX.argMax(lg[$0], axis: -1).item(Int.self) }
-                        }
+                        // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax —
+                        // per-row .item() was 7 separate evals+syncs per block (measured
+                        // c_draft ~4-5 forwards, PR #113 G-D interim).
+                        guard let lg = engine.logits(h, M: h.dim(0)) else { return nil }
+                        let ids = MLX.argMax(lg, axis: -1).asType(.int32)
+                        ids.eval()
+                        return ids.asArray(Int32.self).map { Int($0) }
                     })
                 _ = fwd.attachTap(layerIds: drafter.config.targetLayerIds)
                 dflash = dd
@@ -1178,8 +1182,10 @@ extension Tell {
 
             // #98 DFlash: same slot as mtpDraftSpan above (dflash replaces it when active —
             // the two flags are mutually exclusive by construction, dflash takes priority).
+            var dflashDrafted = false
             if D == 0, let dd = dflash, !useA3, let ds = dd.draft(u: u), !ds.isEmpty {
                 drafts = ds; D = drafts.count
+                dflashDrafted = true
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
@@ -1306,6 +1312,11 @@ extension Tell {
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
                 dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
+                // measurement-only (QWISP_DFLASH_TRACE): accept vs drafter-ctx length —
+                // separates cold-start ctx from feature-shift as the accept limiter.
+                if dflashDrafted, let dd = dflash, Tell.envFlag("QWISP_DFLASH_TRACE") {
+                    FileHandle.standardError.write(Data("[dflash-trace] ctx=\(dd.ctxRowsFed) p=\(p)/\(D)\n".utf8))
+                }
 
                 if p == D {
                     // ── full accept ───────────────────────────────────────

@@ -130,9 +130,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             drafter: drafter, blockSize: blockSize,
             embedFn: { engine.embed(tokens: $0) },
             logitsArgmaxFn: { h in
-                engine.logits(h, M: h.dim(0)).map { lg in
-                    (0 ..< h.dim(0)).map { MLX.argMax(lg[$0], axis: -1).item(Int.self) }
-                }
+                // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax (see
+                // TellRuntime's twin closure; per-row .item() was 7 evals/block).
+                guard let lg = engine.logits(h, M: h.dim(0)) else { return nil }
+                let ids = MLX.argMax(lg, axis: -1).asType(.int32)
+                ids.eval()
+                return ids.asArray(Int32.self).map { Int($0) }
             })
     }
     private var samplingFallbackNoted = false

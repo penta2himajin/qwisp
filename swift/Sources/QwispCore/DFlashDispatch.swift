@@ -73,6 +73,11 @@ public final class DFlashDispatch {
         pendingCtx = []
         pendingRows = 0
         guard let ids = logitsArgmaxFn(hidden[0, 1...]), ids.count == blockSize - 1 else { return nil }
+        // Materialize drafter cache state so the lazy graph doesn't accumulate across
+        // blocks (LayerCache.stateArrays idiom) — the arrays were already computed as part
+        // of the ids readback, so this is a cheap pin, not a second compute.
+        let state = caches.flatMap { c in [c.keys, c.values].compactMap { $0 } }
+        if !state.isEmpty { MLX.eval(state) }
         return ids
     }
 
