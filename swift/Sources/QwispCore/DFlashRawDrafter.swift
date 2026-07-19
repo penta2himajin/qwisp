@@ -96,6 +96,16 @@ public final class DFlashRawDrafter {
         else { return nil }
         SeedlessFusedVerify.ensureQmmPipeline()
         guard SeedlessMetalForward._qmmPipeline != nil else { return nil }
+        // qmm4_tiled warm (attachHead idiom — the lm_head encode force-unwraps the pipeline;
+        // locked tests build this class standalone, so don't rely on suite ordering).
+        if SeedlessMetalForward._qmm4TiledPipeline == nil {
+            let x = MLXRandom.normal([1, 512]).asType(.float16)
+            let wf = MLXRandom.normal([8, 512]).asType(.float16)
+            let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            MLX.eval([x, wq, s, b!])
+            _ = SeedlessMetalForward.qmmTiled(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8)
+        }
+        guard SeedlessMetalForward._qmm4TiledPipeline != nil else { return nil }
         // Force-compile the lazily-built rms(F16/F32) and rope pipelines (encode-only helpers
         // force-unwrap them) — RawMTPHead init idiom, needed on a fresh process too.
         let warmW = MLXArray.ones([8]).asType(.float16)
@@ -257,31 +267,43 @@ public final class DFlashRawDrafter {
         let cachedLen = ctxLen + ctxCount   // KV length valid after this call's ctx append
         let scale = Float(pow(Double(headDim), -0.5))
 
-        let cb = queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
+        let trace = Tell.envFlag("QWISP_DFLASH_TRACE")
+        var cb = queue.makeCommandBuffer()!
+        var enc = cb.makeComputeCommandEncoder()!
+        var stamps: [(String, Double)] = []
+        // trace-only stage split (flag off = single CB, identical to production).
+        func split(_ label: String) {
+            guard trace else { return }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            stamps.append((label, (cb.gpuEndTime - cb.gpuStartTime) * 1000.0))
+            cb = queue.makeCommandBuffer()!
+            enc = cb.makeComputeCommandEncoder()!
+        }
 
         // noise embed → hBuf (residual stream init)
         encodeEmbedNoise(enc, ew: ew, es: es, eb: eb)
 
         // ctx feature path (computed ONCE, shared by every layer's k/v proj)
         if ctxCount > 0 {
-            SeedlessFusedVerify.encodeFmmRows(enc, w: fcW, x: ctxInputBuf, out: fcOutBuf,
+            DFlashRawKernels.encodeFmmTiled(enc, w: fcW, x: ctxInputBuf, out: fcOutBuf,
                                               M: ctxCount, K: ctxFeatureDim, N: H)
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: fcOutBuf, w: hiddenNorm, out: hCtxBuf,
                                                   rows: ctxCount, D: H, eps: eps)
         }
+
+        split("embed+ctx")
 
         for layer in layers {
             // attn input norm (block rows only — ctx k/v project straight from hCtx, no inputLN)
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: layer.inputLN, out: anLNBuf,
                                                   rows: blockSize, D: H, eps: eps)
             // q / propK / propV projections
-            DFlashRawKernels.encodeFmm(enc, w: layer.qW, x: anLNBuf, out: qRawBuf,
-                                       M: blockSize, K: H, N: numHeads * headDim)
-            DFlashRawKernels.encodeFmm(enc, w: layer.kW, x: anLNBuf, out: pkRawBuf,
-                                       M: blockSize, K: H, N: numKV * headDim)
-            DFlashRawKernels.encodeFmm(enc, w: layer.vW, x: anLNBuf, out: pvBuf,
-                                       M: blockSize, K: H, N: numKV * headDim)
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.qW, x: anLNBuf, out: qRawBuf,
+                                              M: blockSize, K: H, N: numHeads * headDim)
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.kW, x: anLNBuf, out: pkRawBuf,
+                                              M: blockSize, K: H, N: numKV * headDim)
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.vW, x: anLNBuf, out: pvBuf,
+                                              M: blockSize, K: H, N: numKV * headDim)
             // q/k rmsNorm (last-dim headDim, treating each (row,head) as an independent chunk)
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: qRawBuf, w: layer.qNorm, out: qNormedBuf,
                                                   rows: blockSize * numHeads, D: headDim, eps: eps)
@@ -297,9 +319,9 @@ public final class DFlashRawDrafter {
 
             if ctxCount > 0 {
                 // ctx k/v from hCtx (this layer's own k/v proj — NOT re-normed by inputLN)
-                SeedlessFusedVerify.encodeFmmRows(enc, w: layer.kW, x: hCtxBuf, out: ckRawBuf,
+                DFlashRawKernels.encodeFmmTiled(enc, w: layer.kW, x: hCtxBuf, out: ckRawBuf,
                                                   M: ctxCount, K: H, N: numKV * headDim)
-                SeedlessFusedVerify.encodeFmmRows(enc, w: layer.vW, x: hCtxBuf, out: cvBuf,
+                DFlashRawKernels.encodeFmmTiled(enc, w: layer.vW, x: hCtxBuf, out: cvBuf,
                                                   M: ctxCount, K: H, N: numKV * headDim)
                 SeedlessFusedVerify.encodeRmsNormRows(enc, x: ckRawBuf, w: layer.kNorm, out: ckNormedBuf,
                                                       rows: ctxCount * numKV, D: headDim, eps: eps)
@@ -324,33 +346,59 @@ public final class DFlashRawDrafter {
                                    scale: scale, causalOffset: layer.isSliding)
 
             // o_proj — NO gate (unlike the target's attention)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: layer.oW, x: attnOutBuf, out: attnResBuf,
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.oW, x: attnOutBuf, out: attnResBuf,
                                               M: blockSize, K: numHeads * headDim, N: H)
             SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: attnResBuf, total: blockSize * H)
 
             // MLP (swiglu)
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: layer.postLN, out: mnBuf,
                                                   rows: blockSize, D: H, eps: eps)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: layer.gateW, x: mnBuf, out: gateBuf,
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.gateW, x: mnBuf, out: gateBuf,
                                               M: blockSize, K: H, N: mlpDim)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: layer.upW, x: mnBuf, out: upBuf,
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.upW, x: mnBuf, out: upBuf,
                                               M: blockSize, K: H, N: mlpDim)
             SeedlessFusedVerify.encodeSwiglu(enc, g: gateBuf, u: upBuf, h: actBuf, total: blockSize * mlpDim)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: layer.downW, x: actBuf, out: downBuf,
+            DFlashRawKernels.encodeFmmTiled(enc, w: layer.downW, x: actBuf, out: downBuf,
                                               M: blockSize, K: mlpDim, N: H)
             SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: downBuf, total: blockSize * H)
         }
+
+        split("layers")
 
         // final rmsNorm (drafter's OWN norm — not the target's final norm)
         SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: finalNorm, out: normedBuf,
                                               rows: blockSize, D: H, eps: eps)
         // target lm_head over ALL rows (row 0 discarded on readback — simpler than an x-offset
-        // qmm variant, at the cost of one extra row of compute).
-        SeedlessFusedVerify.encodeQmmRows(enc, w: lw, scales: ls, biases: lb, x: normedBuf, out: logits,
-                                          M: blockSize, K: H, N: vocab)
+        // qmm variant, at the cost of one extra row of compute). qmm4_tiled (threadgroup
+        // dequant shared across the M rows — same kernel stepArgmax uses for verify M>1):
+        // the per-row qmv (encodeQmmRows) re-reads+dequants the whole 4-bit lm_head PER ROW,
+        // ~8x the weight traffic at blockSize=8.
+        do {
+            let qp = SeedlessMetalForward._qmm4TiledPipeline!
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(lw, offset: 0, index: 0); enc.setBuffer(ls, offset: 0, index: 1)
+            enc.setBuffer(lb, offset: 0, index: 2); enc.setBuffer(normedBuf, offset: 0, index: 3)
+            enc.setBuffer(logits, offset: 0, index: 4)
+            var kk = Int32(H), nn = Int32(vocab), mm = Int32(blockSize)
+            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+            enc.setBytes(&mm, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: vocab, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        split("lmhead")
         encodeArgmax(enc, logits: logits, V: vocab)
 
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        enc.endEncoding()
+        let t0 = DispatchTime.now()
+        cb.commit(); cb.waitUntilCompleted()
+        if trace {
+            let wallMs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
+            stamps.append(("head", (cb.gpuEndTime - cb.gpuStartTime) * 1000.0))
+            let parts = stamps.map { String(format: "%@=%.2fms", $0.0, $0.1) }.joined(separator: " ")
+            FileHandle.standardError.write(Data(String(
+                format: "[dflash-raw-time] %@ (tailWall=%.2fms) ctx=%d cached=%d\n",
+                parts, wallMs, ctxCount, cachedLen).utf8))
+        }
 
         ctxLen += ctxCount
         hasRun = true
@@ -374,6 +422,68 @@ public final class DFlashRawDrafter {
         let ptr = normedBuf.contents().bindMemory(to: Float16.self, capacity: blockSize * H)
         return Array(UnsafeBufferPointer(start: ptr, count: blockSize * H))
     }
+
+    // ── Steady-state micro-bench (QWISP_RUN=dflash-raw-bench): back-to-back forwards on the
+    //    real checkpoint + a synthetic 4-bit head, isolating drafter cost from decode-loop
+    //    interleaving (GPU clock-ramp diagnosis: cold/idle-gap CBs downclock ~10x). ──
+    public static func bench() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
+            ?? "\(home)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
+        guard let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)) else {
+            return "[dflash-raw-bench] weights load failed (\(dir))"
+        }
+        var cfg8 = cfg
+        cfg8.blockSize = 8
+        guard let raw = DFlashRawDrafter(config: cfg8, weights: weights) else {
+            return "[dflash-raw-bench] init failed"
+        }
+        // synthetic 4-bit head (test-91 idiom) — vocab shrunk: head cost measured separately below
+        let V = 8192
+        let ew = MLXRandom.normal([V, cfg.hiddenSize]).asType(.float16)
+        let (ewq, es, ebO) = MLX.quantized(ew, groupSize: 64, bits: 4, mode: .affine)
+        let lw = MLXRandom.normal([V, cfg.hiddenSize]).asType(.float16)
+        let (lwq, ls, lbO) = MLX.quantized(lw, groupSize: 64, bits: 4, mode: .affine)
+        guard let eBias = ebO, let lBias = lbO else { return "[dflash-raw-bench] quantize failed" }
+        MLX.eval([ewq, es, eBias, lwq, ls, lBias])
+        guard raw.attachTargetHead(embedW: ewq, embedS: es, embedB: eBias,
+                                   lmW: lwq, lmS: ls, lmB: lBias, vocab: V) else {
+            return "[dflash-raw-bench] attach failed"
+        }
+        let ctxRow = [Float16](repeating: Float16(0.01), count: 2 * cfg.ctxFeatureDim)
+        // GPU clock-pinning ballast: a heavy dense matmul immediately before each drafter
+        // forward. If the drafter collapses to a few ms with the ballast, the 20-50ms
+        // "cost" is the frequency governor idling on an all-low-occupancy workload — the
+        // production fix is then fusing the drafter into the verify CB, not more kernels.
+        let bm = 2048
+        let bA = MLXRandom.normal([bm, bm]).asType(.float16)
+        let bB = MLXRandom.normal([bm, bm]).asType(.float16)
+        MLX.eval([bA, bB])
+        var lines: [String] = ["[dflash-raw-bench] 30 back-to-back forwards (real drafter weights, synthetic head V=\(V))"]
+        for ballast in [false, true] {
+            var times: [Double] = []
+            for i in 0 ..< 30 {
+                if raw.ctxLen + 2 > raw.ctxCap { raw.reset() }
+                if ballast {
+                    let c = MLX.matmul(bA, bB)
+                    c.eval()
+                }
+                let t0 = DispatchTime.now()
+                guard raw.forward(u: 7, ctxRows: ctxRow, ctxCount: 2) != nil else {
+                    return "[dflash-raw-bench] forward nil at iter \(i)"
+                }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
+                times.append(ms)
+            }
+            let head = times.prefix(3).map { String(format: "%.2f", $0) }.joined(separator: ", ")
+            let tail = times.suffix(20)
+            let mean = tail.reduce(0, +) / Double(tail.count)
+            let mn = tail.min() ?? 0
+            lines.append(String(format: "  ballast=%@  first3: [%@] ms   steady(last20): mean=%.2fms min=%.2fms",
+                                ballast ? "ON " : "off", head, mean, mn))
+        }
+        return lines.joined(separator: "\n")
+    }
 }
 
 // ── New Metal source: the drafter's own SDPA kernel ─────────────────────────
@@ -394,12 +504,67 @@ public final class DFlashRawDrafter {
 // two-call-vs-one-call byte-exact cache-consistency contract (locked test 97) is unaffected.
 private enum DFlashRawKernels {
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var fmmTiledPipeline: MTLComputePipelineState?
 
     static func ensureSdpaPipeline(_ device: MTLDevice) -> Bool {
         if sdpaPipeline != nil { return true }
         let src = """
         #include <metal_stdlib>
         using namespace metal;
+        // dflash_fmm_tiled: out[M,N] = x[M,K] @ W[N,K]^T, all f16. One 256-thread threadgroup
+        // per output column n; the K-strided W-row read is coalesced and stays hot in cache
+        // across the M-loop, so W traffic is ~once per block instead of once per (row, col)
+        // thread. Replaces fmm_rows for the drafter: fmm_rows (one thread per (n,m), 16-wide
+        // groups, serial K) re-reads every W row M times at poor effective bandwidth — fine
+        // for the 1-layer M<=2 MTP head it was built for, catastrophic for 6 layers x M=8
+        // (measured 165-170ms GPU per block, ~10x the MLX drafter it was meant to beat).
+        kernel void dflash_fmm_tiled(
+            device const half* W   [[buffer(0)]],   // [N, K]
+            device const half* x   [[buffer(1)]],   // [M, K]
+            device half*       out [[buffer(2)]],   // [M, N]
+            constant int&      K   [[buffer(3)]],
+            constant int&      N   [[buffer(4)]],
+            constant int&      M   [[buffer(5)]],
+            uint n   [[threadgroup_position_in_grid]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgs [[threads_per_threadgroup]])
+        {
+            // dq_tiled structure (GroupedMoEPoC denseBench, the measured-good dense shape):
+            // stage the W row into threadgroup memory in K-chunks (read from device ONCE),
+            // then each m-pass dots against TG memory — W re-reads are free, x passes are
+            // coalesced (per-m contiguous) and L2-hot (x is 32KB total). Two earlier
+            // variants measured bad: m-outer device re-reads (L1 thrash across TGs, ~20ms)
+            // and m-inner strided x (8 cache lines per k per thread, ~48ms).
+            constexpr int MAXM = 16;
+            constexpr int CHUNK = 2048;
+            threadgroup half ws[CHUNK];
+            threadgroup float red[256];
+            const device half* wrow = W + (size_t)n * (size_t)K;
+            float acc[MAXM];
+            for (int m = 0; m < M; m++) acc[m] = 0.0f;
+            for (int k0 = 0; k0 < K; k0 += CHUNK) {
+                int kc = min(CHUNK, K - k0);
+                for (int k = (int)tid; k < kc; k += (int)tgs) ws[k] = wrow[k0 + k];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int m = 0; m < M; m++) {
+                    const device half* xrow = x + (size_t)m * (size_t)K + k0;
+                    float p = 0.0f;
+                    for (int k = (int)tid; k < kc; k += (int)tgs)
+                        p += (float)xrow[k] * (float)ws[k];
+                    acc[m] += p;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (int m = 0; m < M; m++) {
+                red[tid] = acc[m]; threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tgs / 2; s > 0; s >>= 1) {
+                    if (tid < s) red[tid] += red[tid + s];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) out[m * N + (int)n] = (half)red[0];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
         // dflash_sdpa_rows: keys/values = cache[0..<cachedLen] ‖ prop[0..<propKeys(m)].
         // causalOffset!=0: propKeys(m) = m+1 (causal-with-offset). causalOffset==0: propKeys(m) = M
         // (no mask, bidirectional within the block). Cached keys are ALWAYS fully visible.
@@ -416,25 +581,37 @@ private enum DFlashRawKernels {
             constant uint& numKV        [[buffer(7)]],
             constant uint& D            [[buffer(8)]],
             constant uint& cachedLen    [[buffer(9)]],
-            constant uint& ctxCap       [[buffer(10)]],
+            constant uint& ctxCap      [[buffer(10)]],
             constant uint& M            [[buffer(11)]],
             constant float& scale       [[buffer(12)]],
             constant uint& causalOffset [[buffer(13)]],
             uint2 tgid    [[threadgroup_position_in_grid]],
             uint  lane    [[thread_index_in_simdgroup]])
         {
+            // Key-serial / D-parallel dataflow: keys are walked SERIALLY (deterministic order —
+            // locked test 97's two-call-vs-one-shot byte-exactness needs a key order that
+            // depends only on absolute position), the 32 lanes cooperate on each key: the
+            // q·k dot is a stride-32 partial + simd_sum broadcast, and the online-softmax
+            // accumulator lives DISTRIBUTED across lanes (D/32 floats each — registers, no
+            // spill). The previous lane-per-key variant kept a full acc[256] per lane, which
+            // spilled and ran slower than the MLX drafter it was meant to replace.
             uint h = tgid.x, m = tgid.y;
             uint gqa = numHeads / numKV;
             uint kvh = h / gqa;
             uint propKeys = (causalOffset != 0) ? (m + 1) : M;
             uint totalKeys = cachedLen + propKeys;
-            constexpr uint MAXD = 256;
-            float acc[MAXD];
-            for (uint d = 0; d < D; d++) acc[d] = 0.0f;
-            float localMax = -INFINITY;
-            float localSum = 0.0f;
+            constexpr uint MAXDL = 8;              // supports D up to 8*32 = 256
+            uint perLane = (D + 31) / 32;
             const device half* qrow = q + (m * numHeads + h) * D;
-            for (uint j = lane; j < totalKeys; j += 32) {
+            float qv[MAXDL];
+            float acc[MAXDL];
+            for (uint t = 0; t < perLane; t++) {
+                uint d = lane + t * 32;
+                qv[t] = (d < D) ? (float)qrow[d] : 0.0f;
+                acc[t] = 0.0f;
+            }
+            float runMax = -INFINITY, runSum = 0.0f;
+            for (uint j = 0; j < totalKeys; j++) {
                 const device half* krow;
                 const device half* vrow;
                 if (j < cachedLen) {
@@ -445,33 +622,54 @@ private enum DFlashRawKernels {
                     krow = propK + (pj * numKV + kvh) * D;
                     vrow = propV + (pj * numKV + kvh) * D;
                 }
-                float score = 0.0f;
-                for (uint d = 0; d < D; d++) score += (float)qrow[d] * (float)krow[d];
-                score *= scale;
-                float newMax = max(localMax, score);
-                float factor = fast::exp(localMax - newMax);
-                float expScore = fast::exp(score - newMax);
-                localMax = newMax;
-                localSum = localSum * factor + expScore;
-                for (uint d = 0; d < D; d++) acc[d] = acc[d] * factor + expScore * (float)vrow[d];
+                float part = 0.0f;
+                for (uint t = 0; t < perLane; t++) {
+                    uint d = lane + t * 32;
+                    if (d < D) part += qv[t] * (float)krow[d];
+                }
+                float score = simd_sum(part) * scale;   // broadcast: every lane holds the score
+                float newMax = max(runMax, score);
+                float factor = fast::exp(runMax - newMax);
+                float e = fast::exp(score - newMax);
+                runMax = newMax;
+                runSum = runSum * factor + e;
+                for (uint t = 0; t < perLane; t++) {
+                    uint d = lane + t * 32;
+                    if (d < D) acc[t] = acc[t] * factor + e * (float)vrow[d];
+                }
             }
-            // Merge the 32 lane-local online-softmax partials into one (single-level, since a
-            // simdgroup already spans all lanes assigned to this query).
-            float groupMax = simd_max(localMax);
-            float rescale = fast::exp(localMax - groupMax);
-            float groupSum = simd_sum(localSum * rescale);
             device half* orow = out + (m * numHeads + h) * D;
-            for (uint d = 0; d < D; d++) {
-                float groupAcc = simd_sum(acc[d] * rescale);
-                if (lane == 0) orow[d] = (half)(groupSum > 0.0f ? (groupAcc / groupSum) : groupAcc);
+            float inv = runSum > 0.0f ? (1.0f / runSum) : 1.0f;
+            for (uint t = 0; t < perLane; t++) {
+                uint d = lane + t * 32;
+                if (d < D) orow[d] = (half)(acc[t] * inv);
             }
         }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
             sdpaPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "dflash_sdpa_rows")!)
+            fmmTiledPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "dflash_fmm_tiled")!)
         } catch { print("[dflash-raw-sdpa] compile: \(error)"); return false }
-        return sdpaPipeline != nil
+        return sdpaPipeline != nil && fmmTiledPipeline != nil
+    }
+
+    /// Tiled f16 matmul: out[M,N] = x[M,K] @ W[N,K]^T. Drop-in for the drafter's projection/
+    /// MLP/fc sites (bandwidth-correct replacement for fmm_rows at M=blockSize x 6 layers).
+    static func encodeFmmTiled(_ enc: MTLComputeCommandEncoder,
+                               w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
+                               M: Int, K: Int, N: Int) {
+        let p = fmmTiledPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(x, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        var kk = Int32(K), nn = Int32(N), mm = Int32(M)
+        enc.setBytes(&kk, length: 4, index: 3)
+        enc.setBytes(&nn, length: 4, index: 4)
+        enc.setBytes(&mm, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
     static func encode(_ enc: MTLComputeCommandEncoder,
