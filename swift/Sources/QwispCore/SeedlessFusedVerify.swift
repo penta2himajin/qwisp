@@ -4161,6 +4161,10 @@ public enum SeedlessFusedVerify {
                                                       M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
                 }
+                // #98 DFlash bootstrap: same nil-guarded tap seam as encodeLayer/runStrictLayers
+                // (copy-out only — the hybrid token stream is untouched). tapBuf nil => no-op,
+                // so the canonical hybrid prefill stays byte-identical when DFlash is off.
+                encodeTap(enc(), li: li, M: M)
             }
             if let fw = finalNormW {
                 SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)

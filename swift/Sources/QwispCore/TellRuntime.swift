@@ -527,7 +527,11 @@ extension Tell {
     /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
-                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil,
+                        // #98 DFlash prefill-ctx bootstrap: called after each chunk forward
+                        // with that chunk's row count (the per-forward tapBuf holds exactly
+                        // those rows at that moment). nil (default) = byte-identical.
+                        onChunk: ((Int) -> Void)? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
@@ -540,6 +544,7 @@ extension Tell {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
             guard let normed = fwdFn(chunk) else { return nil }
+            onChunk?(chunk.count)
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
@@ -620,7 +625,22 @@ extension Tell {
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
-        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend) else { return nil }
+        // #98 DFlash prefill-ctx bootstrap (QWISP_DFLASH_BOOTSTRAP=1, opt-in): harvest each
+        // prefill chunk's tap rows into the drafter ctx so block 1 already sees the prompt
+        // features (kills the cold-start accept ramp). Prompt longer than the raw ctx cap →
+        // draft falls back to the MLX drafter (windowed mask) — unchanged v1 contract.
+        // With a restored prefix-cache, only the re-prefilled suffix is harvested (cached
+        // rows never ran a tapped forward) — degraded ctx, still lossless.
+        let dflashBoot: ((Int) -> Void)? = {
+            guard Tell.envFlag("QWISP_DFLASH_BOOTSTRAP"), !useA3, let dd = dflash,
+                  let fwd = dflashFwd, fwd.tapBuf != nil else { return nil }
+            return { rows in
+                guard let tb = fwd.tapBuf else { return }
+                dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
+            }
+        }()
+        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
+                                       onChunk: dflashBoot) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
@@ -1166,8 +1186,19 @@ extension Tell {
 
         // ── PREFILL ───────────────────────────────────────────────────────
         // (mtpHead non-nil → prompt pairs ingested into head KV per chunk, Step 5)
+        // #98 DFlash prefill-ctx bootstrap (QWISP_DFLASH_BOOTSTRAP=1, opt-in): mirrors the
+        // runSpecLoop seam — harvest each prefill chunk's tap rows into the drafter ctx.
+        let dflashBoot: ((Int) -> Void)? = {
+            guard Tell.envFlag("QWISP_DFLASH_BOOTSTRAP"), !useA3, let dd = dflash,
+                  let fwd = _residentFwd, fwd.tapBuf != nil else { return nil }
+            return { rows in
+                guard let tb = fwd.tapBuf else { return }
+                dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
+            }
+        }()
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend,
-                                       mtpHead: mtpHead, mtpFwd: _residentFwd)
+                                       mtpHead: mtpHead, mtpFwd: _residentFwd,
+                                       onChunk: dflashBoot)
         else { return "[raw-spec] ERROR: prefill returned nil" }
 
         // First token: argmax of logits at the last prompt position.
