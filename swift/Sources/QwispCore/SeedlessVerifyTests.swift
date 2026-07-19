@@ -90,7 +90,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 93
+        let total = 95
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5678,6 +5678,106 @@ public enum SeedlessVerifyTests {
             MLX.eval([firstRun, secondRun])
             let (eqB, dtB) = bitEqual(firstRun, secondRun)
             if !eqB { return (false, "trim rollback mismatch: \(dtB)") }
+            return (true, "ok")
+        }
+
+        // ── DFlash dispatch (#98 phase 3) locked tests ────────────────────
+
+        // Test 94: dflash_ctx_assembly
+        // appendCtx accumulates committed tap rows into pendingCtx in row-major
+        // [rows × ctxDim] with row = concat over tap slots t of tapBuf[t][r][0..<H]
+        // (tap-slot order = targetLayerIds order). Two harvests (rows=2 then rows=3)
+        // accumulate 5 rows total; the tap buffer is per-forward, so the second harvest
+        // re-reads rows 0..2 of the SAME buffer (rows restart at 0 each harvest) and the
+        // reference reflects that. Bit-exact (Float16 bitPattern).
+        run("dflash_ctx_assembly") {
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            var cfg = dflashTestConfig()
+            cfg.ctxFeatureDim = 24                        // ctxDim = nTap(3) * tapH(8)
+            let weights = dflashTestWeights(cfg)
+            guard let drafter = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let disp = DFlashDispatch(drafter: drafter, blockSize: 4,
+                                      embedFn: { _ in nil }, logitsArgmaxFn: { _ in nil })
+            let nTap = 3, maxM = 4, H = 8
+            // synthetic tap buffer [nTap, maxM, H], value = t*1000 + r*10 + h (exact in f16).
+            func val(_ t: Int, _ r: Int, _ h: Int) -> Float16 { Float16(t * 1000 + r * 10 + h) }
+            var flat = [Float16](repeating: 0, count: nTap * maxM * H)
+            for t in 0..<nTap { for r in 0..<maxM { for h in 0..<H {
+                flat[t * maxM * H + r * H + h] = val(t, r, h)
+            } } }
+            guard let buf = flat.withUnsafeBytes({ p in
+                device.makeBuffer(bytes: p.baseAddress!, length: flat.count * 2, options: .storageModeShared)
+            }) else { return (false, "makeBuffer nil") }
+            disp.appendCtx(tapBuf: buf, maxM: maxM, rows: 2)
+            disp.appendCtx(tapBuf: buf, maxM: maxM, rows: 3)
+            // reference: [2 rows] ++ [3 rows], each row = concat over t of tapBuf[t][r][0..<H].
+            var ref = [Float16]()
+            for rows in [2, 3] { for r in 0..<rows { for t in 0..<nTap { for h in 0..<H {
+                ref.append(val(t, r, h))
+            } } } }
+            let got = disp.pendingCtx
+            guard got.count == ref.count else {
+                return (false, "pendingCtx count \(got.count) != \(ref.count) (STUB?)")
+            }
+            for i in 0..<ref.count where got[i].bitPattern != ref[i].bitPattern {
+                return (false, "ctx@\(i) got=\(got[i]) ref=\(ref[i])")
+            }
+            return (true, "ok")
+        }
+
+        // Test 95: dflash_dispatch_draft_fallback
+        // (a) cold start (no ctx harvested) → draft nil (fallback contract);
+        // (b) after harvest(rows:2), draft(u:5) → exactly blockSize-1 tokens all == 7,
+        //     embedFn called with [u]++[maskId × (blockSize-1)], and a second draft with no
+        //     new harvest → nil (pendingRows == 0 rule);
+        // (c) after reset(), draft → nil again (fresh-instance state).
+        run("dflash_dispatch_draft_fallback") {
+            guard let (device, _) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            var cfg = dflashTestConfig()
+            cfg.ctxFeatureDim = 24                        // matches test 94: ctxDim = nTap(3)*tapH(8)
+            let weights = dflashTestWeights(cfg)
+            let block = 4
+            // fixed pre-generated embed output (deterministic under the seed): [block, H=64].
+            let embedOut = MLXRandom.normal([block, 64]).asType(.float16)
+            MLX.eval([embedOut])
+            var lastEmbedTokens: [Int32]? = nil
+            let embedFn: ([Int32]) -> MLXArray? = { toks in lastEmbedTokens = toks; return embedOut }
+            let logitsArgmaxFn: (MLXArray) -> [Int]? = { h in (0..<h.dim(0)).map { _ in 7 } }
+            guard let drafter = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let disp = DFlashDispatch(drafter: drafter, blockSize: block,
+                                      embedFn: embedFn, logitsArgmaxFn: logitsArgmaxFn)
+
+            // (a) cold start: no ctx harvested → nil.
+            if disp.draft(u: 3) != nil { return (false, "cold-start draft should be nil") }
+
+            // synthetic tap buffer (test-94 builder) for harvest(rows:2).
+            let nTap = 3, maxM = 4, H = 8
+            var flat = [Float16](repeating: 0, count: nTap * maxM * H)
+            for t in 0..<nTap { for r in 0..<maxM { for h in 0..<H {
+                flat[t * maxM * H + r * H + h] = Float16(t * 1000 + r * 10 + h)
+            } } }
+            guard let buf = flat.withUnsafeBytes({ p in
+                device.makeBuffer(bytes: p.baseAddress!, length: flat.count * 2, options: .storageModeShared)
+            }) else { return (false, "makeBuffer nil") }
+            disp.appendCtx(tapBuf: buf, maxM: maxM, rows: 2)
+
+            // (b) draft after harvest → blockSize-1 tokens, all == 7.
+            lastEmbedTokens = nil
+            guard let ds = disp.draft(u: 5) else { return (false, "draft returned nil (STUB)") }
+            guard ds.count == block - 1 else { return (false, "draft count \(ds.count) != \(block - 1)") }
+            if ds.contains(where: { $0 != 7 }) { return (false, "draft tokens != 7: \(ds)") }
+            let wantTokens: [Int32] = [5] + Array(repeating: Int32(cfg.maskTokenId), count: block - 1)
+            guard lastEmbedTokens == wantTokens else {
+                return (false, "embed tokens \(String(describing: lastEmbedTokens)) != \(wantTokens)")
+            }
+            // second draft without new harvest → nil (pendingRows == 0).
+            if disp.draft(u: 6) != nil { return (false, "draft without new ctx should be nil") }
+
+            // (c) reset → fresh-instance state (draft → nil again).
+            disp.reset()
+            if disp.draft(u: 7) != nil { return (false, "post-reset draft should be nil") }
             return (true, "ok")
         }
 

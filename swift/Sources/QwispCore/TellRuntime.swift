@@ -591,7 +591,13 @@ extension Tell {
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
                              isCancelled: (() -> Bool)? = nil,
-                             onToken: ((Int) -> Void)? = nil) -> [Int]? {
+                             onToken: ((Int) -> Void)? = nil,
+                             // #98 DFlash phase 3: nil-guarded seam (same contract as
+                             // mtpDraftSpan/mtpHead) — dflash nil (default) leaves every
+                             // path below byte-identical. dflashFwd is the tap source
+                             // (attachTap'd by the caller); both travel together.
+                             dflash: DFlashDispatch? = nil,
+                             dflashFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> [Int]? {
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
@@ -612,10 +618,19 @@ extension Tell {
         // greedy stream stays byte-identical while collapsing K CPU round-trips to 1.
         // Strict streaming wires no chain fn (needs a CPU turn per step to ensure/pread
         // the expert union) → nil → per-step fallback by construction. QWISP_CHAIN_K=0 opts out.
-        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+        // dflash non-nil forces chainK=0: chain steps overwrite tap row 0 per step and would
+        // starve the drafter's ctx (DFlash takes over the D==0 span instead of the chain).
+        let chainK = dflash != nil ? 0
+            : Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
+        // Tap harvest (nil-guarded): dflash inactive under A3 (guard !useA3, matches the
+        // draft-attempt guard below). tapBuf missing (not attached) → no-op.
+        func dflashHarvest(_ rows: Int) {
+            guard !useA3, let dd = dflash, let fwd = dflashFwd, let tb = fwd.tapBuf else { return }
+            dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
+        }
 
         // isCancelled nil → `?? false` → loop condition byte-identical (RAWTESTS 79/79).
         // Set by the streaming backend when the consumer drops the stream, so an
@@ -623,8 +638,14 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            let drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
+            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
                                           traceAlts: Tell.traceAltsEnabled)
+            // #98 DFlash: only when SuffixSpec found nothing (draftless span) and not under A3
+            // (dflash is inactive there — see dflashHarvest). Falls back to the old per-step
+            // path on nil (cold start / any failure), unchanged behavior.
+            if drafts.isEmpty, !useA3, let dd = dflash, let ds = dd.draft(u: u), !ds.isEmpty {
+                drafts = ds
+            }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
@@ -656,6 +677,7 @@ extension Tell {
                 } else {
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
                     out.append(u); hist.append(u)
+                    dflashHarvest(1)
                     u = evals[0]
                 }
                 continue
@@ -705,6 +727,7 @@ extension Tell {
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
                 stAccepted += p
+                dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
 
                 if p == D {
                     out.append(u); hist.append(u)
@@ -1045,6 +1068,33 @@ extension Tell {
             print("[raw-spec] NOTE: QWISP_MTP_DRAFT ignored (QWISP_RAW_A3 set — mutually exclusive)")
         }
 
+        // ── DFlash block drafter (#98 phase 3, resident tier only) ─────────
+        // Opt-in QWISP_DFLASH=1, same gating shape as QWISP_MTP_DRAFT above (resident fused
+        // tier, !useA3). Flag off / other tiers → dflash=nil → the loop below is
+        // byte-identical to pre-change (nil-guarded seam contract). Load failure never
+        // fatal — warn and run without DFlash.
+        var dflash: DFlashDispatch? = nil
+        if Tell.envFlag("QWISP_DFLASH"), let fwd = _residentFwd, fwd.streamMode == .resident, !useA3 {
+            let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
+                ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
+            if let drafter = DFlashDrafter.load(dir: URL(fileURLWithPath: dir)) {
+                let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
+                let dd = DFlashDispatch(
+                    drafter: drafter, blockSize: blockSize,
+                    embedFn: { engine.embed(tokens: $0) },
+                    logitsArgmaxFn: { h in
+                        engine.logits(h, M: h.dim(0)).map { lg in
+                            (0 ..< h.dim(0)).map { MLX.argMax(lg[$0], axis: -1).item(Int.self) }
+                        }
+                    })
+                _ = fwd.attachTap(layerIds: drafter.config.targetLayerIds)
+                dflash = dd
+                print("[raw-spec] DFlash dispatch active (block=\(blockSize))")
+            } else {
+                print("[raw-spec] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash")
+            }
+        }
+
         // reuse-rerank setup (flag-off = zero-cost nil path, notes/10 §1c-1e)
         let _useRerank = isStreaming && Tell.envFlag("QWISP_REUSE_RERANK")
         let _reuseAlpha = Double(Tell.envFloat("QWISP_REUSE_ALPHA", 0.0))
@@ -1094,7 +1144,15 @@ extension Tell {
         // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
         // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
         // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
-        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+        // dflash non-nil forces chainK=0 (same reasoning as runSpecLoop: chain steps would
+        // starve the drafter's ctx by overwriting tap row 0 every step).
+        let chainK = dflash != nil ? 0
+            : Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+        // Tap harvest (nil-guarded, mirrors runSpecLoop's dflashHarvest).
+        func dflashHarvest(_ rows: Int) {
+            guard !useA3, let dd = dflash, let fwd = _residentFwd, let tb = fwd.tapBuf else { return }
+            dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
+        }
 
         let t0 = DispatchTime.now()
 
@@ -1111,11 +1169,17 @@ extension Tell {
             //   下の verify path が必ず照合する(reject 経路は greedy と同一 token 列)ので lossless。
             //   flag off = mtpHead nil = mtpDraftSpan nil = このブロック不変(byte-identity)。
             var mtpDrafted = false
-            if D == 0, mtpHead != nil, pending.isEmpty,
+            if D == 0, dflash == nil, mtpHead != nil, pending.isEmpty,
                let d = mtpDraftSpan(head: mtpHead, hPrevBuf: _residentFwd?.normedBuffer,
                                     rowOfU: rowOfU, u: u) {
                 drafts = [d]; D = 1
                 mtpDrafted = true
+            }
+
+            // #98 DFlash: same slot as mtpDraftSpan above (dflash replaces it when active —
+            // the two flags are mutually exclusive by construction, dflash takes priority).
+            if D == 0, let dd = dflash, !useA3, let ds = dd.draft(u: u), !ds.isEmpty {
+                drafts = ds; D = drafts.count
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
@@ -1175,6 +1239,7 @@ extension Tell {
                     guard let evals = backend.stepArgmax([Int32(u)])
                     else { return "[raw-spec] ERROR: step(D=0) nil" }
                     out.append(u); hist.append(u)
+                    dflashHarvest(1)
                     u = evals[0]
                     rowOfU = 0
                 }
@@ -1240,7 +1305,7 @@ extension Tell {
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
-
+                dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
 
                 if p == D {
                     // ── full accept ───────────────────────────────────────
