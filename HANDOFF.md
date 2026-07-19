@@ -1,4 +1,4 @@
-# HANDOFF: #98 A1 CLOSED-NEGATIVE (fused CB shipped, fusion hypothesis falsified) — PR #115 open; next: owner decision (fused drafter kernel devloop vs park #98)
+# HANDOFF: #98 A1 drafter SOLVED (fmm16, 13.4ms) but aggregate still loses — corrected economics: next go/no-go = prefill-ctx bootstrap (accept lever). PR #115 open
 Date: 2026-07-19 | Status: DECISION-PENDING | Branch: claude/issue98-dflash-rawdrafter | Root: /Users/penta2himajin/repos/qwisp
 
 > STOP: Before trusting anything below, run the checks in "Verify First".
@@ -7,50 +7,52 @@ Date: 2026-07-19 | Status: DECISION-PENDING | Branch: claude/issue98-dflash-rawd
 
 ## Verify First
 - `git branch --show-current` → `claude/issue98-dflash-rawdrafter`; `git status` → clean.
-- `git log --oneline -2` → `059699c` chore(profraw) on `a99afe3` probe(dflash) fused CB. main == `fadae32`.
-- PR #115 OPEN (ready) → merge on green review; RAWTESTS **98/98** (total=98 guard now), COMPTEST 33/33, TOKTEST 5/5, BENCHBATCH PASS — all verified this session on a fresh binary.
-- `brew services info qwisp | head -2` → Running: true (stop before ANY GPU run; start after).
-- Model artifacts unchanged: `~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`, drafter `~/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash/`.
+- `git log --oneline -1` → `2d120fe` feat(dflash) dflash_fmm16. main == `fadae32`.
+- PR #115 OPEN (ready, title mentions fmm16); gates verified this session: RAWTESTS **98/98**, BENCHBATCH PASS, COMPTEST 33/33, TOKTEST 5/5.
+- `brew services info qwisp | head -2` → Running: true (STOP before ANY GPU run; check `ps aux | grep -E "qwisp serve|qwisp-poc"` first — user asked for a GPU-process check before every GPU run).
 
-## Next Action
-1. Merge PR #115 on green (default-OFF, correctness-neutral, all gates green).
-2. OWNER DECISION on #98: (a) fused drafter layer kernel devloop (verify-class Metal fusion; est. drafter ~10-16ms/block → code ~90-105 tok/s vs 82.7 = +10-25%; devloop-scale) or (b) PARK #98 at the seam+record and pick another workstream (default per earlier queue: batching #6; also parked: #112 stable-prefix persist = devloop-1-loop size, QAD finetune recon 5-min first step).
+## Current Numbers (N=128 resident, M1 Max 64GB)
+- fused DFlash: code **52.9** / agentic 50.8 / longctx 58.9 / shortnl 27.9 — all 128/128 lossless.
+- flag-off: 82.7 / 76.0 / 90.5 / 81.9. DFlash loses on aggregate in every regime.
+- drafter CB in-loop 13.4ms (c_draft ≈ 1.1×F, F=12.1ms); standalone 7ms; kernel probe: lm_head 622MB f16 3.25ms/191GB/s, dependent chain 0.055ms/GEMM.
 
-## A1 Verdict (measured 2026-07-19, full record = issue #98 comment + commit a99afe3)
-- flag-off code 82.7 tok/s vs fused DFlash 32.2 (agentic 26.3 / longctx 44.3 / shortnl 15.0). Lossless 128/128 × 4 regimes with fusion ON.
-- FALSIFIED (do not re-propose): ① CPU-round-trip/CB-context as drafter cost (fusion bought ~2 tok/s; drafter slow even first-in-CB while verify section of SAME CB fast) ② GPU clock ramp (in-CB high-occupancy ballast ran slow itself +34ms, sped up nothing) ③ buffer provenance (Metal-owned copies = noCopy aliases, 39ms both) ④ MPS granularity (~0.5-1ms/encode; ≥44 calls/block ⇒ floor 25-45ms > ≤15ms bar).
-- Stage split (ctx=1): SDPA ≈2ms; lm_head ≈33-36ms and layers ≈20-24ms REGARDLESS of implementation (qmm4_tiled ≙ MPS f16; hand-rolled ≙ MPS) — dispatch-granularity-bound, not kernel-choice-bound.
-- KILLER ARITHMETIC: at drafter ~110ms/block even p=7/7 every block = 71 tok/s < 82.7 flag-off. Fused drafter kernel is PREREQUISITE to any dflash win, not an optimization.
+## THE CORRECTED COST MODEL (memorize this; the old projection was wrong)
+cost/tok = (c_draft + r_8 + P_rej·r_(p̄+1) + cpu) / T, in units of F=12.1ms.
+- r_8 ≈ 3.2 (verify M=8 = 38.7ms — round-3 economics misread this as ~12ms).
+- P_rej·r_(p̄+1) ≈ 19.4ms/block at code (partial-reject rebuild; OMITTED from the
+  original #98 projection "95-105 tok/s" — that number was wrong).
+- Aggregate code T=4.19 ⇒ even c_draft=0 loses (62ms > 50.7 parity). Measured 52.9 fits the model.
+- Steady tail (ctx>60) T≈6 ⇒ parity..+8% now; ~+15% at c_draft 0.5.
+⇒ THE DRAFTER IS NO LONGER THE BOTTLENECK. Binding constraints: cold-start ctx (aggregate T) and the structural r_8+rebuild cost.
 
-## What Shipped (branch, PR #115)
-- Fused draft+verify seam: `stepArgmax(draftPrologue:draftTokensBuf:)` additive (default nil = byte-identical, resident-only); drafter prologue → blit draft ids → M-row verify in ONE CB, one readback. `DFlashDispatch.draftFused`; fused-first in runSpecLoop + raw-spec bench loop (snapshot BEFORE fused step). `QWISP_DFLASH_NOFUSE=1` = split-path A/B.
-- `DFlashRawDrafter`: prepare()/encode(cb:)/finish() split; GEMMs = MPSMatrixMultiplication; lm_head = dequantized f16 (+0.6GB, resident-only); ctx path per-row M=1 GEMMs (batched MPS is NOT byte-M-invariant → would break locked 97); weights COPIED to Metal-owned buffers (noCopy obligation dropped); dflash_fmm_tiled kernel deleted (falsified).
-- Locked test 98 `dflash_fused_draft_verify`: fused ≡ split bit-equal (drafts/evals/KV/GDN). total=98.
+## Next Action (owner picked "kernel" branch this session; now a new fork)
+1. Merge PR #115 on green (still valid: default-OFF, all gates green, big kernel + record).
+2. NEXT GO/NO-GO: **prefill-ctx bootstrap prototype** — feed prompt-derived ctx rows to the drafter at block 1 so aggregate T reaches the steady 5.6-6. Ceiling if it works: code ~75-90 / longctx ~85-100 vs 82.7/90.5 ⇒ win only if aggregate T ≥ ~5.5. If bootstrap fails → #98 parks as "shipped opt-in, default OFF, loses on aggregate".
+3. Secondary (only if bootstrap greens): drafter polish 13.4→~7ms (fuse small ops, argmax tune) = +3-4 tok/s class; hysteresis dispatch (shortnl auto-off) before any default-ON talk.
+4. Probably NO-GO (check before attempting): rebuild-avoidance via partial GDN rewind — needs per-row GDN state snapshots (same physics as spec-gdn-incompat).
+
+## What Shipped This Session (branch, PR #115; commits a99afe3 + 2d120fe)
+- Fused draft+verify seam (stepArgmax additive draftPrologue/draftTokensBuf; DFlashDispatch.draftFused; QWISP_DFLASH_NOFUSE A/B; locked test 98; total=98).
+- dflash_fmm16 kernel (qmv-class f16 M-row GEMM, M-invariant by construction ⇒ ctx batching legal under locked-97; MPS deleted; ONE encoder).
+- lm_head dequant f16 (+0.6GB resident-only); drafter weights copied to Metal-owned buffers.
+- Probes: QWISP_RUN=dflash-gemm-bench (kernel bw), dflash-raw-bench (forward), QWISP_DFLASH_TRACE ([dflash-fused-time]/[dflash-raw-time]/[dflash-trace]).
+
+## Falsified / Closed (do not re-propose — full trail in #98 comments 2026-07-19 ×3)
+- CPU-round-trip/CB-context as drafter cost; GPU clock ramp (2nd kill); buffer provenance (noCopy vs copied); allocation granularity (slab vs separate); memory pressure (91% free); MPS granularity (~0.5-1ms/encode); fmm_rows/fmm_tiled kernel shapes (35GB/s class); qmm4_tiled barrier-tree at drafter shapes (33ms); per-row `.item()`; MLX drafter as shipping path; block=16; sliding ring-buffer v1.
+- "Mystery in-loop tax": NEVER EXISTED — it was kernel bandwidth + MPS overhead + misreading r_8 as 12ms.
 
 ## Commands
 - build: `cd swift && xcodebuild build -scheme qwisp-poc -configuration Release -destination 'platform=macOS' -derivedDataPath ./.xcode-build-rel -skipPackagePluginValidation`
-- gates: `scripts/test_raw.sh` (98/98) / `scripts/test_completion.sh` 33/33 / `scripts/test_tokenizer.sh` 5/5 / `scripts/test_bench_batch.sh` PASS
-- bench: `QWISP_DFLASH=1 QWISP_GEN=128 QWISP_RUN=raw-spec QWISP_MTP_REF=refs/resident/code.safetensors swift/.xcode-build-rel/Build/Products/Release/qwisp-poc stream` (+`QWISP_DFLASH_TRACE=1` → [dflash-fused-time]/[dflash-trace]; `QWISP_DFLASH_NOFUSE=1` → split + [dflash-raw-time]; `QWISP_DFLASH_MLX=1` → MLX drafter)
-- drafter micro-bench: `QWISP_RUN=dflash-raw-bench` (back-to-back, synthetic V=8192 head, ~39ms steady)
+- gates: scripts/test_raw.sh (98/98) / test_completion.sh 33/33 / test_tokenizer.sh 5/5 / test_bench_batch.sh PASS
+- bench: `QWISP_DFLASH=1 QWISP_GEN=128 QWISP_RUN=raw-spec QWISP_MTP_REF=refs/resident/{code,agentic,longctx,shortnl}.safetensors .../qwisp-poc stream`
 
 ## Do Not Touch
-- `swift/Sources/QwispCore/SeedlessVerifyTests.swift`: WRITE-LOCKED (total=98 guard).
-- Frozen forward path: additive nil-guarded seams only (stepArgmax prologue params are the precedent-conform additive seam).
-- `refs/*.safetensors`: raw greedy only. `refs/resident/*` = N=128 G-D refs (exist locally).
-- Never two GPU processes (incl. brew service).
+- SeedlessVerifyTests.swift WRITE-LOCKED (total=98). Frozen forward path: additive nil-guarded seams only. refs/* raw-greedy only. Never two GPU processes; ps-check before every GPU run (user instruction this session).
 
-## Decisions / Doctrine added this session
-- Batched MPS GEMM output is NOT M-invariant at the byte level → any variable-M path feeding a byte-stable cache must be per-row M=1 (locked 97 contract).
-- Generic dispatch backends (MLX graph / hand-rolled simple kernels / MPS) all land 40-190ms for a 6-layer dense M=8 drafter forward; verify-class fused kernels (~25µs/dispatch) are the only demonstrated regime meeting ≤15ms. Kernel fusion investment is the price of admission for small-model raw forwards on this engine.
-
-## Gotchas & Blockers (carried + new)
-- Workflow args serialization flake → hardcode args in script file, launch via {scriptPath} (workaround proven).
-- Bench N caps at ref spec_greedy length (refs/resident/* = 128).
-- Rate limits were 5h 96% / 7d 64% at PREVIOUS session end; this session ran driver-only (no devloops). Check /status before starting a kernel devloop.
-- SourceKit "No such module MLX" = LSP noise; xcodebuild is truth.
-- zsh: `===` in a compound command errors ("== not found") — quote or avoid.
+## Gotchas
+- Workflow args flake → hardcode in script file + {scriptPath}. Bench N caps at ref length (resident=128). SourceKit MLX noise. zsh `===` errors. Rate limits: check /status before devloops (this session ran driver-only).
 
 ## Pointers
-- swift/Sources/QwispCore/DFlashRawDrafter.swift (MPS drafter + prepare/encode/finish), DFlashDispatch.swift#draftFused, SeedlessFusedVerify.swift#stepArgmax (fused seam), TellRuntime.swift (fused-first wiring both loops).
-- Full measured trail: issue #98 comments (2026-07-19 ×2), PRs #109-#115.
-- Parked: #112 stable-prefix persist (user-approved design); QAD finetune recon (check z-lab training-code publication first, ~5min).
+- DFlashRawDrafter.swift (fmm16 kernel + prepare/encode/finish + gemmBench), DFlashDispatch.swift#draftFused, SeedlessFusedVerify.swift#stepArgmax seam, TellRuntime.swift fused-first wiring.
+- Cost-model discussion + ceiling table: issue #98 comment (round 4). PRs #109-#115.
+- Parked: #112 stable-prefix persist; QAD finetune recon (z-lab training code check, ~5min); batching #6.
