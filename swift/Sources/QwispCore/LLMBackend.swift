@@ -120,14 +120,33 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     private static func makeDFlash(engine: SeedlessEngine) -> DFlashDispatch? {
         let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
             ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
-        guard let drafter = DFlashDrafter.load(dir: URL(fileURLWithPath: dir)) else {
+        // #98 phase A1: Tell.loadDFlashConfigAndWeights (public-API-only re-derivation of what
+        // the frozen DFlashDrafter.load(dir:) does internally — needed here because both the
+        // MLX and raw drafters must share the identical weights dict).
+        guard let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)),
+              let drafter = DFlashDrafter(config: cfg, weights: weights)
+        else {
             FileHandle.standardError.write(Data(
                 "[qwisp] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash\n".utf8))
             return nil
         }
         let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
+        // Raw-first draft path (#98 phase A1): same weights, dispatch's own blockSize (may
+        // differ from the checkpoint's dflash_config.block_size). Load/attach failure → raw
+        // stays nil → DFlashDispatch.draft() runs MLX-only (warn once, not fatal).
+        var rawCfg = cfg
+        rawCfg.blockSize = blockSize
+        var raw = DFlashRawDrafter(config: rawCfg, weights: weights)
+        if let r = raw, !r.attachTargetHead(embedW: engine.embedW, embedS: engine.embedS, embedB: engine.embedB,
+                                            lmW: engine.lmW, lmS: engine.lmS, lmB: engine.lmB, vocab: engine.vocab) {
+            raw = nil
+        }
+        if raw == nil {
+            FileHandle.standardError.write(Data(
+                "[qwisp] WARN: DFlashRawDrafter init/attach failed — MLX-only drafter path\n".utf8))
+        }
         return DFlashDispatch(
-            drafter: drafter, blockSize: blockSize,
+            drafter: drafter, raw: raw, blockSize: blockSize,
             embedFn: { engine.embed(tokens: $0) },
             logitsArgmaxFn: { h in
                 // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax (see

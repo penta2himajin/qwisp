@@ -15,6 +15,11 @@ import Metal
 ///
 public final class DFlashDispatch {
     let drafter: DFlashDrafter
+    // #98 phase A1: raw-first draft path. nil ⇒ MLX-only (load/attach failure, or the
+    // caller never built one). QWISP_DFLASH_MLX=1 forces the MLX path even when raw is
+    // available (A/B measurement seam). Raw returns nil past its v1 ctx cap (4095 committed
+    // rows) or once attachTargetHead was never called — draft() falls back to MLX either way.
+    var raw: DFlashRawDrafter?
     var caches: [DFlashKVCache]
     let blockSize: Int                          // QWISP_DFLASH_BLOCK, default 8
     let maskId: Int32                           // drafter.config.maskTokenId
@@ -27,10 +32,11 @@ public final class DFlashDispatch {
     private(set) var pendingRows: Int = 0
     private(set) var ctxRowsFed: Int = 0        // total ctx rows in drafter cache
 
-    public init(drafter: DFlashDrafter, blockSize: Int,
+    public init(drafter: DFlashDrafter, raw: DFlashRawDrafter? = nil, blockSize: Int,
                 embedFn: @escaping ([Int32]) -> MLXArray?,
                 logitsArgmaxFn: @escaping (MLXArray) -> [Int]?) {
         self.drafter = drafter
+        self.raw = raw
         self.caches = drafter.makeCaches()
         self.blockSize = blockSize
         self.maskId = Int32(drafter.config.maskTokenId)
@@ -64,6 +70,16 @@ public final class DFlashDispatch {
     /// collapse to the same `pendingRows == 0` check.
     public func draft(u: Int) -> [Int]? {
         guard pendingRows > 0 else { return nil }
+        // Raw-first (#98 phase A1): try the one-CB raw forward before the MLX path. nil
+        // (attach missing, or v1 ctx-cap exceeded) falls through to MLX unchanged — pendingCtx
+        // is untouched until whichever path actually consumes it.
+        if let raw, !Tell.envFlag("QWISP_DFLASH_MLX"),
+           let ids = raw.forward(u: Int32(u), ctxRows: pendingCtx, ctxCount: pendingRows) {
+            ctxRowsFed += pendingRows
+            pendingCtx = []
+            pendingRows = 0
+            return ids
+        }
         let tokens: [Int32] = [Int32(u)] + Array(repeating: maskId, count: blockSize - 1)
         guard let embedded = embedFn(tokens) else { return nil }
         let noise = embedded.reshaped([1, blockSize, -1])
@@ -84,6 +100,7 @@ public final class DFlashDispatch {
     /// Fresh caches, clears pending/ctxRowsFed (new request/segment).
     public func reset() {
         caches = drafter.makeCaches()
+        raw?.reset()
         pendingCtx = []
         pendingRows = 0
         ctxRowsFed = 0

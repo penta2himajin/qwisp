@@ -16,6 +16,25 @@ import MLXFast
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
 extension Tell {
 
+    /// #98 phase A1: config.json + safetensors load, mirroring DFlashDrafter.load(dir:)'s
+    /// internals (that frozen helper doesn't expose the parsed config/weights, and both the
+    /// MLX and raw drafters need to share the identical weights dict). Public-API-only —
+    /// does not touch DFlashDrafter.swift.
+    static func loadDFlashConfigAndWeights(dir: URL) -> (DFlashDrafterConfig, [String: MLXArray])? {
+        guard let cfg = try? DFlashDrafterConfig.load(configJSON: dir.appendingPathComponent("config.json")),
+              let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return nil }
+        var weights: [String: MLXArray] = [:]
+        for url in entries where url.pathExtension == "safetensors" {
+            guard let m = try? loadArrays(url: url) else { return nil }
+            for (k, v) in m {
+                let stripped = k.hasPrefix("model.") ? String(k.dropFirst("model.".count)) : k
+                weights[stripped] = v
+            }
+        }
+        return (cfg, weights)
+    }
+
     /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
     /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
     /// 明示 env(QWISP_BOLT_RECALIB_R/QWISP_BOLT_REFRESH_B)が常にこの preset を上書きする。
@@ -1077,10 +1096,21 @@ extension Tell {
         if Tell.envFlag("QWISP_DFLASH"), let fwd = _residentFwd, fwd.streamMode == .resident, !useA3 {
             let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
                 ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
-            if let drafter = DFlashDrafter.load(dir: URL(fileURLWithPath: dir)) {
+            // #98 phase A1: load config+weights once (public-API-only re-derivation of what
+            // DFlashDrafter.load(dir:) does internally — that frozen helper doesn't expose
+            // them, and both the MLX and raw drafters need to share the same weights dict).
+            if let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)),
+               let drafter = DFlashDrafter(config: cfg, weights: weights) {
                 let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
+                var rawCfg = cfg
+                rawCfg.blockSize = blockSize
+                var raw = DFlashRawDrafter(config: rawCfg, weights: weights)
+                if let r = raw, !r.attachTargetHead(embedW: engine.embedW, embedS: engine.embedS, embedB: engine.embedB,
+                                                    lmW: engine.lmW, lmS: engine.lmS, lmB: engine.lmB, vocab: engine.vocab) {
+                    raw = nil
+                }
                 let dd = DFlashDispatch(
-                    drafter: drafter, blockSize: blockSize,
+                    drafter: drafter, raw: raw, blockSize: blockSize,
                     embedFn: { engine.embed(tokens: $0) },
                     logitsArgmaxFn: { h in
                         // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax —
@@ -1093,7 +1123,7 @@ extension Tell {
                     })
                 _ = fwd.attachTap(layerIds: drafter.config.targetLayerIds)
                 dflash = dd
-                print("[raw-spec] DFlash dispatch active (block=\(blockSize))")
+                print("[raw-spec] DFlash dispatch active (block=\(blockSize), raw=\(raw != nil))")
             } else {
                 print("[raw-spec] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash")
             }
