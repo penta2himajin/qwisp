@@ -42,6 +42,47 @@ public enum SeedlessVerifyTests {
                 "max|Δ|=\(maxDiff) first@idx=\(firstIdx) got=\(aArr[firstIdx]) ref=\(bArr[firstIdx])")
     }
 
+    // ── DFlash drafter (#98) synthetic fixtures ───────────────────────────
+    // Small synthetic config shared by locked tests 92-93: 4 layers = 3 sliding
+    // + 1 full (sliding BEFORE full, matching the real model's order).
+
+    static func dflashTestConfig() -> DFlashDrafterConfig {
+        DFlashDrafterConfig(
+            hiddenSize: 64, numLayers: 4, numHeads: 4, numKVHeads: 2,
+            headDim: 16, mlpDim: 128, vocabSize: 256, rmsEps: 1e-6, ropeTheta: 1e4,
+            layerTypes: [true, true, true, false], slidingWindow: 8, blockSize: 16,
+            targetLayerIds: [0, 1, 2], maskTokenId: 0, ctxFeatureDim: 96)
+    }
+
+    /// Synthetic f16 weights with ALL keys of the checkpoint naming scheme, so
+    /// `DFlashDrafter.init?` exercises the full mapping. Materialised (eval) so every
+    /// drafter built from the returned dict shares byte-identical values.
+    static func dflashTestWeights(_ c: DFlashDrafterConfig) -> [String: MLXArray] {
+        func n(_ shape: [Int]) -> MLXArray { MLXRandom.normal(shape).asType(.float16) }
+        var w: [String: MLXArray] = [:]
+        w["fc.weight"] = n([c.hiddenSize, c.ctxFeatureDim])
+        w["hidden_norm.weight"] = n([c.hiddenSize])
+        w["norm.weight"] = n([c.hiddenSize])
+        let qOut = c.numHeads * c.headDim
+        let kvOut = c.numKVHeads * c.headDim
+        for i in 0 ..< c.numLayers {
+            let p = "layers.\(i)."
+            w[p + "self_attn.q_proj.weight"] = n([qOut, c.hiddenSize])
+            w[p + "self_attn.k_proj.weight"] = n([kvOut, c.hiddenSize])
+            w[p + "self_attn.v_proj.weight"] = n([kvOut, c.hiddenSize])
+            w[p + "self_attn.o_proj.weight"] = n([c.hiddenSize, qOut])
+            w[p + "self_attn.q_norm.weight"] = n([c.headDim])
+            w[p + "self_attn.k_norm.weight"] = n([c.headDim])
+            w[p + "mlp.gate_proj.weight"] = n([c.mlpDim, c.hiddenSize])
+            w[p + "mlp.up_proj.weight"] = n([c.mlpDim, c.hiddenSize])
+            w[p + "mlp.down_proj.weight"] = n([c.hiddenSize, c.mlpDim])
+            w[p + "input_layernorm.weight"] = n([c.hiddenSize])
+            w[p + "post_attention_layernorm.weight"] = n([c.hiddenSize])
+        }
+        MLX.eval(Array(w.values))
+        return w
+    }
+
     // ── Main suite ────────────────────────────────────────────────────────
 
     public static func runAll() -> String {
@@ -49,7 +90,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 91
+        let total = 93
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5565,6 +5606,78 @@ public enum SeedlessVerifyTests {
             if !row0.contains(where: { $0 != Float16(0) }) {
                 return (false, "tap slot for layer 5 all-zeros — copy did not fire")
             }
+            return (true, "ok")
+        }
+
+        // ── DFlash drafter (#98) locked tests ─────────────────────────────
+
+        // Test 92: dflash_drafter_bitrepro (issue #98 G-A)
+        // Two independent drafters from the SAME weights + same inputs, fresh caches each →
+        // byte-identical output (Float16 bitPattern) AND shape [1,4,64]. Then re-run on
+        // instance 1 with ANOTHER fresh cache set → byte-identical to the first (run-to-run
+        // determinism incl. cache-state independence).
+        run("dflash_drafter_bitrepro") {
+            let cfg = dflashTestConfig()
+            let weights = dflashTestWeights(cfg)
+            let noise = MLXRandom.normal([1, 4, 64]).asType(.float16)
+            let ctx   = MLXRandom.normal([1, 5, 96]).asType(.float16)
+            MLX.eval([noise, ctx])
+            guard let d1 = DFlashDrafter(config: cfg, weights: weights),
+                  let d2 = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let o1 = d1.forward(noise: noise, ctx: ctx, caches: d1.makeCaches())
+            let o2 = d2.forward(noise: noise, ctx: ctx, caches: d2.makeCaches())
+            MLX.eval([o1, o2])
+            guard o1.shape == [1, 4, 64] else { return (false, "shape \(o1.shape) != [1,4,64]") }
+            let (eq, detail) = bitEqual(o1, o2)
+            if !eq { return (false, "two-instance mismatch: \(detail)") }
+            // Re-run on instance 1 with a fresh cache set: must match run 1 exactly.
+            let o1b = d1.forward(noise: noise, ctx: ctx, caches: d1.makeCaches())
+            MLX.eval([o1b])
+            let (eq2, d2t) = bitEqual(o1, o1b)
+            if !eq2 { return (false, "run-to-run mismatch: \(d2t)") }
+            return (true, "ok")
+        }
+
+        // Test 93: dflash_drafter_cache_consistency
+        // (a) ctx-accumulation equivalence: two-step ctx == one-shot concat(ctx1,ctx2)
+        //     (total ctx 5 <= window-1 = 7, so no crop/eviction; .causal branch identical).
+        // (b) trim rollback: forward → trimTo(pre-call offset) → same forward == first run.
+        run("dflash_drafter_cache_consistency") {
+            let cfg = dflashTestConfig()
+            let weights = dflashTestWeights(cfg)
+            let noise1 = MLXRandom.normal([1, 2, 64]).asType(.float16)
+            let ctx1   = MLXRandom.normal([1, 3, 96]).asType(.float16)
+            let noise2 = MLXRandom.normal([1, 2, 64]).asType(.float16)
+            let ctx2   = MLXRandom.normal([1, 2, 96]).asType(.float16)
+            MLX.eval([noise1, ctx1, noise2, ctx2])
+
+            // (a) two-step accumulation vs one-shot concatenated ctx.
+            guard let dA = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let cachesA = dA.makeCaches()
+            _ = dA.forward(noise: noise1, ctx: ctx1, caches: cachesA)   // primes caches with ctx1
+            let outStep = dA.forward(noise: noise2, ctx: ctx2, caches: cachesA)
+            guard let dB = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let ctxFull = MLX.concatenated([ctx1, ctx2], axis: 1)       // [1,5,96]
+            let outOneShot = dB.forward(noise: noise2, ctx: ctxFull, caches: dB.makeCaches())
+            MLX.eval([outStep, outOneShot])
+            let (eqA, dtA) = bitEqual(outStep, outOneShot)
+            if !eqA { return (false, "ctx-accumulation mismatch: \(dtA)") }
+
+            // (b) trim rollback restores cache state exactly.
+            guard let dC = DFlashDrafter(config: cfg, weights: weights)
+            else { return (false, "DFlashDrafter init returned nil (STUB)") }
+            let cachesC = dC.makeCaches()
+            guard !cachesC.isEmpty else { return (false, "makeCaches empty") }
+            let committed = cachesC[0].offset                          // pre-call offset (0)
+            let firstRun = dC.forward(noise: noise1, ctx: ctx1, caches: cachesC)
+            dC.trimTo(committed: committed, caches: cachesC)
+            let secondRun = dC.forward(noise: noise1, ctx: ctx1, caches: cachesC)
+            MLX.eval([firstRun, secondRun])
+            let (eqB, dtB) = bitEqual(firstRun, secondRun)
+            if !eqB { return (false, "trim rollback mismatch: \(dtB)") }
             return (true, "ok")
         }
 
