@@ -237,6 +237,60 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // #117 gate: PREFIXE2E for the RAM tier. Interleaved conversations — A cold, B cold
+    // (unrelated → replaces A's arena path), then A extended: the third request must
+    // restore A's whole-conversation state from the RAM store (prefixRAMHits asserts the
+    // restore actually fired) and stream byte-identical to the cache-off path. A fourth
+    // request extends the third: the in-path slot now ties the RAM entry, so the gain
+    // guard (>512 tok) must keep the cheap in-path restore (hits stays 1).
+    public static func prefixRAME2E(modelDir: String) -> String {
+        let ec = Tell.envInt("QWISP_PREFIX_E2E_C", 0)
+        let tier: SeedlessTier = ec > 0 ? .streaming(c: ec) : .auto
+        guard let backend = try? SeedlessBackend(modelDir: modelDir, tier: tier) else { return "[prefix-ram-e2e] load fail\nPREFIXRAME2E FAIL" }
+        if ec > 0 { backend.losslessForced = true }
+        setenv("QWISP_PREFIX_RAM_MB", "512", 1)      // force the tier ON (streaming defaults OFF)
+        defer { unsetenv("QWISP_PREFIX_RAM_MB") }
+
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let cA = toks(700, 1)                        // conv A (700 > the 512-tok gain guard)
+        let cB = toks(700, 2)                        // conv B, no shared prefix
+        let cA2 = cA + toks(40, 3)                   // A continues after the switch
+        let cA3 = cA2 + toks(40, 4)                  // A continues in-path (RAM must NOT fire)
+        func req(_ content: [Int]) -> (prompt: [Int], cl: Int) { (content + toks(8, 777), content.count) }
+        let reqs = [req(cA), req(cB), req(cA2), req(cA3)]
+        let maxTok = 24
+
+        final class Box: @unchecked Sendable { var v: [Int] = [] }
+        func gen(_ p: [Int], _ cl: Int) -> [Int] {
+            let box = Box()
+            let sem = DispatchSemaphore(value: 0)
+            let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
+            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            sem.wait()
+            return box.v
+        }
+
+        backend.prefixCacheForced = false
+        let ref = reqs.map { gen($0.prompt, $0.cl) }
+        backend.prefixCacheForced = true
+        backend.resetPrefixCache()
+        var hitsAfter: [Int] = []
+        let got = reqs.map { r in let g = gen(r.prompt, r.cl); hitsAfter.append(backend.prefixRAMHits); return g }
+
+        var lines = ["[prefix-ram-e2e] A cold / B cold / A-extend (RAM restore) / A-extend (in-path), maxTok=\(maxTok), tier=\(ec > 0 ? "streaming C=\(ec)" : "resident")"]
+        var pass = true
+        let labels = ["R1 A cold    ", "R2 B switch  ", "R3 A ram-hit ", "R4 A in-path "]
+        let wantHits = [0, 0, 1, 1]
+        for i in 0..<reqs.count {
+            let ok = ref[i] == got[i] && hitsAfter[i] == wantHits[i]
+            pass = pass && ok
+            lines.append("  \(labels[i])  ref=\(ref[i].count)tok  cached=\(got[i].count)tok  ramHits=\(hitsAfter[i]) (want \(wantHits[i]))  \(ok ? "IDENTICAL ✅" : "DIVERGE ❌")")
+            if ref[i] != got[i] { lines.append("    ref   : \(ref[i].prefix(12))"); lines.append("    cached: \(got[i].prefix(12))") }
+        }
+        lines.append("PREFIXRAME2E \(pass ? "PASS" : "FAIL")")
+        return lines.joined(separator: "\n")
+    }
+
     // #76 gate (bolt side): bolt-mode decode with the in-RAM prompt-prefix blob
     // (QWISP_BOLT_PREFIX) vs without must be byte-identical. Two INDEPENDENT backends
     // (own BoltServe, own arena) are fed the same request sequence so per-process calib

@@ -157,3 +157,75 @@ public enum PrefixPersist {
         return checks
     }
 }
+
+// RAM tier for the cross-request prefix cache (issue #117): interleaved conversations
+// (OpenCode title-gen / tabs / sub-sessions) thrash the single-path in-arena cache — every
+// switch re-prefills everything past the shared harness prefix (measured reuse 4–52%,
+// TTFT up to 7 min on a 49K prompt). This store keeps whole-conversation decode states
+// (SeedlessFusedForward.persistentStateData blobs — path-independent, unlike FullSnapshot's
+// KV-length-only restore points) in RAM, keyed by token content, LRU-evicted by byte
+// budget. No disk writes — the SSD-wear objection that keeps #89 opt-in does not apply.
+public struct PrefixRAMStore {
+    public var budget: Int                                    // bytes; 0 = disabled
+    // MRU-first; an entry ≈ 24KB/token (attention KV used slice + GDN state).
+    var entries: [(tokens: [Int32], state: Data)] = []
+    public init(budget: Int = 0) { self.budget = budget }
+    var bytes: Int { entries.reduce(0) { $0 + $1.state.count } }
+
+    /// Store one content-boundary state. Entries that are a prefix of `tokens` (earlier
+    /// turns of the same conversation, or the same key) are superseded and dropped.
+    public mutating func save(tokens: [Int32], state: Data) {
+        guard budget > 0, !tokens.isEmpty, state.count <= budget else { return }
+        entries.removeAll { $0.tokens.count <= tokens.count
+            && Array(tokens[0 ..< $0.tokens.count]) == $0.tokens }
+        entries.insert((tokens, state), at: 0)
+        while bytes > budget { entries.removeLast() }
+    }
+
+    /// The stored entry whose token sequence is the LONGEST prefix of `content`; touches LRU.
+    public mutating func bestMatch(content: [Int32]) -> (tokens: [Int32], state: Data)? {
+        var best = -1
+        for i in entries.indices
+        where entries[i].tokens.count <= content.count
+            && (best < 0 || entries[i].tokens.count > entries[best].tokens.count)
+            && Array(content[0 ..< entries[i].tokens.count]) == entries[i].tokens {
+            best = i
+        }
+        guard best >= 0 else { return nil }
+        let e = entries.remove(at: best)
+        entries.insert(e, at: 0)
+        return e
+    }
+
+    public mutating func removeAll() { entries.removeAll() }
+
+    /// Pure self-check (no GPU): longest match, supersede, LRU byte eviction, budget gates.
+    public static func selfCheck() -> [(String, Bool)] {
+        func blob(_ n: Int, _ b: UInt8) -> Data { Data(repeating: b, count: n) }
+        var s = PrefixRAMStore(budget: 1000)
+        let a: [Int32] = [1, 2, 3, 4], a2: [Int32] = [1, 2, 3, 4, 5, 6], b: [Int32] = [9, 8, 7]
+        s.save(tokens: a, state: blob(100, 1))
+        s.save(tokens: b, state: blob(100, 2))
+        s.save(tokens: a2, state: blob(100, 3))                   // supersedes a
+        var checks: [(String, Bool)] = [
+            ("supersede_prefix", s.entries.count == 2),
+            ("longest_prefix", s.bestMatch(content: a2 + [7])?.state == blob(100, 3)),
+            ("miss_after_supersede", s.bestMatch(content: [1, 2, 3, 4, 99]) == nil),
+            ("unrelated_kept", s.bestMatch(content: b + [0])?.state == blob(100, 2)),
+            ("miss_diverge", s.bestMatch(content: [42]) == nil),
+        ]
+        var l = PrefixRAMStore(budget: 250)
+        l.save(tokens: [1], state: blob(100, 1))
+        l.save(tokens: [2], state: blob(100, 2))
+        _ = l.bestMatch(content: [1])                             // touch [1] → MRU
+        l.save(tokens: [3], state: blob(100, 3))                  // 300 > 250 → evict LRU = [2]
+        checks.append(("lru_evict_touched_kept", l.bestMatch(content: [2]) == nil && l.bestMatch(content: [1]) != nil))
+        var d = PrefixRAMStore(budget: 0)
+        d.save(tokens: [1], state: blob(10, 1))
+        checks.append(("disabled_budget0", d.bestMatch(content: [1]) == nil))
+        var o = PrefixRAMStore(budget: 100)
+        o.save(tokens: [1], state: blob(200, 1))                  // entry larger than the whole budget
+        checks.append(("oversize_skip", o.bestMatch(content: [1]) == nil))
+        return checks
+    }
+}
