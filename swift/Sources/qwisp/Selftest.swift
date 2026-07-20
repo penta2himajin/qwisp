@@ -95,6 +95,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // prefix-cache disk persistence (issue #89; pure tmp-dir store checks, no GPU).
     for (name, ok) in PrefixPersist.selfCheck() { check("prefixpersist_\(name)", ok) }
 
+    // prefix-cache RAM tier (issue #117; pure keyed-store checks, no GPU).
+    for (name, ok) in PrefixRAMStore.selfCheck() { check("prefixram_\(name)", ok) }
+
     // continuous-batching scheduler (issue #6; pure logic over a scripted fake engine).
     for (name, ok) in ContinuousScheduler.selfCheck() { check("batch_\(name)", ok) }
 

@@ -211,6 +211,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     private var prefixEmptySnap: Any?                       // fullSnapshot of the fresh arena, for reset
     private var arenaContent: [Int32] = []                  // tokens currently prefilled into the arena (one path)
     private var prefixSlots: [(len: Int, snap: Any)] = []   // restore points along arenaContent, sorted by len
+    // #117 RAM tier: whole-conversation states (persistentState blobs, path-independent) so
+    // interleaved conversations don't thrash the single-arena path above. LRU by byte budget;
+    // default 2GB resident / OFF streaming (wired-memory pressure — see PR #70).
+    private var prefixRAM = PrefixRAMStore()
+    public private(set) var prefixRAMHits = 0               // gate observability, mirrors PrefixPersist.restoreHits
+    func prefixRAMBudget(isStreaming: Bool) -> Int {
+        Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreaming ? 0 : 2048)) * 1_048_576
+    }
 
     /// Read `text_config.max_position_embeddings` from the checkpoint's config.json.
     /// Falls back to 32768 if absent — a sane bound that still lets any real chat reach EOS.
@@ -550,7 +558,25 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // of re-prefilling it. Boundaries past the divergence point are stale → drop them.
                 let lcp = SeedlessBackend.commonPrefixLen(content, self.arenaContent)
                 var restoreLen = self.prefixSlots.last(where: { $0.len <= lcp })?.len ?? 0
-                if restoreLen > 0, let s = self.prefixSlots.last(where: { $0.len == restoreLen })?.snap {
+                // #117 RAM tier: another conversation's stored state whose prefix beats the
+                // in-path restore point by more than a restore is worth (~512 tok of prefill).
+                self.prefixRAM.budget = self.prefixRAMBudget(isStreaming: cfg.isStreaming)
+                if let hit = self.prefixRAM.bestMatch(content: content), hit.tokens.count > restoreLen + 512 {
+                    if backend.restorePersistentState?(hit.state) == true {
+                        self.arenaContent = hit.tokens
+                        self.prefixSlots = []
+                        if let snap = backend.fullSnapshot?() {
+                            self.prefixSlots = [(len: hit.tokens.count, snap: snap)]
+                        }
+                        restoreLen = hit.tokens.count
+                        self.prefixRAMHits += 1
+                    } else {
+                        // A failed restore may have half-written the arena — the in-path
+                        // state is dead; fall back to a cold prefill from the empty state.
+                        self.arenaContent = []; self.prefixSlots = []; restoreLen = 0
+                        if let e = self.prefixEmptySnap { backend.fullRestore?(e) }
+                    }
+                } else if restoreLen > 0, let s = self.prefixSlots.last(where: { $0.len == restoreLen })?.snap {
                     backend.fullRestore?(s)
                 } else if PrefixPersist.enabled,
                           let hit = PrefixPersist.bestMatch(modelDir: self.modelDir, content: content),
@@ -589,10 +615,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // #89 (opt-in): persist the content-boundary state for cross-process reuse.
                 // The state is exactly at the boundary here (gen-suffix prefill comes next);
                 // persistentState() is a CPU copy of shared buffers, the file write is async.
-                if PrefixPersist.enabled, let blob = backend.persistentState?() {
-                    let model = self.modelDir
-                    DispatchQueue.global(qos: .utility).async {
-                        PrefixPersist.save(modelDir: model, tokens: content, state: blob)
+                if self.prefixRAM.budget > 0 || PrefixPersist.enabled,
+                   let blob = backend.persistentState?() {
+                    // #117: RAM tier keeps this conversation warm across arena-path switches.
+                    if self.prefixRAM.budget > 0 { self.prefixRAM.save(tokens: content, state: blob) }
+                    if PrefixPersist.enabled {
+                        let model = self.modelDir
+                        DispatchQueue.global(qos: .utility).async {
+                            PrefixPersist.save(modelDir: model, tokens: content, state: blob)
+                        }
                     }
                 }
 
@@ -624,6 +655,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public func resetPrefixCache() {
         prefixBackend = nil; prefixFwd = nil; prefixProviders = nil; prefixArenaLen = 0; prefixEmptySnap = nil
         arenaContent = []; prefixSlots = []
+        prefixRAM.removeAll()   // #117: "restart" semantics — only the DISK store (#89) survives
     }
 
     // Cap resident snapshots (~60MB each) at prefixMaxSlots, evicting the densest neighbour so a coarse

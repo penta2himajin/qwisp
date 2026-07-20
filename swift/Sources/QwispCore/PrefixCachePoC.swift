@@ -12,6 +12,103 @@ import MLX
 // tail = the generation prompt + generated tokens that the next request rewinds past, B = the new
 // content appended in the next request.
 extension Tell {
+    // Long-context decay probe (#117 follow-up): the production log shows prefill chunk rate
+    // decaying 348→66 tok/s over 0→40K and decode collapsing 45→7 tok/s at 48K. This isolates
+    // WHY, per stage, using forwardRowsProfiled (exact per-encoder GPU ms bucketed GDN/attn/MoE).
+    // One long prefill builds the context; at checkpoints it also runs M=1 forwards (= decode
+    // step cost at that context). If attn ms scales ~linearly with position while GDN/MoE stay
+    // flat, the driver is full-attention O(N) reads (fundamental; only the 10 full-attn layers
+    // grow) — not a fixable constant. Env: QWISP_DECAY_MAX (default 49152).
+    public static func longContextDecayProbe(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[decay] load fail\nDECAY done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let maxCtx = Tell.envInt("QWISP_DECAY_MAX", 49152)
+        let chunk = 1024
+        guard let (fwd, _) = engine.makeFused(maxM: chunk + 8, maxSeqLen: maxCtx + 128) else {
+            return "[decay] makeFused nil\nDECAY done"
+        }
+        let checkpoints = [4096, 8192, 16384, 32768, 49152].filter { $0 <= maxCtx }
+        var lines = ["[decay] maxCtx=\(maxCtx) chunk=\(chunk) resident/fused — per-stage GPU ms (exact)",
+                     "  ── prefill: per-chunk stage ms by context position ──",
+                     "     posStart   attn_ms   gdn_ms   moe_ms   chunk_ms   tok/s"]
+        func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
+        let prompt = tok(maxCtx, 13)
+        var pos = 0
+        let sampleAt = Set([0, 1024, 2048, 4096, 8192, 16384, 24576, 32768, 40960, 47104])
+        var decodeRows: [String] = []
+        while pos < maxCtx {
+            let end = Swift.min(pos + chunk, maxCtx)
+            let x = engine.embed(tokens: Array(prompt[pos ..< end]))
+            guard let t = fwd.forwardRowsProfiled(x, M: end - pos) else { break }
+            if sampleAt.contains(pos) {
+                let cm = t.gdn + t.attn + t.moe
+                lines.append(String(format: "     %8d  %8.2f %8.2f %8.2f  %8.2f  %6.0f",
+                                    pos, t.attn, t.gdn, t.moe, cm, Double(end - pos) / (cm / 1000)))
+            }
+            pos = end
+            // Decode-step cost (M=1) at this context depth — average 5, skip warmup.
+            if checkpoints.contains(pos) {
+                var a = 0.0, g = 0.0, m = 0.0; let reps = 6
+                for r in 0..<reps {
+                    let x1 = engine.embed(tokens: [prompt[pos % maxCtx]])
+                    guard let t1 = fwd.forwardRowsProfiled(x1, M: 1) else { break }
+                    if r > 0 { a += t1.attn; g += t1.gdn; m += t1.moe }   // drop rep 0 (warmup)
+                }
+                let n = Double(reps - 1); let step = (a + g + m) / n
+                decodeRows.append(String(format: "     %8d  %8.3f %8.3f %8.3f  %8.3f  %6.1f",
+                                         pos, a/n, g/n, m/n, step, 1000.0 / step))
+            }
+        }
+        lines.append("  ── decode (M=1) step stage ms by context length ──")
+        lines.append("     context    attn_ms   gdn_ms   moe_ms   step_ms   tok/s")
+        lines.append(contentsOf: decodeRows)
+        return lines.joined(separator: "\n") + "\nDECAY done"
+    }
+
+    // Spec-verify width probe (#117 follow-up): the decay probe showed the RAW M=1 forward at
+    // 49K is ~36 tok/s, yet the production log's spec-decode collapses to 6-7 tok/s there. The
+    // suspect is the verify forward: full-attention is O(M·N), so a K-token draft costs ~K× the
+    // attention of a single row at that context. This prefills to QWISP_SPEC_CTX (default 32768)
+    // then sweeps M (verify width) measuring per-stage forward ms. If attn ms scales ~linearly
+    // with M while GDN/MoE stay flat, long drafts are counterproductive at long context and the
+    // fix is a context-aware draft-length cap (spec loop, additive, lossless). Measure-first.
+    public static func specWidthProbe(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[spec-width] load fail\nSPECWIDTH done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let ctx = Tell.envInt("QWISP_SPEC_CTX", 32768)
+        let maxM = 32
+        guard let (fwd, _) = engine.makeFused(maxM: maxM, maxSeqLen: ctx + maxM + 8) else {
+            return "[spec-width] makeFused nil\nSPECWIDTH done"
+        }
+        func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
+        // Prefill to `ctx` in chunks of 1024 (build the KV context).
+        let pre = tok(ctx, 13); var pos = 0
+        while pos < ctx {
+            let end = Swift.min(pos + 1024, ctx)
+            _ = fwd.forwardRowsProfiled(engine.embed(tokens: Array(pre[pos ..< end])), M: end - pos)
+            pos = end
+        }
+        var lines = ["[spec-width] ctx=\(ctx) resident/fused — forward stage ms by verify width M",
+                     "     M    attn_ms   gdn_ms   moe_ms   step_ms  attn/M   (draft cost model)"]
+        // Sweep M; each M runs a few reps (dropping warmup). forwardRowsProfiled appends to KV,
+        // but we only need the timing — the small KV growth (a few hundred rows total) is noise
+        // against a 32K context.
+        for M in [1, 2, 4, 8, 16] {
+            var a = 0.0, g = 0.0, m = 0.0; let reps = 5
+            for r in 0..<reps {
+                let x = engine.embed(tokens: tok(M, 100 + r))
+                guard let t = fwd.forwardRowsProfiled(x, M: M) else { break }
+                if r > 0 { a += t.attn; g += t.gdn; m += t.moe }
+            }
+            let n = Double(reps - 1)
+            lines.append(String(format: "  %4d  %8.3f %8.3f %8.3f %8.3f %8.3f",
+                                M, a/n, g/n, m/n, (a+g+m)/n, (a/n)/Double(M)))
+        }
+        return lines.joined(separator: "\n") + "\nSPECWIDTH done"
+    }
+
     // Prefill throughput probe: measures tok/s prefilling a fixed prompt at several chunk sizes.
     // If larger chunks are much faster → per-forward overhead dominates (raise the chunk).
     // If flat → per-token compute is the limit (kernel-level work). Measure-before-implement.
@@ -234,6 +331,60 @@ extension Tell {
         lines.append("  restart-continue  ref=\(ref2.count)tok  restored=\(got2.count)tok  \(identical ? "IDENTICAL ✅" : "DIVERGE ❌")  diskRestore=\(restored ? "HIT" : "MISS ❌")")
         if !identical { lines.append("    ref: \(ref2.prefix(12))"); lines.append("    got: \(got2.prefix(12))") }
         lines.append("PREFIXPERSISTE2E \(identical && restored ? "PASS" : "FAIL")")
+        return lines.joined(separator: "\n")
+    }
+
+    // #117 gate: PREFIXE2E for the RAM tier. Interleaved conversations — A cold, B cold
+    // (unrelated → replaces A's arena path), then A extended: the third request must
+    // restore A's whole-conversation state from the RAM store (prefixRAMHits asserts the
+    // restore actually fired) and stream byte-identical to the cache-off path. A fourth
+    // request extends the third: the in-path slot now ties the RAM entry, so the gain
+    // guard (>512 tok) must keep the cheap in-path restore (hits stays 1).
+    public static func prefixRAME2E(modelDir: String) -> String {
+        let ec = Tell.envInt("QWISP_PREFIX_E2E_C", 0)
+        let tier: SeedlessTier = ec > 0 ? .streaming(c: ec) : .auto
+        guard let backend = try? SeedlessBackend(modelDir: modelDir, tier: tier) else { return "[prefix-ram-e2e] load fail\nPREFIXRAME2E FAIL" }
+        if ec > 0 { backend.losslessForced = true }
+        setenv("QWISP_PREFIX_RAM_MB", "512", 1)      // force the tier ON (streaming defaults OFF)
+        defer { unsetenv("QWISP_PREFIX_RAM_MB") }
+
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let cA = toks(700, 1)                        // conv A (700 > the 512-tok gain guard)
+        let cB = toks(700, 2)                        // conv B, no shared prefix
+        let cA2 = cA + toks(40, 3)                   // A continues after the switch
+        let cA3 = cA2 + toks(40, 4)                  // A continues in-path (RAM must NOT fire)
+        func req(_ content: [Int]) -> (prompt: [Int], cl: Int) { (content + toks(8, 777), content.count) }
+        let reqs = [req(cA), req(cB), req(cA2), req(cA3)]
+        let maxTok = 24
+
+        final class Box: @unchecked Sendable { var v: [Int] = [] }
+        func gen(_ p: [Int], _ cl: Int) -> [Int] {
+            let box = Box()
+            let sem = DispatchSemaphore(value: 0)
+            let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
+            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            sem.wait()
+            return box.v
+        }
+
+        backend.prefixCacheForced = false
+        let ref = reqs.map { gen($0.prompt, $0.cl) }
+        backend.prefixCacheForced = true
+        backend.resetPrefixCache()
+        var hitsAfter: [Int] = []
+        let got = reqs.map { r in let g = gen(r.prompt, r.cl); hitsAfter.append(backend.prefixRAMHits); return g }
+
+        var lines = ["[prefix-ram-e2e] A cold / B cold / A-extend (RAM restore) / A-extend (in-path), maxTok=\(maxTok), tier=\(ec > 0 ? "streaming C=\(ec)" : "resident")"]
+        var pass = true
+        let labels = ["R1 A cold    ", "R2 B switch  ", "R3 A ram-hit ", "R4 A in-path "]
+        let wantHits = [0, 0, 1, 1]
+        for i in 0..<reqs.count {
+            let ok = ref[i] == got[i] && hitsAfter[i] == wantHits[i]
+            pass = pass && ok
+            lines.append("  \(labels[i])  ref=\(ref[i].count)tok  cached=\(got[i].count)tok  ramHits=\(hitsAfter[i]) (want \(wantHits[i]))  \(ok ? "IDENTICAL ✅" : "DIVERGE ❌")")
+            if ref[i] != got[i] { lines.append("    ref   : \(ref[i].prefix(12))"); lines.append("    cached: \(got[i].prefix(12))") }
+        }
+        lines.append("PREFIXRAME2E \(pass ? "PASS" : "FAIL")")
         return lines.joined(separator: "\n")
     }
 
