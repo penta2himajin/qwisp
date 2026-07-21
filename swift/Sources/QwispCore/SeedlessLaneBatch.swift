@@ -64,8 +64,148 @@ public final class SeedlessLaneBatch {
         return true
     }
 
-    private func encodeRowCopy(_ enc: MTLComputeCommandEncoder,
-                               src: MTLBuffer, srcOff: Int, dst: MTLBuffer, dstOff: Int, count: Int) {
+    // ── qmm4_rows_b: B-row qmv (Stage 1b projection lever — measured NO-GO) ───
+    // Same grid/simdgroup structure and PER-ROW arithmetic order as the shipped
+    // qmm4 (qmv) kernel — the ONLY change is an inner b-loop so the device weight
+    // reads are shared across up to 4 x-rows instead of re-read per row.
+    // Per-(row,b) accumulation = identical fma sequence to qmm4 with that x row
+    // ⇒ bit-exact by construction (byte-compared PASS in lane-kernel-bench).
+    // VERDICT (2026-07-21, lane-kernel-bench @[N=8192,K=2048]): 4-6x SLOWER than
+    // qmm4_rows at every B (B=1 107µs vs 26; B=3 402 vs 65) — the x_thread[4][16]
+    // register file collapses occupancy and costs far more than the ~0.7x/row
+    // weight re-read it saves. NOT wired into any forward path; kept only as the
+    // measured evidence + harness for the Stage-1b projection-lever NO-GO. Do not
+    // re-propose weight-read amortization for qmv decode shapes without a design
+    // that adds rows WITHOUT growing per-thread register state.
+    nonisolated(unsafe) static var qmmBPipeline: MTLComputePipelineState? = nil
+    static func compileQmmB(_ device: MTLDevice) -> Bool {
+        if qmmBPipeline != nil { return true }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        #define SIMD_SIZE 32
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) {
+                sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                xt[i]   = x[i];
+                xt[i+1] = x[i+1] / 16.0f;
+                xt[i+2] = x[i+2] / 256.0f;
+                xt[i+3] = x[i+3] / 4096.0f;
+            }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                          xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                          xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                          xt[4*i+3] * (float)(ws[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void qmm4_rows_b(device const uint32_t* w      [[buffer(0)]],
+                                device const half*     scales [[buffer(1)]],
+                                device const half*     biases [[buffer(2)]],
+                                device const half*     x      [[buffer(3)]],
+                                device half*           y      [[buffer(4)]],
+                                constant int&          in_vec_size  [[buffer(5)]],   // K
+                                constant int&          out_vec_size [[buffer(6)]],   // N
+                                constant int&          nrows        [[buffer(7)]],   // B ≤ 4
+                                uint3 tid      [[threadgroup_position_in_grid]],
+                                uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                                uint  simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 4;
+            constexpr int pack_factor = 8;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = 512;
+            constexpr int scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[4][16];
+            thread U sums[4];
+            thread U result[4][4] = {{0}};        // [out-row][b]
+            const int B = nrows;
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            y += out_row;
+            int xoff = simd_lid * values_per_thread;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                for (int b = 0; b < B; b++)
+                    sums[b] = ld16(x + b * in_vec_size + xoff, x_thread[b]);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U bi = bl[0];
+                    for (int b = 0; b < B; b++)
+                        result[row][b] += qd4(wl, x_thread[b], s, bi, sums[b]);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                xoff += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                for (int b = 0; b < B; b++) {
+                    result[row][b] = simd_sum(result[row][b]);
+                    if (simd_lid == 0) y[b * out_vec_size + row] = (half)result[row][b];
+                }
+            }
+        }
+        """
+        // Math opts MUST mirror the shipped qmm4 compile (QWISP_QMM_MATH, default
+        // safe) — bit-exactness of qd4 depends on identical FMA-contraction setting.
+        let opts = MTLCompileOptions()
+        let mathSel = ProcessInfo.processInfo.environment["QWISP_QMM_MATH"] ?? "safe"
+        if #available(macOS 15.0, *) {
+            switch mathSel {
+            case "fast": opts.mathMode = .fast
+            case "relaxed": opts.mathMode = .relaxed
+            default: opts.mathMode = .safe
+            }
+        } else {
+            opts.fastMathEnabled = (mathSel == "fast")
+        }
+        guard let lib = try? device.makeLibrary(source: src, options: opts),
+              let fn = lib.makeFunction(name: "qmm4_rows_b"),
+              let ps = try? device.makeComputePipelineState(function: fn) else { return false }
+        qmmBPipeline = ps
+        return true
+    }
+
+    /// Encode qmm4_rows_b: x[B,K] · W[N,K] → y[B,N], B ≤ 4 per dispatch (callers
+    /// split larger B into row groups). x/y offsets are BYTE offsets (row groups).
+    static func encodeQmmRowsB(_ enc: MTLComputeCommandEncoder,
+                               w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                               x: MTLBuffer, xOff: Int, out: MTLBuffer, outOff: Int,
+                               B: Int, K: Int, N: Int) {
+        let p = SeedlessLaneBatch.qmmBPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: xOff, index: 3)
+        enc.setBuffer(out, offset: outOff, index: 4)
+        var kk = Int32(K), nn = Int32(N), bb = Int32(B)
+        enc.setBytes(&kk, length: 4, index: 5)
+        enc.setBytes(&nn, length: 4, index: 6)
+        enc.setBytes(&bb, length: 4, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    static func encodeRowCopyStatic(_ enc: MTLComputeCommandEncoder,
+                                    src: MTLBuffer, srcOff: Int, dst: MTLBuffer, dstOff: Int, count: Int) {
         let ps = SeedlessLaneBatch.copyPipeline!
         enc.setComputePipelineState(ps)
         enc.setBuffer(src, offset: 0, index: 0)
@@ -75,6 +215,11 @@ public final class SeedlessLaneBatch {
         enc.setBytes(&do_, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(ps.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    private func encodeRowCopy(_ enc: MTLComputeCommandEncoder,
+                               src: MTLBuffer, srcOff: Int, dst: MTLBuffer, dstOff: Int, count: Int) {
+        SeedlessLaneBatch.encodeRowCopyStatic(enc, src: src, srcOff: srcOff, dst: dst, dstOff: dstOff, count: count)
     }
 
     /// driver: weights + scratch sized maxM ≥ lanes.count. lanes: one forward per
