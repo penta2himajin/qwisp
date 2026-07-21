@@ -31,7 +31,8 @@ Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126
 - [x] DONE: LaneServe wiring (adbfdf4) — LaneBatchSlots on ContinuousScheduler + LaneBackend behind QWISP_LANES; step batches ACTIVE lanes only.
 - [x] DONE: canonical admit (9ae9932) — hybrid prefill@1024 + Tell first-token (engine.logits qmmTiled + MLX.argMax). Replay 6/6 byte-identical, 1.63x, TTFT 20-28ms flat (serialize ladder was 3ms→23.4s).
 - [x] MEASURED full greedy step (resident, ctx=1024): B=1 80.4 / B=2 59.6 / B=3 46.0 / B=4 36.2 / B=8 20.4 tok/s (agg 162.9). Layers-only: 86.9/62.4/49.3/40.3/21.9.
-- [ ] TODO: none on this branch — PR review, then optional Stage 1b (see Then).
+- [x] DONE: Stage 1b decomposition probe (7b0b309) — lane-kernel-bench; all 3 B-scaling levers NO-GO (see Rejected).
+- [ ] TODO: none on this branch — PR review; next workstream = #121 (see Then).
 
 ## Rejected
 - Stage 1b (merge per-lane sequence-coupled dispatches into B-lane kernels): lane-kernel-bench decomposition shows those kernels total only ~1.6ms/lane of the ~4.4ms increment; dispatch-tax share ~0.5ms → ceiling +2-3 tok/s @B=3. NO-GO. (Probe: `QWISP_RUN=lane-kernel-bench`, no model.)
