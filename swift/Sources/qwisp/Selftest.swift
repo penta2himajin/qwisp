@@ -98,6 +98,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // prefix-cache RAM tier (issue #117; pure keyed-store checks, no GPU).
     for (name, ok) in PrefixRAMStore.selfCheck() { check("prefixram_\(name)", ok) }
 
+    // speculation gate arithmetic (issue #119; pure, no GPU).
+    for (name, ok) in Tell.specGateSelfCheck() { check("specgate_\(name)", ok) }
+
     // continuous-batching scheduler (issue #6; pure logic over a scripted fake engine).
     for (name, ok) in ContinuousScheduler.selfCheck() { check("batch_\(name)", ok) }
 

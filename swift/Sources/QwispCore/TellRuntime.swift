@@ -675,10 +675,27 @@ extension Tell {
         // Set by the streaming backend when the consumer drops the stream, so an
         // aborted request stops at the next spec-step boundary instead of running
         // to N and orphaning the GPU (see SeedlessBackend.generate).
+        // #119: env-gated per-step wall-time buckets (QWISP_SPEC_PROFILE=1). Flag off →
+        // no Date() calls on the hot path, loop byte-identical.
+        let prof = Tell.envFlag("QWISP_SPEC_PROFILE")
+        var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0
+        var pfChainCalls = 0
+        let tLoop0 = Date()
+
+        // #119 speculation gate state (see Tell.specGate*): rolling accepted-per-attempt
+        // window + suspension horizon in emitted tokens. A3 keeps the ungated path (opt-in
+        // research mode; the server decode path is non-A3).
+        let gateOn = Tell.specGateEnabled && !useA3
+        var gateWindow: [Int] = []
+        var gateSuspendedUntil = -1
+
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
-            var drafts = Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
-                                          traceAlts: Tell.traceAltsEnabled)
+            let tD = prof ? Date() : Date.distantPast
+            var drafts = (gateOn && out.count < gateSuspendedUntil) ? []
+                : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
+                                   traceAlts: Tell.traceAltsEnabled)
+            if prof { pfDraft += Date().timeIntervalSince(tD) * 1000 }
             // #98 DFlash: only when SuffixSpec found nothing (draftless span) and not under A3
             // (dflash is inactive there — see dflashHarvest). Falls back to the old per-step
             // path on nil (cold start / any failure), unchanged behavior.
@@ -706,8 +723,10 @@ extension Tell {
                 // empty-pending greedy span. Chained tokens skip drafting opportunities for
                 // those positions — at d0≈90% almost always free. nil chain fn / failed call
                 // → fall through to per-step.
+                let tC = prof ? Date() : Date.distantPast
                 if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
                    let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
+                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1 }
                     out.append(u); hist.append(u)
                     let addN = Swift.min(chainResult.count - 1, N - out.count)
                     for i in 0 ..< addN {
@@ -725,7 +744,9 @@ extension Tell {
                     u = evals[pk]  // next token after pending+u (pk = position of u)
                     pending = []
                 } else {
+                    let tV = prof ? Date() : Date.distantPast
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
+                    if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
                     out.append(u); hist.append(u)
                     dflashHarvest(1)
                     u = evals[0]
@@ -775,14 +796,26 @@ extension Tell {
                 if let fe = fusedEvals {
                     evals = fe
                 } else {
+                    let tV = prof ? Date() : Date.distantPast
                     let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
                     guard let e = backend.stepArgmax(verifyTokens) else { return nil }
+                    if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
                     evals = e
                 }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
                 stAccepted += p
+                // #119 gate: record this attempt's yield; suspend drafting when the rolling
+                // mean falls under the ctx-scaled break-even. Window survives suspension →
+                // a still-bad regime re-suspends after one probe attempt.
+                if gateOn {
+                    gateWindow.append(p)
+                    if gateWindow.count > Tell.specGateWindow { gateWindow.removeFirst() }
+                    if Tell.specGateShouldSuspend(window: gateWindow, histLen: hist.count) {
+                        gateSuspendedUntil = out.count + Tell.specGateReprobe
+                    }
+                }
                 dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
 
                 if p == D {
@@ -796,17 +829,28 @@ extension Tell {
                     stRejects += 1
                     if Tell.traceAltsEnabled, p < Tell.lastDraftAlts.count,
                        Tell.lastDraftAlts[p] == evals[p] { stAltHits += 1 }
+                    let tR = prof ? Date() : Date.distantPast
                     backend.rollback(snap)
                     out.append(u); hist.append(u)
                     for d in drafts.prefix(p) { out.append(d); hist.append(d) }
                     let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
                     guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    if prof { pfRebuild += Date().timeIntervalSince(tR) * 1000 }
                     u = evals[p]
                 }
             }
         }
         flush()
         Tell.lastSpecStats = (stSteps, stDrafted, stAccepted, stD0, stRejects, stAltHits)
+        if prof {
+            let total = Date().timeIntervalSince(tLoop0) * 1000
+            let other = total - pfDraft - pfChain - pfVerify - pfRebuild
+            FileHandle.standardError.write(Data(String(format:
+                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
+                promptIds.count, out.count, stSteps, pfChainCalls,
+                total, pfDraft, pfChain, pfVerify, pfRebuild, other,
+                out.isEmpty ? 0 : total / Double(out.count)).utf8))
+        }
         return Array(out.prefix(N))
     }
 
