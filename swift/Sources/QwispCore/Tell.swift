@@ -30,6 +30,53 @@ public enum Tell {
     /// per process (env-in-loop is 18.8µs, fusion doctrine).
     static let suffixMinMatch = Swift.max(1, Tell.envInt("QWISP_SUFFIX_MINMATCH", 4))
 
+    // ── #119: mechanical speculation gate ────────────────────────────────────────
+    // A draft attempt runs the f32 strict verify, whose cost is ~linear in context
+    // (measured 288ms/attempt @14K → 878ms @48K), while a chain step costs 17→29ms.
+    // Break-even is ~17 accepted tokens/attempt @14K, ~30 @48K; low-accept agentic
+    // regimes deliver 4-5 — every attempt is a net loss and decode collapses (issue
+    // #119: 6-7 tok/s at 48K; gate off/on measured 18.8 → 38 tok/s). The gate is
+    // mechanical (rolling measured accept, no prediction): suspend drafting when the
+    // rolling mean accepted-per-attempt is below a ctx-scaled threshold, re-probe
+    // after specGateReprobe emitted tokens. The window is NOT cleared on suspension,
+    // so a still-bad regime re-suspends after a single probe attempt. Greedy chain is
+    // the reference path — gating changes speed only, the token stream is unchanged.
+    // QWISP_SPEC_GATE=0 opts out (always draft, pre-#119 behavior).
+    static let specGateWindow = 8
+    static var specGateEnabled: Bool { envInt("QWISP_SPEC_GATE", 1) != 0 }
+    static var specGateReprobe: Int { Swift.max(8, envInt("QWISP_SPEC_REPROBE", 256)) }
+    /// Conservative floor of the measured break-even curve (errs toward keeping spec on).
+    static func specGateThreshold(histLen: Int) -> Int { 4 + histLen / 3000 }
+    /// Evidence needed before suspending shrinks as context grows: an attempt's waste is
+    /// ctx-linear (~900ms @48K) while a false suspension costs only one re-probe span, so
+    /// at long ctx a single sub-threshold attempt suffices; short ctx demands a full window.
+    static func specGateWindowNeeded(histLen: Int) -> Int { Swift.max(1, specGateWindow - histLen / 6000) }
+    static func specGateShouldSuspend(window: [Int], histLen: Int) -> Bool {
+        window.count >= specGateWindowNeeded(histLen: histLen)
+            && window.reduce(0, +) < specGateThreshold(histLen: histLen) * window.count
+    }
+
+    /// Pure self-check (no GPU) for the gate arithmetic.
+    public static func specGateSelfCheck() -> [(String, Bool)] {
+        let bad = Array(repeating: 4, count: specGateWindow)      // 4 acc/attempt
+        let good = Array(repeating: 20, count: specGateWindow)
+        return [
+            ("threshold_short", specGateThreshold(histLen: 2000) == 4),
+            ("threshold_14k", specGateThreshold(histLen: 14000) == 8),
+            ("threshold_48k", specGateThreshold(histLen: 48000) == 20),
+            ("window_short_full", specGateWindowNeeded(histLen: 0) == 8),
+            ("window_14k", specGateWindowNeeded(histLen: 14000) == 6),
+            ("window_48k_single", specGateWindowNeeded(histLen: 48000) == 1),
+            ("suspend_one_bad_long", specGateShouldSuspend(window: [4], histLen: 48000)),
+            ("suspend_bad_long", specGateShouldSuspend(window: bad, histLen: 48000)),
+            ("keep_good_long", !specGateShouldSuspend(window: good, histLen: 48000)),
+            ("keep_one_good_long", !specGateShouldSuspend(window: [24], histLen: 48000)),
+            ("keep_bad_short", !specGateShouldSuspend(window: bad, histLen: 0)),   // 4 ≥ threshold 4
+            ("no_suspend_before_window_short", !specGateShouldSuspend(window: [0], histLen: 0)),
+            ("rolling_recovers", !specGateShouldSuspend(window: Array(bad.dropFirst(4)) + [40, 40, 40, 40], histLen: 48000)),
+        ]
+    }
+
     /// suffix lookup draft（SuffixDecoding-style, 訓練不要・cost ~0）:
     /// 1) seq 末尾の m token(minMatch..maxMatch の最長一致)が seq 内の earlier 位置に出現する
     ///    「全ての」出現位置を収集（旧: 最近 1 箇所のみ）。
