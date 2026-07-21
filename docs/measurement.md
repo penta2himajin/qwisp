@@ -16,7 +16,7 @@ Qwen3.6-35B MTPLX path). **The GPU is exclusive — never run two GPU processes 
 | completion core + pure logic (no GPU) | `scripts/test_completion.sh` → COMPTEST |
 | bench harness fixture (no GPU) | `scripts/test_bench_batch.sh` |
 | tokenizer round-trip (no GPU) | `scripts/test_tokenizer.sh` |
-| prefix cache lossless (all tiers) | `QWISP_RUN=prefix-cache-e2e` (+`QWISP_PREFIX_E2E_C=<c>` streaming), `prefix-ram-e2e`, `prefix-persist-e2e`, `prefix-bolt-e2e` |
+| prefix cache lossless (all tiers) | `QWISP_RUN=prefix-cache-e2e` (+`QWISP_PREFIX_E2E_C=<c>` streaming), `prefix-ram-e2e`, `prefix-persist-e2e`, `prefix-stable-e2e`, `prefix-bolt-e2e` |
 
 A red strict-fidelity cell on longctx/shortnl after a fresh checkout is usually missing
 `refs/` (gitignored) — regenerate from Swift raw greedy, never from MLX.

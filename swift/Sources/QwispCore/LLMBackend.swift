@@ -492,7 +492,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     }
                 } else if restoreLen > 0, let s = self.prefixSlots.last(where: { $0.len == restoreLen })?.snap {
                     backend.fullRestore?(s)
-                } else if PrefixPersist.enabled,
+                } else if PrefixPersist.lookupEnabled,
                           let hit = PrefixPersist.bestMatch(modelDir: self.modelDir, content: content),
                           backend.restorePersistentState?(hit.state) == true {
                     // #89 (opt-in): no in-memory restore point — cross-process warm start from
@@ -509,6 +509,25 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     backend.fullRestore?(e)
                 }
                 self.prefixSlots.removeAll { $0.len > Swift.max(lcp, restoreLen) }
+                // #112 stable-prefix persist: divergence from the arena path (= a NEW
+                // conversation) that still shares a ≥stableMinTokens restore point is
+                // recurrence evidence — the shared block is the harness system+tools
+                // prefix. The arena is exactly at restoreLen here, so persistentState()
+                // captures the stable boundary with zero extra prefill. has() gates the
+                // (expensive) state copy to once per key; save() dedupes re-writes, so
+                // the #89 per-turn wear cannot occur. restoreLen ≤ lcp excludes RAM-tier
+                // whole-conversation restores (those are not shared-prefix evidence).
+                if PrefixPersist.stableEnabled, lcp < self.arenaContent.count,
+                   restoreLen >= PrefixPersist.stableMinTokens, restoreLen <= lcp {
+                    let toks = Array(content[0 ..< restoreLen])
+                    if !PrefixPersist.has(modelDir: self.modelDir, tokens: toks),
+                       let blob = backend.persistentState?() {
+                        let model = self.modelDir
+                        DispatchQueue.global(qos: .utility).async {
+                            PrefixPersist.save(modelDir: model, tokens: toks, state: blob)
+                        }
+                    }
+                }
 
                 // Re-prefill the delta [restoreLen ..< contentLen], snapshotting at stride-aligned
                 // boundaries (so different conversations that share a prefix snapshot at the SAME

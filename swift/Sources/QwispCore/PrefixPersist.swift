@@ -22,8 +22,19 @@ public enum PrefixPersist {
     static let format: UInt32 = 1
 
     public static var enabled: Bool { Tell.envInt("QWISP_PREFIX_PERSIST", 0) != 0 }
-    static var maxSlots: Int { Swift.max(1, Tell.envInt("QWISP_PREFIX_PERSIST_SLOTS", 4)) }
+    // #112 stable-prefix tier (default ON; QWISP_PREFIX_STABLE=0 opts out): a harness's
+    // system+tools block is operationally defined by RECURRENCE — the shared prefix of two
+    // DIFFERENT conversations. That trigger writes the SAME key once per (harness × prompt
+    // version), so the per-turn SSD wear that keeps #89 opt-in cannot occur here.
+    public static var stableEnabled: Bool { Tell.envInt("QWISP_PREFIX_STABLE", 1) != 0 }
+    /// Minimum shared-prefix restore point (tokens) that counts as recurrence evidence.
+    public static var stableMinTokens: Int { Swift.max(64, Tell.envInt("QWISP_PREFIX_STABLE_MIN", 1024)) }
+    /// Disk restore lookups run when either tier is on.
+    public static var lookupEnabled: Bool { enabled || stableEnabled }
+    static var maxSlots: Int { Swift.max(1, Tell.envInt("QWISP_PREFIX_PERSIST_SLOTS", 20)) }
     static var maxBytes: Int { Swift.max(1, Tell.envInt("QWISP_PREFIX_PERSIST_MAX_MB", 512)) * 1_048_576 }
+    /// #112: total store byte budget (LRU-evicted), sized for 6-20 harness entries.
+    static var storeBudget: Int { Swift.max(1, Tell.envInt("QWISP_PREFIX_STORE_MB", 2048)) * 1_048_576 }
 
     static var defaultDir: URL {
         if let p = ProcessInfo.processInfo.environment["QWISP_PREFIX_PERSIST_DIR"] {
@@ -82,6 +93,11 @@ public enum PrefixPersist {
         return (model, tokens, wantState ? d.subdata(in: off ..< d.count) : Data())
     }
 
+    /// Cheap existence probe for `tokens` (no blob IO) — gates the expensive state copy.
+    public static func has(modelDir: String, tokens: [Int32], dir: URL? = nil) -> Bool {
+        FileManager.default.fileExists(atPath: url(dir: dir ?? defaultDir, modelDir: modelDir, tokens: tokens).path)
+    }
+
     /// Persist one content-boundary state. Skips oversized blobs; LRU-evicts beyond maxSlots.
     public static func save(modelDir: String, tokens: [Int32], state: Data, dir: URL? = nil) {
         guard state.count <= maxBytes, !tokens.isEmpty else { return }
@@ -118,15 +134,20 @@ public enum PrefixPersist {
         return (tokens, state)
     }
 
-    static func evict(dir: URL) {
+    static func evict(dir: URL, budget: Int? = nil) {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
-        let bins = files.filter { $0.pathExtension == "bin" }
-        guard bins.count > maxSlots else { return }
-        let dated = bins.map { f -> (URL, Date) in
-            ((f, (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast))
-        }.sorted { $0.1 < $1.1 }
-        for (f, _) in dated.prefix(bins.count - maxSlots) { try? fm.removeItem(at: f) }
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
+        var dated = files.filter { $0.pathExtension == "bin" }.map { f -> (url: URL, mtime: Date, size: Int) in
+            let rv = try? f.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            return (f, rv?.contentModificationDate ?? .distantPast, rv?.fileSize ?? 0)
+        }.sorted { $0.mtime < $1.mtime }                       // oldest first
+        var total = dated.reduce(0) { $0 + $1.size }
+        let cap = budget ?? storeBudget
+        while let oldest = dated.first, dated.count > maxSlots || total > cap {
+            try? fm.removeItem(at: oldest.url)
+            total -= oldest.size
+            dated.removeFirst()
+        }
     }
 
     /// Pure self-check (no GPU, tmp dir): round trip, longest-prefix match, model isolation, LRU.
@@ -148,12 +169,25 @@ public enum PrefixPersist {
             ("model_isolation", bestMatch(modelDir: "/nope", content: ab, dir: tmp) == nil),
             ("miss_diverge", missDiverge == nil),
         ]
+        // #112: existence probe (no blob IO).
+        checks.append(("has_existing", has(modelDir: "/m", tokens: a, dir: tmp)))
+        checks.append(("has_missing", !has(modelDir: "/m", tokens: [77, 78], dir: tmp)))
         // LRU: with maxSlots files already present, adding more evicts the oldest.
         for i in 0 ..< maxSlots + 2 {
             save(modelDir: "/m", tokens: [100, Int32(i)], state: state, dir: tmp)
         }
         let n = (try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil).filter { $0.pathExtension == "bin" }.count) ?? -1
         checks.append(("lru_cap", n == maxSlots))
+        // #112: byte-budget eviction — squeeze the budget to one file's size ⇒ only the
+        // most recently used survives.
+        func binCount() -> Int {
+            (try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil).filter { $0.pathExtension == "bin" }.count) ?? -1
+        }
+        let one = (try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: [.fileSizeKey])
+            .filter { $0.pathExtension == "bin" }
+            .compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.max()) ?? 0
+        evict(dir: tmp, budget: one)
+        checks.append(("byte_budget_evict", binCount() == 1 && one > 0))
         return checks
     }
 }
