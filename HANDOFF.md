@@ -1,4 +1,4 @@
-# HANDOFF: lane-batch workstream COMPLETE — PR #126 open (bit-exact fan-out serving, 6/6 replay, 1.63x, TTFT flat)
+# HANDOFF: lane-batch COMPLETE + Stage 1b closed by measurement (all 3 levers NO-GO) — PR #126 open, next lever = #121
 Date: 2026-07-21 | Status: GREEN (awaiting PR review) | Branch: claude/lane-batch (pushed, PR #126 → main) | Root: /Users/penta2himajin/repos/qwisp
 
 > STOP: Before trusting anything below, run the checks in "Verify First".
@@ -7,17 +7,16 @@ Date: 2026-07-21 | Status: GREEN (awaiting PR review) | Branch: claude/lane-batc
 
 ## Verify First
 - `git branch --show-current` → `claude/lane-batch`; `git status` → clean; `gh pr view 126 --json state -q .state` → OPEN.
-- `git log --oneline -3` → `9ae9932` fix(server) canonical hybrid prefill, `adbfdf4` feat(server) lane serving, `759c158` feat(seedless) stepArgmaxBatch.
+- `git log --oneline -3` → `7b0b309` probe lane-kernel-bench (Stage 1b NO-GO), `9ae9932` fix(server) canonical hybrid prefill, `adbfdf4` feat(server) lane serving.
 - `~/bin/jacquard run scripts/test_raw.sh` → RAWTESTS **91/91** (tests 90+91 = lane lossless contract, WRITE-LOCKED, total=91).
 - GPU rule: `~/bin/jacquard` (run=shared / measure=exclusive; `JACQUARD_GPU_IDLE_THRESHOLD=20` for measure). Never two GPU procs; brew service stopped (`brew services info qwisp`).
 
 ## Next Action
-Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126). No code work pending on this branch. If the user wants more per-stream at B≥3 (currently 46.0 tok/s @B=3 vs the ~55-61 aspiration), the lever is Stage 1b — see Then.
+Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126). No code work pending on this branch. Speed at B≥3 is CLOSED: all three Stage-1b levers measured NO-GO (see Rejected) — B=3 ≈ 46-49 tok/s/stream is the engine kernel family's practical floor.
 
 ## Then
-1. (post-merge follow-up, only if per-stream @B≥3 matters) Stage 1b: B-lane kernels — batch GDN conv-shift/recurrence and attn SDPA across lanes in ONE dispatch each (needs per-lane cache buffer indexing: argument buffers or shared cache allocation). BEFORE attempting: profile per-stage to verify the ASSUMPTION that ~100 per-lane dispatches/step (GDN 2×30 + attn 4×10) are the gap, and that GDN state traffic (~480MB/lane/step) is the floor.
-2. (parked, #121) prefix-cache-aware admission on the lane path: admits re-pay shared system+tools prefixes; sharing the prefill across lanes is the next TTFT lever for real OpenCode fan-out (prompts ~8-50K).
-3. Stage 2 (per-row spec-in-batch, tinycodr DraftGate) only if B≥4 per-stream still short after 1b.
+1. (next workstream, #121) prefix-cache-aware admission on the lane path: admits re-pay shared system+tools prefixes; sharing the prefill across lanes is the remaining fan-out lever (TTFT with real 8-50K prompts). Design seam: LaneBatchSlots.admit re-creates the lane per request — a shared-prefix snapshot/restore (prefix cache machinery, LLMBackend.swift#generateCached idioms) could seed the lane state instead of cold prefill.
+2. Stage 2 (per-row spec-in-batch, tinycodr DraftGate) remains the only per-stream decode lever left, and only pays if accept economics beat the qmv M-scaling floor — needs its own measurement before any build.
 
 ## Commands
 - gate:  `~/bin/jacquard run scripts/test_raw.sh` → RAWTESTS 91/91; `scripts/test_bench_batch.sh` PASS; `scripts/test_completion.sh` 57/57; `scripts/test_tokenizer.sh` 5/5
@@ -35,6 +34,9 @@ Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126
 - [ ] TODO: none on this branch — PR review, then optional Stage 1b (see Then).
 
 ## Rejected
+- Stage 1b (merge per-lane sequence-coupled dispatches into B-lane kernels): lane-kernel-bench decomposition shows those kernels total only ~1.6ms/lane of the ~4.4ms increment; dispatch-tax share ~0.5ms → ceiling +2-3 tok/s @B=3. NO-GO. (Probe: `QWISP_RUN=lane-kernel-bench`, no model.)
+- Tiled (shared-dequant) projections at decode M: 9x slower than qmv rows at every M≤8 ([N=8192,K=2048]). NO-GO.
+- qmm4_rows_b (B-row qmv, weight reads shared across ≤4 rows): bit-exact by construction (byte-compare PASS) but 4-6x SLOWER at every B — x_thread[4][16] register file collapses occupancy. Kernel kept in SeedlessLaneBatch.swift as evidence, NOT wired. Do not re-propose weight-read amortization for qmv decode shapes without a zero-extra-register design.
 - Tiled lm_head (QWISP_LMHEAD_QMV=0) for the batch step: 1.7-2x SLOWER at B=2-8 (B=3 argmax 21.7→36.3ms). qmv default stays. Do not re-propose.
 - "Shared laneX/laneOut staging serializes lanes on GPU": buffer separation changed nothing. Real model: encoder-wide hazard barriers ⇒ lane cores never overlap; dispatch COUNT is the cost. Do not re-propose buffer separation as an overlap lever.
 - Raw chunk-64 prefill + solo stepArgmax first token in admit: produces the PRE-hybrid stream → diverges from the canonical serialize stream ~100+ tokens in (f16 near-tie chains). Canonical = hybrid@1024 + qmmTiled/MLX.argMax first token (TellRuntime.swift wiring, Tell.prefill).
@@ -49,7 +51,7 @@ Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126
 - FACT: lane batching is composition-independent — lane-concurrent ≡ lane-serial 6/6 on the real model (and tests 90/91 at synthetic dims).
 - DECISION: LaneServe admits with makeFused(maxM:1024) per request (~200MB transient scratch/lane, resident tier) to get canonical chunk-1024 hybrid prefill. Alternative (persistent small-maxM lanes + raw prefill): rejected, non-canonical stream.
 - DECISION: step() batches only ACTIVE lanes, rebuilt on active-set change (per-lane cost ~linear in B; idle lanes must not ride).
-- ASSUMPTION: per-lane GDN state traffic ~480MB/lane/step is the per-stream floor at B≥3 — unverified; profile before Stage 1b.
+- FACT (was ASSUMPTION, now measured): GDN state traffic is NOT the floor — recurrence DRAM excess is only ~0.2-0.4ms/lane; the residual ~2.8ms/lane is qmv M-scaling (~+19µs/row @[8192,2048]) across projections/MoE, the kernel family floor.
 - DECISION: PR #126 opened referencing #120/#121 (not closing #121 — prefix-sharing on lanes is a real remaining lever).
 
 ## Gotchas & Blockers
