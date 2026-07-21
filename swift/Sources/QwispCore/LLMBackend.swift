@@ -103,60 +103,6 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public var losslessForced: Bool? = nil
     public var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
     private var boltServe: BoltServe? = nil
-    // #98 DFlash phase 3: opt-in QWISP_DFLASH=1, resident tier only. Built once (lazily) per
-    // instance and reused across requests — loading the drafter checkpoint per-request would
-    // be a needless disk read. nil (flag off, or load failure) → dflashIfEnabled() returns nil
-    // every call → every runSpecLoop seam stays byte-identical (nil-guarded).
-    private var dflash: DFlashDispatch? = nil
-    private var dflashLoadAttempted = false
-    private func dflashIfEnabled() -> DFlashDispatch? {
-        guard Tell.envFlag("QWISP_DFLASH") else { return nil }
-        if dflash == nil, !dflashLoadAttempted {
-            dflashLoadAttempted = true
-            dflash = SeedlessBackend.makeDFlash(engine: engine)
-        }
-        return dflash
-    }
-    private static func makeDFlash(engine: SeedlessEngine) -> DFlashDispatch? {
-        let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
-            ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
-        // #98 phase A1: Tell.loadDFlashConfigAndWeights (public-API-only re-derivation of what
-        // the frozen DFlashDrafter.load(dir:) does internally — needed here because both the
-        // MLX and raw drafters must share the identical weights dict).
-        guard let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)),
-              let drafter = DFlashDrafter(config: cfg, weights: weights)
-        else {
-            FileHandle.standardError.write(Data(
-                "[qwisp] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash\n".utf8))
-            return nil
-        }
-        let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
-        // Raw-first draft path (#98 phase A1): same weights, dispatch's own blockSize (may
-        // differ from the checkpoint's dflash_config.block_size). Load/attach failure → raw
-        // stays nil → DFlashDispatch.draft() runs MLX-only (warn once, not fatal).
-        var rawCfg = cfg
-        rawCfg.blockSize = blockSize
-        var raw = DFlashRawDrafter(config: rawCfg, weights: weights)
-        if let r = raw, !r.attachTargetHead(embedW: engine.embedW, embedS: engine.embedS, embedB: engine.embedB,
-                                            lmW: engine.lmW, lmS: engine.lmS, lmB: engine.lmB, vocab: engine.vocab) {
-            raw = nil
-        }
-        if raw == nil {
-            FileHandle.standardError.write(Data(
-                "[qwisp] WARN: DFlashRawDrafter init/attach failed — MLX-only drafter path\n".utf8))
-        }
-        return DFlashDispatch(
-            drafter: drafter, raw: raw, blockSize: blockSize,
-            embedFn: { engine.embed(tokens: $0) },
-            logitsArgmaxFn: { h in
-                // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax (see
-                // TellRuntime's twin closure; per-row .item() was 7 evals/block).
-                guard let lg = engine.logits(h, M: h.dim(0)) else { return nil }
-                let ids = MLX.argMax(lg, axis: -1).asType(.int32)
-                ids.eval()
-                return ids.asArray(Int32.self).map { Int($0) }
-            })
-    }
     private var samplingFallbackNoted = false
     // Segment gate (issue #47): a new request's decode thread must wait for the previous
     // decode thread's FULL exit. Stream teardown (consumer break / client disconnect) only
@@ -200,10 +146,6 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
-    // #98 DFlash phase 3: the fwd handle for the persistent prefix-cache backend (tap
-    // source), rebuilt alongside prefixBackend on arena growth. nil on streaming tiers /
-    // build failure — same nil-guarded contract as everywhere else in this file.
-    private var prefixFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
     // Streaming tier (#76): the C-slot expert arena persists across cached-backend rebuilds
     // (only the KV/GDN arena is rebuilt on growth) — rebuilding providers would re-stream GBs.
     private var prefixProviders: [ArenaExpertProvider]? = nil
@@ -405,31 +347,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         budget = Swift.min(budget * 2, 65536)
                         continue
                     }
-                    // #98 DFlash phase 3: resident tier always builds via fusedBackendWithFwd
-                    // (fusedBackend is just `.map { $0.0 }` of this — identical either way) so
-                    // the fwd handle is available for the tap when QWISP_DFLASH is active.
-                    var segFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
-                    let sb: Tell.SpecBackend?
-                    if cfg.isStreaming {
-                        sb = Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
-                                                   maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
-                    } else if let (b, fwd) = Tell.fusedBackendWithFwd(
-                        engine: self.engine,
-                        maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
-                        maxSeqLen: maxSeqLen) {
-                        segFwd = fwd
-                        sb = b
-                    } else {
-                        sb = nil
-                    }
+                    let sb: Tell.SpecBackend? = cfg.isStreaming
+                        ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
+                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
+                        : Tell.fusedBackend(
+                            engine: self.engine,
+                            maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
+                            maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
-                    // dflash nil (QWISP_DFLASH unset, or streaming tier) → dd nil → runSpecLoop's
-                    // seam is a no-op, byte-identical to pre-change.
-                    let dd = cfg.isStreaming ? nil : self.dflashIfEnabled()
-                    if let dd, let fwd = segFwd {
-                        _ = fwd.attachTap(layerIds: dd.drafter.config.targetLayerIds)
-                        dd.reset()   // fresh segment re-prefills `seq` from scratch into a new backend
-                    }
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
                     // per segment (RNG restarts, so vary the seed by `produced` to avoid reusing the
                     // same stream across segment boundaries). ponytail: penalty counts reset per
@@ -464,8 +389,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                toks: toks, outPath: outP)
                     } else {
                         seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
-                                               N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok,
-                                               dflash: dd, dflashFwd: segFwd)
+                                               N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
                     }
                     guard let seg, !seg.isEmpty else { break }
                     // Greedy strict flows through the guard (unified seq/produced + re-arm);
@@ -515,7 +439,6 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
                     let built: Tell.SpecBackend?
-                    var builtFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
                     if cfg.isStreaming {
                         // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
                         // existingProviders survive KV-arena growth rebuilds.
@@ -529,22 +452,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         } else { built = nil }
                     } else {
                         // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
-                        // #98 DFlash phase 3: fusedBackendWithFwd (fusedBackend is just its `.0`) so the
-                        // fwd handle is available for the tap when QWISP_DFLASH is active.
                         let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
-                        if let (b, fwd) = Tell.fusedBackendWithFwd(engine: self.engine, maxM: mm, maxSeqLen: newLen) {
-                            builtFwd = fwd
-                            built = b
-                        } else { built = nil }
+                        built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen)
                     }
                     guard let b = built else {
                         continuation.finish(); return
                     }
                     self.prefixBackend = b; self.prefixArenaLen = newLen
-                    self.prefixFwd = builtFwd
-                    if let fwd = builtFwd, let dd = self.dflashIfEnabled() {
-                        _ = fwd.attachTap(layerIds: dd.drafter.config.targetLayerIds)
-                    }
                     self.prefixEmptySnap = b.fullSnapshot?()
                     self.prefixSlots = []; self.arenaContent = []   // new arena → old snapshots invalid
                 }
@@ -635,17 +549,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 let maxK = cfg.isStreaming
                     ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
                     : cfg.maxK
-                // #98 DFlash: this whole cached call is one generation segment for the drafter
-                // (the target's KV persists via restore, but the drafter's own small ctx cache
-                // doesn't track restores) — reset() so it starts cold each request, matching the
-                // segmented path's "reset() per new generation segment" contract.
-                let dd = cfg.isStreaming ? nil : self.dflashIfEnabled()
-                dd?.reset()
                 _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
                                      N: genBudget, maxK: maxK, prefillTokens: genSuffix,
                                      isCancelled: { cancel.isCancelled },
-                                     onToken: { continuation.yield($0) },
-                                     dflash: dd, dflashFwd: self.prefixFwd)
+                                     onToken: { continuation.yield($0) })
                 continuation.finish()
             }
         }
@@ -653,7 +560,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
 
     /// Test/override hook: drop the persistent arena + all restore points (start cold).
     public func resetPrefixCache() {
-        prefixBackend = nil; prefixFwd = nil; prefixProviders = nil; prefixArenaLen = 0; prefixEmptySnap = nil
+        prefixBackend = nil; prefixProviders = nil; prefixArenaLen = 0; prefixEmptySnap = nil
         arenaContent = []; prefixSlots = []
         prefixRAM.removeAll()   // #117: "restart" semantics — only the DISK store (#89) survives
     }

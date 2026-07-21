@@ -3225,47 +3225,6 @@ public enum SeedlessFusedVerify {
         /// (layerIndex, inds[M*Ktop]) — nil の間は呼び出しコスト無し。
         public var indsCaptureHook: ((Int, [Int32]) -> Void)? = nil
 
-        // ── #98 DFlash phase 1: target-hidden tap ────────────────────────────────────────
-        // Additive persistent f16 side-buffer holding the residual-stream hidden states
-        // (hBuf) of a configurable layer set immediately after each layer's post-MoE
-        // residAdd, for every forward (resident/bolt/strict). These are the DFlash
-        // drafter's ctx features (model.py extract_context_feature offset=1: ctx for
-        // target_layer_id L == hBuf right after layer L's post-MoE residAdd).
-        // tap nil (default) => ZERO added encodes => every existing path byte-identical.
-        public private(set) var tapBuf: MTLBuffer? = nil
-        public private(set) var tapLayerIds: [Int] = []
-
-        /// Validates ids (strictly ascending, unique, each in 0..<layers.count; else nil),
-        /// ensures compileDiagCopyRoute, allocates a shared MTLBuffer of
-        /// layerIds.count*maxM*H*2 bytes, stores both props, returns it.
-        @discardableResult
-        public func attachTap(layerIds: [Int]) -> MTLBuffer? {
-            for (i, id) in layerIds.enumerated() {
-                guard id >= 0, id < layers.count else { return nil }
-                if i > 0, id <= layerIds[i - 1] { return nil }
-            }
-            guard SeedlessMetalForward.compileDiagCopyRoute() else { return nil }
-            guard let buf = device.makeBuffer(length: layerIds.count * maxM * H * 2,
-                                              options: .storageModeShared) else { return nil }
-            tapBuf = buf
-            tapLayerIds = layerIds
-            return buf
-        }
-
-        /// Clears tapBuf and tapLayerIds.
-        public func detachTap() { tapBuf = nil; tapLayerIds = [] }
-
-        /// If tapBuf is set and li is a tap layer, reuse encodeDiagCopyRoute (half branch,
-        /// Ktop=0 keeps the int32 branch dead, E=M*H) to copy hBuf's M*H f16 into slot
-        /// (ti*maxM*H*2). No new kernel. tapBuf nil (default) => no-op => zero added encodes.
-        private func encodeTap(_ enc: MTLComputeCommandEncoder, li: Int, M: Int) {
-            guard let buf = tapBuf, let ti = tapLayerIds.firstIndex(of: li) else { return }
-            SeedlessMetalForward.encodeDiagCopyRoute(enc, inds: hBuf, gl: hBuf,
-                                                indsDst: buf, indsDstByteOffset: 0,
-                                                glDst: buf, glDstByteOffset: ti * maxM * H * 2,
-                                                Ktop: 0, E: M * H)
-        }
-
         public init?(layers specs: [SeedlessVerifyForward.LayerSpec], caches: [SeedlessVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
                      numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
@@ -3358,7 +3317,6 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
             SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
-            encodeTap(enc, li: li, M: M)
         }
 
         /// bolt routing telemetry (notes/11 Stage 0 → notes/13 採用で一般化): 非 nil のとき
@@ -3392,7 +3350,6 @@ public enum SeedlessFusedVerify {
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
                                               slotTable: slotTables[li], diag: diag, bias: biasTuple)
             SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
-            encodeTap(enc, li: li, M: M)
         }
 
         /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
@@ -3614,7 +3571,6 @@ public enum SeedlessFusedVerify {
                 SeedlessFusedVerify.encodeMoESharedRows(curEnc!, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                     M: M, I: L.I, H: H, Ktop: L.Ktop)
                 SeedlessFusedVerify.encodeResidAdd(curEnc!, h: hBuf, r: moeOut, total: M * H)
-                encodeTap(curEnc!, li: li, M: M)
 
                 if li + 1 < layers.count {
                     // 次層の pre-MoE + route を同 CB に連結してから flush(route 読み出し)
@@ -3684,18 +3640,8 @@ public enum SeedlessFusedVerify {
 
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
-        ///
-        /// #98 A1 fused draft+verify (additive seam, default nil = byte-identical): resident
-        /// のみ、drafter prologue を同一 CB の先頭に encode し、その argmax 出力
-        /// `draftTokensBuf` の rows 1..<M を blit で tokensIn rows 1..<M へ GPU-copy して
-        /// から通常の M 行 verify を走らせる(tokens の rows 1.. は placeholder)。draft と
-        /// verify の CPU 往復を 1 CB に畳む。prologue は CB を受ける(MPS が自前の encoder
-        /// を開くため encoder 単位では渡せない)。
-        public func stepArgmax(_ tokens: [Int32],
-                               draftPrologue: ((MTLCommandBuffer) -> Void)? = nil,
-                               draftTokensBuf: MTLBuffer? = nil) -> [Int]? {
+        public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
             guard let hd = head, tokens.count <= maxM else { return nil }
-            if draftPrologue != nil, streamMode != .resident { return nil }   // fused seam: resident-only
             let M = tokens.count
             hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
 
@@ -3743,15 +3689,6 @@ public enum SeedlessFusedVerify {
             switch streamMode {
             case .resident:
                 let cb = queue.makeCommandBuffer()!
-                // #98 A1: drafter prologue + blit(draft argmax ids → tokensIn rows 1..<M)。
-                // encoder 境界の implicit barrier が embed の read を blit の後に順序付ける。
-                if let prologue = draftPrologue, let dt = draftTokensBuf, M > 1 {
-                    prologue(cb)
-                    let blit = cb.makeBlitCommandEncoder()!
-                    blit.copy(from: dt, sourceOffset: 4, to: hd.tokensIn, destinationOffset: 4,
-                              size: (M - 1) * 4)
-                    blit.endEncoding()
-                }
                 let enc = cb.makeComputeCommandEncoder()!
                 encodeEmbed(enc)
                 for (li, L) in layers.enumerated() { encodeLayer(enc, L, li: li, M: M) }
@@ -4161,10 +4098,6 @@ public enum SeedlessFusedVerify {
                                                       M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
                 }
-                // #98 DFlash bootstrap: same nil-guarded tap seam as encodeLayer/runStrictLayers
-                // (copy-out only — the hybrid token stream is untouched). tapBuf nil => no-op,
-                // so the canonical hybrid prefill stays byte-identical when DFlash is off.
-                encodeTap(enc(), li: li, M: M)
             }
             if let fw = finalNormW {
                 SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
