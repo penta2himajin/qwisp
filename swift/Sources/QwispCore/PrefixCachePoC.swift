@@ -265,7 +265,35 @@ extension Tell {
         } else {
             bLines.append("  qmm4_rows_b: compile FAIL")
         }
-        return (lines + projLines + bLines).joined(separator: "\n") + "\nLANEKBENCH done"
+
+        // ── MLX reference: what does MLX's own quantizedMM (qmv/steel dispatch)
+        // cost at M=1..8 on the same shape? If MLX at M=3 ≪ 3× M=1, a better
+        // small-M kernel EXISTS and the qmv M-scaling floor is engine-local.
+        var mlxLines: [String] = ["  MLX quantizedMM [N=\(pN),K=\(pK)] µs/op: M → wall"]
+        let mx = MLXRandom.normal([8, pK]).asType(.float16)
+        let mwf = MLXRandom.normal([pN, pK]).asType(.float16)
+        let (mwq, ms0, mb0) = MLX.quantized(mwf, groupSize: 64, bits: 4, mode: .affine)
+        MLX.eval([mx, mwq, ms0, mb0!])
+        for M in [1, 2, 3, 4, 8] {
+            let xm = mx[0 ..< M]; xm.eval()
+            let iters = 200
+            var warm: [MLXArray] = []
+            for _ in 0 ..< 20 {
+                warm.append(MLX.quantizedMM(xm, mwq, scales: ms0, biases: mb0!,
+                                            transpose: true, groupSize: 64, bits: 4))
+            }
+            MLX.eval(warm)
+            var ys: [MLXArray] = []
+            for _ in 0 ..< iters {
+                ys.append(MLX.quantizedMM(xm, mwq, scales: ms0, biases: mb0!,
+                                          transpose: true, groupSize: 64, bits: 4))
+            }
+            let t0 = Date()
+            MLX.eval(ys)
+            let usOp = Date().timeIntervalSince(t0) * 1e6 / Double(iters)
+            mlxLines.append(String(format: "    M=%d  %7.1f", M, usOp))
+        }
+        return (lines + projLines + bLines + mlxLines).joined(separator: "\n") + "\nLANEKBENCH done"
     }
 
     // Long-context decay probe (#117 follow-up): the production log shows prefill chunk rate
