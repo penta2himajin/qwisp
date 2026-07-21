@@ -47,17 +47,20 @@ extension Tell {
                   let batch = SeedlessLaneBatch(driver: drv, lanes: lanes) else {
                 return lines.joined(separator: "\n") + "\n[lane-bench] driver nil\nLANEBENCH done"
             }
-            var ms = 0.0
+            var ms = 0.0, gpuMs = 0.0
             let reps = 30
             for r in 0 ..< reps {
                 let toks = (0 ..< B).map { Int32(200 + r * 7 + $0 * 31) }
                 let t0 = Date()
                 _ = batch.forwardRowsBatch(engine.embed(tokens: toks))
-                if r >= 5 { ms += Date().timeIntervalSince(t0) * 1000 }   // drop warmup
+                if r >= 5 {   // drop warmup
+                    ms += Date().timeIntervalSince(t0) * 1000
+                    gpuMs += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                }
             }
             let step = ms / Double(reps - 5)
-            lines.append(String(format: "  %4d  %8.2f  %8.1f tok/s  %8.1f tok/s",
-                                B, step, 1000.0 / step, Double(B) * 1000.0 / step))
+            lines.append(String(format: "  %4d  %8.2f  %8.1f tok/s  %8.1f tok/s   (gpu %.2f ms)",
+                                B, step, 1000.0 / step, Double(B) * 1000.0 / step, gpuMs / Double(reps - 5)))
         }
         return lines.joined(separator: "\n") + "\nLANEBENCH done"
     }
