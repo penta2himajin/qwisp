@@ -28,6 +28,8 @@ if CommandLine.arguments.contains("stream") {
                run: { md, _ in Tell.prefixCacheE2E(modelDir: md) }),
         Runner(name: "prefix-persist-e2e", desc: "disk-persist restart lossless gate (#89; GPU+model)",
                run: { md, _ in Tell.prefixPersistE2E(modelDir: md) }),
+        Runner(name: "prefix-stable-e2e", desc: "stable-prefix recurrence persist: write-once + restart warm-start lossless gate (#112; GPU+model)",
+               run: { md, _ in Tell.prefixStableE2E(modelDir: md) }),
         Runner(name: "prefix-ram-e2e", desc: "RAM-tier conversation-switch lossless gate + ramHits assertions (#117; GPU+model)",
                run: { md, _ in Tell.prefixRAME2E(modelDir: md) }),
         Runner(name: "prefix-bolt-e2e", desc: "bolt prompt-prefix blob reuse byte-identity (#76 bolt side; GPU+model)",

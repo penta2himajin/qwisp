@@ -334,6 +334,75 @@ extension Tell {
         return lines.joined(separator: "\n")
     }
 
+    // #112 gate: stable-prefix persist. Conversation A warms the arena; conversation B
+    // (same ≥1024-token "harness prefix", different tail) diverges → the recurrence
+    // trigger persists the shared restore point ONCE to disk. resetPrefixCache() (=
+    // process restart: arena, slots, and the RAM tier all die) then conversation C with
+    // the same prefix must warm-start from the DISK entry (restoreHits asserts the
+    // restore fired) and stream byte-identical to the cache-off path. Also asserts the
+    // store holds exactly ONE file (recurrence writes once — no per-turn wear).
+    public static func prefixStableE2E(modelDir: String) -> String {
+        let ec = Tell.envInt("QWISP_PREFIX_E2E_C", 0)
+        let tier: SeedlessTier = ec > 0 ? .streaming(c: ec) : .auto
+        guard let backend = try? SeedlessBackend(modelDir: modelDir, tier: tier) else { return "[prefix-stable-e2e] load fail\nPREFIXSTABLEE2E FAIL" }
+        if ec > 0 { backend.losslessForced = true }
+        let store = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("qwisp-prefix-stable-e2e-\(ProcessInfo.processInfo.processIdentifier)")
+        setenv("QWISP_PREFIX_PERSIST_DIR", store.path, 1)
+        setenv("QWISP_PREFIX_SNAP_STRIDE", "512", 1)   // slots inside the 1200-token prefix
+        defer { unsetenv("QWISP_PREFIX_PERSIST_DIR"); try? FileManager.default.removeItem(at: store) }
+
+        func toks(_ n: Int, _ salt: Int) -> [Int] { (0..<n).map { (($0 &* 7 &+ salt) % 5000) + 100 } }
+        let shared = toks(1200, 13)                    // ≥ stableMinTokens at a 1024 slot boundary
+        let cA = shared + toks(48, 1)
+        let cB = shared + toks(48, 2)                  // recurrence: same prefix, new conversation
+        let cC = shared + toks(48, 3)                  // post-"restart" conversation
+        func req(_ content: [Int]) -> (prompt: [Int], cl: Int) { (content + toks(8, 777), content.count) }
+        let maxTok = 24
+
+        final class Box: @unchecked Sendable { var v: [Int] = [] }
+        func gen(_ p: [Int], _ cl: Int) -> [Int] {
+            let box = Box()
+            let sem = DispatchSemaphore(value: 0)
+            let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
+            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            sem.wait()
+            return box.v
+        }
+        func binCount() -> Int {
+            (try? FileManager.default.contentsOfDirectory(atPath: store.path).filter { $0.hasSuffix(".bin") }.count) ?? 0
+        }
+
+        backend.prefixCacheForced = false
+        let refs = [req(cA), req(cB), req(cC)].map { gen($0.prompt, $0.cl) }
+        backend.prefixCacheForced = true
+        backend.resetPrefixCache()
+        let gotA = gen(req(cA).prompt, req(cA).cl)                 // cold, warms the arena path
+        let filesAfterA = binCount()
+        let gotB = gen(req(cB).prompt, req(cB).cl)                 // divergence → stable persist fires
+        var waited = 0.0                                            // async write → poll
+        while waited < 15, binCount() == 0 { Thread.sleep(forTimeInterval: 0.2); waited += 0.2 }
+        let filesAfterB = binCount()
+        backend.resetPrefixCache()                                  // "restart": only the disk survives
+        let hits0 = PrefixPersist.restoreHits
+        let gotC = gen(req(cC).prompt, req(cC).cl)
+        let diskRestored = PrefixPersist.restoreHits > hits0
+        let filesAfterC = binCount()
+
+        var lines = ["[prefix-stable-e2e] shared=1200tok, stride=512, tier=\(ec > 0 ? "streaming C=\(ec)" : "resident")"]
+        var pass = true
+        func check(_ name: String, _ ok: Bool, _ detail: String) {
+            pass = pass && ok
+            lines.append("  \(name)  \(detail)  \(ok ? "✅" : "❌")")
+        }
+        check("R1 A cold      ", refs[0] == gotA && filesAfterA == 0, "identical=\(refs[0] == gotA) files=\(filesAfterA) (want 0 — one conversation is no evidence)")
+        check("R2 B recurrence", refs[1] == gotB && filesAfterB == 1, "identical=\(refs[1] == gotB) files=\(filesAfterB) (want 1 — persisted once)")
+        check("R3 C restart   ", refs[2] == gotC && diskRestored, "identical=\(refs[2] == gotC) diskRestore=\(diskRestored ? "HIT" : "MISS")")
+        check("write-once     ", filesAfterC == 1, "files=\(filesAfterC) (want 1 — no per-turn growth)")
+        lines.append("PREFIXSTABLEE2E \(pass ? "PASS" : "FAIL")")
+        return lines.joined(separator: "\n")
+    }
+
     // #117 gate: PREFIXE2E for the RAM tier. Interleaved conversations — A cold, B cold
     // (unrelated → replaces A's arena path), then A extended: the third request must
     // restore A's whole-conversation state from the RAM store (prefixRAMHits asserts the

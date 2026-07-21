@@ -73,6 +73,7 @@ case "serve":
         // Resident tier only, greedy only, and NOT bit-exact with single-stream decode
         // (batch near-tie flips) — hence never the default.
         print("[qwisp serve] continuous batching: B=\(bs) slots (resident MLX path, greedy; requests batch instead of queueing)")
+        print("[qwisp serve] NOTE: batching targets multi-user cold-prompt throughput; for agentic harnesses (OpenCode etc.) the DEFAULT mode is faster (measured 2.6x) and bit-exact — see issue #121")
         backend = try BatchBackend(modelDir: model, slots: bs)
         batchMode = true
     } else {
