@@ -268,7 +268,27 @@ public final class BatchBackend: LLMBackend, @unchecked Sendable {
         self.contextLen = SeedlessBackend.readContextLen(modelDir)
     }
 
+    // #121 workload guard: batch admits pay a FULL prefill per request (no prefix cache,
+    // no SuffixSpec). On agentic-harness traffic — consecutive prompts sharing a large
+    // system+tools prefix — this measured 2.6x SLOWER than the default serialize path
+    // (and diverges: MLX f16 near-tie flips). Detect that signature and say so once.
+    private var lastPromptHead: [Int] = []
+    private var sharedPrefixSeen = 0
+    private var warnedSharedPrefix = false
+
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
+        if !warnedSharedPrefix {
+            let head = Array(prompt.prefix(4096))
+            var lcp = 0
+            while lcp < head.count && lcp < lastPromptHead.count && head[lcp] == lastPromptHead[lcp] { lcp += 1 }
+            lastPromptHead = head
+            if lcp >= 1024 { sharedPrefixSeen += 1 }
+            if sharedPrefixSeen >= 2 {
+                warnedSharedPrefix = true
+                FileHandle.standardError.write(Data(
+                    "[qwisp] NOTE: requests share large prompt prefixes (agentic-harness signature). QWISP_BATCH re-prefills every request and loses ~2.6x to the default mode on this traffic (issue #121) — unset QWISP_BATCH unless you need multi-user cold-prompt throughput.\n".utf8))
+            }
+        }
         let headroom = Swift.max(0, contextLen - prompt.count)
         let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
         return scheduler.submit(prompt: prompt, maxTokens: ceiling, stopIds: options.stopTokens)
