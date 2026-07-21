@@ -16,25 +16,6 @@ import MLXFast
 /// QWISP_DUMP_TOKENS=1     — print PROMPT_TOKENS / OUT_TOKENS lines (bench correctness axis)
 extension Tell {
 
-    /// #98 phase A1: config.json + safetensors load, mirroring DFlashDrafter.load(dir:)'s
-    /// internals (that frozen helper doesn't expose the parsed config/weights, and both the
-    /// MLX and raw drafters need to share the identical weights dict). Public-API-only —
-    /// does not touch DFlashDrafter.swift.
-    static func loadDFlashConfigAndWeights(dir: URL) -> (DFlashDrafterConfig, [String: MLXArray])? {
-        guard let cfg = try? DFlashDrafterConfig.load(configJSON: dir.appendingPathComponent("config.json")),
-              let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
-        else { return nil }
-        var weights: [String: MLXArray] = [:]
-        for url in entries where url.pathExtension == "safetensors" {
-            guard let m = try? loadArrays(url: url) else { return nil }
-            for (k, v) in m {
-                let stripped = k.hasPrefix("model.") ? String(k.dropFirst("model.".count)) : k
-                weights[stripped] = v
-            }
-        }
-        return (cfg, weights)
-    }
-
     /// notes/14 TODO-2: bolt の rolling re-calib R と async refresh chunk B を workload 名で
     /// 実証済み最適値へ切り替える opt-in preset(QWISP_BOLT_WORKLOAD)。純関数。
     /// 明示 env(QWISP_BOLT_RECALIB_R/QWISP_BOLT_REFRESH_B)が常にこの preset を上書きする。
@@ -527,11 +508,7 @@ extension Tell {
     /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
-                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil,
-                        // #98 DFlash prefill-ctx bootstrap: called after each chunk forward
-                        // with that chunk's row count (the per-forward tapBuf holds exactly
-                        // those rows at that moment). nil (default) = byte-identical.
-                        onChunk: ((Int) -> Void)? = nil) -> MLXArray? {
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
@@ -544,7 +521,6 @@ extension Tell {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
             guard let normed = fwdFn(chunk) else { return nil }
-            onChunk?(chunk.count)
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
@@ -615,32 +591,11 @@ extension Tell {
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
                              isCancelled: (() -> Bool)? = nil,
-                             onToken: ((Int) -> Void)? = nil,
-                             // #98 DFlash phase 3: nil-guarded seam (same contract as
-                             // mtpDraftSpan/mtpHead) — dflash nil (default) leaves every
-                             // path below byte-identical. dflashFwd is the tap source
-                             // (attachTap'd by the caller); both travel together.
-                             dflash: DFlashDispatch? = nil,
-                             dflashFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> [Int]? {
+                             onToken: ((Int) -> Void)? = nil) -> [Int]? {
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
-        // #98 DFlash prefill-ctx bootstrap (QWISP_DFLASH_BOOTSTRAP=1, opt-in): harvest each
-        // prefill chunk's tap rows into the drafter ctx so block 1 already sees the prompt
-        // features (kills the cold-start accept ramp). Prompt longer than the raw ctx cap →
-        // draft falls back to the MLX drafter (windowed mask) — unchanged v1 contract.
-        // With a restored prefix-cache, only the re-prefilled suffix is harvested (cached
-        // rows never ran a tapped forward) — degraded ctx, still lossless.
-        let dflashBoot: ((Int) -> Void)? = {
-            guard Tell.envFlag("QWISP_DFLASH_BOOTSTRAP"), !useA3, let dd = dflash,
-                  let fwd = dflashFwd, fwd.tapBuf != nil else { return nil }
-            return { rows in
-                guard let tb = fwd.tapBuf else { return }
-                dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
-            }
-        }()
-        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
-                                       onChunk: dflashBoot) else { return nil }
+        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
@@ -657,20 +612,10 @@ extension Tell {
         // greedy stream stays byte-identical while collapsing K CPU round-trips to 1.
         // Strict streaming wires no chain fn (needs a CPU turn per step to ensure/pread
         // the expert union) → nil → per-step fallback by construction. QWISP_CHAIN_K=0 opts out.
-        // dflash non-nil forces chainK=0: chain steps overwrite tap row 0 per step and would
-        // starve the drafter's ctx (DFlash takes over the D==0 span instead of the chain).
-        let chainK = dflash != nil ? 0
-            : Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
-        // Tap harvest (nil-guarded): dflash inactive under A3 (guard !useA3, matches the
-        // draft-attempt guard below). tapBuf missing (not attached) → no-op.
-        func dflashHarvest(_ rows: Int) {
-            guard !useA3, let dd = dflash, let fwd = dflashFwd, let tb = fwd.tapBuf else { return }
-            dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
-        }
-
         // isCancelled nil → `?? false` → loop condition byte-identical (RAWTESTS 79/79).
         // Set by the streaming backend when the consumer drops the stream, so an
         // aborted request stops at the next spec-step boundary instead of running
@@ -696,27 +641,10 @@ extension Tell {
                 : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
                                    traceAlts: Tell.traceAltsEnabled)
             if prof { pfDraft += Date().timeIntervalSince(tD) * 1000 }
-            // #98 DFlash: only when SuffixSpec found nothing (draftless span) and not under A3
-            // (dflash is inactive there — see dflashHarvest). Falls back to the old per-step
-            // path on nil (cold start / any failure), unchanged behavior.
-            // #98 A1 fused-first: draft+verify in ONE CB on dflashFwd. Snapshot is taken
-            // BEFORE the fused step (the verify inside it advances the cache; the drafter
-            // itself never touches the target cache, so pre-draft == pre-verify state).
-            var fusedEvals: [Int]? = nil
-            var fusedSnap: Any? = nil
-            if drafts.isEmpty, !useA3, let dd = dflash {
-                if let fwd = dflashFwd {
-                    let s = backend.snapshot()
-                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
-                        drafts = r.drafts; fusedEvals = r.evals; fusedSnap = s
-                    }
-                }
-                if fusedEvals == nil, let ds = dd.draft(u: u), !ds.isEmpty { drafts = ds }
-            }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
-            let snap = fusedSnap ?? backend.snapshot()
+            let snap = backend.snapshot()
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -748,7 +676,6 @@ extension Tell {
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
                     if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
                     out.append(u); hist.append(u)
-                    dflashHarvest(1)
                     u = evals[0]
                 }
                 continue
@@ -791,17 +718,10 @@ extension Tell {
                     }
                 }
             } else {
-                // Non-A3 path (unchanged; fused path already ran the verify in the draft CB)
-                let evals: [Int]
-                if let fe = fusedEvals {
-                    evals = fe
-                } else {
-                    let tV = prof ? Date() : Date.distantPast
-                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                    guard let e = backend.stepArgmax(verifyTokens) else { return nil }
-                    if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
-                    evals = e
-                }
+                let tV = prof ? Date() : Date.distantPast
+                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
+                if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
@@ -816,7 +736,6 @@ extension Tell {
                         gateSuspendedUntil = out.count + Tell.specGateReprobe
                     }
                 }
-                dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
 
                 if p == D {
                     out.append(u); hist.append(u)
@@ -1168,48 +1087,6 @@ extension Tell {
             print("[raw-spec] NOTE: QWISP_MTP_DRAFT ignored (QWISP_RAW_A3 set — mutually exclusive)")
         }
 
-        // ── DFlash block drafter (#98 phase 3, resident tier only) ─────────
-        // Opt-in QWISP_DFLASH=1, same gating shape as QWISP_MTP_DRAFT above (resident fused
-        // tier, !useA3). Flag off / other tiers → dflash=nil → the loop below is
-        // byte-identical to pre-change (nil-guarded seam contract). Load failure never
-        // fatal — warn and run without DFlash.
-        var dflash: DFlashDispatch? = nil
-        if Tell.envFlag("QWISP_DFLASH"), let fwd = _residentFwd, fwd.streamMode == .resident, !useA3 {
-            let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"]
-                ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.mtplx/models/z-lab--Qwen3.6-35B-A3B-DFlash"
-            // #98 phase A1: load config+weights once (public-API-only re-derivation of what
-            // DFlashDrafter.load(dir:) does internally — that frozen helper doesn't expose
-            // them, and both the MLX and raw drafters need to share the same weights dict).
-            if let (cfg, weights) = Tell.loadDFlashConfigAndWeights(dir: URL(fileURLWithPath: dir)),
-               let drafter = DFlashDrafter(config: cfg, weights: weights) {
-                let blockSize = Tell.envInt("QWISP_DFLASH_BLOCK", 8)
-                var rawCfg = cfg
-                rawCfg.blockSize = blockSize
-                var raw = DFlashRawDrafter(config: rawCfg, weights: weights)
-                if let r = raw, !r.attachTargetHead(embedW: engine.embedW, embedS: engine.embedS, embedB: engine.embedB,
-                                                    lmW: engine.lmW, lmS: engine.lmS, lmB: engine.lmB, vocab: engine.vocab) {
-                    raw = nil
-                }
-                let dd = DFlashDispatch(
-                    drafter: drafter, raw: raw, blockSize: blockSize,
-                    embedFn: { engine.embed(tokens: $0) },
-                    logitsArgmaxFn: { h in
-                        // c_draft: ONE lazy-graph eval for embed+drafter+lm_head+argmax —
-                        // per-row .item() was 7 separate evals+syncs per block (measured
-                        // c_draft ~4-5 forwards, PR #113 G-D interim).
-                        guard let lg = engine.logits(h, M: h.dim(0)) else { return nil }
-                        let ids = MLX.argMax(lg, axis: -1).asType(.int32)
-                        ids.eval()
-                        return ids.asArray(Int32.self).map { Int($0) }
-                    })
-                _ = fwd.attachTap(layerIds: drafter.config.targetLayerIds)
-                dflash = dd
-                print("[raw-spec] DFlash dispatch active (block=\(blockSize), raw=\(raw != nil))")
-            } else {
-                print("[raw-spec] WARN: QWISP_DFLASH=1 but drafter load failed (\(dir)) — running without DFlash")
-            }
-        }
-
         // reuse-rerank setup (flag-off = zero-cost nil path, notes/10 §1c-1e)
         let _useRerank = isStreaming && Tell.envFlag("QWISP_REUSE_RERANK")
         let _reuseAlpha = Double(Tell.envFloat("QWISP_REUSE_ALPHA", 0.0))
@@ -1230,19 +1107,8 @@ extension Tell {
 
         // ── PREFILL ───────────────────────────────────────────────────────
         // (mtpHead non-nil → prompt pairs ingested into head KV per chunk, Step 5)
-        // #98 DFlash prefill-ctx bootstrap (QWISP_DFLASH_BOOTSTRAP=1, opt-in): mirrors the
-        // runSpecLoop seam — harvest each prefill chunk's tap rows into the drafter ctx.
-        let dflashBoot: ((Int) -> Void)? = {
-            guard Tell.envFlag("QWISP_DFLASH_BOOTSTRAP"), !useA3, let dd = dflash,
-                  let fwd = _residentFwd, fwd.tapBuf != nil else { return nil }
-            return { rows in
-                guard let tb = fwd.tapBuf else { return }
-                dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
-            }
-        }()
         guard let lastNormed = prefill(promptIds: promptIds, backend: backend,
-                                       mtpHead: mtpHead, mtpFwd: _residentFwd,
-                                       onChunk: dflashBoot)
+                                       mtpHead: mtpHead, mtpFwd: _residentFwd)
         else { return "[raw-spec] ERROR: prefill returned nil" }
 
         // First token: argmax of logits at the last prompt position.
@@ -1270,15 +1136,7 @@ extension Tell {
         // Phase II-a: QWISP_CHAIN_K=<k>opt-in GPU token-feedback chained greedy decode.
         // Only the D==0 non-A3/empty-pending greedy span uses the chain path; A3 and draft-
         // bearing steps keep the per-step path (snapshot/rollback + suffix-draft needs CPU tokens).
-        // dflash non-nil forces chainK=0 (same reasoning as runSpecLoop: chain steps would
-        // starve the drafter's ctx by overwriting tap row 0 every step).
-        let chainK = dflash != nil ? 0
-            : Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
-        // Tap harvest (nil-guarded, mirrors runSpecLoop's dflashHarvest).
-        func dflashHarvest(_ rows: Int) {
-            guard !useA3, let dd = dflash, let fwd = _residentFwd, let tb = fwd.tapBuf else { return }
-            dd.appendCtx(tapBuf: tb, maxM: fwd.maxM, rows: rows)
-        }
+        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
 
         let t0 = DispatchTime.now()
 
@@ -1295,33 +1153,11 @@ extension Tell {
             //   下の verify path が必ず照合する(reject 経路は greedy と同一 token 列)ので lossless。
             //   flag off = mtpHead nil = mtpDraftSpan nil = このブロック不変(byte-identity)。
             var mtpDrafted = false
-            if D == 0, dflash == nil, mtpHead != nil, pending.isEmpty,
+            if D == 0, mtpHead != nil, pending.isEmpty,
                let d = mtpDraftSpan(head: mtpHead, hPrevBuf: _residentFwd?.normedBuffer,
                                     rowOfU: rowOfU, u: u) {
                 drafts = [d]; D = 1
                 mtpDrafted = true
-            }
-
-            // #98 DFlash: same slot as mtpDraftSpan above (dflash replaces it when active —
-            // the two flags are mutually exclusive by construction, dflash takes priority).
-            // A1 fused-first: draft+verify in ONE CB (snapshot BEFORE — the fused verify
-            // advances the cache). Guards: mtpHead feeds pre-verify normed rows and rerank
-            // needs the verify tokens up-front — both fall back to the split path.
-            var dflashDrafted = false
-            var fusedEvals: [Int]? = nil
-            var fusedSnap: Any? = nil
-            if D == 0, let dd = dflash, !useA3 {
-                if mtpHead == nil, !_useRerank, let fwd = _residentFwd {
-                    let s = backend.snapshot()
-                    if let r = dd.draftFused(u: u, fwd: fwd), !r.drafts.isEmpty {
-                        drafts = r.drafts; D = drafts.count; dflashDrafted = true
-                        fusedEvals = r.evals; fusedSnap = s
-                    }
-                }
-                if !dflashDrafted, let ds = dd.draft(u: u), !ds.isEmpty {
-                    drafts = ds; D = drafts.count
-                    dflashDrafted = true
-                }
             }
 
             // ★ MTP-D1 (Step 5): u はこの step で必ず commit される → pair (h_prev, u) を
@@ -1340,8 +1176,7 @@ extension Tell {
             }
 
             // Snapshot before the batched verify (backend-specific representation).
-            // Fused dflash step: the verify already ran → use the pre-fused snapshot.
-            let snap = fusedSnap ?? backend.snapshot()
+            let snap = backend.snapshot()
 
             if D == 0 {
                 // No draft available
@@ -1382,7 +1217,6 @@ extension Tell {
                     guard let evals = backend.stepArgmax([Int32(u)])
                     else { return "[raw-spec] ERROR: step(D=0) nil" }
                     out.append(u); hist.append(u)
-                    dflashHarvest(1)
                     u = evals[0]
                     rowOfU = 0
                 }
@@ -1440,26 +1274,14 @@ extension Tell {
                     }
                 }
             } else {
-                // ── Non-A3 path (unchanged; fused path already ran the verify) ──
-                let evals: [Int]
-                if let fe = fusedEvals {
-                    evals = fe
-                } else {
-                    let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
-                    if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
-                    guard let e = backend.stepArgmax(verifyTokens)
-                    else { return "[raw-spec] ERROR: verify step nil" }
-                    evals = e
-                }
+                // ── Non-A3 path ──
+                let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
+                if _useRerank { _reuseVerifyToks = verifyTokens.map { Int($0) } }
+                guard let evals = backend.stepArgmax(verifyTokens)
+                else { return "[raw-spec] ERROR: verify step nil" }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
-                dflashHarvest(p + 1)   // rows 0..p = [u]+accepted drafts (both branches below)
-                // measurement-only (QWISP_DFLASH_TRACE): accept vs drafter-ctx length —
-                // separates cold-start ctx from feature-shift as the accept limiter.
-                if dflashDrafted, let dd = dflash, Tell.envFlag("QWISP_DFLASH_TRACE") {
-                    FileHandle.standardError.write(Data("[dflash-trace] ctx=\(dd.ctxRowsFed) p=\(p)/\(D)\n".utf8))
-                }
 
                 if p == D {
                     // ── full accept ───────────────────────────────────────
