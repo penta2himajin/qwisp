@@ -39,7 +39,11 @@ function fire(hostport, body, greedy) {
             if (!line.startsWith("data:")) continue;
             const d = line.slice(5).trim();
             if (d === "[DONE]") continue;
-            try { const j = JSON.parse(d); const delta = j.choices?.[0]?.delta?.content; if (delta) text += delta; } catch {}
+            try {
+              const j = JSON.parse(d); const dl = j.choices?.[0]?.delta;
+              if (dl?.reasoning_content) text += dl.reasoning_content;   // thinking models
+              if (dl?.content) text += dl.content;
+            } catch {}
           }
         });
         res.on("end", () => resolve({ ok: true, text, ttft, wall: Date.now() - t0, status: res.statusCode }));

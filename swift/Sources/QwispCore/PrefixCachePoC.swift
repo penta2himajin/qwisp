@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 
 // Feasibility PoC for cross-request prefix caching (issue: agentic TTFT dominated by re-prefilling
@@ -12,6 +13,261 @@ import MLX
 // tail = the generation prompt + generated tokens that the next request rewinds past, B = the new
 // content appended in the next request.
 extension Tell {
+    // Lane-batch bench (Stage 1, parallel agents): real-model speed of the
+    // bit-exact lane-batched greedy step. B lanes prefill DIFFERENT prompts
+    // (diverse routing = worst-case MoE union), then decode batched; reports
+    // ms/step and per-stream + aggregate tok/s vs the M=1 solo baseline.
+    // Env: QWISP_LANE_B (default "1,2,3,4,8" sweep), QWISP_LANE_CTX (default 1024).
+    public static func laneBatchBench(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[lane-bench] load fail\nLANEBENCH done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let ctx = Tell.envInt("QWISP_LANE_CTX", 1024)
+        let bs = (ProcessInfo.processInfo.environment["QWISP_LANE_B"] ?? "1,2,3,4,8")
+            .split(separator: ",").compactMap { Int($0) }
+        func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
+        var lines = ["[lane-bench] ctx=\(ctx)/lane resident — bit-exact lane-batched greedy step",
+                     "     B   ms/step   per-stream   aggregate"]
+        for B in bs {
+            // Fresh lanes each B: own arena + prefill of a DIFFERENT prompt.
+            var lanes: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            for b in 0 ..< B {
+                guard let (fwd, _) = engine.makeFused(maxM: 64, maxSeqLen: ctx + 128) else {
+                    return lines.joined(separator: "\n") + "\n[lane-bench] lane makeFused nil\nLANEBENCH done"
+                }
+                let prompt = tok(ctx, 13 + b * 17)
+                var pos = 0
+                while pos < ctx {
+                    let end = Swift.min(pos + 64, ctx)
+                    _ = fwd.forwardRows(engine.embed(tokens: Array(prompt[pos ..< end])), M: end - pos)
+                    pos = end
+                }
+                lanes.append(fwd)
+            }
+            guard let (drv, _) = engine.makeFused(maxM: Swift.max(8, B), maxSeqLen: 128),
+                  let batch = SeedlessLaneBatch(driver: drv, lanes: lanes) else {
+                return lines.joined(separator: "\n") + "\n[lane-bench] driver nil\nLANEBENCH done"
+            }
+            var ms = 0.0, gpuMs = 0.0
+            let reps = 30
+            for r in 0 ..< reps {
+                let toks = (0 ..< B).map { Int32(200 + r * 7 + $0 * 31) }
+                let t0 = Date()
+                _ = batch.forwardRowsBatch(engine.embed(tokens: toks))
+                if r >= 5 {   // drop warmup
+                    ms += Date().timeIntervalSince(t0) * 1000
+                    gpuMs += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                }
+            }
+            let step = ms / Double(reps - 5)
+            lines.append(String(format: "  %4d  %8.2f  %8.1f tok/s  %8.1f tok/s   (gpu %.2f ms)",
+                                B, step, 1000.0 / step, Double(B) * 1000.0 / step, gpuMs / Double(reps - 5)))
+            // Full greedy step (embed→layers→head→argmax, 1 CB, int-only readback)
+            // — the serve-path primitive; token feedback chains the trajectory.
+            var ams = 0.0, agpu = 0.0
+            var toks = (0 ..< B).map { Int32(300 + $0 * 13) }
+            var argmaxOK = true
+            for r in 0 ..< reps {
+                let t0 = Date()
+                guard let next = batch.stepArgmaxBatch(toks) else { argmaxOK = false; break }
+                if r >= 5 {
+                    ams += Date().timeIntervalSince(t0) * 1000
+                    agpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                }
+                toks = next.map { Int32($0) }
+            }
+            if argmaxOK {
+                let astep = ams / Double(reps - 5)
+                lines.append(String(format: "        argmax %6.2f  %8.1f tok/s  %8.1f tok/s   (gpu %.2f ms)",
+                                    astep, 1000.0 / astep, Double(B) * 1000.0 / astep, agpu / Double(reps - 5)))
+            } else {
+                lines.append("        argmax: stepArgmaxBatch nil (no head?)")
+            }
+        }
+        return lines.joined(separator: "\n") + "\nLANEBENCH done"
+    }
+
+    // Lane-kernel micro-bench (Stage 1b go/no-go discriminator; GPU, no model):
+    // per-dispatch cost of each PER-LANE sequence-coupled kernel at real dims,
+    // hazard-chained like the real encoder (a shared output buffer WAW-serializes
+    // consecutive dispatches, mirroring the encoder-wide barrier behaviour), with
+    // state buffers cycling over a working set larger than the SLC so recurrence /
+    // KV traffic hits DRAM. Splits the per-lane step cost into dispatch tax
+    // (merge-able by B-lane kernels) vs state bandwidth (irreducible per lane).
+    public static func laneKernelBench() -> String {
+        guard let (device, queue) = SeedlessMetalForward.ensure(),
+              SeedlessFusedVerify.ensureRowsAuxPipelines(),
+              SeedlessFusedVerify.ensureGdnPipelines(),
+              SeedlessFusedVerify.ensureAttnPipelines(),
+              SeedlessFusedVerify.ensureWave3Pipelines(),
+              SeedlessLaneBatch.compileCopy(device)
+        else { return "[lane-kbench] pipeline ensure fail\nLANEKBENCH done" }
+        let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+        let keyDim = Hk * Dk, valueDim = Hv * Dv, convDim = 2 * keyDim + valueDim
+        let nH = 16, nKV = 2, hD = 256, qd2 = 2 * hD, ropeDim = 64
+        let ctx = Tell.envInt("QWISP_LANE_CTX", 1024)
+        let eps: Float = 1e-6, ropeBase: Float = 1e7
+        func buf(_ n: Int) -> MTLBuffer { device.makeBuffer(length: n, options: .storageModeShared)! }
+        let N = 300                      // dispatches per measurement (~10 steps of 30)
+        let nSets = 16                   // state working set: 16×8.4MB rec = 134MB ≫ SLC
+
+        // shared (read or chained-write) buffers
+        let qB = buf(keyDim * 2), kB = buf(keyDim * 2), vB = buf(valueDim * 2)
+        let gB = buf(Hv * 4), betaB = buf(Hv * 4), yB = buf(valueDim * 2)
+        let qkvB = buf(convDim * 2), convOutB = buf(convDim * 2), convW = buf(convDim * cK * 4)
+        let qOutB = buf(nH * qd2 * 2), qNormB = buf(hD * 2), qRotB = buf(nH * hD * 2)
+        let kOutB = buf(nKV * hD * 2), kNormB = buf(hD * 2), kRotB = buf(nKV * hD * 2)
+        let vSrcB = buf(nKV * hD * 2), attnOutB = buf(nH * hD * 2)
+        // cycling per-"lane-layer" state sets
+        let recIn = (0 ..< nSets).map { _ in buf(Hv * Dv * Dk * 4) }
+        let recOut = (0 ..< nSets).map { _ in buf(Hv * Dv * Dk * 4) }
+        let hists = (0 ..< nSets).map { _ in buf(cK * convDim * 2) }
+        let histOuts = (0 ..< nSets).map { _ in buf(cK * convDim * 2) }
+        let kCaches = (0 ..< nSets).map { _ in buf(nKV * ctx * hD * 2) }
+        let vCaches = (0 ..< nSets).map { _ in buf(nKV * ctx * hD * 2) }
+        let copyA = buf(256 * 2), copyBf = buf(256 * 2)
+
+        func timeCB(_ body: (MTLComputeCommandEncoder, Int) -> Void) -> Double {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            for i in 0 ..< N { body(enc, i) }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+        }
+        // measure twice (clock ramp), keep the second; report µs/dispatch
+        func us(_ body: @escaping (MTLComputeCommandEncoder, Int) -> Void) -> Double {
+            _ = timeCB(body)
+            return timeCB(body) * 1000.0 / Double(N)
+        }
+
+        let copyUs = us { enc, _ in
+            // dispatch+barrier floor: tiny chained copy (WAW on copyBf)
+            SeedlessLaneBatch.encodeRowCopyStatic(enc, src: copyA, srcOff: 0, dst: copyBf, dstOff: 0, count: 256)
+        }
+        let convUs = us { enc, i in
+            SeedlessFusedVerify.encodeGdnFusionConvShift(enc, hist: hists[i % nSets], qkv: qkvB,
+                                                         w: convW, convOut: convOutB, histOut: histOuts[i % nSets],
+                                                         M: 1, K: cK, C: convDim)
+        }
+        let recUs = us { enc, i in
+            SeedlessFusedVerify.encodeGatedDeltaStepRows(enc, q: qB, k: kB, v: vB, g: gB, beta: betaB,
+                                                         stateIn: recIn[i % nSets], stateOut: recOut[i % nSets],
+                                                         y: yB, T: 1, B: 1, Hv: Hv, Dv: Dv)
+        }
+        let recHotUs = us { enc, _ in
+            // same kernel, ONE state pair reused → SLC-hot: the DRAM-vs-latency split
+            SeedlessFusedVerify.encodeGatedDeltaStepRows(enc, q: qB, k: kB, v: vB, g: gB, beta: betaB,
+                                                         stateIn: recIn[0], stateOut: recOut[0],
+                                                         y: yB, T: 1, B: 1, Hv: Hv, Dv: Dv)
+        }
+        let qPrepUs = us { enc, _ in
+            SeedlessFusedVerify.encodeAttnQPrepRows(enc, qOut: qOutB, qNorm: qNormB, qRot: qRotB,
+                                                    qd2: qd2, headDim: hD, ropeDim: ropeDim, base: ropeBase,
+                                                    startOffset: ctx - 1, numHeads: nH, M: 1, eps: eps)
+        }
+        let kPrepUs = us { enc, i in
+            SeedlessFusedVerify.encodeAttnKPrepRows(enc, kOut: kOutB, kNorm: kNormB, kRot: kRotB,
+                                                    kCache: kCaches[i % nSets], headDim: hD, ropeDim: ropeDim,
+                                                    base: ropeBase, startOffset: ctx - 1, numKV: nKV,
+                                                    maxLen: ctx, M: 1, eps: eps)
+        }
+        let wkvUs = us { enc, i in
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: vSrcB, cache: vCaches[i % nSets],
+                                                  KV: nKV, D: hD, maxLen: ctx, pos: ctx - 1, M: 1)
+        }
+        let sdpaUs = us { enc, i in
+            SeedlessFusedVerify.encodeSdpaRows(enc, q: qRotB, k: kCaches[i % nSets], v: vCaches[i % nSets],
+                                               out: attnOutB, H: nH, KV: nKV, D: hD,
+                                               baseLenPlus1: ctx, M: 1,
+                                               scale: Float(pow(Double(hD), -0.5)), maxLen: ctx)
+        }
+
+        let gdnLane = 30.0 * (convUs + recUs)
+        let attnLane = 10.0 * (qPrepUs + kPrepUs + wkvUs + sdpaUs)
+        let perLaneMs = (gdnLane + attnLane) / 1000.0
+        let dispatches = 30.0 * 2 + 10.0 * 4
+        let taxMs = dispatches * copyUs / 1000.0
+        let recDramMs = 30.0 * Swift.max(0, recUs - recHotUs) / 1000.0
+        let lines = ["[lane-kbench] per-dispatch µs at real dims, hazard-chained, ctx=\(ctx), N=\(N), sets=\(nSets)",
+                     String(format: "  copy(floor) %6.1f | conv %6.1f | recur %6.1f (hot %6.1f) | qprep %6.1f | kprep %6.1f | wkv %6.1f | sdpa@%d %6.1f",
+                            copyUs, convUs, recUs, recHotUs, qPrepUs, kPrepUs, wkvUs, ctx, sdpaUs),
+                     String(format: "  per-lane/step: GDN 30×(conv+recur)=%.2fms + attn 10×(4)=%.2fms = %.2fms",
+                            gdnLane / 1000, attnLane / 1000, perLaneMs),
+                     String(format: "  split: dispatch-tax(%.0f × copy-floor)=%.2fms | recur DRAM excess=%.2fms | rest=%.2fms",
+                            dispatches, taxMs, recDramMs, perLaneMs - taxMs - recDramMs),
+                     String(format: "  Stage-1b ceiling @B=3 (tax/3, bandwidth kept): %.2fms/lane vs now %.2fms",
+                            perLaneMs - taxMs * 2.0 / 3.0, perLaneMs)]
+
+        // ── projection-kernel M-scaling probe: does qmm4_rows (qmv, per-row weight
+        // reads) vs qmm4_tiled (threadgroup-shared dequant) flip at small M for
+        // LAYER-shaped matrices? This is the residual B-scaling lever: the M=B
+        // projection dispatches dominate the per-lane increment if weights re-read per row.
+        guard SeedlessMetalForward._qmm4TiledPipeline != nil || {
+            let x = MLXRandom.normal([1, 512]).asType(.float16)
+            let wf = MLXRandom.normal([8, 512]).asType(.float16)
+            let (wq, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            MLX.eval([x, wq, s, b!])
+            return SeedlessMetalForward.qmmTiled(x, wq, scales: s, biases: b!, M: 1, K: 512, N: 8) != nil
+        }() else { return lines.joined(separator: "\n") + "\nLANEKBENCH done" }
+        let pK = 2048, pN = 8192                      // GDN in-proj shape [8192, 2048]
+        let pw = buf(pN * pK / 2), ps = buf(pN * (pK / 64) * 2), pb = buf(pN * (pK / 64) * 2)
+        var projLines: [String] = ["  proj [N=\(pN),K=\(pK)] µs/dispatch: M → rows | tiled"]
+        for M in [1, 2, 3, 4, 8] {
+            let px = buf(M * pK * 2), po = buf(M * pN * 2)
+            let rowsUs = us { enc, _ in
+                SeedlessFusedVerify.encodeQmmRows(enc, w: pw, scales: ps, biases: pb, x: px, out: po, M: M, K: pK, N: pN)
+            }
+            let tiledUs = us { enc, _ in
+                let qp = SeedlessMetalForward._qmm4TiledPipeline!
+                enc.setComputePipelineState(qp)
+                enc.setBuffer(pw, offset: 0, index: 0); enc.setBuffer(ps, offset: 0, index: 1)
+                enc.setBuffer(pb, offset: 0, index: 2); enc.setBuffer(px, offset: 0, index: 3)
+                enc.setBuffer(po, offset: 0, index: 4)
+                var kk = Int32(pK), nn = Int32(pN), mm = Int32(M)
+                enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: pN, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+            projLines.append(String(format: "    M=%d  %7.1f | %7.1f", M, rowsUs, tiledUs))
+        }
+
+        // ── qmm4_rows_b (B-row qmv): correctness (byte vs qmm4_rows, random data)
+        // + speed. If B=3 ≪ 3× the M=1 rows cost, the projection lever is real.
+        var bLines: [String] = []
+        if SeedlessLaneBatch.compileQmmB(device) {
+            let xa = MLXRandom.normal([4, pK]).asType(.float16)
+            let wf = MLXRandom.normal([pN, pK]).asType(.float16)
+            let (wq, s0, b0) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine)
+            let sc = s0.asType(.float16), bi = b0!.asType(.float16)
+            MLX.eval([xa, wq, sc, bi])
+            if let bx = SeedlessMetalForward.mtlBuf(xa, device),
+               let bw = SeedlessMetalForward.mtlBuf(wq, device),
+               let bs = SeedlessMetalForward.mtlBuf(sc, device),
+               let bbq = SeedlessMetalForward.mtlBuf(bi, device) {
+                let oA = buf(4 * pN * 2), oB = buf(4 * pN * 2)
+                let ccb = queue.makeCommandBuffer()!
+                let cenc = ccb.makeComputeCommandEncoder()!
+                SeedlessFusedVerify.encodeQmmRows(cenc, w: bw, scales: bs, biases: bbq, x: bx, out: oA, M: 4, K: pK, N: pN)
+                SeedlessLaneBatch.encodeQmmRowsB(cenc, w: bw, scales: bs, biases: bbq, x: bx, xOff: 0, out: oB, outOff: 0, B: 4, K: pK, N: pN)
+                cenc.endEncoding(); ccb.commit(); ccb.waitUntilCompleted()
+                let same = memcmp(oA.contents(), oB.contents(), 4 * pN * 2) == 0
+                withExtendedLifetime([xa, wq, sc, bi]) {}
+                bLines.append("  qmm4_rows_b vs qmm4_rows byte-compare (B=4, random): \(same ? "PASS" : "FAIL")")
+            }
+            for M in [1, 2, 3, 4] {
+                let px = buf(M * pK * 2), po = buf(M * pN * 2)
+                let bUs = us { enc, _ in
+                    SeedlessLaneBatch.encodeQmmRowsB(enc, w: pw, scales: ps, biases: pb,
+                                                     x: px, xOff: 0, out: po, outOff: 0, B: M, K: pK, N: pN)
+                }
+                bLines.append(String(format: "    rows_b B=%d  %7.1f", M, bUs))
+            }
+        } else {
+            bLines.append("  qmm4_rows_b: compile FAIL")
+        }
+        return (lines + projLines + bLines).joined(separator: "\n") + "\nLANEKBENCH done"
+    }
+
     // Long-context decay probe (#117 follow-up): the production log shows prefill chunk rate
     // decaying 348→66 tok/s over 0→40K and decode collapsing 45→7 tok/s at 48K. This isolates
     // WHY, per stage, using forwardRowsProfiled (exact per-encoder GPU ms bucketed GDN/attn/MoE).

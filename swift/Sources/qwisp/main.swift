@@ -40,6 +40,10 @@ environment:
   QWISP_BATCH=<B>                    serve only: continuous batching with B slots (multi-user
                                      aggregate throughput; resident ≥32GB, greedy-only, not
                                      bit-exact with single-stream — opt-in)
+  QWISP_LANES=<B>                    serve only: lane batching with B raw-engine lanes
+                                     (parallel sub-agent fan-out; resident ≥32GB, greedy-only,
+                                     BIT-EXACT with single-stream — opt-in). Per-lane context
+                                     capped by QWISP_LANE_CTX (default 16384)
 
 first run: `qwisp pull` downloads ~20GB. The first chat/serve request loads the model, and
 on <32GB machines runs a one-time bolt calibration (a few minutes; progress goes to stderr).
@@ -68,6 +72,13 @@ case "serve":
     if ProcessInfo.processInfo.environment["QWISP_FAKE"] == "1" {
         print("[qwisp serve] FAKE backend (no engine load) — wire-format testing only")
         backend = FakeBackend(script: tok.encode("Hello! This is qwisp with a fake backend for wire-format testing."))
+    } else if let ls = Int(ProcessInfo.processInfo.environment["QWISP_LANES"] ?? ""), ls >= 2 {
+        // Lane batching (parallel sub-agent fan-out, opt-in): raw-engine lanes on the
+        // continuous scheduler — bit-exact with the default serialize path, resident
+        // tier only, greedy only. Per-lane context capped by QWISP_LANE_CTX (16384).
+        print("[qwisp serve] lane batching: B=\(ls) lanes (raw engine, greedy, bit-exact; requests batch instead of queueing)")
+        backend = try LaneBackend(modelDir: model, slots: ls)
+        batchMode = true
     } else if let bs = Int(ProcessInfo.processInfo.environment["QWISP_BATCH"] ?? ""), bs >= 2 {
         // Continuous batching (issue #6, opt-in): multi-user aggregate-throughput mode.
         // Resident tier only, greedy only, and NOT bit-exact with single-stream decode

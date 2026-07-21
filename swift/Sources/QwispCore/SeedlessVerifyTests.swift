@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 89
+        let total = 91
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5413,6 +5413,231 @@ public enum SeedlessVerifyTests {
             // k4 far beyond budget clamps to budget/slot4=64, leaving m2=0.
             let over = DeviceCalibration.mixedKM(budgetBytes: budget, slot4Bytes: slot4, slot2Bytes: slot2, k4: 999)
             if over.k4 != 64 || over.m2 != 0 { return (false, "k4=999 → \(over) != (64,0)") }
+            return (true, "ok")
+        }
+
+
+        // ── Lane-batched greedy decode (Stage 1, parallel agents) ─────────
+        // WRITE-LOCKED (guarded by total = 90). Do not weaken/skip/delete.
+        //
+        // Test 90: lane_batch_bitexact
+        // B=3 lanes with DIVERGENT histories (1/2/3 warm-up steps each) advance one
+        // token per step through SeedlessLaneBatch.forwardRowsBatch. Every lane's
+        // output row and cache trajectory must be BIT-identical to that lane running
+        // solo forwardRows(M:1) — the lossless contract of batched multi-sequence
+        // decode. 4 chained steps assert cache continuity, not just one forward.
+        run("lane_batch_bitexact") {
+            let H = 2048, E = 16, I = 512
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
+                let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+                let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+                let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                    swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                    swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                    shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                    sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            }
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
+            let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
+                normWeight: MLXRandom.normal([Dv]).asType(.float16),
+                aLog: MLXRandom.normal([Hv]).asType(.float32), dtBias: MLXRandom.normal([Hv]).asType(.float32))
+            let nH = 16, nKV = 2, hD = 256
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let layers = [
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
+            ]
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([cs0, rs0, kC0, vC0])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            }
+            let B = 3
+            var solos: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            var laneFwds: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            for b in 0 ..< B {
+                guard let s1 = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                        maxM: 4, H: H, maxSeqLen: 64),
+                      let l1 = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                        maxM: 4, H: H, maxSeqLen: 64)
+                else { return (false, "lane/solo init nil b=\(b)") }
+                // Divergent warm-up: b+1 M=1 steps, the SAME inputs to solo and lane.
+                for _ in 0 ... b {
+                    let xw = MLXRandom.normal([1, H]).asType(.float16); xw.eval()
+                    guard s1.forwardRows(xw, M: 1) != nil, l1.forwardRows(xw, M: 1) != nil
+                    else { return (false, "warmup nil b=\(b)") }
+                }
+                solos.append(s1); laneFwds.append(l1)
+            }
+            guard let drv = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                     maxM: 8, H: H, maxSeqLen: 64),
+                  let batch = SeedlessLaneBatch(driver: drv, lanes: laneFwds)
+            else { return (false, "driver/batch init nil") }
+            for step in 0 ..< 4 {
+                let xs = MLXRandom.normal([B, H]).asType(.float16); xs.eval()
+                guard let got = batch.forwardRowsBatch(xs) else { return (false, "batch nil step=\(step)") }
+                got.eval()
+                for b in 0 ..< B {
+                    let xb = xs[b ..< (b + 1)]
+                    guard let ref = solos[b].forwardRows(xb, M: 1) else { return (false, "solo nil b=\(b)") }
+                    ref.eval()
+                    let (ok, d) = bitEqual(got[b ..< (b + 1)], ref)
+                    if !ok { return (false, "h step=\(step) lane=\(b): \(d)") }
+                }
+            }
+            // Cache trajectories must match too (gdn conv/rec at layer 0, kv at layer 1).
+            for b in 0 ..< B {
+                let (lc, lr) = laneFwds[b].readLayerCache(0)
+                let (sc2, sr) = solos[b].readLayerCache(0)
+                let (lk, lv) = laneFwds[b].readLayerCache(1)
+                let (sk, sv) = solos[b].readLayerCache(1)
+                let pairs: [(MLXArray?, MLXArray?, String)] = [
+                    (lc, sc2, "convState"), (lr, sr, "recState"), (lk, sk, "kCache"), (lv, sv, "vCache")]
+                for (x, y, nm) in pairs {
+                    guard let xx = x, let yy = y else { return (false, "\(nm) nil lane=\(b)") }
+                    let (ok, d) = bitEqual(xx, yy)
+                    if !ok { return (false, "\(nm) lane=\(b): \(d)") }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // WRITE-LOCKED (guarded by total = 91). Do not weaken/skip/delete.
+        //
+        // Test 91: lane_batch_argmax_bitexact
+        // Full 1-CB batched greedy step (embed → layers → final norm → lm_head →
+        // argmax, all at M=B / per-lane cores) must produce token ids BIT-identical
+        // to each lane running solo stepArgmax — chained 4 steps feeding the argmax
+        // outputs back as the next tokens (real greedy trajectory, cache continuity).
+        run("lane_batch_argmax_bitexact") {
+            let H = 2048, E = 16, I = 512, vocab = 1024
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
+                let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+                let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+                let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                    swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                    swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                    shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                    sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            }
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
+            let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
+                normWeight: MLXRandom.normal([Dv]).asType(.float16),
+                aLog: MLXRandom.normal([Hv]).asType(.float32), dtBias: MLXRandom.normal([Hv]).asType(.float32))
+            let nH = 16, nKV = 2, hD = 256
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let layers = [
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
+            ]
+            let (eW, eS, eB) = q4(vocab, H)
+            let (lW, lS, lB) = q4(vocab, H)
+            let fnW = MLXRandom.normal([H]).asType(.float16)
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([cs0, rs0, kC0, vC0, eW, eS, eB, lW, lS, lB, fnW])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            }
+            let B = 3
+            var solos: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            var laneFwds: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            for b in 0 ..< B {
+                guard let s1 = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                        maxM: 4, H: H, maxSeqLen: 64),
+                      let l1 = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                        maxM: 4, H: H, maxSeqLen: 64)
+                else { return (false, "lane/solo init nil b=\(b)") }
+                guard s1.attachHead(embedW: eW, embedS: eS, embedB: eB, lmW: lW, lmS: lS, lmB: lB,
+                                    fnW: fnW, vocab: vocab)
+                else { return (false, "solo attachHead fail b=\(b)") }
+                // Divergent warm-up: b+1 M=1 steps, the SAME inputs to solo and lane.
+                for _ in 0 ... b {
+                    let xw = MLXRandom.normal([1, H]).asType(.float16); xw.eval()
+                    guard s1.forwardRows(xw, M: 1) != nil, l1.forwardRows(xw, M: 1) != nil
+                    else { return (false, "warmup nil b=\(b)") }
+                }
+                solos.append(s1); laneFwds.append(l1)
+            }
+            guard let drv = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                     maxM: 8, H: H, maxSeqLen: 64),
+                  drv.attachHead(embedW: eW, embedS: eS, embedB: eB, lmW: lW, lmS: lS, lmB: lB,
+                                 fnW: fnW, vocab: vocab),
+                  let batch = SeedlessLaneBatch(driver: drv, lanes: laneFwds)
+            else { return (false, "driver/batch init nil") }
+            var toks: [Int32] = [7, 123, 500]
+            for step in 0 ..< 4 {
+                var refs: [Int] = []
+                for b in 0 ..< B {
+                    guard let r = solos[b].stepArgmax([toks[b]]), r.count == 1
+                    else { return (false, "solo stepArgmax nil b=\(b) step=\(step)") }
+                    refs.append(r[0])
+                }
+                guard let got = batch.stepArgmaxBatch(toks) else { return (false, "batch nil step=\(step)") }
+                if got != refs { return (false, "tokens step=\(step): got \(got) want \(refs)") }
+                toks = got.map { Int32($0) }
+            }
             return (true, "ok")
         }
 

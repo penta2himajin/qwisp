@@ -37,6 +37,8 @@ if CommandLine.arguments.contains("stream") {
         // ── decode speed (regressions, long-context) ──
         Runner(name: "raw-spec", desc: "shipping decode bench, strict/bolt tok/s + token dump (GPU+model+refs) — bench_batch.sh cell",
                run: { try Tell.run(modelDir: $0, refPath: $1) }),
+        Runner(name: "lane-batch-bench", desc: "bit-exact lane-batched greedy: ms/step + per-stream/aggregate tok/s by B (Stage 1; QWISP_LANE_B, QWISP_LANE_CTX)",
+               run: { md, _ in Tell.laneBatchBench(modelDir: md) }),
         Runner(name: "long-context-decay", desc: "per-stage (GDN/attn/MoE) GPU ms: prefill chunks by position + M=1 decode by ctx up to 48K (#119; QWISP_DECAY_MAX)",
                run: { md, _ in Tell.longContextDecayProbe(modelDir: md) }),
         Runner(name: "spec-width", desc: "verify forward stage ms by draft width M at fixed ctx (#119; QWISP_SPEC_CTX) — is speculation paying?",
@@ -59,6 +61,8 @@ if CommandLine.arguments.contains("stream") {
         Runner(name: "prefix-cache-poc", desc: "snapshot/restore byte-identity micro-PoC (design validation, pre-e2e)",
                run: { md, _ in Tell.prefixCachePoC(modelDir: md) }),
         // ── kernel micro-benchmarks (no model) ──
+        Runner(name: "lane-kernel-bench", desc: "per-lane sequence-coupled kernel µs at real dims (Stage 1b go/no-go: dispatch tax vs state bandwidth; GPU, no model; QWISP_LANE_CTX)",
+               run: { _, _ in Tell.laneKernelBench() }),
         Runner(name: "grouped-moe-bench", desc: "grouped MoE expert kernel micro-bench",
                run: { _, _ in GroupedMoEPoC.bench() }),
         Runner(name: "dense-tiled-bench", desc: "dense tiled matmul micro-bench",
