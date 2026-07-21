@@ -204,6 +204,261 @@ public final class SeedlessLaneBatch {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
+    // ── B-EXACT qmv variants (b2/b3): the audit-confirmed projection lever ─────
+    // Same per-row dot arithmetic as qmm4 / qmm4_inproj_demux_rows, with the
+    // x_thread register array sized EXACTLY [NB][16] so the weight bytes are read
+    // once per threadgroup for NB rows. Measured (lane-kernel-bench 2026-07-22):
+    // bit-exact byte-compare PASS at every B; −8% at B=2, −8..−10% at B=3, tie at
+    // B=4 (occupancy 576/512/448 maxThreads/tg) — hence only NB=2,3 are wired.
+    // Compile opts mirror the counterparts (plain: QWISP_QMM_MATH; demux:
+    // mlxMatchCompileOpts) so the fma-contraction setting matches bit-for-bit.
+    nonisolated(unsafe) static var qmmB2Pipeline: MTLComputePipelineState? = nil
+    nonisolated(unsafe) static var qmmB3Pipeline: MTLComputePipelineState? = nil
+    nonisolated(unsafe) static var demuxB2Pipeline: MTLComputePipelineState? = nil
+    nonisolated(unsafe) static var demuxB3Pipeline: MTLComputePipelineState? = nil
+
+    private static func laneBSource(_ NB: Int) -> String {
+        """
+        #include <metal_stdlib>
+        using namespace metal;
+        #define SIMD_SIZE 32
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) {
+                sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                xt[i]   = x[i];
+                xt[i+1] = x[i+1] / 16.0f;
+                xt[i+2] = x[i+2] / 256.0f;
+                xt[i+3] = x[i+3] / 4096.0f;
+            }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f;
+            const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                          xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                          xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                          xt[4*i+3] * (float)(ws[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        kernel void qmm4_rows_b\(NB)(device const uint32_t* w      [[buffer(0)]],
+                                device const half*     scales [[buffer(1)]],
+                                device const half*     biases [[buffer(2)]],
+                                device const half*     x      [[buffer(3)]],
+                                device half*           y      [[buffer(4)]],
+                                constant int&          in_vec_size  [[buffer(5)]],
+                                constant int&          out_vec_size [[buffer(6)]],
+                                uint3 tid      [[threadgroup_position_in_grid]],
+                                uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                                uint  simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int NB = \(NB);
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 4;
+            constexpr int pack_factor = 8;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = 512;
+            constexpr int scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[NB][16];
+            thread U sums[NB];
+            thread U result[4][NB] = {{0}};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            y += out_row;
+            int xoff = simd_lid * values_per_thread;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                for (int b = 0; b < NB; b++)
+                    sums[b] = ld16(x + b * in_vec_size + xoff, x_thread[b]);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U bi = bl[0];
+                    for (int b = 0; b < NB; b++)
+                        result[row][b] += qd4(wl, x_thread[b], s, bi, sums[b]);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                xoff += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                for (int b = 0; b < NB; b++) {
+                    result[row][b] = simd_sum(result[row][b]);
+                    if (simd_lid == 0) y[b * out_vec_size + row] = (half)result[row][b];
+                }
+            }
+        }
+        kernel void qmm4_inproj_demux_rows_b\(NB)(device const uint32_t* w   [[buffer(0)]],
+                                           device const half*  scales [[buffer(1)]],
+                                           device const half*  biases [[buffer(2)]],
+                                           device const half*  x      [[buffer(3)]],
+                                           device half*  yQkv         [[buffer(4)]],
+                                           device half*  yZ           [[buffer(5)]],
+                                           device half*  yB           [[buffer(6)]],
+                                           device half*  yA           [[buffer(7)]],
+                                           constant int& in_vec_size  [[buffer(8)]],
+                                           constant int& out_vec_size [[buffer(9)]],
+                                           constant int& qkvN         [[buffer(10)]],
+                                           constant int& zN           [[buffer(11)]],
+                                           constant int& bN           [[buffer(12)]],
+                                           uint3 tid      [[threadgroup_position_in_grid]],
+                                           uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                                           uint  simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int NB = \(NB);
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 4;
+            constexpr int pack_factor = 8;
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = 512;
+            constexpr int scale_step_per_thread = 4;
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[NB][16];
+            thread U sums[NB];
+            thread U result[4][NB] = {{0}};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            device half* y; int bufN; int localRow;
+            int zEnd = qkvN + zN, bEnd = zEnd + bN;
+            if (out_row < qkvN)      { y = yQkv; bufN = qkvN;  localRow = out_row; }
+            else if (out_row < zEnd) { y = yZ;   bufN = zN;    localRow = out_row - qkvN; }
+            else if (out_row < bEnd) { y = yB;   bufN = bN;    localRow = out_row - zEnd; }
+            else                     { y = yA;   bufN = out_vec_size - bEnd; localRow = out_row - bEnd; }
+            y += localRow;
+            int xoff = simd_lid * values_per_thread;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                for (int b = 0; b < NB; b++)
+                    sums[b] = ld16(x + b * in_vec_size + xoff, x_thread[b]);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U bi = bl[0];
+                    for (int b = 0; b < NB; b++)
+                        result[row][b] += qd4(wl, x_thread[b], s, bi, sums[b]);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                xoff += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                for (int b = 0; b < NB; b++) {
+                    result[row][b] = simd_sum(result[row][b]);
+                    if (simd_lid == 0) y[b * bufN + row] = (half)result[row][b];
+                }
+            }
+        }
+        """
+    }
+
+    static func compileLaneB(_ device: MTLDevice) {
+        if qmmB2Pipeline != nil { return }
+        // plain variants: mirror qmm4's QWISP_QMM_MATH compile setting
+        let plainOpts = MTLCompileOptions()
+        let mathSel = ProcessInfo.processInfo.environment["QWISP_QMM_MATH"] ?? "safe"
+        if #available(macOS 15.0, *) {
+            switch mathSel {
+            case "fast": plainOpts.mathMode = .fast
+            case "relaxed": plainOpts.mathMode = .relaxed
+            default: plainOpts.mathMode = .safe
+            }
+        } else {
+            plainOpts.fastMathEnabled = (mathSel == "fast")
+        }
+        // demux variants: mirror the fusion lib's compile opts
+        let demuxOpts = SeedlessMetalForward.mlxMatchCompileOpts()
+        for nb in [2, 3] {
+            guard let plib = try? device.makeLibrary(source: laneBSource(nb), options: plainOpts),
+                  let pfn = plib.makeFunction(name: "qmm4_rows_b\(nb)"),
+                  let pps = try? device.makeComputePipelineState(function: pfn),
+                  let dlib = try? device.makeLibrary(source: laneBSource(nb), options: demuxOpts),
+                  let dfn = dlib.makeFunction(name: "qmm4_inproj_demux_rows_b\(nb)"),
+                  let dps = try? device.makeComputePipelineState(function: dfn) else { continue }
+            if nb == 2 { qmmB2Pipeline = pps; demuxB2Pipeline = dps }
+            else { qmmB3Pipeline = pps; demuxB3Pipeline = dps }
+        }
+    }
+
+    /// b2/b3 wiring is OPT-IN (QWISP_LANE_BEXACT=1), default OFF: the isolated-kernel
+    /// win (−8..−10 %) did NOT survive the real chain — paired A/B measured B=3
+    /// layers-only ON 21.08-21.50 ms vs OFF 20.24-20.41 ms (consistent +0.8-1.1 ms).
+    /// The b-variant trades grid parallelism (width 1 vs M) + occupancy for weight-read
+    /// amortization, and in the barrier-separated chain that trade loses. Output is
+    /// byte-identical either way (RAWTESTS 91/91 verified with the flag ON).
+    static let bExactEnabled =
+        ProcessInfo.processInfo.environment["QWISP_LANE_BEXACT"] == "1"
+
+    /// The B-exact pipelines for this batch size, or nil (B ∉ {2,3} / compile failed / off).
+    private func bPipes() -> (qmm: MTLComputePipelineState, demux: MTLComputePipelineState)? {
+        guard SeedlessLaneBatch.bExactEnabled else { return nil }
+        switch B {
+        case 2:
+            guard let q = SeedlessLaneBatch.qmmB2Pipeline, let d = SeedlessLaneBatch.demuxB2Pipeline else { return nil }
+            return (q, d)
+        case 3:
+            guard let q = SeedlessLaneBatch.qmmB3Pipeline, let d = SeedlessLaneBatch.demuxB3Pipeline else { return nil }
+            return (q, d)
+        default: return nil
+        }
+    }
+
+    /// x[B,K]·W[N,K] → y[B,N] via the B-exact pipeline (bit-exact with encodeQmmRows). -/
+    private func encodeQmmRowsBExact(_ enc: MTLComputeCommandEncoder, pipe: MTLComputePipelineState,
+                                     w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                                     x: MTLBuffer, out: MTLBuffer, K: Int, N: Int) {
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(out, offset: 0, index: 4)
+        var kk = Int32(K), nn = Int32(N)
+        enc.setBytes(&kk, length: 4, index: 5)
+        enc.setBytes(&nn, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: N / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
+    /// Concatenated in-proj demux via the B-exact pipeline (bit-exact with
+    /// encodeQmmInProjDemuxRows — identical dot order and write routing). -/
+    private func encodeInProjDemuxBExact(_ enc: MTLComputeCommandEncoder, pipe: MTLComputePipelineState,
+                                         w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                                         x: MTLBuffer,
+                                         outQkv: MTLBuffer, outZ: MTLBuffer, outB: MTLBuffer, outA: MTLBuffer,
+                                         K: Int, dims: (qkv: Int, z: Int, b: Int, a: Int)) {
+        let totalN = dims.qkv + dims.z + dims.b + dims.a
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(outQkv, offset: 0, index: 4); enc.setBuffer(outZ, offset: 0, index: 5)
+        enc.setBuffer(outB, offset: 0, index: 6); enc.setBuffer(outA, offset: 0, index: 7)
+        var kk = Int32(K), nn = Int32(totalN)
+        var qkvN = Int32(dims.qkv), zN = Int32(dims.z), bN = Int32(dims.b)
+        enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&nn, length: 4, index: 9)
+        enc.setBytes(&qkvN, length: 4, index: 10); enc.setBytes(&zN, length: 4, index: 11)
+        enc.setBytes(&bN, length: 4, index: 12)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: totalN / 8, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+    }
+
     static func encodeRowCopyStatic(_ enc: MTLComputeCommandEncoder,
                                     src: MTLBuffer, srcOff: Int, dst: MTLBuffer, dstOff: Int, count: Int) {
         let ps = SeedlessLaneBatch.copyPipeline!
@@ -230,6 +485,7 @@ public final class SeedlessLaneBatch {
         guard !lanes.isEmpty, driver.maxM >= lanes.count,
               lanes.allSatisfy({ $0.layers.count == driver.layers.count }),
               SeedlessLaneBatch.compileCopy(driver.device) else { return nil }
+        SeedlessLaneBatch.compileLaneB(driver.device)   // b2/b3 variants (optional; nil ⇒ rows path)
         self.driver = driver
         self.lanes = lanes
         self.B = lanes.count
@@ -360,11 +616,20 @@ public final class SeedlessLaneBatch {
     private func encodeGdnLayerFast(_ enc: MTLComputeCommandEncoder, li: Int, gw: SeedlessFusedVerify.GdnLayerBufs,
                                     keyDim: Int, valueDim: Int, convDim: Int) {
         let H = driver.H, Hv = driver.numVHeads
-        SeedlessFusedVerify.encodeQmmInProjDemuxRows(
-            enc, w: gw.catInProjW!, scales: gw.catInProjS!, biases: gw.catInProjB!, x: driver.normed,
-            outQkv: driver.gdnSc.qkv, outZ: driver.gdnSc.z,
-            outB: driver.gdnSc.bP, outA: driver.gdnSc.aP,
-            M: B, K: H, dims: (qkv: convDim, z: valueDim, b: Hv, a: Hv))
+        if let bp = bPipes() {
+            encodeInProjDemuxBExact(enc, pipe: bp.demux,
+                                    w: gw.catInProjW!, scales: gw.catInProjS!, biases: gw.catInProjB!,
+                                    x: driver.normed,
+                                    outQkv: driver.gdnSc.qkv, outZ: driver.gdnSc.z,
+                                    outB: driver.gdnSc.bP, outA: driver.gdnSc.aP,
+                                    K: H, dims: (qkv: convDim, z: valueDim, b: Hv, a: Hv))
+        } else {
+            SeedlessFusedVerify.encodeQmmInProjDemuxRows(
+                enc, w: gw.catInProjW!, scales: gw.catInProjS!, biases: gw.catInProjB!, x: driver.normed,
+                outQkv: driver.gdnSc.qkv, outZ: driver.gdnSc.z,
+                outB: driver.gdnSc.bP, outA: driver.gdnSc.aP,
+                M: B, K: H, dims: (qkv: convDim, z: valueDim, b: Hv, a: Hv))
+        }
         for b in 0 ..< B {
             let gc = lanes[b].layers[li].gdnCache!
             laneConvShift(enc, hist: gc.convHist, qkv: driver.gdnSc.qkv, qkvOff: b * convDim * 2,
@@ -396,9 +661,14 @@ public final class SeedlessLaneBatch {
                                                   normWeight: gw.normWeight, outV: driver.gdnSc.outV,
                                                   M: B, Hv: Hv, Dv: driver.headVDim,
                                                   eps: driver.eps, promoteF32: gw.promoteRMS)
-        SeedlessFusedVerify.encodeQmmRows(enc, w: gw.outW, scales: gw.outS, biases: gw.outB,
-                                          x: driver.gdnSc.outV, out: driver.mixerOut,
-                                          M: B, K: valueDim, N: H)
+        if let bp = bPipes() {
+            encodeQmmRowsBExact(enc, pipe: bp.qmm, w: gw.outW, scales: gw.outS, biases: gw.outB,
+                                x: driver.gdnSc.outV, out: driver.mixerOut, K: valueDim, N: H)
+        } else {
+            SeedlessFusedVerify.encodeQmmRows(enc, w: gw.outW, scales: gw.outS, biases: gw.outB,
+                                              x: driver.gdnSc.outV, out: driver.mixerOut,
+                                              M: B, K: valueDim, N: H)
+        }
     }
 
     /// Fast attn layer: qkv demux (M=B) → q-prep/k-prep/v-append/SDPA per lane
@@ -407,11 +677,20 @@ public final class SeedlessLaneBatch {
         let H = driver.H, nH = driver.numHeads, nKV = driver.numKV, hD = driver.headDim
         let qd2 = 2 * hD
         let scale = Float(pow(Double(hD), -0.5))
-        SeedlessFusedVerify.encodeQmmInProjDemuxRows(
-            enc, w: aw.catQkvW!, scales: aw.catQkvS!, biases: aw.catQkvB!, x: driver.normed,
-            outQkv: driver.attnSc.qOut, outZ: driver.attnSc.kOut,
-            outB: driver.attnSc.vOut, outA: aw.catQkvDummy!,
-            M: B, K: H, dims: (qkv: nH * qd2, z: nKV * hD, b: nKV * hD, a: 0))
+        if let bp = bPipes() {
+            encodeInProjDemuxBExact(enc, pipe: bp.demux,
+                                    w: aw.catQkvW!, scales: aw.catQkvS!, biases: aw.catQkvB!,
+                                    x: driver.normed,
+                                    outQkv: driver.attnSc.qOut, outZ: driver.attnSc.kOut,
+                                    outB: driver.attnSc.vOut, outA: aw.catQkvDummy!,
+                                    K: H, dims: (qkv: nH * qd2, z: nKV * hD, b: nKV * hD, a: 0))
+        } else {
+            SeedlessFusedVerify.encodeQmmInProjDemuxRows(
+                enc, w: aw.catQkvW!, scales: aw.catQkvS!, biases: aw.catQkvB!, x: driver.normed,
+                outQkv: driver.attnSc.qOut, outZ: driver.attnSc.kOut,
+                outB: driver.attnSc.vOut, outA: aw.catQkvDummy!,
+                M: B, K: H, dims: (qkv: nH * qd2, z: nKV * hD, b: nKV * hD, a: 0))
+        }
         for b in 0 ..< B {
             let kv = lanes[b].layers[li].kvCache!
             let baseLen = kv.len
@@ -433,9 +712,14 @@ public final class SeedlessLaneBatch {
         SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: driver.attnSc.attnOut, qOut: driver.attnSc.qOut,
                                              gated: driver.attnSc.gated,
                                              headDim: hD, qd2: qd2, total: B * nH * hD)
-        SeedlessFusedVerify.encodeQmmRows(enc, w: aw.oW, scales: aw.oS, biases: aw.oB,
-                                          x: driver.attnSc.gated, out: driver.mixerOut,
-                                          M: B, K: nH * hD, N: H)
+        if let bp = bPipes() {
+            encodeQmmRowsBExact(enc, pipe: bp.qmm, w: aw.oW, scales: aw.oS, biases: aw.oB,
+                                x: driver.attnSc.gated, out: driver.mixerOut, K: nH * hD, N: H)
+        } else {
+            SeedlessFusedVerify.encodeQmmRows(enc, w: aw.oW, scales: aw.oS, biases: aw.oB,
+                                              x: driver.attnSc.gated, out: driver.mixerOut,
+                                              M: B, K: nH * hD, N: H)
+        }
     }
 
     /// Fallback GDN layer (fusion flags off): in-proj at M=B where possible, mixer
@@ -611,8 +895,13 @@ public final class SeedlessLaneBatch {
         SeedlessFusedVerify.encodeRmsNormRows(enc, x: driver.hBuf, w: hd.fnW,
                                               out: driver.normed, rows: B, D: H, eps: driver.eps)
         if SeedlessFusedVerify.SeedlessFusedForward.lmHeadQmv {
-            SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
-                                              x: driver.normed, out: hd.logits, M: B, K: H, N: hd.vocab)
+            if let bp = bPipes() {
+                encodeQmmRowsBExact(enc, pipe: bp.qmm, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                    x: driver.normed, out: hd.logits, K: H, N: hd.vocab)
+            } else {
+                SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                                  x: driver.normed, out: hd.logits, M: B, K: H, N: hd.vocab)
+            }
         } else {
             let qp = SeedlessMetalForward._qmm4TiledPipeline!
             enc.setComputePipelineState(qp)
