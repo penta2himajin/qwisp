@@ -61,6 +61,27 @@ extension Tell {
             let step = ms / Double(reps - 5)
             lines.append(String(format: "  %4d  %8.2f  %8.1f tok/s  %8.1f tok/s   (gpu %.2f ms)",
                                 B, step, 1000.0 / step, Double(B) * 1000.0 / step, gpuMs / Double(reps - 5)))
+            // Full greedy step (embed→layers→head→argmax, 1 CB, int-only readback)
+            // — the serve-path primitive; token feedback chains the trajectory.
+            var ams = 0.0, agpu = 0.0
+            var toks = (0 ..< B).map { Int32(300 + $0 * 13) }
+            var argmaxOK = true
+            for r in 0 ..< reps {
+                let t0 = Date()
+                guard let next = batch.stepArgmaxBatch(toks) else { argmaxOK = false; break }
+                if r >= 5 {
+                    ams += Date().timeIntervalSince(t0) * 1000
+                    agpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                }
+                toks = next.map { Int32($0) }
+            }
+            if argmaxOK {
+                let astep = ams / Double(reps - 5)
+                lines.append(String(format: "        argmax %6.2f  %8.1f tok/s  %8.1f tok/s   (gpu %.2f ms)",
+                                    astep, 1000.0 / astep, Double(B) * 1000.0 / astep, agpu / Double(reps - 5)))
+            } else {
+                lines.append("        argmax: stepArgmaxBatch nil (no head?)")
+            }
         }
         return lines.joined(separator: "\n") + "\nLANEBENCH done"
     }

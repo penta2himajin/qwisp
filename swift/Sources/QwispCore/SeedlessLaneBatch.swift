@@ -361,18 +361,10 @@ public final class SeedlessLaneBatch {
                                           M: B, K: nH * hD, N: H)
     }
 
-    /// One batched step: row b of `x` [B, H] is lane b's next-token hidden input.
-    /// Returns the residual-stream output rows [B, H] (pre-final-norm, mirroring
-    /// forwardRows(finalNormW: nil)). Each lane's caches advance by exactly one
-    /// position — bit-identical to that lane running forwardRows(M: 1) alone.
-    public func forwardRowsBatch(_ x: MLXArray) -> MLXArray? {
+    /// Encode all layers for one batched step (rows already in driver.hBuf [B, H]).
+    /// Shared by forwardRowsBatch and stepArgmaxBatch.
+    private func encodeAllLayers(_ enc: MTLComputeCommandEncoder) {
         let H = driver.H
-        guard x.dim(0) == B, x.dim(1) == H else { return nil }
-        let xf = x.asType(.float16).reshaped([-1]); xf.eval()
-        let arr = xf.asArray(Float16.self)
-        driver.hBuf.contents().bindMemory(to: Float16.self, capacity: driver.maxM * H)
-            .update(from: arr, count: B * H)
-
         let keyDim = driver.headKDim * driver.numKHeads
         let valueDim = driver.headVDim * driver.numVHeads
         let convDim = keyDim * 2 + valueDim
@@ -383,8 +375,6 @@ public final class SeedlessLaneBatch {
             && SeedlessFusedVerify.SeedlessFusedForward.fuseA1Enabled
             && SeedlessFusedVerify.ensureWave3Pipelines()
 
-        let cb = driver.queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
         for li in driver.layers.indices {
             let L = driver.layers[li]
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: driver.hBuf, w: L.inputLN,
@@ -421,10 +411,84 @@ public final class SeedlessLaneBatch {
                                                    M: B, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
             SeedlessFusedVerify.encodeResidAdd(enc, h: driver.hBuf, r: driver.moeOut, total: B * H)
         }
+    }
+
+    /// One batched step: row b of `x` [B, H] is lane b's next-token hidden input.
+    /// Returns the residual-stream output rows [B, H] (pre-final-norm, mirroring
+    /// forwardRows(finalNormW: nil)). Each lane's caches advance by exactly one
+    /// position — bit-identical to that lane running forwardRows(M: 1) alone.
+    public func forwardRowsBatch(_ x: MLXArray) -> MLXArray? {
+        let H = driver.H
+        guard x.dim(0) == B, x.dim(1) == H else { return nil }
+        let xf = x.asType(.float16).reshaped([-1]); xf.eval()
+        let arr = xf.asArray(Float16.self)
+        driver.hBuf.contents().bindMemory(to: Float16.self, capacity: driver.maxM * H)
+            .update(from: arr, count: B * H)
+
+        let cb = driver.queue.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        encodeAllLayers(enc)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
         let ptr = driver.hBuf.contents().bindMemory(to: Float16.self, capacity: driver.maxM * H)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: B * H)), [B, H])
+    }
+
+    /// One batched GREEDY step: token ids [B] → next token ids [B]. A single CB
+    /// (embed → layers → final norm → lm_head → argmax), int32-only readback —
+    /// the batched mirror of the driver's solo stepArgmax. The head stages run at
+    /// M=B (row-independent ⇒ M-invariant); uses the DRIVER's attached head.
+    /// Bit-identical per lane to that lane running solo stepArgmax (locked test
+    /// lane_batch_argmax_bitexact).
+    public func stepArgmaxBatch(_ tokens: [Int32]) -> [Int]? {
+        guard let hd = driver.head, tokens.count == B,
+              SeedlessFusedVerify._embedRowsPipeline != nil,
+              SeedlessFusedVerify._argmaxRowsPipeline != nil else { return nil }
+        let H = driver.H
+        hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: driver.maxM)
+            .update(from: tokens, count: B)
+
+        let cb = driver.queue.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        // embed: tokens → hBuf [B, H] (mirrors stepArgmax's encodeEmbed at M=B)
+        let ep = SeedlessFusedVerify._embedRowsPipeline!
+        enc.setComputePipelineState(ep)
+        enc.setBuffer(hd.embedW, offset: 0, index: 0); enc.setBuffer(hd.embedS, offset: 0, index: 1)
+        enc.setBuffer(hd.embedB, offset: 0, index: 2); enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+        enc.setBuffer(driver.hBuf, offset: 0, index: 4)
+        var hh = UInt32(H), tt = UInt32(B * H)
+        enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: B * H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        encodeAllLayers(enc)
+        // final norm → lm_head → argmax at M=B (mirrors stepArgmax's encodeFinalOps)
+        SeedlessFusedVerify.encodeRmsNormRows(enc, x: driver.hBuf, w: hd.fnW,
+                                              out: driver.normed, rows: B, D: H, eps: driver.eps)
+        if SeedlessFusedVerify.SeedlessFusedForward.lmHeadQmv {
+            SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
+                                              x: driver.normed, out: hd.logits, M: B, K: H, N: hd.vocab)
+        } else {
+            let qp = SeedlessMetalForward._qmm4TiledPipeline!
+            enc.setComputePipelineState(qp)
+            enc.setBuffer(hd.lmW, offset: 0, index: 0); enc.setBuffer(hd.lmS, offset: 0, index: 1)
+            enc.setBuffer(hd.lmB, offset: 0, index: 2); enc.setBuffer(driver.normed, offset: 0, index: 3)
+            enc.setBuffer(hd.logits, offset: 0, index: 4)
+            var kk = Int32(H), nn = Int32(hd.vocab), mm = Int32(B)
+            enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6); enc.setBytes(&mm, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: hd.vocab, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        let ap = SeedlessFusedVerify._argmaxRowsPipeline!
+        enc.setComputePipelineState(ap)
+        enc.setBuffer(hd.logits, offset: 0, index: 0); enc.setBuffer(hd.tokensOut, offset: 0, index: 1)
+        var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+
+        let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: driver.maxM)
+        return (0 ..< B).map { Int(ptr[$0]) }
     }
 }
