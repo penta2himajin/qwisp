@@ -41,19 +41,55 @@ public final class LaneBatchSlots: BatchSlots {
     }
 
     public func admit(prompt: [Int32], slot: Int) -> Int? {
+        // maxM 1024 = the canonical steel-hybrid prefill chunk (the shipped serialize
+        // path prefills hybrid@1024; the canonical greedy stream is defined WITH it —
+        // raw chunked prefill produces the pre-hybrid stream and diverges ~100 tokens
+        // in on f16 near-ties). Costs ~200MB scratch per active lane, resident tier.
         guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen,
-              let (fwd, _) = engine.makeFused(maxM: 64, maxSeqLen: maxSeqLen) else { return nil }
-        // Chunked prefill of all but the last prompt token; the last token goes
-        // through stepArgmax so the first generated token comes out of the same
-        // 1-CB primitive the decode loop uses (solo path — bit-exact anchor).
+              let (fwd, fnBuf) = engine.makeFused(maxM: 1024, maxSeqLen: maxSeqLen) else { return nil }
+        let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
+        if hybrid {
+            // Same wiring as TellRuntime's hybrid setup: per-layer MLX weight trios.
+            var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
+            var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
+            for (i, spec) in engine.layers.enumerated() {
+                if let g = spec.gdn {
+                    hw[i] = (qkv: (g.qkvWq, g.qkvSc, g.qkvBi), z: (g.zWq, g.zSc, g.zBi), out: (g.outWq, g.outSc, g.outBi))
+                } else if let a = spec.attn {
+                    aw[i] = (q: (a.qWq, a.qSc, a.qBi), k: (a.kWq, a.kSc, a.kBi), v: (a.vWq, a.vSc, a.vBi), o: (a.oWq, a.oSc, a.oBi))
+                }
+            }
+            fwd.hybridGdnW = hw
+            fwd.hybridAttnW = aw
+            if Tell.envInt("QWISP_HYBRID_MOE", 1) == 1 {
+                var mw: [Int: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))] = [:]
+                for (i, spec) in engine.layers.enumerated() {
+                    let m = spec.moe
+                    mw[i] = (g: (m.swGWq, m.swGSc, m.swGBi), u: (m.swUWq, m.swUSc, m.swUBi), d: (m.swDWq, m.swDSc, m.swDBi))
+                }
+                fwd.hybridMoEW = mw
+            }
+        }
+        // Canonical prefill + first token, mirroring Tell.prefill + the spec-loop
+        // entry EXACTLY (kernel choice and tie-break included): full prompt through
+        // chunked (hybrid) forward with final norm, then first token =
+        // MLX.argMax(engine.logits(lastNormed)) — qmmTiled lm_head, MLX argmax.
+        let chunkSize = hybrid ? 1024 : 64
+        var lastNormed: MLXArray? = nil
         var pos = 0
-        while pos < prompt.count - 1 {
-            let end = Swift.min(pos + 64, prompt.count - 1)
-            guard fwd.forwardRows(engine.embed(tokens: Array(prompt[pos ..< end])), M: end - pos) != nil
+        while pos < prompt.count {
+            let end = Swift.min(pos + chunkSize, prompt.count)
+            let x = engine.embed(tokens: Array(prompt[pos ..< end]))
+            guard let normed = hybrid ? fwd.forwardRowsHybrid(x, M: end - pos, finalNormW: fnBuf)
+                                      : fwd.forwardRows(x, M: end - pos, finalNormW: fnBuf)
             else { return nil }
+            lastNormed = normed[end - pos - 1]
             pos = end
         }
-        guard let first = fwd.stepArgmax([prompt[prompt.count - 1]])?.first else { return nil }
+        guard let ln = lastNormed?.reshaped([1, SeedlessEngine.H]),
+              let lg = engine.logits(ln, M: 1) else { return nil }
+        MLX.eval([lg])
+        let first = MLX.argMax(lg[0], axis: -1).item(Int.self)
         lanes[slot] = fwd
         return first
     }
