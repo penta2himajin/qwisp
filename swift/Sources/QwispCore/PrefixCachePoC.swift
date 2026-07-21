@@ -12,6 +12,56 @@ import MLX
 // tail = the generation prompt + generated tokens that the next request rewinds past, B = the new
 // content appended in the next request.
 extension Tell {
+    // Lane-batch bench (Stage 1, parallel agents): real-model speed of the
+    // bit-exact lane-batched greedy step. B lanes prefill DIFFERENT prompts
+    // (diverse routing = worst-case MoE union), then decode batched; reports
+    // ms/step and per-stream + aggregate tok/s vs the M=1 solo baseline.
+    // Env: QWISP_LANE_B (default "1,2,3,4,8" sweep), QWISP_LANE_CTX (default 1024).
+    public static func laneBatchBench(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[lane-bench] load fail\nLANEBENCH done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let ctx = Tell.envInt("QWISP_LANE_CTX", 1024)
+        let bs = (ProcessInfo.processInfo.environment["QWISP_LANE_B"] ?? "1,2,3,4,8")
+            .split(separator: ",").compactMap { Int($0) }
+        func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
+        var lines = ["[lane-bench] ctx=\(ctx)/lane resident — bit-exact lane-batched greedy step",
+                     "     B   ms/step   per-stream   aggregate"]
+        for B in bs {
+            // Fresh lanes each B: own arena + prefill of a DIFFERENT prompt.
+            var lanes: [SeedlessFusedVerify.SeedlessFusedForward] = []
+            for b in 0 ..< B {
+                guard let (fwd, _) = engine.makeFused(maxM: 64, maxSeqLen: ctx + 128) else {
+                    return lines.joined(separator: "\n") + "\n[lane-bench] lane makeFused nil\nLANEBENCH done"
+                }
+                let prompt = tok(ctx, 13 + b * 17)
+                var pos = 0
+                while pos < ctx {
+                    let end = Swift.min(pos + 64, ctx)
+                    _ = fwd.forwardRows(engine.embed(tokens: Array(prompt[pos ..< end])), M: end - pos)
+                    pos = end
+                }
+                lanes.append(fwd)
+            }
+            guard let (drv, _) = engine.makeFused(maxM: Swift.max(8, B), maxSeqLen: 128),
+                  let batch = SeedlessLaneBatch(driver: drv, lanes: lanes) else {
+                return lines.joined(separator: "\n") + "\n[lane-bench] driver nil\nLANEBENCH done"
+            }
+            var ms = 0.0
+            let reps = 30
+            for r in 0 ..< reps {
+                let toks = (0 ..< B).map { Int32(200 + r * 7 + $0 * 31) }
+                let t0 = Date()
+                _ = batch.forwardRowsBatch(engine.embed(tokens: toks))
+                if r >= 5 { ms += Date().timeIntervalSince(t0) * 1000 }   // drop warmup
+            }
+            let step = ms / Double(reps - 5)
+            lines.append(String(format: "  %4d  %8.2f  %8.1f tok/s  %8.1f tok/s",
+                                B, step, 1000.0 / step, Double(B) * 1000.0 / step))
+        }
+        return lines.joined(separator: "\n") + "\nLANEBENCH done"
+    }
+
     // Long-context decay probe (#117 follow-up): the production log shows prefill chunk rate
     // decaying 348→66 tok/s over 0→40K and decode collapsing 45→7 tok/s at 48K. This isolates
     // WHY, per stage, using forwardRowsProfiled (exact per-encoder GPU ms bucketed GDN/attn/MoE).
