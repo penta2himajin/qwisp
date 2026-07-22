@@ -1,4 +1,4 @@
-# HANDOFF: #121 SHIPPED on branch — prefix-cache-aware lane admission (aligned-boundary restore); PR to open/merge, then L3 relaxation discussion
+# HANDOFF: L1 lever sweep DONE (#128 lane prefix admission → #130 StreamDetok → #131 exact-boundary capture, steady-state fan-out 2.76x) — next = L3 probe (margin-MTP in lanes)
 Date: 2026-07-22 | Status: GREEN | Branch: claude/lane-prefix-admission (PR to open → merge) | Root: /Users/penta2himajin/repos/qwisp
 
 > STOP: Before trusting anything below, run the checks in "Verify First".
@@ -13,8 +13,24 @@ Date: 2026-07-22 | Status: GREEN | Branch: claude/lane-prefix-admission (PR to o
 - GPU rule: `~/bin/jacquard` (run=shared / measure=exclusive). Never two GPU procs; brew service stopped.
 
 ## Next Action
-1. Open/merge the PR from `claude/lane-prefix-admission` (Closes #121).
-2. Then the user wants to DISCUSS L3 relaxation (see L3 section below) — margin-accept MTP in lanes is the one high-EV experiment; do not build before that discussion.
+User-approved order was: incremental detokenize -> prefill-overlap -> L3 probe. Tasks 1-2 are DONE
+(prefill-overlap was MEASURED OBSOLETE — see below); next = the L3 probe: "Stage 2 = margin-gated
+MTP-D1 in lanes" WITH quality measurement (token-match + task eval; bolt fidelity 88.7-98.2 =
+reference dial). Quality-bar question for the owner is still open (fidelity dial only vs task eval).
+
+## Session results after #128 (all merged to main)
+- #130 StreamDetok: incremental detokenize, O(n^2)->O(1) amortized. HONEST: 0-4% at 256-tok
+  streams (noise); the quadratic pays at thinking-scale generations (2-10K). Contract locked
+  (TOKTEST stream_detok_stepwise_equals_full on the REAL tokenizer + COMPTEST detok_*).
+- #131 exact-boundary capture: v1's chunk-aligned grid re-prefilled ~860 tok/admit (~2.4s);
+  v2 captures at the EXACT recurrence LCP + saves conv state at prompt end. Warm admit ~0.35s.
+  Fan-out trace: burst1 27.9s (r2 pays one full shared prefill — once-per-harness transient),
+  burst2 STEADY STATE 15.4s = 2.76x vs serial ref, 2.5x vs serialize concurrent. Identity 6/6
+  on BOTH bursts => arbitrary-boundary restore holds bit-exactness on the real model (same
+  empirical-gate class as serialize's PREFIXE2E).
+- prefill-overlap/interleave: DEMOTED, measured obsolete — wall ≈ GPU-work sum (admits+decode);
+  interleave only redistributes latency, and admit stalls shrank 18.3s -> ~2.6s/burst anyway.
+  Do not re-propose without a GPU-concurrency (compute vs BW overlap) measurement.
 
 ## What shipped this session (#121)
 `LaneBatchSlots.admit` consults two `PrefixRAMStore` tiers before prefilling and restores the
