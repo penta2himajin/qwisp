@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 
 // Lane-batched serving path (Stage 1 wiring, parallel sub-agent fan-out).
@@ -29,6 +30,18 @@ public final class LaneBatchSlots: BatchSlots {
     private var lanes: [SeedlessFusedVerify.SeedlessFusedForward?]
     private var batch: SeedlessLaneBatch? = nil
     private var batchLanes: [ObjectIdentifier] = []   // active-set key for rebuild
+    // #121 prefix-cache-aware admission: cross-request decode states (persistentStateData
+    // blobs) so same-prefix fan-out and multi-turn extensions prefill only the delta.
+    // Two tiers (one PrefixRAMStore each — mixing them is wrong: save()'s supersede
+    // semantics would drop a shared-harness boundary entry every time a longer
+    // full-prompt key lands, re-paying the shared prefill on alternate requests):
+    //   sharedStore — recurrence-detected harness prefixes (fan-out sharing)
+    //   convStore   — per-conversation last-boundary states (multi-turn extension)
+    // Decode-thread only (ContinuousScheduler admits serially) → no lock.
+    private var sharedStore: PrefixRAMStore
+    private var convStore: PrefixRAMStore
+    /// Gate observability (mirrors SeedlessBackend.prefixRAMHits): warm restores this process.
+    public private(set) var restoreHits = 0
 
     public init?(store: WeightStore, slots: Int, maxSeqLen: Int) {
         self.engine = SeedlessEngine.build(store: store)
@@ -38,18 +51,73 @@ public final class LaneBatchSlots: BatchSlots {
         self.slotCount = slots
         self.maxSeqLen = maxSeqLen
         self.lanes = Array(repeating: nil, count: slots)
+        // One knob: QWISP_LANE_PREFIX_MB total budget (default 3072, resident tier) —
+        // 1/3 recurrence tier, 2/3 conversation tier. 0 disables.
+        let mb = Swift.max(0, Tell.envInt("QWISP_LANE_PREFIX_MB", 3072))
+        self.sharedStore = PrefixRAMStore(budget: mb / 3 * 1_048_576)
+        self.convStore = PrefixRAMStore(budget: mb * 2 / 3 * 1_048_576)
     }
 
-    public func admit(prompt: [Int32], slot: Int) -> Int? {
-        // maxM 1024 = the canonical steel-hybrid prefill chunk (the shipped serialize
-        // path prefills hybrid@1024; the canonical greedy stream is defined WITH it —
-        // raw chunked prefill produces the pre-hybrid stream and diverges ~100 tokens
-        // in on f16 near-ties). Costs ~200MB scratch per active lane, resident tier.
-        guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen,
-              let (fwd, fnBuf) = engine.makeFused(maxM: 1024, maxSeqLen: maxSeqLen) else { return nil }
-        let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
+    // ── #121 admission plan (pure logic; COMPTEST laneadmit_*) ────────────────
+    /// Every cache boundary (restore, capture, save) is an ABSOLUTE chunk-aligned
+    /// position. The delta prefill then reproduces the cold path's chunk boundaries
+    /// exactly, so restore+delta is bit-identical to cold BY CONSTRUCTION — no
+    /// assumption about the hybrid kernels' chunk-composition invariance is needed
+    /// (the serialize path's arbitrary-boundary restores lean on the PREFIXE2E gate;
+    /// the lane path removes the assumption instead).
+    public struct LaneAdmitPlan: Equatable {
+        public var restoreLen: Int   // aligned cached prefix to restore (0 = cold admit)
+        public var captureAt: Int?   // aligned recurrence boundary → sharedStore save
+        public var saveAt: Int?      // aligned last boundary → convStore save
+        public init(restoreLen: Int, captureAt: Int?, saveAt: Int?) {
+            self.restoreLen = restoreLen; self.captureAt = captureAt; self.saveAt = saveAt
+        }
+    }
+    /// hitLen = longest whole-entry store hit over prompt.dropLast() (aligned by
+    /// construction — stores only ever receive aligned keys); lcp = longest PARTIAL
+    /// key match (recurrence evidence: two different conversations sharing ≥minShared
+    /// tokens define a harness prefix, same operational definition as PrefixPersist #112).
+    public static func admitPlan(promptLen: Int, chunk: Int, hitLen: Int, lcp: Int,
+                                 minShared: Int) -> LaneAdmitPlan {
+        let restoreLen = hitLen
+        var capture: Int? = (lcp / chunk) * chunk             // floor to the chunk grid
+        if let c = capture, c < minShared || c <= restoreLen { capture = nil }
+        var save: Int? = ((promptLen - 1) / chunk) * chunk    // ≥1 token always re-prefilled
+        if let s = save, s <= restoreLen || s == capture { save = nil }
+        return LaneAdmitPlan(restoreLen: restoreLen, captureAt: capture, saveAt: save)
+    }
+
+    /// Pure self-check (no GPU, no model): boundary arithmetic of the admission plan.
+    public static func admitSelfCheck() -> [(String, Bool)] {
+        func p(_ len: Int, _ hit: Int, _ lcp: Int) -> LaneAdmitPlan {
+            admitPlan(promptLen: len, chunk: 1024, hitLen: hit, lcp: lcp, minShared: 1024)
+        }
+        return [
+            // cold first request: no evidence, save the last aligned boundary
+            ("cold", p(9000, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: 8192)),
+            // second same-prefix request: partial match ⇒ capture the shared boundary too
+            ("recurrence_capture", p(12000, 0, 9000) == LaneAdmitPlan(restoreLen: 0, captureAt: 8192, saveAt: 11264)),
+            // third request: warm restore at the shared boundary, no re-capture
+            ("restore_no_recapture", p(12000, 8192, 8192) == LaneAdmitPlan(restoreLen: 8192, captureAt: nil, saveAt: 11264)),
+            // shared prefix below minShared: never capture
+            ("min_shared", p(4000, 0, 900) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: 3072)),
+            // capture and save on the same boundary: conv save skipped (one blob, one tier)
+            ("save_capture_dedup", p(9000, 0, 8500) == LaneAdmitPlan(restoreLen: 0, captureAt: 8192, saveAt: nil)),
+            // prompt shorter than one chunk: no boundary at all
+            ("short_prompt", p(800, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: nil)),
+            // restore already at the last boundary: nothing new to save
+            ("restore_covers_save", p(9000, 8192, 8192) == LaneAdmitPlan(restoreLen: 8192, captureAt: nil, saveAt: nil)),
+        ]
+    }
+
+    /// Fresh lane forward with the canonical hybrid wiring (same trios as TellRuntime's
+    /// hybrid setup). maxM 1024 = the canonical steel-hybrid prefill chunk (the shipped
+    /// serialize path prefills hybrid@1024; the canonical greedy stream is defined WITH
+    /// it — raw chunked prefill produces the pre-hybrid stream and diverges ~100 tokens
+    /// in on f16 near-ties). Costs ~200MB scratch per active lane, resident tier.
+    private func makeLane(hybrid: Bool) -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer)? {
+        guard let (fwd, fnBuf) = engine.makeFused(maxM: 1024, maxSeqLen: maxSeqLen) else { return nil }
         if hybrid {
-            // Same wiring as TellRuntime's hybrid setup: per-layer MLX weight trios.
             var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
             var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
             for (i, spec) in engine.layers.enumerated() {
@@ -70,13 +138,49 @@ public final class LaneBatchSlots: BatchSlots {
                 fwd.hybridMoEW = mw
             }
         }
+        return (fwd, fnBuf)
+    }
+
+    public func admit(prompt: [Int32], slot: Int) -> Int? {
+        guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen else { return nil }
+        let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
+        let chunkSize = hybrid ? 1024 : 64
+        guard var (fwd, fnBuf) = makeLane(hybrid: hybrid) else { return nil }
+        // #121: restore the longest cached aligned prefix, prefill only the delta.
+        // Default ON; QWISP_LANE_PREFIX=0 (or _MB=0) opts out. dropLast ⇒ a hit never
+        // swallows the whole prompt (the last position is always recomputed for the
+        // first-token argmax).
+        var plan = LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: nil)
+        if Tell.envInt("QWISP_LANE_PREFIX", 1) != 0,
+           sharedStore.budget + convStore.budget > 0 {
+            let matchable = Array(prompt.dropLast())
+            let hs = sharedStore.bestMatch(content: matchable)
+            let hc = convStore.bestMatch(content: matchable)
+            let hit = [hs, hc].compactMap { $0 }.max { $0.tokens.count < $1.tokens.count }
+            let lcp = Swift.max(sharedStore.maxCommonPrefix(with: prompt),
+                                convStore.maxCommonPrefix(with: prompt))
+            plan = Self.admitPlan(promptLen: prompt.count, chunk: chunkSize,
+                                  hitLen: hit?.tokens.count ?? 0, lcp: lcp,
+                                  minShared: PrefixPersist.stableMinTokens)
+            if plan.restoreLen > 0, let hit {
+                if fwd.restorePersistentState(hit.state) {
+                    restoreHits += 1
+                } else {
+                    // Shape/format mismatch half-writes the arena — this lane is unusable.
+                    // Cannot happen with same-engine blobs; rebuild fresh and go cold.
+                    guard let fresh = makeLane(hybrid: hybrid) else { return nil }
+                    (fwd, fnBuf) = fresh
+                    plan.restoreLen = 0
+                }
+            }
+        }
         // Canonical prefill + first token, mirroring Tell.prefill + the spec-loop
-        // entry EXACTLY (kernel choice and tie-break included): full prompt through
+        // entry EXACTLY (kernel choice and tie-break included): prompt through
         // chunked (hybrid) forward with final norm, then first token =
         // MLX.argMax(engine.logits(lastNormed)) — qmmTiled lm_head, MLX argmax.
-        let chunkSize = hybrid ? 1024 : 64
+        // restoreLen is chunk-aligned, so the loop's boundaries match a cold run's.
         var lastNormed: MLXArray? = nil
-        var pos = 0
+        var pos = plan.restoreLen
         while pos < prompt.count {
             let end = Swift.min(pos + chunkSize, prompt.count)
             let x = engine.embed(tokens: Array(prompt[pos ..< end]))
@@ -85,6 +189,13 @@ public final class LaneBatchSlots: BatchSlots {
             else { return nil }
             lastNormed = normed[end - pos - 1]
             pos = end
+            // Boundary states (blob = CPU memcpy of KV used slice + GDN state, ~24KB/token).
+            if pos == plan.captureAt {
+                sharedStore.save(tokens: Array(prompt[0 ..< pos]), state: fwd.persistentStateData())
+            }
+            if pos == plan.saveAt {
+                convStore.save(tokens: Array(prompt[0 ..< pos]), state: fwd.persistentStateData())
+            }
         }
         guard let ln = lastNormed?.reshaped([1, SeedlessEngine.H]),
               let lg = engine.logits(ln, M: 1) else { return nil }

@@ -233,6 +233,20 @@ public struct PrefixRAMStore {
 
     public mutating func removeAll() { entries.removeAll() }
 
+    /// Longest common token prefix between `content` and ANY stored key (a partial match,
+    /// unlike bestMatch's whole-entry match) — recurrence evidence for the lane path's
+    /// shared-prefix capture (#121). Non-mutating; O(entries × lcp) token compares.
+    public func maxCommonPrefix(with content: [Int32]) -> Int {
+        var best = 0
+        for e in entries {
+            let n = Swift.min(e.tokens.count, content.count)
+            var i = 0
+            while i < n && e.tokens[i] == content[i] { i += 1 }
+            best = Swift.max(best, i)
+        }
+        return best
+    }
+
     /// Pure self-check (no GPU): longest match, supersede, LRU byte eviction, budget gates.
     public static func selfCheck() -> [(String, Bool)] {
         func blob(_ n: Int, _ b: UInt8) -> Data { Data(repeating: b, count: n) }
@@ -260,6 +274,12 @@ public struct PrefixRAMStore {
         var o = PrefixRAMStore(budget: 100)
         o.save(tokens: [1], state: blob(200, 1))                  // entry larger than the whole budget
         checks.append(("oversize_skip", o.bestMatch(content: [1]) == nil))
+        // #121: partial-match LCP (recurrence evidence), vs bestMatch's whole-entry match.
+        var m = PrefixRAMStore(budget: 1000)
+        m.save(tokens: [1, 2, 3, 4], state: blob(10, 1))
+        checks.append(("maxlcp_partial", m.maxCommonPrefix(with: [1, 2, 9, 9, 9]) == 2))
+        checks.append(("maxlcp_full_key", m.maxCommonPrefix(with: [1, 2, 3, 4, 5]) == 4))
+        checks.append(("maxlcp_empty", PrefixRAMStore(budget: 1000).maxCommonPrefix(with: [1, 2]) == 0))
         return checks
     }
 }
