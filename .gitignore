@@ -18,3 +18,6 @@ results*.json
 # macOS
 .DS_Store
 *.profraw
+
+# Session handoff state is LOCAL-ONLY (SessionStart hook reads it; never commit — drifted in 2026-07-19..22, re-agreed 2026-07-22)
+HANDOFF.md
