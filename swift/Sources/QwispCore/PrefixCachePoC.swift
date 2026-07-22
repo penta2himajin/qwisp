@@ -265,7 +265,176 @@ extension Tell {
         } else {
             bLines.append("  qmm4_rows_b: compile FAIL")
         }
-        return (lines + projLines + bLines).joined(separator: "\n") + "\nLANEKBENCH done"
+
+        // ── B-EXACT register variants (audit §4 untested gap): same kernel as
+        // qmm4_rows_b but with x_thread[NB][16] sized EXACTLY for the row count
+        // (the measured rows_b carried a fixed [4][16] array at every B — the
+        // register array size, not the b-loop, was suspected as the whole cost).
+        // Decides whether the physics-ceiling path exists at small B.
+        func compileQmmBVariant(_ NB: Int) -> MTLComputePipelineState? {
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            #define SIMD_SIZE 32
+            inline float ld16(const device half* x, thread float* xt) {
+                float sum = 0.0f;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+                    xt[i]   = x[i];
+                    xt[i+1] = x[i+1] / 16.0f;
+                    xt[i+2] = x[i+2] / 256.0f;
+                    xt[i+3] = x[i+3] / 4096.0f;
+                }
+                return sum;
+            }
+            inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+                float accum = 0.0f;
+                const device uint16_t* ws = (const device uint16_t*)w;
+                for (int i = 0; i < 4; i++) {
+                    accum += (xt[4*i]   * (float)(ws[i] & 0x000f) +
+                              xt[4*i+1] * (float)(ws[i] & 0x00f0) +
+                              xt[4*i+2] * (float)(ws[i] & 0x0f00) +
+                              xt[4*i+3] * (float)(ws[i] & 0xf000));
+                }
+                return scale * accum + sum * bias;
+            }
+            kernel void qmm4_rows_b\(NB)(device const uint32_t* w      [[buffer(0)]],
+                                    device const half*     scales [[buffer(1)]],
+                                    device const half*     biases [[buffer(2)]],
+                                    device const half*     x      [[buffer(3)]],
+                                    device half*           y      [[buffer(4)]],
+                                    constant int&          in_vec_size  [[buffer(5)]],
+                                    constant int&          out_vec_size [[buffer(6)]],
+                                    uint3 tid      [[threadgroup_position_in_grid]],
+                                    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                                    uint  simd_lid [[thread_index_in_simdgroup]]) {
+                constexpr int NB = \(NB);
+                constexpr int packs_per_thread = 2;
+                constexpr int num_simdgroups = 2;
+                constexpr int results_per_simdgroup = 4;
+                constexpr int pack_factor = 8;
+                constexpr int bytes_per_pack = 4;
+                constexpr int values_per_thread = 16;
+                constexpr int block_size = 512;
+                constexpr int scale_step_per_thread = 4;
+                const device uint8_t* ws = (const device uint8_t*)w;
+                typedef float U;
+                thread U x_thread[NB][16];
+                thread U sums[NB];
+                thread U result[4][NB] = {{0}};
+                const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                const int in_vec_size_g = in_vec_size / 64;
+                const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+                ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+                scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+                y += out_row;
+                int xoff = simd_lid * values_per_thread;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    for (int b = 0; b < NB; b++)
+                        sums[b] = ld16(x + b * in_vec_size + xoff, x_thread[b]);
+                    for (int row = 0; row < results_per_simdgroup; row++) {
+                        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                        const device half* sl = scales + row * in_vec_size_g;
+                        const device half* bl = biases + row * in_vec_size_g;
+                        U s = sl[0]; U bi = bl[0];
+                        for (int b = 0; b < NB; b++)
+                            result[row][b] += qd4(wl, x_thread[b], s, bi, sums[b]);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;
+                    scales += block_size / 64;
+                    biases += block_size / 64;
+                    xoff += block_size;
+                }
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    for (int b = 0; b < NB; b++) {
+                        result[row][b] = simd_sum(result[row][b]);
+                        if (simd_lid == 0) y[b * out_vec_size + row] = (half)result[row][b];
+                    }
+                }
+            }
+            """
+            let opts = MTLCompileOptions()
+            if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
+            guard let lib = try? device.makeLibrary(source: src, options: opts),
+                  let fn = lib.makeFunction(name: "qmm4_rows_b\(NB)"),
+                  let ps = try? device.makeComputePipelineState(function: fn) else { return nil }
+            return ps
+        }
+        var vLines: [String] = ["  B-exact register variants [N=\(pN),K=\(pK)] µs/dispatch (vs rows above):"]
+        // shared random data for the per-variant byte-compare vs qmm4_rows
+        let vxa = MLXRandom.normal([4, pK]).asType(.float16)
+        let vwf = MLXRandom.normal([pN, pK]).asType(.float16)
+        let (vwq, vs0, vb0) = MLX.quantized(vwf, groupSize: 64, bits: 4, mode: .affine)
+        let vsc = vs0.asType(.float16), vbi = vb0!.asType(.float16)
+        MLX.eval([vxa, vwq, vsc, vbi])
+        for NB in [2, 3, 4] {
+            guard let pipe = compileQmmBVariant(NB) else { vLines.append("    b\(NB): compile FAIL"); continue }
+            var exact = "?"
+            if let vbx = SeedlessMetalForward.mtlBuf(vxa, device),
+               let vbw = SeedlessMetalForward.mtlBuf(vwq, device),
+               let vbs = SeedlessMetalForward.mtlBuf(vsc, device),
+               let vbb = SeedlessMetalForward.mtlBuf(vbi, device) {
+                let cA = buf(NB * pN * 2), cB = buf(NB * pN * 2)
+                let ccb = queue.makeCommandBuffer()!
+                let cenc = ccb.makeComputeCommandEncoder()!
+                SeedlessFusedVerify.encodeQmmRows(cenc, w: vbw, scales: vbs, biases: vbb,
+                                                  x: vbx, out: cA, M: NB, K: pK, N: pN)
+                cenc.setComputePipelineState(pipe)
+                cenc.setBuffer(vbw, offset: 0, index: 0); cenc.setBuffer(vbs, offset: 0, index: 1)
+                cenc.setBuffer(vbb, offset: 0, index: 2); cenc.setBuffer(vbx, offset: 0, index: 3)
+                cenc.setBuffer(cB, offset: 0, index: 4)
+                var kk = Int32(pK), nn = Int32(pN)
+                cenc.setBytes(&kk, length: 4, index: 5); cenc.setBytes(&nn, length: 4, index: 6)
+                cenc.dispatchThreadgroups(MTLSize(width: 1, height: pN / 8, depth: 1),
+                                          threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+                cenc.endEncoding(); ccb.commit(); ccb.waitUntilCompleted()
+                exact = memcmp(cA.contents(), cB.contents(), NB * pN * 2) == 0 ? "bit-exact PASS" : "MISMATCH"
+                withExtendedLifetime([vxa, vwq, vsc, vbi]) {}
+            }
+            let px = buf(NB * pK * 2), po = buf(NB * pN * 2)
+            let vUs = us { enc, _ in
+                enc.setComputePipelineState(pipe)
+                enc.setBuffer(pw, offset: 0, index: 0); enc.setBuffer(ps, offset: 0, index: 1)
+                enc.setBuffer(pb, offset: 0, index: 2); enc.setBuffer(px, offset: 0, index: 3)
+                enc.setBuffer(po, offset: 0, index: 4)
+                var kk = Int32(pK), nn = Int32(pN)
+                enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: pN / 8, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+            }
+            vLines.append(String(format: "    b%d  %7.1f  (maxThreads/tg %d, %@)",
+                                 NB, vUs, pipe.maxTotalThreadsPerThreadgroup, exact as NSString))
+        }
+
+        // ── MLX reference: what does MLX's own quantizedMM (qmv/steel dispatch)
+        // cost at M=1..8 on the same shape? If MLX at M=3 ≪ 3× M=1, a better
+        // small-M kernel EXISTS and the qmv M-scaling floor is engine-local.
+        var mlxLines: [String] = ["  MLX quantizedMM [N=\(pN),K=\(pK)] µs/op: M → wall"]
+        let mx = MLXRandom.normal([8, pK]).asType(.float16)
+        let mwf = MLXRandom.normal([pN, pK]).asType(.float16)
+        let (mwq, ms0, mb0) = MLX.quantized(mwf, groupSize: 64, bits: 4, mode: .affine)
+        MLX.eval([mx, mwq, ms0, mb0!])
+        for M in [1, 2, 3, 4, 8] {
+            let xm = mx[0 ..< M]; xm.eval()
+            let iters = 200
+            var warm: [MLXArray] = []
+            for _ in 0 ..< 20 {
+                warm.append(MLX.quantizedMM(xm, mwq, scales: ms0, biases: mb0!,
+                                            transpose: true, groupSize: 64, bits: 4))
+            }
+            MLX.eval(warm)
+            var ys: [MLXArray] = []
+            for _ in 0 ..< iters {
+                ys.append(MLX.quantizedMM(xm, mwq, scales: ms0, biases: mb0!,
+                                          transpose: true, groupSize: 64, bits: 4))
+            }
+            let t0 = Date()
+            MLX.eval(ys)
+            let usOp = Date().timeIntervalSince(t0) * 1e6 / Double(iters)
+            mlxLines.append(String(format: "    M=%d  %7.1f", M, usOp))
+        }
+        return (lines + projLines + bLines + vLines + mlxLines).joined(separator: "\n") + "\nLANEKBENCH done"
     }
 
     // Long-context decay probe (#117 follow-up): the production log shows prefill chunk rate

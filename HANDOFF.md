@@ -1,22 +1,40 @@
-# HANDOFF: lane-batch COMPLETE + Stage 1b closed by measurement (all 3 levers NO-GO) — PR #126 open, next lever = #121
-Date: 2026-07-21 | Status: GREEN (awaiting PR review) | Branch: claude/lane-batch (pushed, PR #126 → main) | Root: /Users/penta2himajin/repos/qwisp
+# HANDOFF: PR #126 MERGED; parallel-speedup ceiling investigation CLOSED (kernel+system+roofline) — B-scaling is at the floor, next = #121
+Date: 2026-07-22 | Status: GREEN | Branch: claude/lane-ceiling (probe commits, PR to open/merge) | Root: /Users/penta2himajin/repos/qwisp
 
 > STOP: Before trusting anything below, run the checks in "Verify First".
 > If any observation differs from the expected value, this handoff is stale —
 > the code is the truth, not this document. Report the mismatch before proceeding.
 
 ## Verify First
-- `git branch --show-current` → `claude/lane-batch`; `git status` → clean; `gh pr view 126 --json state -q .state` → OPEN.
-- `git log --oneline -3` → `7b0b309` probe lane-kernel-bench (Stage 1b NO-GO), `9ae9932` fix(server) canonical hybrid prefill, `adbfdf4` feat(server) lane serving.
+- `git branch --show-current` → `claude/lane-ceiling`; `git status` → clean; PR #126 → MERGED (main has e492bbc).
+- `git log --oneline -2` → `f19630c` probe MLX quantizedMM M-scaling, on top of main merge.
 - `~/bin/jacquard run scripts/test_raw.sh` → RAWTESTS **91/91** (tests 90+91 = lane lossless contract, WRITE-LOCKED, total=91).
 - GPU rule: `~/bin/jacquard` (run=shared / measure=exclusive; `JACQUARD_GPU_IDLE_THRESHOLD=20` for measure). Never two GPU procs; brew service stopped (`brew services info qwisp`).
 
 ## Next Action
-Wait for / respond to review on PR #126 (github.com/penta2himajin/qwisp/pull/126). No code work pending on this branch. Speed at B≥3 is CLOSED: all three Stage-1b levers measured NO-GO (see Rejected) — B=3 ≈ 46-49 tok/s/stream is the engine kernel family's practical floor.
+Open/merge the small probe PR from `claude/lane-ceiling` (7b0b309 already merged via #126; f19630c = MLX reference probe). Then start #121 (prefix-cache-aware admission on lanes) — the ceiling investigation is CLOSED (see CEILING VERDICT).
+
+## CEILING VERDICT (2026-07-22, M1 Max 64GB / 400GB/s / SLC 48MB)
+Question: is further parallel (B-lane) decode speedup possible? Answer: NO at the kernel and system level; only two small orthogonal levers remain (below).
+- Kernel: 3 designs measured NO-GO (Stage-1b merge +2-3 tok/s ceiling; tiled 9x slower; qmm4_rows_b register-collapse 4-6x slower). MLX's own quantizedMM measured on the same shape scales ~+19µs/row — SAME as our qmv port — and MLX's dispatch (get_qmv_batch_limit, metal/quantized.cpp) keeps per-row qmv up to M=12 for [K=2048,N=8192] on this chip, steel only beyond: the reference implementation has no better small-M kernel.
+- System: QWISP_BATCH=6 (MLX batched model path) on the 6-stream replay = 16.62s vs lanes 16.67s (tie), not bit-exact, and loses at B=8 (17 vs 21.9/stream, #120). No upside.
+- Roofline (CORRECTED 2026-07-22 by the Lean derivation — earlier "0.5GB GDN state/lane" was a ×3.9 arithmetic error): W = 1671.8MB (derived from config.json, kernel-checked), S = 129.8MB/lane (2.10MB state + 64KB conv hist, r+w, ×30). Pure-BW ideal B=3/B=1 ratio 5591/4887 ≈ 1.144; actual 1.748 ⇒ efficiency 65-66% vs pure-BW ideal, 60-61% vs the two-component (latency+BW) ideal; honest range [~0.60, ~0.66], robust ±3% (0.61-0.70). Coherence: measured recurrence DRAM excess 0.24-0.36ms/lane ≈ corrected S/BW = 0.324ms.
+- Lean-certified (qwisp-lean `4ae5d4c`, `Qwispmath/LaneCeiling.lean`, no sorry): W/S DERIVED not pinned (Wbytes_val/Sbytes_val); NO-GO ratios; Stage-1b < +2 tok/s; raw≡MLX marginal bands; aggregate ceilings 233 (empirical kernel-family) / 3083 (physics, assumption-free — S/BW marginal only); io_schedule_fits (physics floor NOT blocked by I/O — 32KB on-chip suffices); b_exact_wins (see next bullet). NO-GO verdicts independent of the ideal-model choice.
+- b2/b3 B-exact variants: isolated kernel win (−8-10%, bit-exact, `b_exact_wins`) but LOSES ~1ms in-chain at B=3 (`b_exact_chain_loss`, grid-parallelism/occupancy trade vs encoder barriers) — wired OPT-IN `QWISP_LANE_BEXACT=1`, default OFF (7a83e2b). Doctrine: isolated-dispatch throughput ≠ in-chain throughput. Next kernel lever (unmeasured): raw-half x_thread + exact f32 scale-on-use.
+
+
+## L3 RELAXATION ANALYSIS (2026-07-22, answered from measured data — no new runs)
+Question: what opens if the bit-exact contract is removed / relaxed to greedy-equal or quality-equal?
+- Greedy-equal (re-canonicalization tier, precedent: steel-hybrid prefill): opens accumulation-order freedoms (split-K, simdgroup-matrix, half-accum) — but the measured obstacle is latency/occupancy/barriers, NOT arithmetic order, and MLX tuning shows simdgroup-matrix loses below M~12. Gain: single-digit %. NOT worth it alone.
+- L3 (quality-bounded): THE unlock is margin-accept MTP speculation in lanes — verify rows disappear (strict spec-in-batch is a wash: B=3+D1 exact-verify ~x0.95 by the SpecWidth accounting, same batch-1 physics as #98). Assets all exist: raw MTP-D1 port (green, default OFF), measured D1 accepts (code .720/agentic .829/longctx .803/shortnl .506), margin instrumentation (lastMargin), tinycodr DraftGate design. Estimate at B=3 (accept .75 x cov .7): 46 -> ~64 tok/s/stream (+40%); aggregate ceiling 233 -> ~350. shortnl degrades gracefully (gate closes). Quality must be MEASURED (token-match + task eval; bolt fidelity 88.7-98.2 is the reference dial).
+- Lower-bit W: closed (2-bit quality-rejected, lm_head cert mathematically closed). Union expert routing across lanes: few % (latency-bound).
+- Realistic stacked ceiling: B=3 ~75-85 tok/s (~1.6-1.8x). Physics 3083 unreachable even at L3 (lat 7.9ms + per-row dequant are quality-independent structure).
+- IF pursuing this axis: the one high-EV experiment is "Stage 2 = margin-gated MTP-D1 in lanes" probe WITH quality measurement (~1 session to GO/NO-GO). Priority order still favors #121 first.
 
 ## Then
 1. (next workstream, #121) prefix-cache-aware admission on the lane path: admits re-pay shared system+tools prefixes; sharing the prefill across lanes is the remaining fan-out lever (TTFT with real 8-50K prompts). Design seam: LaneBatchSlots.admit re-creates the lane per request — a shared-prefix snapshot/restore (prefix cache machinery, LLMBackend.swift#generateCached idioms) could seed the lane state instead of cold prefill.
-2. Stage 2 (per-row spec-in-batch, tinycodr DraftGate) remains the only per-stream decode lever left, and only pays if accept economics beat the qmv M-scaling floor — needs its own measurement before any build.
+2. (small, optional) lane chainK: batch K chained steps per CB with GPU token feedback (solo chainedStepArgmax machinery + stop flag) — kills the ~1.1ms/step wall−GPU gap at B=3 ⇒ est. +5%; trades streaming granularity. Only worth doing opportunistically.
+3. Stage 2 (per-row spec-in-batch, tinycodr DraftGate) remains the only substantial per-stream decode lever left — a DIFFERENT axis (acceptance economics, not batching efficiency); needs its own measurement before any build.
 
 ## Commands
 - gate:  `~/bin/jacquard run scripts/test_raw.sh` → RAWTESTS 91/91; `scripts/test_bench_batch.sh` PASS; `scripts/test_completion.sh` 57/57; `scripts/test_tokenizer.sh` 5/5
