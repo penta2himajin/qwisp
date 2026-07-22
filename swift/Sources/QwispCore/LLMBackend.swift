@@ -152,6 +152,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public static func prefixArenaMaxDefault(contextLen: Int, isStreaming: Bool) -> Int {
         isStreaming ? Swift.min(contextLen, 65536) : contextLen
     }
+    /// Arena GENERATION budget for one cached request (tokens past the prompt). Distinct from
+    /// prefixArenaMax (cache ELIGIBILITY): the arena costs ~80KB/token of wired GPU memory, so
+    /// sizing it to prompt + full context headroom (as the pre-#135 code implicitly did once the
+    /// eligibility cap rose to the model context) allocates ~20GB at 262K and collapses the box
+    /// (observed 2026-07-22: footprint 41GB, prefill 138→41 tok/s). Longer answers finish=length
+    /// at the budget — same behavior the old 64K cap imposed near its edge. QWISP_PREFIX_GEN_MAX.
+    public static func cachedGenBudget(promptLen: Int, ceiling: Int, arenaMax: Int, genCap: Int) -> Int {
+        Swift.max(1, Swift.min(ceiling, Swift.min(genCap, arenaMax - promptLen)))
+    }
+    var prefixGenCap: Int { Swift.max(1024, Tell.envInt("QWISP_PREFIX_GEN_MAX", 16384)) }
     var prefixArenaMax: Int {
         let dflt = SeedlessBackend.prefixArenaMaxDefault(contextLen: contextLen, isStreaming: isStreamingTier)
         return Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", dflt)))
@@ -449,9 +459,11 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 defer { self.segGate.signal() }
                 // Design B: ensure the arena fits prompt + this request's generation; grow (rebuild,
                 // geometric, monotonic) if not. ponytail: unbounded/huge generations cap at
-                // prefixArenaMax (model context on resident, 64K on streaming); >that falls through upstream. Mid-decode
-                // arena growth is the upgrade path if a real workload needs >prefixArenaMax generation.
-                let genBudget = Swift.max(1, Swift.min(ceiling, self.prefixArenaMax - prompt.count))
+                // cachedGenBudget (default 16K past the prompt; QWISP_PREFIX_GEN_MAX). Mid-decode
+                // arena growth is the upgrade path if a real workload needs a longer cached answer.
+                let genBudget = SeedlessBackend.cachedGenBudget(
+                    promptLen: prompt.count, ceiling: ceiling, arenaMax: self.prefixArenaMax,
+                    genCap: self.prefixGenCap)
                 let needed = prompt.count + genBudget
                 if self.prefixBackend == nil || self.prefixArenaLen < needed {
                     var newLen = Swift.max(self.prefixArenaLen, 16384)

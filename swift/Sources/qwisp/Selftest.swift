@@ -114,6 +114,15 @@ func runCompletionSelftest(modelDir: String) async -> String {
     check("prefixmax_small_ctx_clamp",
           SeedlessBackend.prefixArenaMaxDefault(contextLen: 32_768, isStreaming: true) == 32_768)
 
+    // cached-arena generation budget (#135 follow-up): the arena must size to
+    // prompt + bounded gen budget, never prompt + full context headroom (~80KB/token wired).
+    check("genbudget_bounded_by_cap",
+          SeedlessBackend.cachedGenBudget(promptLen: 19_600, ceiling: 242_544, arenaMax: 262_144, genCap: 16_384) == 16_384)
+    check("genbudget_small_ceiling_wins",
+          SeedlessBackend.cachedGenBudget(promptLen: 1_000, ceiling: 512, arenaMax: 262_144, genCap: 16_384) == 512)
+    check("genbudget_arena_edge_clamp",
+          SeedlessBackend.cachedGenBudget(promptLen: 64_000, ceiling: 100_000, arenaMax: 65_536, genCap: 16_384) == 1_536)
+
     // prefix-cache disk persistence (issue #89; pure tmp-dir store checks, no GPU).
     for (name, ok) in PrefixPersist.selfCheck() { check("prefixpersist_\(name)", ok) }
 
