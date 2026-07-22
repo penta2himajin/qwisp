@@ -104,6 +104,16 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // calib warm-start artifact (issue #73; pure tmp-dir round trip, no GPU).
     for (name, ok) in CalibArtifact.selfCheck() { check("calib_\(name)", ok) }
 
+    // prefix arena cap default (the 64K cliff, 2026-07-22): resident follows the model
+    // context so long OpenCode sessions never silently lose the cache; streaming keeps
+    // the wired-pressure-safe 65536 (PR #70); tiny contexts clamp to the context.
+    check("prefixmax_resident_follows_ctx",
+          SeedlessBackend.prefixArenaMaxDefault(contextLen: 262_144, isStreaming: false) == 262_144)
+    check("prefixmax_streaming_64k",
+          SeedlessBackend.prefixArenaMaxDefault(contextLen: 262_144, isStreaming: true) == 65_536)
+    check("prefixmax_small_ctx_clamp",
+          SeedlessBackend.prefixArenaMaxDefault(contextLen: 32_768, isStreaming: true) == 32_768)
+
     // prefix-cache disk persistence (issue #89; pure tmp-dir store checks, no GPU).
     for (name, ok) in PrefixPersist.selfCheck() { check("prefixpersist_\(name)", ok) }
 
