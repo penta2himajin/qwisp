@@ -40,10 +40,16 @@ longest cached prefix into the fresh lane (`restorePersistentState`), prefilling
 - Trace generator + driver: scratchpad `gen_fanout_prefix.py`, `driver.sh`, `fanout6-prefix.jsonl`
   (session scratchpad; regenerate as needed — recipe: 6 recs, shared ~12.4K-char system, distinct
   short user tasks, stream:true, temperature 0).
-- OBSERVATION (unmeasured, follow-up): server-path decode ≈110-127ms/step at B=6 vs bench ~45-49ms
-  full-argmax step — the serialize server shows the same ~2x server-vs-bench gap (40 tok/s vs 80-96
-  solo). Per-token server overhead (detokenize/SSE/scheduler) is a shared follow-up lever, NOT
-  lane-specific. Measure before building anything.
+- MEASURED (server logs, probes mt64/B=1): the earlier "server ~2x/step" read was a MISATTRIBUTION.
+  Decomposition: (1) DOMINANT = admits stall the single decode thread (ContinuousScheduler.loop):
+  warm admit ~2.4s (delta prefill ~880 tok @ ~350-450 tok/s), cold ~6.2s; 6 admits = 18.3s of the
+  32.8s wall (56%) — prefill-overlap admission is the next lane lever. (2) True per-token server
+  tax is only 14% @B=1 (69.0 vs 80.4) / ~25% @B=6 (19.3 vs ~26 interp) — cause located:
+  Server.swift:196 + ChatCompletion.swift:210 re-decode the FULL output per token (O(n^2)
+  tokenizer.decode(outIds)) + splitOutput/<tool_call> full scans + JSON/SSE per token per stream.
+  Incremental detokenize kills it, server-layer only. (3) serialize's apparent 40 tok/s was
+  TTFT+lock in wall; real serialize decode 74-79 tok/s (accept 2-22% on this synthetic thinking
+  content — spec adds little there).
 
 ## Then
 1. L3 relaxation discussion with the user (owner asked explicitly). Assets + estimates in the
