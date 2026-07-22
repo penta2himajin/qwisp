@@ -195,8 +195,12 @@ final class QwispEngine: @unchecked Sendable {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
             if tFirst == nil { tFirst = Date() }
-            // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
-            let (r, afterThink) = splitOutput(detok.push(tok), thinkingDisabled: req.thinkingDisabled)
+            detok.push(tok)
+            // Deltas derive from the FINALIZED text only (append-only, no dangling
+            // U+FFFD) — deriving them from the full view stalled the stream forever
+            // once a split multibyte char emitted a replacement char that the next
+            // token rewrote (hasPrefix(sent) never held again). See StreamDetok.
+            let (r, afterThink) = splitOutput(detok.finalized, thinkingDisabled: req.thinkingDisabled)
             if r.count > sentR.count, r.hasPrefix(sentR) {
                 try await send(Delta(reasoning_content: String(r.dropFirst(sentR.count))), nil); sentR = r
             }
@@ -207,8 +211,19 @@ final class QwispEngine: @unchecked Sendable {
             }
             if p.maxTokens >= 0 && outIds.count >= p.maxTokens { finish = "length"; break }  // <0 = until EOS/context
         }
+        // End-of-stream flush from the authoritative full decode: anything still held
+        // back (pending window) or trailing bytes goes out here; finalized is always a
+        // prefix of the full text, so the prefix guards hold by construction.
+        let (rEnd, afterEnd) = splitOutput(tokenizer.decode(outIds), thinkingDisabled: req.thinkingDisabled)
+        if rEnd.count > sentR.count, rEnd.hasPrefix(sentR) {
+            try await send(Delta(reasoning_content: String(rEnd.dropFirst(sentR.count))), nil); sentR = rEnd
+        }
+        let visEnd = afterEnd.range(of: "<tool_call>").map { String(afterEnd[..<$0.lowerBound]) } ?? afterEnd
+        if visEnd.count > sentC.count, visEnd.hasPrefix(sentC) {
+            try await send(Delta(content: String(visEnd.dropFirst(sentC.count))), nil); sentC = visEnd
+        }
         // Buffered tool calls: parse the completed output and emit them as tool_calls deltas.
-        let (_, toolCalls) = ToolParse.parse(splitOutput(tokenizer.decode(outIds), thinkingDisabled: req.thinkingDisabled).content)
+        let (_, toolCalls) = ToolParse.parse(afterEnd)
         for (i, tc) in toolCalls.enumerated() {
             try await send(Delta(tool_calls: [ToolCallDelta(index: i, id: tc.id, type: "function", function: tc.function)]), nil)
         }

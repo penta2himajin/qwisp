@@ -63,6 +63,18 @@ func runCompletionSelftest(modelDir: String) async -> String {
                                  decode: decode, backend: FakeBackend(script: helloIds)) { streamed += $0 }
     check("delta_concat", streamed == r4.text && !streamed.isEmpty)
 
+    // 4b. multibyte character SPLIT across tokens (the OpenCode mid-stream stall,
+    // 2026-07-22): the half-char step must not emit U+FFFD — once a replacement char
+    // is emitted and later rewritten, prefix-guarded delta streams either stall
+    // (streamSSE) or duplicate (this path). Deltas must concat to the exact text.
+    let frags: [[UInt8]] = [Array("a".utf8) + [0xF0, 0x9F], [0x9A, 0x80] + Array("x".utf8)]
+    var mbStreamed = ""
+    let r4b = await runGeneration(promptIds: [], maxTokens: 8, stopIds: [],
+                                  decode: { ids in String(decoding: ids.flatMap { frags[$0] }, as: UTF8.self) },
+                                  backend: FakeBackend(script: [0, 1])) { mbStreamed += $0 }
+    check("delta_multibyte_split", mbStreamed == "a🚀x" && r4b.text == "a🚀x")
+    check("delta_no_replacement_char", !mbStreamed.contains("\u{FFFD}"))
+
     // 5-7. splitThink: reasoning/content separation (pure; Qwen3.6 <think> handling).
     let sp = splitThink("weighing options</think>\n\nThe answer is 42.")
     check("think_split_content", sp.content == "The answer is 42.")

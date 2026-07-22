@@ -209,11 +209,18 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
         // Defensive: the backend must already honor stopTokens/maxTokens, but guard here too.
         if stopIds.contains(id) { finish = "stop"; break }
         outIds.append(id)
-        let full = detok.push(id)
+        detok.push(id)
+        // Deltas from the FINALIZED text only (append-only, no dangling U+FFFD) — a
+        // split multibyte char used to emit a replacement char here and then re-send
+        // the whole text once the char completed (see StreamDetok.finalized).
+        let full = detok.finalized
         let delta = full.hasPrefix(emitted) ? String(full[emitted.endIndex...]) : full
         emitted = full
         if !delta.isEmpty { onDelta(delta) }
         if maxTokens >= 0 && outIds.count >= maxTokens { finish = "length"; break }  // <0 = until EOS/context
     }
-    return CompletionResult(text: emitted, completionTokens: outIds.count, finishReason: finish)
+    // Flush anything still held in the pending window (finalized ⊆ text always).
+    let final = detok.text
+    if final.count > emitted.count, final.hasPrefix(emitted) { onDelta(String(final[emitted.endIndex...])) }
+    return CompletionResult(text: final, completionTokens: outIds.count, finishReason: finish)
 }
