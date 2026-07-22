@@ -104,7 +104,9 @@ red strict cell.
 ## Session Handoff
 
 Cross-session continuity uses `HANDOFF.md` at the repo root (overwritten each session; the
-SessionStart hook re-injects it) plus the file-based memory index. The GitHub-issue protocol in
+SessionStart hook re-injects it) plus the file-based memory index. `HANDOFF.md` is **local-only
+and gitignored — never commit it** (the hook reads the local file; sessions 2026-07-19..22
+drifted into committing it, re-agreed untracked 2026-07-22). The GitHub-issue protocol in
 `docs/handoff-protocol.md` is the canonical spec for the issue-based variant if/when a workstream
 moves to issues; the `session-handoff` label and `.github/ISSUE_TEMPLATE/handoff.md` support it.
 
