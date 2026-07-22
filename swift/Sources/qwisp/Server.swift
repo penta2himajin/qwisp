@@ -143,7 +143,7 @@ final class QwispEngine: @unchecked Sendable {
         if serialize { await lock.acquire() }
         let t0 = Date(); var tFirst: Date? = nil
         let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
-                                    decode: { tokenizer.decode($0) }, backend: backend,
+                                    decode: { self.tokenizer.decode($0) }, backend: backend,
                                     temperature: s.temperature, topP: s.topP, seed: s.seed,
                                     frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
                                     logitBias: s.logitBias, promptContentLen: p.contentLen) { _ in if tFirst == nil { tFirst = Date() } }
@@ -188,12 +188,15 @@ final class QwispEngine: @unchecked Sendable {
                                    frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
                                    logitBias: s.logitBias, promptContentLen: p.contentLen)
         let t0 = Date(); var tFirst: Date? = nil
+        // Incremental detokenize (StreamDetok): full re-decode per token was O(n²) in the
+        // generation length — the dominant share of the measured 14-25% per-token server tax.
+        var detok = StreamDetok(decode: { self.tokenizer.decode($0) })
         for await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
             if tFirst == nil { tFirst = Date() }
             // Split thinking from answer: reasoning → delta.reasoning_content, answer → delta.content.
-            let (r, afterThink) = splitOutput(tokenizer.decode(outIds), thinkingDisabled: req.thinkingDisabled)
+            let (r, afterThink) = splitOutput(detok.push(tok), thinkingDisabled: req.thinkingDisabled)
             if r.count > sentR.count, r.hasPrefix(sentR) {
                 try await send(Delta(reasoning_content: String(r.dropFirst(sentR.count))), nil); sentR = r
             }

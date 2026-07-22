@@ -50,3 +50,60 @@ struct QwispTokenizer {
                                                additionalContext: additionalContext)
     }
 }
+
+/// Incremental detokenizer for the streaming loops. The server re-decoded the FULL
+/// output on every token (O(n²) — measured as the 14-25% per-token decode tax,
+/// HANDOFF 2026-07-22); byte-level BPE decode is byte concatenation, so a finalized
+/// prefix may be cut wherever the decoded tail ends on a codepoint boundary. A tail
+/// whose decode ends in U+FFFD is a dangling multi-byte sequence — it stays pending
+/// until later tokens complete it (a genuine mid-tail U+FFFD finalizes as-is: decode
+/// is deterministic, later tokens cannot repair it).
+/// Contract (locked by TOKTEST stream_detok_stepwise_equals_full): after n pushes the
+/// returned text == decode(first n ids), so swapping it into the loops is
+/// byte-identical to the old full re-decode by induction.
+struct StreamDetok {
+    let decode: ([Int]) -> String
+    private var stable = ""          // finalized text — never changes retroactively
+    private var pending: [Int] = []  // ids not yet safely cut
+    init(decode: @escaping ([Int]) -> String) { self.decode = decode }
+    /// Push one id; returns the full text so far (== decode(all ids pushed)).
+    mutating func push(_ id: Int) -> String {
+        pending.append(id)
+        let tail = decode(pending)
+        if tail.last == "\u{FFFD}" { return stable + tail }   // dangling bytes — hold the cut
+        stable += tail
+        pending.removeAll(keepingCapacity: true)
+        return stable
+    }
+
+    /// Pure self-check (COMPTEST, no model): a fake byte-level "tokenizer" whose ids map
+    /// to UTF-8 byte fragments (🚀 split across two ids) — stepwise views must equal the
+    /// full fake decode at every step, and the pending window must drain.
+    static func selfCheck() -> [(String, Bool)] {
+        let frags: [[UInt8]] = [
+            Array("a".utf8),                       // 0: plain ASCII
+            [0xF0, 0x9F],                          // 1: first half of 🚀
+            [0x9A, 0x80],                          // 2: second half of 🚀
+            Array("日本語".utf8),                   // 3: complete multi-byte run
+            [0xE2],                                // 4: first byte of ✓
+            [0x9C, 0x93],                          // 5: rest of ✓
+            Array("!".utf8),                       // 6
+        ]
+        func fakeDecode(_ ids: [Int]) -> String {
+            String(decoding: ids.flatMap { frags[$0] }, as: UTF8.self)
+        }
+        let seq = [0, 1, 2, 3, 4, 5, 6, 0]
+        var d = StreamDetok(decode: fakeDecode)
+        var stepwise = true
+        for k in 0 ..< seq.count {
+            stepwise = stepwise && (d.push(seq[k]) == fakeDecode(Array(seq[0 ... k])))
+        }
+        var d2 = StreamDetok(decode: fakeDecode)
+        let mid = seq.prefix(4).map { d2.push($0) }.last ?? ""
+        return [
+            ("stepwise_equals_full", stepwise),
+            ("split_rocket_rendered", mid.contains("🚀") && mid.contains("日本語")),
+            ("final_text", d.push(6) == fakeDecode(seq + [6])),
+        ]
+    }
+}

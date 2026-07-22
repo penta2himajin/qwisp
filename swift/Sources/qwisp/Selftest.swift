@@ -107,6 +107,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // lane admission plan (#121; pure boundary arithmetic, no GPU).
     for (name, ok) in LaneBatchSlots.admitSelfCheck() { check("laneadmit_\(name)", ok) }
 
+    // incremental detokenizer (server O(n²) fix; pure fake byte-level tokenizer).
+    for (name, ok) in StreamDetok.selfCheck() { check("detok_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
@@ -161,6 +164,19 @@ func runTokenizerSelftest(modelDir: String) async -> String {
         let msgs: [[String: any Sendable]] = [["role": "user", "content": "Hi"]]
         let ids = try tok.render(messages: msgs)
         return tok.tokenizer.decode(tokens: ids, skipSpecialTokens: false).hasSuffix("<think>\n")
+    }
+    // Incremental detokenizer (server O(n²) fix): pushing ids one at a time must equal the
+    // full re-decode at EVERY step — this is the exact contract the streaming loop relied
+    // on; stepwise equality on the REAL tokenizer makes the swap byte-identical by
+    // induction. Japanese + emoji stress multi-byte characters split across BPE tokens.
+    check("stream_detok_stepwise_equals_full") {
+        let s = "日本語テキストと emoji 🚀🔧 の混在、多バイト分割: héllo — ✓ code `let x = 1`。"
+        let ids = tok.encode(s)
+        var d = StreamDetok(decode: { tok.decode($0) })
+        for k in 0 ..< ids.count {
+            if d.push(ids[k]) != tok.decode(Array(ids[0 ... k])) { return false }
+        }
+        return true
     }
 
     return lines.joined(separator: "\n") + "\nTOKTEST \(passed)/\(total)"
