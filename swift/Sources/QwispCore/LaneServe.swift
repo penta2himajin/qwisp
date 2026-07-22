@@ -59,54 +59,62 @@ public final class LaneBatchSlots: BatchSlots {
     }
 
     // ── #121 admission plan (pure logic; COMPTEST laneadmit_*) ────────────────
-    /// Every cache boundary (restore, capture, save) is an ABSOLUTE chunk-aligned
-    /// position. The delta prefill then reproduces the cold path's chunk boundaries
-    /// exactly, so restore+delta is bit-identical to cold BY CONSTRUCTION — no
-    /// assumption about the hybrid kernels' chunk-composition invariance is needed
-    /// (the serialize path's arbitrary-boundary restores lean on the PREFIXE2E gate;
-    /// the lane path removes the assumption instead).
+    /// Boundaries are EXACT positions (v2): capture sits at the exact recurrence LCP
+    /// and the conversation state is saved at the prompt end. The v1 chunk-aligned
+    /// grid was bit-safe by construction but measured 860-token re-prefills per admit
+    /// (~2.4s each) whenever the shared prefix fell between grid points — the
+    /// dominant fan-out cost after #121. Arbitrary-boundary restore + delta prefill
+    /// re-chunks from the restore point, the SAME contract the shipped serialize
+    /// RAM tier relies on (PREFIXE2E gate, #117 lossless 4/4); the lane gate is the
+    /// replay identity diff (6/6 byte-identical required).
     public struct LaneAdmitPlan: Equatable {
-        public var restoreLen: Int   // aligned cached prefix to restore (0 = cold admit)
-        public var captureAt: Int?   // aligned recurrence boundary → sharedStore save
-        public var saveAt: Int?      // aligned last boundary → convStore save
-        public init(restoreLen: Int, captureAt: Int?, saveAt: Int?) {
-            self.restoreLen = restoreLen; self.captureAt = captureAt; self.saveAt = saveAt
+        public var restoreLen: Int   // cached prefix to restore (0 = cold admit)
+        public var captureAt: Int?   // exact recurrence LCP → sharedStore save (mid-prefill)
+        public var saveAtEnd: Bool   // save the prompt-end state → convStore (post-prefill)
+        public init(restoreLen: Int, captureAt: Int?, saveAtEnd: Bool) {
+            self.restoreLen = restoreLen; self.captureAt = captureAt; self.saveAtEnd = saveAtEnd
         }
     }
-    /// hitLen = longest whole-entry store hit over prompt.dropLast() (aligned by
-    /// construction — stores only ever receive aligned keys); lcp = longest PARTIAL
-    /// key match (recurrence evidence: two different conversations sharing ≥minShared
-    /// tokens define a harness prefix, same operational definition as PrefixPersist #112).
-    public static func admitPlan(promptLen: Int, chunk: Int, hitLen: Int, lcp: Int,
+    /// hitLen = longest whole-entry store hit over prompt.dropLast() (never the full
+    /// prompt — the last position is always recomputed for the first-token argmax);
+    /// lcp = longest PARTIAL key match (recurrence evidence: two different
+    /// conversations sharing ≥minShared tokens define a harness prefix, same
+    /// operational definition as PrefixPersist #112).
+    public static func admitPlan(promptLen: Int, hitLen: Int, lcp: Int,
                                  minShared: Int) -> LaneAdmitPlan {
         let restoreLen = hitLen
-        var capture: Int? = (lcp / chunk) * chunk             // floor to the chunk grid
-        if let c = capture, c < minShared || c <= restoreLen { capture = nil }
-        var save: Int? = ((promptLen - 1) / chunk) * chunk    // ≥1 token always re-prefilled
-        if let s = save, s <= restoreLen || s == capture { save = nil }
-        return LaneAdmitPlan(restoreLen: restoreLen, captureAt: capture, saveAt: save)
+        // Capture only when the recurrence boundary beats the restore point by more
+        // than a blob copy is worth (~256 tokens of prefill), and leaves ≥1 token.
+        var capture: Int? = Swift.min(lcp, promptLen - 1)
+        if let c = capture, c < minShared || c < restoreLen + 256 { capture = nil }
+        // Conversation-end state: skip only when the restore already covers the whole
+        // prompt but its last token (nothing new past the stored entry).
+        let saveAtEnd = promptLen >= minShared && restoreLen < promptLen - 1
+        return LaneAdmitPlan(restoreLen: restoreLen, captureAt: capture, saveAtEnd: saveAtEnd)
     }
 
     /// Pure self-check (no GPU, no model): boundary arithmetic of the admission plan.
     public static func admitSelfCheck() -> [(String, Bool)] {
         func p(_ len: Int, _ hit: Int, _ lcp: Int) -> LaneAdmitPlan {
-            admitPlan(promptLen: len, chunk: 1024, hitLen: hit, lcp: lcp, minShared: 1024)
+            admitPlan(promptLen: len, hitLen: hit, lcp: lcp, minShared: 1024)
         }
         return [
-            // cold first request: no evidence, save the last aligned boundary
-            ("cold", p(9000, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: 8192)),
-            // second same-prefix request: partial match ⇒ capture the shared boundary too
-            ("recurrence_capture", p(12000, 0, 9000) == LaneAdmitPlan(restoreLen: 0, captureAt: 8192, saveAt: 11264)),
+            // cold first request: no recurrence evidence, save the prompt-end state
+            ("cold", p(9000, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: true)),
+            // second same-prefix request: capture at the EXACT shared boundary
+            ("recurrence_capture", p(12000, 0, 9000) == LaneAdmitPlan(restoreLen: 0, captureAt: 9000, saveAtEnd: true)),
             // third request: warm restore at the shared boundary, no re-capture
-            ("restore_no_recapture", p(12000, 8192, 8192) == LaneAdmitPlan(restoreLen: 8192, captureAt: nil, saveAt: 11264)),
+            ("restore_no_recapture", p(12000, 9000, 9000) == LaneAdmitPlan(restoreLen: 9000, captureAt: nil, saveAtEnd: true)),
             // shared prefix below minShared: never capture
-            ("min_shared", p(4000, 0, 900) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: 3072)),
-            // capture and save on the same boundary: conv save skipped (one blob, one tier)
-            ("save_capture_dedup", p(9000, 0, 8500) == LaneAdmitPlan(restoreLen: 0, captureAt: 8192, saveAt: nil)),
-            // prompt shorter than one chunk: no boundary at all
-            ("short_prompt", p(800, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: nil)),
-            // restore already at the last boundary: nothing new to save
-            ("restore_covers_save", p(9000, 8192, 8192) == LaneAdmitPlan(restoreLen: 8192, captureAt: nil, saveAt: nil)),
+            ("min_shared", p(4000, 0, 900) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: true)),
+            // capture not worth a blob copy over the existing restore point
+            ("capture_margin", p(12000, 8900, 9000) == LaneAdmitPlan(restoreLen: 8900, captureAt: nil, saveAtEnd: true)),
+            // lcp reaching the prompt end clamps to promptLen-1 (≥1 token recomputed)
+            ("capture_clamped", p(9000, 0, 9000) == LaneAdmitPlan(restoreLen: 0, captureAt: 8999, saveAtEnd: true)),
+            // short prompt: not worth caching at all
+            ("short_prompt", p(800, 0, 0) == LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: false)),
+            // restore covers all but the recomputed last token: nothing new to save
+            ("restore_covers_save", p(9000, 8999, 8999) == LaneAdmitPlan(restoreLen: 8999, captureAt: nil, saveAtEnd: false)),
         ]
     }
 
@@ -146,11 +154,11 @@ public final class LaneBatchSlots: BatchSlots {
         let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
         let chunkSize = hybrid ? 1024 : 64
         guard var (fwd, fnBuf) = makeLane(hybrid: hybrid) else { return nil }
-        // #121: restore the longest cached aligned prefix, prefill only the delta.
+        // #121: restore the longest cached prefix, prefill only the delta.
         // Default ON; QWISP_LANE_PREFIX=0 (or _MB=0) opts out. dropLast ⇒ a hit never
         // swallows the whole prompt (the last position is always recomputed for the
         // first-token argmax).
-        var plan = LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAt: nil)
+        var plan = LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: false)
         if Tell.envInt("QWISP_LANE_PREFIX", 1) != 0,
            sharedStore.budget + convStore.budget > 0 {
             let matchable = Array(prompt.dropLast())
@@ -159,7 +167,7 @@ public final class LaneBatchSlots: BatchSlots {
             let hit = [hs, hc].compactMap { $0 }.max { $0.tokens.count < $1.tokens.count }
             let lcp = Swift.max(sharedStore.maxCommonPrefix(with: prompt),
                                 convStore.maxCommonPrefix(with: prompt))
-            plan = Self.admitPlan(promptLen: prompt.count, chunk: chunkSize,
+            plan = Self.admitPlan(promptLen: prompt.count,
                                   hitLen: hit?.tokens.count ?? 0, lcp: lcp,
                                   minShared: PrefixPersist.stableMinTokens)
             if plan.restoreLen > 0, let hit {
@@ -178,29 +186,34 @@ public final class LaneBatchSlots: BatchSlots {
         // entry EXACTLY (kernel choice and tie-break included): prompt through
         // chunked (hybrid) forward with final norm, then first token =
         // MLX.argMax(engine.logits(lastNormed)) — qmmTiled lm_head, MLX argmax.
-        // restoreLen is chunk-aligned, so the loop's boundaries match a cold run's.
+        // The loop re-chunks from restoreLen and splits one chunk at captureAt
+        // (exact boundaries — bit identity gated by the replay diff, see admitPlan).
         var lastNormed: MLXArray? = nil
         var pos = plan.restoreLen
         while pos < prompt.count {
-            let end = Swift.min(pos + chunkSize, prompt.count)
+            var end = Swift.min(pos + chunkSize, prompt.count)
+            if let c = plan.captureAt, pos < c { end = Swift.min(end, c) }
             let x = engine.embed(tokens: Array(prompt[pos ..< end]))
             guard let normed = hybrid ? fwd.forwardRowsHybrid(x, M: end - pos, finalNormW: fnBuf)
                                       : fwd.forwardRows(x, M: end - pos, finalNormW: fnBuf)
             else { return nil }
             lastNormed = normed[end - pos - 1]
             pos = end
-            // Boundary states (blob = CPU memcpy of KV used slice + GDN state, ~24KB/token).
+            // Recurrence boundary state (blob = CPU memcpy of KV used slice + GDN state,
+            // ~24KB/token) — captured mid-prefill at the exact shared-prefix end.
             if pos == plan.captureAt {
                 sharedStore.save(tokens: Array(prompt[0 ..< pos]), state: fwd.persistentStateData())
-            }
-            if pos == plan.saveAt {
-                convStore.save(tokens: Array(prompt[0 ..< pos]), state: fwd.persistentStateData())
             }
         }
         guard let ln = lastNormed?.reshaped([1, SeedlessEngine.H]),
               let lg = engine.logits(ln, M: 1) else { return nil }
         MLX.eval([lg])
         let first = MLX.argMax(lg[0], axis: -1).item(Int.self)
+        // Conversation-end state (multi-turn extension restores). The arena is exactly at
+        // the prompt boundary here — the decode steps that follow only append past it.
+        if plan.saveAtEnd {
+            convStore.save(tokens: prompt, state: fwd.persistentStateData())
+        }
         lanes[slot] = fwd
         return first
     }
