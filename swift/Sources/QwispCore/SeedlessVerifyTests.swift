@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 91
+        let total = 92
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5637,6 +5637,142 @@ public enum SeedlessVerifyTests {
                 guard let got = batch.stepArgmaxBatch(toks) else { return (false, "batch nil step=\(step)") }
                 if got != refs { return (false, "tokens step=\(step): got \(got) want \(refs)") }
                 toks = got.map { Int32($0) }
+            }
+            return (true, "ok")
+        }
+
+        // WRITE-LOCKED (guarded by total = 92). Do not weaken/skip/delete.
+        //
+        // Test 92: lane_admit_restore_bitexact
+        // #121 prefix-cache-aware lane admission, mechanism contract: a lane whose
+        // prefix state was RESTORED from a persistentStateData blob (captured on a
+        // DIFFERENT forward instance at a chunk boundary) and then delta-prefilled
+        // must be BIT-identical to a lane that computed the whole history itself —
+        // delta outputs, cache trajectories, and token ids through 3 chained
+        // stepArgmaxBatch steps against solo stepArgmax. Truncated blobs must be
+        // rejected (restore returns false; the lane is then discarded, never used).
+        run("lane_admit_restore_bitexact") {
+            let H = 2048, E = 16, I = 512, vocab = 1024
+            func q4(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func q8(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine); return (q, s, b!)
+            }
+            func q4e(_ e: Int, _ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal([e, n, k]).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: 4, mode: .affine); return (q, s, b!)
+            }
+            func mkMoE() -> SeedlessVerifyForward.MoEBlockW {
+                let (gW, gS, gB) = q8(E, H); let (sgW, sgS, sgB) = q8(8, H)
+                let (a0, a1, a2) = q4e(E, I, H); let (b0, b1, b2) = q4e(E, I, H); let (c0, c1, c2) = q4e(E, H, I)
+                let (d0, d1, d2) = q4(I, H); let (e0, e1, e2) = q4(I, H); let (f0, f1, f2) = q4(H, I)
+                return SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                    swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                    swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                    shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                    sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            }
+            let Hk = 16, Dk = 128, Hv = 32, Dv = 128, cK = 4
+            let convDim = Hk * Dk * 2 + Hv * Dv
+            let (qkvW, qkvS, qkvB) = q4(convDim, H); let (zW, zS, zB) = q4(Hv * Dv, H)
+            let (bW, bS, bB) = q4(Hv, H); let (aW, aS, aB) = q4(Hv, H); let (oW, oS, oB) = q4(H, Hv * Dv)
+            let gdnW = SeedlessVerifyForward.GDNLayerW(qkvWq: qkvW, qkvSc: qkvS, qkvBi: qkvB,
+                zWq: zW, zSc: zS, zBi: zB, bWq: bW, bSc: bS, bBi: bB, aWq: aW, aSc: aS, aBi: aB,
+                outWq: oW, outSc: oS, outBi: oB,
+                conv1dW: MLXRandom.normal([convDim, cK]).asType(.float16),
+                normWeight: MLXRandom.normal([Dv]).asType(.float16),
+                aLog: MLXRandom.normal([Hv]).asType(.float32), dtBias: MLXRandom.normal([Hv]).asType(.float32))
+            let nH = 16, nKV = 2, hD = 256
+            let (aqW, aqS, aqB) = q4(nH * 2 * hD, H); let (akW, akS, akB) = q4(nKV * hD, H)
+            let (avW, avS, avB) = q4(nKV * hD, H); let (aoW, aoS, aoB) = q4(H, nH * hD)
+            let attnW = SeedlessVerifyForward.AttnLayerW(qWq: aqW, qSc: aqS, qBi: aqB, kWq: akW, kSc: akS, kBi: akB,
+                vWq: avW, vSc: avS, vBi: avB, oWq: aoW, oSc: aoS, oBi: aoB,
+                qNorm: MLXRandom.normal([hD]).asType(.float16), kNorm: MLXRandom.normal([hD]).asType(.float16))
+            let layers = [
+                SeedlessVerifyForward.LayerSpec(isLinear: true,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: gdnW, attn: nil, moe: mkMoE(), moeE: E, moeI: I),
+                SeedlessVerifyForward.LayerSpec(isLinear: false,
+                    inputLN: MLXRandom.normal([H]).asType(.float16), postLN: MLXRandom.normal([H]).asType(.float16),
+                    gdn: nil, attn: attnW, moe: mkMoE(), moeE: E, moeI: I),
+            ]
+            let (eW, eS, eB) = q4(vocab, H)
+            let (lW, lS, lB) = q4(vocab, H)
+            let fnW = MLXRandom.normal([H]).asType(.float16)
+            let cs0 = MLXRandom.normal([cK - 1, convDim]).asType(.float16)
+            let rs0 = MLXRandom.normal([1, Hv, Dv, Dk]).asType(.float32)
+            let kC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            let vC0 = MLXRandom.normal([nKV, 16, hD]).asType(.float16)
+            MLX.eval([cs0, rs0, kC0, vC0, eW, eS, eB, lW, lS, lB, fnW])
+            func freshCaches() -> [SeedlessVerifyForward.LayerCaches] {
+                [SeedlessVerifyForward.LayerCaches(convState: cs0, recState: rs0),
+                 SeedlessVerifyForward.LayerCaches(kCache: kC0, vCache: vC0)]
+            }
+            func mkFwd() -> SeedlessFusedVerify.SeedlessFusedForward? {
+                SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                         maxM: 4, H: H, maxSeqLen: 64)
+            }
+            // Shared history: prefix W (one M=3 chunk) + delta Dx (one M=2 chunk) —
+            // the SAME chunking on both paths (aligned-boundary contract: the lane
+            // admission only ever restores at chunk boundaries, so the delta chunking
+            // always matches the cold path's).
+            let W3 = MLXRandom.normal([3, H]).asType(.float16)
+            let Dx = MLXRandom.normal([2, H]).asType(.float16)
+            MLX.eval([W3, Dx])
+            // Donor: compute the prefix, capture the blob at its boundary.
+            guard let donor = mkFwd(), donor.forwardRows(W3, M: 3) != nil
+            else { return (false, "donor init/forward nil") }
+            let blob = donor.persistentStateData()
+            // Truncated blob must be rejected; the half-written forward is discarded.
+            guard let trunc = mkFwd() else { return (false, "trunc init nil") }
+            if trunc.restorePersistentState(Data(blob.prefix(16))) {
+                return (false, "truncated blob accepted")
+            }
+            // Cold lane: computes prefix + delta itself. Restored lane: blob + delta.
+            guard let cold = mkFwd(), cold.forwardRows(W3, M: 3) != nil
+            else { return (false, "cold init/forward nil") }
+            guard let rest = mkFwd() else { return (false, "restored init nil") }
+            guard rest.restorePersistentState(blob) else { return (false, "restore false") }
+            guard let outC = cold.forwardRows(Dx, M: 2), let outR = rest.forwardRows(Dx, M: 2)
+            else { return (false, "delta forward nil") }
+            outC.eval(); outR.eval()
+            let (hOk, hD2) = bitEqual(outR, outC)
+            if !hOk { return (false, "delta h: \(hD2)") }
+            for (li, names) in [(0, ("convState", "recState")), (1, ("kCache", "vCache"))] {
+                let (ra, rb) = rest.readLayerCache(li)
+                let (ca, cb) = cold.readLayerCache(li)
+                for (x, y, nm) in [(ra, ca, names.0), (rb, cb, names.1)] {
+                    guard let xx = x, let yy = y else { return (false, "\(nm) nil") }
+                    let (ok, d) = bitEqual(xx, yy)
+                    if !ok { return (false, "\(nm): \(d)") }
+                }
+            }
+            // Batch composition: the restored lane and the cold lane advance through
+            // stepArgmaxBatch identically, and identically to a solo cold stepArgmax.
+            guard let solo = mkFwd(),
+                  solo.attachHead(embedW: eW, embedS: eS, embedB: eB, lmW: lW, lmS: lS, lmB: lB,
+                                  fnW: fnW, vocab: vocab),
+                  solo.forwardRows(W3, M: 3) != nil, solo.forwardRows(Dx, M: 2) != nil
+            else { return (false, "solo init/forward nil") }
+            guard let drv = SeedlessFusedVerify.SeedlessFusedForward(layers: layers, caches: freshCaches(),
+                                                                     maxM: 8, H: H, maxSeqLen: 64),
+                  drv.attachHead(embedW: eW, embedS: eS, embedB: eB, lmW: lW, lmS: lS, lmB: lB,
+                                 fnW: fnW, vocab: vocab),
+                  let batch = SeedlessLaneBatch(driver: drv, lanes: [rest, cold])
+            else { return (false, "driver/batch init nil") }
+            var tok: Int32 = 7
+            for step in 0 ..< 3 {
+                guard let r = solo.stepArgmax([tok]), r.count == 1
+                else { return (false, "solo stepArgmax nil step=\(step)") }
+                guard let got = batch.stepArgmaxBatch([tok, tok])
+                else { return (false, "batch nil step=\(step)") }
+                if got[0] != got[1] || got[0] != r[0] {
+                    return (false, "tokens step=\(step): got \(got) want \(r[0])")
+                }
+                tok = Int32(got[0])
             }
             return (true, "ok")
         }

@@ -87,7 +87,8 @@ red strict cell.
 
 1. Do not regenerate `refs/*.safetensors` from MLX or any non-raw-greedy source.
 2. Do not weaken, skip, or delete the `WRITE-LOCKED` tests in
-   `swift/Sources/QwispCore/SeedlessVerifyTests.swift` (guarded by `total = 89`). They are the lossless safety net.
+   `swift/Sources/QwispCore/SeedlessVerifyTests.swift` (guarded by the `total = N` counter; extending the
+   suite with new locked tests bumps N — weakening existing ones never does). They are the lossless safety net.
 3. Do not rewrite the shipped forward path (SeedlessEngine / SeedlessMetalForward / SeedlessFusedVerify /
    Tell / ExpertArena / ExpertSource + model layers). It is frozen — refactor/rename only, never rewrite.
 4. Do not rewrite `main`'s history. Work on a topic branch (`claude/<topic>`, etc.) and open a PR to `main`.

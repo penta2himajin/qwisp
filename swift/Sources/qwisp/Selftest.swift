@@ -104,6 +104,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // continuous-batching scheduler (issue #6; pure logic over a scripted fake engine).
     for (name, ok) in ContinuousScheduler.selfCheck() { check("batch_\(name)", ok) }
 
+    // lane admission plan (#121; pure boundary arithmetic, no GPU).
+    for (name, ok) in LaneBatchSlots.admitSelfCheck() { check("laneadmit_\(name)", ok) }
+
     return lines.joined(separator: "\n") + "\nCOMPTEST \(passed)/\(total)"
 }
 
