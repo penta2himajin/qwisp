@@ -190,7 +190,7 @@ struct CompletionResult {
 /// with each new text fragment (for SSE). Honors EOS/stop tokens (not emitted) and
 /// maxTokens (finish_reason "length"). Transport-agnostic; GPU-free with a fake backend.
 func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
-                   decode: ([Int]) -> String, backend: any LLMBackend,
+                   decode: @escaping ([Int]) -> String, backend: any LLMBackend,
                    temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
                    frequencyPenalty: Double = 0, presencePenalty: Double = 0,
                    logitBias: [Int: Double] = [:], promptContentLen: Int? = nil,
@@ -202,12 +202,14 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
     var outIds: [Int] = []
     var emitted = ""
     var finish = "stop"
+    // Incremental detokenize (StreamDetok, O(n²) fix): push() returns the same text as
+    // decode(outIds) at every step (TOKTEST-locked contract), multi-token characters included.
+    var detok = StreamDetok(decode: decode)
     for await id in backend.generate(promptIds, options: opts) {
         // Defensive: the backend must already honor stopTokens/maxTokens, but guard here too.
         if stopIds.contains(id) { finish = "stop"; break }
         outIds.append(id)
-        // Decode the whole sequence and emit the new suffix (handles multi-token characters).
-        let full = decode(outIds)
+        let full = detok.push(id)
         let delta = full.hasPrefix(emitted) ? String(full[emitted.endIndex...]) : full
         emitted = full
         if !delta.isEmpty { onDelta(delta) }
