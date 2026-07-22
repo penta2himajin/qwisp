@@ -66,7 +66,17 @@ struct StreamDetok {
     private var stable = ""          // finalized text — never changes retroactively
     private var pending: [Int] = []  // ids not yet safely cut
     init(decode: @escaping ([Int]) -> String) { self.decode = decode }
+    /// Finalized text: append-only, never ends in a dangling U+FFFD. Streaming deltas
+    /// MUST be derived from THIS, not from the full view — a view's trailing
+    /// replacement char gets rewritten by the next token, and a prefix-guarded delta
+    /// stream then stalls (streamSSE suppressed every later delta once `sent` held a
+    /// U+FFFD — the OpenCode mid-stream stall, 2026-07-22) or duplicates
+    /// (runGeneration re-sent the full text).
+    var finalized: String { stable }
+    /// Full text so far (== decode(all ids pushed)) — final-result use only.
+    var text: String { pending.isEmpty ? stable : stable + decode(pending) }
     /// Push one id; returns the full text so far (== decode(all ids pushed)).
+    @discardableResult
     mutating func push(_ id: Int) -> String {
         pending.append(id)
         let tail = decode(pending)
