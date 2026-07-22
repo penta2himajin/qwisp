@@ -470,6 +470,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     while newLen < needed { newLen *= 2 }
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
+                    // Release the OLD arena before building the new one: otherwise both coexist
+                    // at peak, and MLX's buffer pool keeps the freed one cached indefinitely
+                    // (observed 2026-07-22: 39GB IOAccelerator after growth rebuilds on a 64GB
+                    // box → swap thrash, prefill 1 tok/s). clearCache returns it to the OS.
+                    if self.prefixBackend != nil {
+                        self.prefixBackend = nil
+                        self.prefixSlots = []; self.arenaContent = []; self.prefixEmptySnap = nil
+                        Memory.clearCache()
+                    }
                     let built: Tell.SpecBackend?
                     if cfg.isStreaming {
                         // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
@@ -566,6 +575,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // positions → cross-conversation reuse), plus one at the content boundary.
                 var pos = restoreLen
                 while pos < contentLen {
+                    // Client abort (2026-07-22): without this check a 30K+ delta prefill grinds
+                    // the GPU for minutes after disconnect, and the next request queues behind
+                    // segGate. The arena keeps [0, pos) — the next request's LCP resumes there.
+                    if cancel.isCancelled {
+                        self.arenaContent = Array(content[0 ..< pos])
+                        continuation.finish()
+                        return
+                    }
                     let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
                     _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
