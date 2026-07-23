@@ -129,6 +129,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let modelDir: String
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
+    let isStreamingTier: Bool // tier resolved once at init (prompt-length independent)
 
     // ── Cross-request prefix cache (default ON; QWISP_PREFIX_CACHE=0 opts out) ──────────
     // Persistent per-instance backend (fused on resident; strict streaming since #76) + a
@@ -142,7 +143,29 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public var prefixCacheForced: Bool? = nil      // test/override hook; nil → env flag
     // Default ON (lossless: PREFIXE2E gate; growth removed the truncation risk). QWISP_PREFIX_CACHE=0 opts out.
     var prefixCacheEnabled: Bool { prefixCacheForced ?? (ProcessInfo.processInfo.environment["QWISP_PREFIX_CACHE"] != "0") }
-    var prefixArenaMax: Int { Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", 65536))) }
+    /// Arena cap default for the cached path (tokens). Resident tiers follow the model context:
+    /// beyond the cap the cache is silently bypassed and EVERY turn of a long conversation
+    /// re-prefills the whole history (the 64K cliff — a 77K OpenCode session paid ~12 min TTFT
+    /// per turn, 2026-07-22). KV is cheap here (10 full-attn layers ≈ 20KB/token ⇒ ≤5.4GB at
+    /// 262K). Streaming tiers keep 65536: the KV arena is wired memory and small-RAM Macs are
+    /// pressure-sensitive (PR #70).
+    public static func prefixArenaMaxDefault(contextLen: Int, isStreaming: Bool) -> Int {
+        isStreaming ? Swift.min(contextLen, 65536) : contextLen
+    }
+    /// Arena GENERATION budget for one cached request (tokens past the prompt). Distinct from
+    /// prefixArenaMax (cache ELIGIBILITY): the arena costs ~80KB/token of wired GPU memory, so
+    /// sizing it to prompt + full context headroom (as the pre-#135 code implicitly did once the
+    /// eligibility cap rose to the model context) allocates ~20GB at 262K and collapses the box
+    /// (observed 2026-07-22: footprint 41GB, prefill 138→41 tok/s). Longer answers finish=length
+    /// at the budget — same behavior the old 64K cap imposed near its edge. QWISP_PREFIX_GEN_MAX.
+    public static func cachedGenBudget(promptLen: Int, ceiling: Int, arenaMax: Int, genCap: Int) -> Int {
+        Swift.max(1, Swift.min(ceiling, Swift.min(genCap, arenaMax - promptLen)))
+    }
+    var prefixGenCap: Int { Swift.max(1024, Tell.envInt("QWISP_PREFIX_GEN_MAX", 16384)) }
+    var prefixArenaMax: Int {
+        let dflt = SeedlessBackend.prefixArenaMaxDefault(contextLen: contextLen, isStreaming: isStreamingTier)
+        return Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", dflt)))
+    }
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
@@ -176,9 +199,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.modelDir = modelDir
         self.tier = tier
         self.contextLen = SeedlessBackend.readContextLen(modelDir)
+        self.isStreamingTier = SeedlessBackend.config(tier: tier, promptLen: 0, maxTokens: 0).isStreaming
         let store = try WeightStore(modelDir: modelDir)
         // residency by tier (mirrors run(): streaming keeps only non-experts resident).
-        if SeedlessBackend.config(tier: tier, promptLen: 0, maxTokens: 0).isStreaming {
+        if isStreamingTier {
             store.residentNonExperts()
         } else {
             store.residentAll()
@@ -206,8 +230,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         let streamingCacheOK = !cfg.isStreaming
             || (lossless && Tell.envInt("QWISP_PREFIX_STREAMING", 1) != 0)
         if prefixCacheEnabled, streamingCacheOK, !options.sampling,
-           let cl = options.promptContentLen, cl < prompt.count, prompt.count + 64 <= prefixArenaMax {
-            return generateCached(prompt: prompt, contentLen: cl, ceiling: ceiling, cfg: cfg)
+           let cl = options.promptContentLen, cl < prompt.count {
+            if prompt.count + 64 <= prefixArenaMax {
+                return generateCached(prompt: prompt, contentLen: cl, ceiling: ceiling, cfg: cfg)
+            }
+            // The 64K cliff (2026-07-22): past the cap the whole history re-prefills every
+            // turn with zero reuse — that must never happen silently again.
+            fputs("[qwisp] prefix cache BYPASS: prompt \(prompt.count) tok + 64 > arena cap \(prefixArenaMax) "
+                + "(QWISP_PREFIX_MAX) — full re-prefill, no reuse\n", stderr)
         }
         // First KV arena budget; grows geometrically to `ceiling` only if generation needs it.
         let baseline = Swift.max(1, Tell.envInt("QWISP_CTX_BASELINE", 8192))
@@ -429,15 +459,26 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 defer { self.segGate.signal() }
                 // Design B: ensure the arena fits prompt + this request's generation; grow (rebuild,
                 // geometric, monotonic) if not. ponytail: unbounded/huge generations cap at
-                // prefixArenaMax (fits ≤64K total by default); >that falls through upstream. Mid-decode
-                // arena growth is the upgrade path if a real workload needs >prefixArenaMax generation.
-                let genBudget = Swift.max(1, Swift.min(ceiling, self.prefixArenaMax - prompt.count))
+                // cachedGenBudget (default 16K past the prompt; QWISP_PREFIX_GEN_MAX). Mid-decode
+                // arena growth is the upgrade path if a real workload needs a longer cached answer.
+                let genBudget = SeedlessBackend.cachedGenBudget(
+                    promptLen: prompt.count, ceiling: ceiling, arenaMax: self.prefixArenaMax,
+                    genCap: self.prefixGenCap)
                 let needed = prompt.count + genBudget
                 if self.prefixBackend == nil || self.prefixArenaLen < needed {
                     var newLen = Swift.max(self.prefixArenaLen, 16384)
                     while newLen < needed { newLen *= 2 }
                     newLen = Swift.min(newLen, self.prefixArenaMax)
                     if newLen < needed { newLen = needed }
+                    // Release the OLD arena before building the new one: otherwise both coexist
+                    // at peak, and MLX's buffer pool keeps the freed one cached indefinitely
+                    // (observed 2026-07-22: 39GB IOAccelerator after growth rebuilds on a 64GB
+                    // box → swap thrash, prefill 1 tok/s). clearCache returns it to the OS.
+                    if self.prefixBackend != nil {
+                        self.prefixBackend = nil
+                        self.prefixSlots = []; self.arenaContent = []; self.prefixEmptySnap = nil
+                        Memory.clearCache()
+                    }
                     let built: Tell.SpecBackend?
                     if cfg.isStreaming {
                         // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
@@ -534,6 +575,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // positions → cross-conversation reuse), plus one at the content boundary.
                 var pos = restoreLen
                 while pos < contentLen {
+                    // Client abort (2026-07-22): without this check a 30K+ delta prefill grinds
+                    // the GPU for minutes after disconnect, and the next request queues behind
+                    // segGate. The arena keeps [0, pos) — the next request's LCP resumes there.
+                    if cancel.isCancelled {
+                        self.arenaContent = Array(content[0 ..< pos])
+                        continuation.finish()
+                        return
+                    }
                     let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
                     _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }

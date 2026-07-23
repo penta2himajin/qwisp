@@ -121,14 +121,17 @@ public enum PrefixPersist {
         guard let files = try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: nil) else { return nil }
         var best: (url: URL, tokens: [Int32])? = nil
         for f in files where f.pathExtension == "bin" {
-            guard let data = try? Data(contentsOf: f),
+            // Mapped read: the scan only parses header + tokens (a few hundred KB); an eager
+            // Data(contentsOf:) would fault the whole multi-GB state blob of EVERY entry into
+            // RAM on EVERY lookup (observed 5.5GB/request store churn, 2026-07-22).
+            guard let data = try? Data(contentsOf: f, options: .mappedIfSafe),
                   let (model, tokens, _) = decode(data, wantState: false),
                   model == modelDir, tokens.count <= content.count,
                   tokens.count > (best?.tokens.count ?? 0),
                   Array(content[0 ..< tokens.count]) == tokens else { continue }
             best = (f, tokens)
         }
-        guard let best, let data = try? Data(contentsOf: best.url),
+        guard let best, let data = try? Data(contentsOf: best.url, options: .mappedIfSafe),
               let (_, tokens, state) = decode(data, wantState: true) else { return nil }
         try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: best.url.path)   // LRU touch
         return (tokens, state)
