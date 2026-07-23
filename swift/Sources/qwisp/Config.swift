@@ -22,7 +22,7 @@ enum Config {
     // ── defaults (the SSoT) ──────────────────────────────────────────────
     /// Release version. release.sh auto-syncs this to the tag (commits the bump if needed)
     /// and still verifies the built binary's `qwisp version` output matches the tag.
-    static let version = "0.3.9"
+    static let version = "0.3.10"
     static let defaultModel = FileManager.default.homeDirectoryForCurrentUser.path
         + "/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
     static let defaultPort = 8080
