@@ -135,3 +135,40 @@ unoccupied. Read before the next positioning update.
 3. Stage A (token-budget interleaved admission on the lane scheduler) is the
    industry-standard shape; survey adds parameter defaults (budget 2048, tier column
    for chunk size, prefix-aware lane assignment via maxCommonPrefix).
+
+## 8. Probe results (2026-07-23, resident 64GB, jacquard measure)
+
+`long-context-decay` (chunk=1024, per-stage GPU ms per chunk):
+
+| pos | attn | gdn | moe | chunk | tok/s | attn share |
+|---|---|---|---|---|---|---|
+| 0 | 0.42s | 1.33s | 1.86s | 3.6s | 284 | 12% |
+| 16384 | 5.03s | 2.29s | 2.84s | 10.2s | 101 | 50% |
+| 47104 | 17.72s | 2.49s | 3.16s | 23.4s | 44 | **76%** |
+
+GDN+MoE (steel-hybrid, matrix-unit) are near-flat with depth; the attention term
+grows 42x and owns the decay. Rough FLOP count puts the attention-prefill kernel at
+low-single-digit % GPU utilization at depth — the headroom is well beyond the flat
+1.38x number (which `prefill-stage-profile` re-confirms at shallow 2048: raw wall
+10.3s vs MLX 7.3s = 1.41x, attn share only 13.5% there).
+
+`lane-batch-bench` (ctx=1024/lane, bit-exact greedy):
+
+| B | ms/step | per-stream | aggregate |
+|---|---|---|---|
+| 1 | 11.40 | 87.7 tok/s | 87.7 |
+| 2 | 15.71 | 63.7 | 127.3 |
+| 4 | 26.63 | 37.6 | 150.2 |
+| 8 | 43.89 | 22.8 | 182.3 |
+
+B=1 lane ≈ serialize decode at comparable shallow ctx (~81-88 tok/s) → parity holds.
+
+VERDICTS:
+- **A-axis GO, re-scoped**: the canonicalization prize is NOT more dense-GEMM steel
+  (done) but a matrix-unit flash-style ATTENTION-PREFILL kernel. At 47K it owns 76%
+  of chunk time; 2-4x on that term alone = 1.6-2.3x end-to-end deep prefill
+  (44 → 71-101 tok/s). Follow the hybrid playbook: additive kernel, refs re-gen,
+  RAWTESTS/PREFIXE2E/fidelity gates.
+- **B-axis GO**: B=1 parity → lanes can subsume serialize; scheduler = admission
+  policy, not mode switch. OpenCode fan-out sweet spot B=2-3 (aggregate 1.45-1.67x,
+  per-stream 49-64 tok/s).
