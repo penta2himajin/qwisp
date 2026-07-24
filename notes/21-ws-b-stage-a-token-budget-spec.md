@@ -91,6 +91,57 @@ than ~1 chunk-worth of decode latency (bounded by `ceil(budget / chunk_size)`
 token-times), not by the other request's entire prefill duration (today's
 behavior — unbounded stall).
 
+## Bench verification results (2026-07-25, `scripts/bench_lane_budget_ab.sh 24000`, real model, QWISP_LANE_CTX=32768 for the measurement only)
+
+Paired same-session run: lane 0 streams 45 tokens (`Count slowly from 1 to 45...`),
+lane 1 admits a real ~24K-token prompt ~600ms in. Inter-token gaps (ms) of lane 0's
+stream, `QWISP_TOKEN_BUDGET_SCHED` unset vs `=1`:
+
+| | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| OFF | 44 | 12 | 17 | **93,668** | **93,668** |
+| ON (budget 2048) | 44 | 12 | 9,983 | **13,516** | **13,516** |
+
+**Qualitative GO**: the motivating failure mode is fixed. OFF stalls lane 0 for one
+unbounded block (~93.7s = the other request's entire prefill — and this duration
+scales with THAT prompt's size, unboundedly). ON caps the worst single stall at
+13.5s regardless of how large the admitted prompt is — a ~7x reduction in max/p99,
+and the bound no longer grows with the admitting request's total prompt length.
+
+**The spec's literal GO-bar text above ("~1 chunk-worth of decode latency") does
+NOT hold at depth, and that's expected, not a bug**: `ON`'s 44 gaps are NOT one
+small stall per round — the last 11 are a MONOTONICALLY GROWING series (5.0s →
+5.4s → 6.0s → 6.7s → 7.9s → 9.3s → 10.0s → 10.9s → 11.9s → 12.9s → 13.5s), one per
+scheduler round, because `budgetedStep` runs a full budget-worth of `admitStep`
+prefill work SYNCHRONOUSLY before the round's `step()` — and per notes/19 §8, a
+1024-token prefill chunk itself costs 0.42s→17.72s depending on DEPTH (12%→76% attn
+share by 47K). So the real bound Stage A delivers is "≤1 budget-worth of prefill
+compute AT THE ADMITTING REQUEST'S CURRENT DEPTH", not a constant decode-token
+time — correct the spec's mental model to this, not "~1 chunk-worth of decode
+latency" (that phrase implicitly assumed flat per-chunk cost, which WS-A's own
+findings (notes/20) already contradicted).
+
+**Distribution tradeoff, stated plainly**: OFF concentrates all pain into ONE
+sample (p90 = 17ms, only the last 1-2 of 44 gaps are large). ON spreads it across
+~25% of samples (p90 = 9,983ms — a single measurement 587x worse than OFF's p90,
+even though max improved 7x). This is the expected shape for a token-budget
+scheduler (bounded-but-frequent beats unbounded-but-rare) but it is a real,
+measurable regression on the p90 percentile specifically — record it, don't bury
+it under the max/p99 win.
+
+**Actionable lever for a follow-up**: default budget is 2048 (2 hybrid chunks);
+halving it to 1024 (1 chunk) would roughly halve the max single-round stall at the
+cost of admitting the other request's prefill in twice as many rounds (more total
+rounds, each smaller) — untested this pass, a candidate tuning knob before any
+default-ON decision.
+
+Script: `scripts/bench_lane_budget_ab.sh` (orchestrator) + `tools/lane_budget_probe.mjs`
+(HTTP/SSE client, built-in Node `http` only) — kept as the regression tool per the
+project's measure-first doctrine. Known gotcha hit while building this probe:
+macOS's bash 3.2 evaluates all RHS expansions in a multi-var `local a=x b=$a` line
+BEFORE any assignment (`$a` reads as unbound under `set -u`) — split into separate
+`local` statements, don't chain them.
+
 ## Prohibitions (this phase)
 
 - Do not touch `ContinuousBatchEngine`/`BatchBackend` (MLX batch mode).
