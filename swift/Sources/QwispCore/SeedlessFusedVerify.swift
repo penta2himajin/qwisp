@@ -4174,7 +4174,9 @@ public enum SeedlessFusedVerify {
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
                 return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
             }
-            let mmaPrefill = ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1"
+            // M > 1 only: the decay runner also profiles M=1 decode steps through this
+            // function — the MMA kernel is a prefill-tile kernel and must never see decode.
+            let mmaPrefill = M > 1 && ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1"
             for L in layers {
                 let t1 = timed { enc in self.encodePreMoE(enc, L, M: M, useMmaPrefill: mmaPrefill) }
                 if L.isLinear { tGdn += t1 } else { tAttn += t1 }
