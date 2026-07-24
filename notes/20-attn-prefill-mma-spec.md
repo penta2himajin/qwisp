@@ -78,3 +78,48 @@ record the full table in this file's addendum.
 - Do NOT modify `sdpa_rows`, the verify path, decode path, or any existing kernel.
 - Do NOT regenerate refs/ or flip any default.
 - Do NOT weaken/skip existing WRITE-LOCKED tests (total goes 92→96 by ADDITION).
+
+---
+
+## VERDICT (2026-07-25): NO-GO on M1-class hardware — phase 2 does not proceed
+
+Correctness fully landed (RAWTESTS 96/96: determinism / chunk-composition
+invariance / causal+pad zero-influence / f64 reference sanity). Performance
+failed the bar, twice, on the only valid instrument (same-session paired 24K
+decay A/B, scripts/bench_decay_ab.sh):
+
+| pos | run1 OFF/ON | run2 OFF/ON | speedup |
+|---|---|---|---|
+| 4096 | 1885 / 7632 | 1305 / 6206 | 0.21-0.25x |
+| 8192 | 2781 / 13778 | 2587 / 10708 | 0.20-0.24x |
+| 16384 | 6676 / 14528 | 4421 / 15583 | 0.28-0.46x |
+
+Mechanism (control-bounded, kernel doc header has details): the kernel is
+BIMODAL — a fast mode (~0.011 ms/pos, the source of the misleading isolated
+502ms probe) appears only on repeated identical dispatches; the encode path
+always runs the deterministic slow mode (~0.13 ms/pos/layer). Pure MMA in the
+identical grid sustains 10.1 TFLOPS; adding TG memory, barriers, and device
+streams keeps 9-10; only the full kernel's dependency-chained per-lane
+fragment gathers collapse it to ~½ core-equivalent. No structural variant
+(register blocking / tile sizes / load vectorization / residency) recovered
+it. sdpa_rows' 1024-wide coalesced GEMV sustains ~1 TFLOPS deterministically
+— that shape wins this op on M1-class.
+
+Measurement doctrine bought by this phase:
+1. Isolated kernel probes on repeated identical dispatches are INVALID for
+   this class of kernel (bimodality; SLC flattery). Only same-session paired
+   in-situ A/B counts.
+2. Cross-day decay comparisons are void (~45% drift on untouched stages).
+3. Apple-GPU MMA in latency-bound contexts is fragment-gather-limited;
+   residency/blocking cannot rescue it. Matches Rigel's finding (notes/19 §2)
+   that Metal4 MPP is only 1.05-1.21x over simdgroup_matrix.
+
+Door left open: M5-class NAX (16x16 tensor ops, different feed path) may
+change the verdict — the kernel + locked tests are preserved flag-off as the
+re-entry point. BaseRT's claimed simdgroup_matrix prefill win (notes/19 §5)
+is on M4 Pro with different shapes; unverified, not evidence against this
+measurement.
+
+Consequence: the prefill-decay attack shifts to WS-B (scheduler: hide the
+cliff) + the already-shipped cache tiers (never pay twice) + harness-side
+ingestion reduction. The attention term itself stays on sdpa_rows.
