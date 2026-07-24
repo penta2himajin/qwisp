@@ -169,7 +169,7 @@ public final class LaneBatchSlots: BatchSlots {
     public func admit(prompt: [Int32], slot: Int) -> Int? {
         while true {
             switch admitStep(prompt: prompt, slot: slot, tokenBudget: Int.max) {
-            case .done(let firstToken): return firstToken
+            case .done(let firstToken, _): return firstToken
             case .failed: return nil
             case .prefilling: continue   // Int.max never actually pauses; defensive only
             }
@@ -262,7 +262,7 @@ public final class LaneBatchSlots: BatchSlots {
         }
         lanes[slot] = st.fwd
         prefills[slot] = nil
-        return .done(firstToken: firstToken)
+        return .done(firstToken: firstToken, consumed: consumed)
     }
 
     public func step(last: [Int32?]) -> [Int?] {

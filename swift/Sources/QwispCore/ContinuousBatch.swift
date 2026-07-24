@@ -26,7 +26,10 @@ import MLXFast
 /// returns the first decode token via `.done`.
 public enum AdmitProgress {
     case prefilling(consumed: Int)   // paused at a legal chunk boundary; `consumed` tokens this call
-    case done(firstToken: Int)       // whole prompt prefilled; greedy first token
+    case done(firstToken: Int, consumed: Int)   // whole prompt prefilled; greedy first token;
+                                                 // `consumed` = tokens processed in THIS call only
+                                                 // (excludes any prefix-cache restore credit) — the
+                                                 // caller's budget debit, not the prompt length.
     case failed                      // engine/arena error — drop the request
 }
 
@@ -57,7 +60,7 @@ public extension BatchSlots {
     /// Stage A) override to pause/resume at chunk boundaries.
     func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int) -> AdmitProgress {
         guard let t = admit(prompt: prompt, slot: slot) else { return .failed }
-        return .done(firstToken: t)
+        return .done(firstToken: t, consumed: prompt.count)
     }
 }
 
@@ -203,8 +206,12 @@ public final class ContinuousScheduler {
             case .prefilling(let consumed):
                 pool -= consumed
                 stillPending.append(Pend(req: p.req, pos: p.pos + consumed, slot: p.slot))
-            case .done(let first):
-                pool -= (p.req.prompt.count - p.pos)
+            case .done(let first, let consumed):
+                // Debit only the real work this call did — NOT prompt.count - p.pos, which
+                // would over-charge by any prefix-cache restore credit the lane applied
+                // internally (Fable review: a 24K prompt with a 20K warm restore is ~4K of
+                // real work, not 24K).
+                pool -= consumed
                 toActivate.append((p.slot, p.req, first))
             }
         }
@@ -360,12 +367,12 @@ public final class ContinuousScheduler {
                 guard slot >= 0, slot < slotCount, !prompt.isEmpty else { return .failed }
                 let first = Int((prompt.first ?? 0) + 1)
                 let remaining = prompt.count - pos[slot]
-                if remaining <= 0 { return .done(firstToken: first) }
+                if remaining <= 0 { return .done(firstToken: first, consumed: 0) }
                 let affordable = Swift.max(1, tokenBudget / chunk) * chunk   // ≥1 whole chunk
                 let consumed = Swift.min(affordable, remaining)             // final remainder completes
                 pos[slot] += consumed
                 log.append(.admit(slot: slot, budget: tokenBudget, consumed: consumed))
-                return pos[slot] >= prompt.count ? .done(firstToken: first) : .prefilling(consumed: consumed)
+                return pos[slot] >= prompt.count ? .done(firstToken: first, consumed: consumed) : .prefilling(consumed: consumed)
             }
             func step(last: [Int32?]) -> [Int?] {
                 var out: [Int?] = Array(repeating: nil, count: slotCount)
