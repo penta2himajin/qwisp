@@ -138,6 +138,9 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // lane admission plan (#121; pure boundary arithmetic, no GPU).
     for (name, ok) in LaneBatchSlots.admitSelfCheck() { check("laneadmit_\(name)", ok) }
 
+    // token-budget admission scheduler (WS-B Stage A; pure logic over a scripted fake).
+    for (name, ok) in ContinuousScheduler.tokenBudgetSelfCheck() { check("tokenbudget_\(name)", ok) }
+
     // incremental detokenizer (server O(n²) fix; pure fake byte-level tokenizer).
     for (name, ok) in StreamDetok.selfCheck() { check("detok_\(name)", ok) }
 

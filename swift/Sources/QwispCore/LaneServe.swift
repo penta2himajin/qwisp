@@ -28,6 +28,20 @@ public final class LaneBatchSlots: BatchSlots {
     public let slotCount: Int
     let maxSeqLen: Int
     private var lanes: [SeedlessFusedVerify.SeedlessFusedForward?]
+    /// WS-B Stage A (notes/21): resumable per-slot prefill state, hoisted out of
+    /// `admit()`'s local loop so a budgeted scheduler can pause/resume it across calls
+    /// at existing legal chunk boundaries. Numerically identical to the old atomic loop —
+    /// scheduling-only, zero kernel/precision changes.
+    private struct Prefill {
+        var fwd: SeedlessFusedVerify.SeedlessFusedForward
+        let fnBuf: MTLBuffer
+        let hybrid: Bool
+        let chunkSize: Int
+        let plan: LaneAdmitPlan
+        var pos: Int
+        var lastNormed: MLXArray?
+    }
+    private var prefills: [Prefill?]
     private var batch: SeedlessLaneBatch? = nil
     private var batchLanes: [ObjectIdentifier] = []   // active-set key for rebuild
     // #121 prefix-cache-aware admission: cross-request decode states (persistentStateData
@@ -51,6 +65,7 @@ public final class LaneBatchSlots: BatchSlots {
         self.slotCount = slots
         self.maxSeqLen = maxSeqLen
         self.lanes = Array(repeating: nil, count: slots)
+        self.prefills = Array(repeating: nil, count: slots)
         // One knob: QWISP_LANE_PREFIX_MB total budget (default 3072, resident tier) —
         // 1/3 recurrence tier, 2/3 conversation tier. 0 disables.
         let mb = Swift.max(0, Tell.envInt("QWISP_LANE_PREFIX_MB", 3072))
@@ -149,73 +164,105 @@ public final class LaneBatchSlots: BatchSlots {
         return (fwd, fnBuf)
     }
 
+    /// Atomic prefill (thin wrapper, WS-B Stage A): drive `admitStep` to completion with
+    /// an effectively-unbounded budget — one call, same result as the old atomic loop.
     public func admit(prompt: [Int32], slot: Int) -> Int? {
-        guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen else { return nil }
-        let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
-        let chunkSize = hybrid ? 1024 : 64
-        guard var (fwd, fnBuf) = makeLane(hybrid: hybrid) else { return nil }
-        // #121: restore the longest cached prefix, prefill only the delta.
-        // Default ON; QWISP_LANE_PREFIX=0 (or _MB=0) opts out. dropLast ⇒ a hit never
-        // swallows the whole prompt (the last position is always recomputed for the
-        // first-token argmax).
-        var plan = LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: false)
-        if Tell.envInt("QWISP_LANE_PREFIX", 1) != 0,
-           sharedStore.budget + convStore.budget > 0 {
-            let matchable = Array(prompt.dropLast())
-            let hs = sharedStore.bestMatch(content: matchable)
-            let hc = convStore.bestMatch(content: matchable)
-            let hit = [hs, hc].compactMap { $0 }.max { $0.tokens.count < $1.tokens.count }
-            let lcp = Swift.max(sharedStore.maxCommonPrefix(with: prompt),
-                                convStore.maxCommonPrefix(with: prompt))
-            plan = Self.admitPlan(promptLen: prompt.count,
-                                  hitLen: hit?.tokens.count ?? 0, lcp: lcp,
-                                  minShared: PrefixPersist.stableMinTokens)
-            if plan.restoreLen > 0, let hit {
-                if fwd.restorePersistentState(hit.state) {
-                    restoreHits += 1
-                } else {
-                    // Shape/format mismatch half-writes the arena — this lane is unusable.
-                    // Cannot happen with same-engine blobs; rebuild fresh and go cold.
-                    guard let fresh = makeLane(hybrid: hybrid) else { return nil }
-                    (fwd, fnBuf) = fresh
-                    plan.restoreLen = 0
+        while true {
+            switch admitStep(prompt: prompt, slot: slot, tokenBudget: Int.max) {
+            case .done(let firstToken, _): return firstToken
+            case .failed: return nil
+            case .prefilling: continue   // Int.max never actually pauses; defensive only
+            }
+        }
+    }
+
+    /// Resumable prefill (WS-B Stage A, notes/21): advances `slot`'s prefill by at most
+    /// `tokenBudget` tokens, always by ≥1 legal chunk (forward-progress guarantee — see
+    /// the `!first` guard below), pausing only at the same internal chunk / `captureAt`
+    /// boundaries the old atomic loop would stop at. Setup (restore-plan lookup + lane
+    /// creation) happens once per admission, on the first call for a slot.
+    public func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int) -> AdmitProgress {
+        guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen else { return .failed }
+        var st: Prefill
+        if let existing = prefills[slot] {
+            st = existing
+        } else {
+            let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
+            let chunkSize = hybrid ? 1024 : 64
+            guard var (fwd, fnBuf) = makeLane(hybrid: hybrid) else { return .failed }
+            // #121: restore the longest cached prefix, prefill only the delta.
+            // Default ON; QWISP_LANE_PREFIX=0 (or _MB=0) opts out. dropLast ⇒ a hit never
+            // swallows the whole prompt (the last position is always recomputed for the
+            // first-token argmax).
+            var plan = LaneAdmitPlan(restoreLen: 0, captureAt: nil, saveAtEnd: false)
+            if Tell.envInt("QWISP_LANE_PREFIX", 1) != 0,
+               sharedStore.budget + convStore.budget > 0 {
+                let matchable = Array(prompt.dropLast())
+                let hs = sharedStore.bestMatch(content: matchable)
+                let hc = convStore.bestMatch(content: matchable)
+                let hit = [hs, hc].compactMap { $0 }.max { $0.tokens.count < $1.tokens.count }
+                let lcp = Swift.max(sharedStore.maxCommonPrefix(with: prompt),
+                                    convStore.maxCommonPrefix(with: prompt))
+                plan = Self.admitPlan(promptLen: prompt.count,
+                                      hitLen: hit?.tokens.count ?? 0, lcp: lcp,
+                                      minShared: PrefixPersist.stableMinTokens)
+                if plan.restoreLen > 0, let hit {
+                    if fwd.restorePersistentState(hit.state) {
+                        restoreHits += 1
+                    } else {
+                        // Shape/format mismatch half-writes the arena — this lane is unusable.
+                        // Cannot happen with same-engine blobs; rebuild fresh and go cold.
+                        guard let fresh = makeLane(hybrid: hybrid) else { return .failed }
+                        (fwd, fnBuf) = fresh
+                        plan.restoreLen = 0
+                    }
                 }
             }
+            st = Prefill(fwd: fwd, fnBuf: fnBuf, hybrid: hybrid, chunkSize: chunkSize,
+                        plan: plan, pos: plan.restoreLen, lastNormed: nil)
         }
-        // Canonical prefill + first token, mirroring Tell.prefill + the spec-loop
-        // entry EXACTLY (kernel choice and tie-break included): prompt through
-        // chunked (hybrid) forward with final norm, then first token =
-        // MLX.argMax(engine.logits(lastNormed)) — qmmTiled lm_head, MLX argmax.
-        // The loop re-chunks from restoreLen and splits one chunk at captureAt
-        // (exact boundaries — bit identity gated by the replay diff, see admitPlan).
-        var lastNormed: MLXArray? = nil
-        var pos = plan.restoreLen
-        while pos < prompt.count {
-            var end = Swift.min(pos + chunkSize, prompt.count)
-            if let c = plan.captureAt, pos < c { end = Swift.min(end, c) }
-            let x = engine.embed(tokens: Array(prompt[pos ..< end]))
-            guard let normed = hybrid ? fwd.forwardRowsHybrid(x, M: end - pos, finalNormW: fnBuf)
-                                      : fwd.forwardRows(x, M: end - pos, finalNormW: fnBuf)
-            else { return nil }
-            lastNormed = normed[end - pos - 1]
-            pos = end
+        // Canonical prefill, mirroring Tell.prefill + the spec-loop entry EXACTLY (kernel
+        // choice and tie-break included): prompt through chunked (hybrid) forward with
+        // final norm. Re-chunks from st.pos and splits one chunk at captureAt (exact
+        // boundaries — bit identity gated by the replay diff, see admitPlan). Always
+        // completes ≥1 chunk before checking the budget (forward-progress guarantee) —
+        // `first` gates the check, not the loop entry.
+        var consumed = 0
+        var first = true
+        while st.pos < prompt.count {
+            if !first, consumed >= tokenBudget { break }
+            var end = Swift.min(st.pos + st.chunkSize, prompt.count)
+            if let c = st.plan.captureAt, st.pos < c { end = Swift.min(end, c) }
+            let x = engine.embed(tokens: Array(prompt[st.pos ..< end]))
+            guard let normed = st.hybrid ? st.fwd.forwardRowsHybrid(x, M: end - st.pos, finalNormW: st.fnBuf)
+                                          : st.fwd.forwardRows(x, M: end - st.pos, finalNormW: st.fnBuf)
+            else { prefills[slot] = nil; return .failed }
+            st.lastNormed = normed[end - st.pos - 1]
+            consumed += end - st.pos
+            st.pos = end
+            first = false
             // Recurrence boundary state (blob = CPU memcpy of KV used slice + GDN state,
             // ~24KB/token) — captured mid-prefill at the exact shared-prefix end.
-            if pos == plan.captureAt {
-                sharedStore.save(tokens: Array(prompt[0 ..< pos]), state: fwd.persistentStateData())
+            if st.pos == st.plan.captureAt {
+                sharedStore.save(tokens: Array(prompt[0 ..< st.pos]), state: st.fwd.persistentStateData())
             }
         }
-        guard let ln = lastNormed?.reshaped([1, SeedlessEngine.H]),
-              let lg = engine.logits(ln, M: 1) else { return nil }
+        guard st.pos >= prompt.count else {
+            prefills[slot] = st
+            return .prefilling(consumed: consumed)
+        }
+        guard let ln = st.lastNormed?.reshaped([1, SeedlessEngine.H]),
+              let lg = engine.logits(ln, M: 1) else { prefills[slot] = nil; return .failed }
         MLX.eval([lg])
-        let first = MLX.argMax(lg[0], axis: -1).item(Int.self)
+        let firstToken = MLX.argMax(lg[0], axis: -1).item(Int.self)
         // Conversation-end state (multi-turn extension restores). The arena is exactly at
         // the prompt boundary here — the decode steps that follow only append past it.
-        if plan.saveAtEnd {
-            convStore.save(tokens: prompt, state: fwd.persistentStateData())
+        if st.plan.saveAtEnd {
+            convStore.save(tokens: prompt, state: st.fwd.persistentStateData())
         }
-        lanes[slot] = fwd
-        return first
+        lanes[slot] = st.fwd
+        prefills[slot] = nil
+        return .done(firstToken: firstToken, consumed: consumed)
     }
 
     public func step(last: [Int32?]) -> [Int?] {
@@ -237,6 +284,7 @@ public final class LaneBatchSlots: BatchSlots {
     public func release(slot: Int) {
         guard slot >= 0, slot < slotCount else { return }
         lanes[slot] = nil
+        prefills[slot] = nil   // drop an aborted mid-admission's SeedlessFusedForward
         batch = nil; batchLanes = []   // active set changed
     }
 }
@@ -270,7 +318,16 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         }
         self.slots = slots
         self.laneCtx = ctx
-        self.scheduler = ContinuousScheduler(slots: laneSlots)
+        // WS-B Stage A (notes/21): token-budget admission scheduler. Default ON as of the
+        // GO-bar bench (notes/21 "Bench verification results", 2026-07-25): a 24K-token
+        // concurrent admit's worst-case stall on another lane's decode stream drops from
+        // an unbounded ~93.7s to a depth-bounded ~13.5s. QWISP_TOKEN_BUDGET_SCHED=0 opts
+        // back out to the old atomic drain-then-step. Gate/size env reads live here only,
+        // never inside the scheduler or LaneBatchSlots, so their self-checks stay
+        // deterministic.
+        let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
+        let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
+        self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
