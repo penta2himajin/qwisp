@@ -4999,6 +4999,340 @@ public enum SeedlessMetalForward {
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H * D)), [M * H, D])
     }
 
+    nonisolated(unsafe) static var _sdpaPrefillMmaPipeline: MTLComputePipelineState?
+    /// WS-A #137 — flash-style MMA attention-prefill kernel (notes/20). ADDITIVE,
+    /// wired only behind QWISP_ATTN_MMA_PREFILL (default OFF).
+    ///
+    /// Semantics identical to `sdpaRows`: q[M*H, D] (row m*H+h), k/v shared cache
+    /// [KV, totalSeq-or-more, D] (strides passed explicitly), out[M*H, D] half;
+    /// per-row causal prefix N = baseLen + m; gqa_factor = H/KV; D = 256 fixed;
+    /// fp32 accumulation. Fixed tile geometry always: one threadgroup =
+    /// (kv_head, tile of TQ=8 query rows) with NSG=8 simdgroups, one per q-head
+    /// of that kv_head (grid = KV × ceil(M/TQ), 256 threads/tg). Each KV tile
+    /// (TK=8 positions) is staged ONCE into threadgroup memory and consumed by
+    /// all 8 q-heads × 8 rows — 64-way K/V reuse, which is what pulls the 47K
+    /// DRAM re-read floor under the notes/20 GO budget. Per-head fp32 output
+    /// accumulators live in REGISTERS (32 simdgroup_float8x8 fragments per
+    /// simdgroup), not threadgroup memory.
+    ///
+    /// TK=8 is deliberate and load-bearing (round 3): with loads in the stream a
+    /// simdgroup is LATENCY-bound (~85 cyc/MMA vs ~4 for a pure-MMA control), so
+    /// throughput ∝ resident simdgroups per core. Apple caps ~8 threadgroups per
+    /// core; TK=8 keeps the TG footprint at ~12.7KB so TWO 8-simdgroup tgs fit
+    /// per core (16 resident sgs) — measured 3.2x over the identical kernel at
+    /// TK=16 (22.7KB, 1 tg/core). Bigger tiles, more register blocking (RB×CB≥4
+    /// d-sliced, round 3), fewer sgs, q-hoisting, and load vectorization all
+    /// measured neutral-to-worse; residency is the only lever that moved.
+    /// Bit-exactness to sdpa_rows is NOT required (hardware matrix-unit rounding
+    /// differs) — required instead: determinism, chunk-composition invariance,
+    /// causal/pad zero-influence, numeric sanity (locked tests 93–96, notes/20).
+    ///
+    /// Both QK^T and PV are simdgroup_float8x8 MMA chains (fp32 accumulate) —
+    /// the per-lane (row,col) coordinate mapping is the one used by MLX's own
+    /// steel/gemm kernels (mlx-swift Cmlx/mlx-generated/metal/steel/gemm/mma.h —
+    /// BaseMMAFrag::get_coord), reused verbatim for A/B/C alike since it must
+    /// match the hardware's actual simdgroup_matrix element layout.
+    /// gqa_factor > NSG is unsupported (model is fixed at 8); gqa_factor < NSG
+    /// (e.g. the H=1 pipeline warm-up) leaves the surplus simdgroups computing a
+    /// clamped duplicate head that is never stored, so barriers stay uniform.
+    ///
+    /// Perf status — NO-GO evidence (round 4, AC power, paired in-situ A/B +
+    /// isolated probes): the kernel is BIMODAL. Deterministic slow mode
+    /// ≈0.12-0.155 ms/pos/layer (all in-situ chunks, all isolated runs at
+    /// ctx ≤8K, and first/most reps at 47K) ⇒ in-situ ON = 0.20-0.46x of
+    /// sdpa_rows — SLOWER. A fast mode ≈0.011 ms/pos appears only on repeated
+    /// identical dispatches with >SLC buffers, unreliably; the encode path
+    /// never enters it. Mechanism bounding (controls in the same 2×128 grid):
+    /// pure-MMA 10.1 TFLOPS stable; +12.7KB TG mem, +per-tile barriers,
+    /// +per-tile 16B/thread device streams — all still ~9-10 TFLOPS. Only the
+    /// full kernel's dependency-chained per-lane fragment gathers collapse
+    /// aggregate throughput to ~½ core-equivalent; no structural variant
+    /// (register blocking, tile sizes, load vectorization, residency) moved it
+    /// past ~2x. sdpa_rows' 1024-wide coalesced GEMV sustains ~1 TFLOPS
+    /// deterministically — on M1-class hardware that shape wins for this op.
+    /// History: round-2 TK=16 ~1.69s@47K; round-3 d-sliced RB×CB blocking
+    /// ~3.2s = NO-GO; round-4 uint4 staging kept (strict improvement).
+    public static func sdpaPrefillMma(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+                                       H: Int, KV: Int, D: Int,
+                                       baseLen: Int, M: Int, scale: Float) -> MLXArray? {
+        guard let (device, queue) = ensure() else { return nil }
+        guard D == 256 else { print("[raw-sdpa-prefill-mma] D!=256 未対応 D=\(D)"); return nil }
+        let totalSeq = baseLen + M - 1
+        if _sdpaPrefillMmaPipeline == nil {
+            let src = """
+            #include <metal_stdlib>
+            #include <metal_simdgroup_matrix>
+            using namespace metal;
+            kernel void sdpa_prefill_mma(
+                device const half* queries   [[buffer(0)]],   // [rows, D], row = m*H+h (m local to this call)
+                device const half* keys      [[buffer(1)]],   // [KV, *, D]
+                device const half* values    [[buffer(2)]],   // [KV, *, D]
+                device half* out             [[buffer(3)]],   // [M*H, D]
+                constant int& gqa_factor     [[buffer(4)]],
+                constant int& baseN          [[buffer(5)]],    // N for local row 0
+                constant int& k_head_stride  [[buffer(6)]],
+                constant int& k_seq_stride   [[buffer(7)]],
+                constant int& v_head_stride  [[buffer(8)]],
+                constant int& v_seq_stride   [[buffer(9)]],
+                constant float& scale        [[buffer(10)]],
+                constant int& M              [[buffer(11)]],
+                constant int& totalSeqUnused [[buffer(12)]],
+                constant int& H              [[buffer(13)]],
+                uint3 tgid  [[threadgroup_position_in_grid]],
+                ushort sgid [[simdgroup_index_in_threadgroup]],
+                ushort simd_lid [[thread_index_in_simdgroup]])
+            {
+                constexpr int TQ = 8, TK = 8, D = 256;   // rows/sg, KV positions/tile
+                constexpr int NSG = 8;       // simdgroups per tg = q-heads served per kv_head
+                constexpr int CB = TK / 8;   // 2 KV-position fragments (QK^T cols / PV contraction)
+                constexpr int KF = D / 8;    // 32 contraction fragments (QK^T, over d)
+                constexpr int DB = D / 8;    // 32 output-column fragments (PV, over d)
+
+                const int kv_head = (int)tgid.x;
+                const int qt = (int)tgid.y;
+                const int qTileStart = qt * TQ;   // local row offset (0-based within this call)
+                const int sg = (int)sgid;
+                // Simdgroup sg serves q-head kv_head*gqa + sg. When gqa_factor < NSG
+                // (H=1 warm-up), surplus simdgroups compute a clamped duplicate head and
+                // never store — keeps every threadgroup_barrier uniformly executed.
+                const bool active = sg < gqa_factor;
+                const int h = kv_head * gqa_factor + min(sg, gqa_factor - 1);
+
+                // Shared staged K/V (~5K+4.2K) + per-simdgroup score slices (2.5K) +
+                // row state (<1K) ≈ 12.7KB — deliberately ≤16KB so TWO threadgroups
+                // stay resident per core (see header: residency is THE perf lever).
+                // Output accumulators are per-lane REGISTERS. Row strides are PADDED
+                // off the 128B threadgroup-bank period (cheap insurance; measured
+                // perf-neutral).
+                constexpr int KSTRIDE = D + 8;    // half elements per staged V row (pos-major)
+                constexpr int TKS = TK + 2;       // half elements per transposed-K row (d-major)
+                constexpr int SSTRIDE = TK + 2;   // float elements per sBuf row
+                threadgroup half kStage[D * TKS];        // current KV-tile's K, TRANSPOSED [d][pos]
+                threadgroup half vStage[TK * KSTRIDE];   // current KV-tile's V [pos][d]
+                threadgroup float sBufAll[NSG * TQ * SSTRIDE];   // per-sg: scores → weights
+                threadgroup float rowMaxAll[NSG * TQ];
+                threadgroup float rowSumAll[NSG * TQ];
+                threadgroup float rowScaleAll[NSG * TQ];    // per-tile rescale factor
+
+                threadgroup float* sBuf = sBufAll + sg * TQ * SSTRIDE;
+                threadgroup float* rowMax = rowMaxAll + sg * TQ;
+                threadgroup float* rowSum = rowSumAll + sg * TQ;
+                threadgroup float* rowScale = rowScaleAll + sg * TQ;
+                for (int i = (int)simd_lid; i < TQ; i += 32) {
+                    rowMax[i] = -INFINITY; rowSum[i] = 0.0f; rowScale[i] = 1.0f;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Per-lane (row,col) coordinate within an 8x8 simdgroup_matrix tile.
+                // Matches mlx-swift steel/gemm/mma.h BaseMMAFrag::get_coord exactly
+                // (must match the hardware's simdgroup_matrix element layout). This same
+                // (fm,fn) mapping is reused verbatim for the PV chain below — the fixed
+                // per-lane hardware layout is identical regardless of the fragment's role
+                // (A/B/C), only the logical (row,col) meaning of that role changes.
+                const short qid = (short)(simd_lid / 4);
+                const short fm = (short)((qid & 4) + ((simd_lid / 2) % 4));       // row within tile, 0..7
+                const short fn = (short)((qid & 2) * 2 + (simd_lid % 2) * 2);     // col-pair start, 0/2/4/6
+
+                // Per-head fp32 output accumulator, in registers: this lane owns
+                // elements (fm, db*8+fn) and (fm, db*8+fn+1) of the TQ×D output.
+                simdgroup_float8x8 oFrag[DB];
+                #pragma unroll
+                for (int db = 0; db < DB; db++) {
+                    oFrag[db].thread_elements()[0] = 0.0f;
+                    oFrag[db].thread_elements()[1] = 0.0f;
+                }
+
+                // Clamped read row for this lane's fragment row: handles a partial last
+                // Q-tile and caller padding uniformly (padding rows are never written to
+                // `out`, so what they read is content-irrelevant, never OOB).
+                // q is deliberately NOT hoisted into registers: the per-tile device q
+                // reads hit L1 (same 4KB/simdgroup every tile) and a 64-float register
+                // hoist measured ~15% SLOWER in the isolated probe (register pressure).
+                const int localRowQ = min(qTileStart + (int)fm, M - 1);
+                const int qElemBase = (localRowQ * H + h) * D;
+
+                const int lastLocalRow = min(qTileStart + TQ - 1, M - 1);
+                const int nMax = baseN + lastLocalRow;
+                const int flatTid = sg * 32 + (int)simd_lid;
+
+                int kvStart = 0;
+                while (kvStart < nMax) {
+                    const int kvCount = min(TK, nMax - kvStart);
+
+                    // ---- stage this KV-tile's K/V once, consumed by all NSG q-heads ----
+                    // Exactly one 16B uint4 device read per thread per array (256
+                    // threads × 8 halves = the whole 4KB tile): collapses the round-2
+                    // 8-deep scalar-load chain per thread into one transaction
+                    // (measured: 8K-ctx layer 1345→1015ms). 16B alignment holds — the
+                    // seq/head strides are multiples of D=256 halves and d is a
+                    // multiple of 8. K scatter-writes into its transposed TG layout
+                    // stay scalar (TG SRAM, cheap).
+                    {
+                        const int e8 = flatTid * 8;
+                        const int pos = e8 / D, d = e8 - pos * D;
+                        const int gpos = kvStart + pos;
+                        if (pos < kvCount) {
+                            const uint4 kw = *(device const uint4*)(keys + kv_head * k_head_stride + gpos * k_seq_stride + d);
+                            const uint4 vw = *(device const uint4*)(values + kv_head * v_head_stride + gpos * v_seq_stride + d);
+                            *(threadgroup uint4*)(vStage + pos * KSTRIDE + d) = vw;
+                            thread const half* kh = (thread const half*)&kw;
+                            #pragma unroll
+                            for (int j = 0; j < 8; j++) kStage[(d + j) * TKS + pos] = kh[j];
+                        } else {
+                            *(threadgroup uint4*)(vStage + pos * KSTRIDE + d) = uint4(0);
+                            #pragma unroll
+                            for (int j = 0; j < 8; j++) kStage[(d + j) * TKS + pos] = (half)0;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    // ---- QK^T via simdgroup MMA, fp32 accumulate (K from stage) ----
+                    {
+                        simdgroup_float8x8 acc0;
+                        acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
+                        #pragma unroll
+                        for (int kf = 0; kf < KF; kf++) {
+                            device const half* qp = queries + qElemBase + kf * 8;
+                            simdgroup_float8x8 A;
+                            A.thread_elements()[0] = (float)qp[fn];
+                            A.thread_elements()[1] = (float)qp[fn + 1];
+
+                            // B[d, pos]: contraction row = d, col = pos. Transposed
+                            // staging makes each lane's element pair CONTIGUOUS → one
+                            // half2 vector load per fragment instead of two scalars.
+                            const int dRow = (kf * 8 + (int)fm) * TKS;
+                            const half2 b0 = *(threadgroup const half2*)(kStage + dRow + fn);
+                            simdgroup_float8x8 B0;
+                            B0.thread_elements()[0] = (float)b0.x;
+                            B0.thread_elements()[1] = (float)b0.y;
+                            simdgroup_multiply_accumulate(acc0, A, B0, acc0);
+                        }
+                        sBuf[(int)fm * SSTRIDE + fn]     = acc0.thread_elements()[0];
+                        sBuf[(int)fm * SSTRIDE + fn + 1] = acc0.thread_elements()[1];
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);   // sBuf is sg-private
+
+                    // ---- scale + causal mask + online softmax update (per real row) ----
+                    for (int r = (int)simd_lid; r < TQ; r += 32) {
+                        const int localRow = qTileStart + r;
+                        if (localRow >= M) continue;   // pad row: never written, never re-read
+                        const int N_m = baseN + localRow;
+                        const float curMax = rowMax[r];
+                        float newMax = curMax;
+                        for (int c = 0; c < kvCount; c++) {
+                            const int gpos = kvStart + c;
+                            const float s = (gpos < N_m) ? sBuf[r * SSTRIDE + c] * scale : -INFINITY;
+                            sBuf[r * SSTRIDE + c] = s;
+                            newMax = max(newMax, s);
+                        }
+                        const float factor = (curMax <= -INFINITY) ? 0.0f : fast::exp(curMax - newMax);
+                        float newSum = rowSum[r] * factor;
+                        for (int c = 0; c < kvCount; c++) {
+                            const float sv = sBuf[r * SSTRIDE + c];
+                            const float e = (sv <= -INFINITY) ? 0.0f : fast::exp(sv - newMax);
+                            sBuf[r * SSTRIDE + c] = e;   // now holds this tile's un-normalised weight
+                            newSum += e;
+                        }
+                        // Positions beyond kvCount (partial last tile) must carry ZERO
+                        // weight into the PV MMA below, which runs the full fixed TK-wide
+                        // fragments unconditionally (no per-column bound check inside the
+                        // tensor op — it lives here instead). vStage tail is also zeroed,
+                        // so masked/pad columns contribute exact ±0 products = zero bit
+                        // influence on any accumulator that is not itself -0 (oFrag
+                        // starts +0 and stays {+0}∪nonzero: x+±0=x, and an all-zero MMA
+                        // sum with a +0 accumulator is +0 in round-to-nearest).
+                        for (int c = kvCount; c < TK; c++) sBuf[r * SSTRIDE + c] = 0.0f;
+                        rowMax[r] = newMax;
+                        rowSum[r] = newSum;
+                        rowScale[r] = factor;
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                    // ---- rescale register accumulator (this lane's row is fm) ----
+                    {
+                        const float f = rowScale[(int)fm];
+                        #pragma unroll
+                        for (int db = 0; db < DB; db++) {
+                            oFrag[db].thread_elements()[0] *= f;
+                            oFrag[db].thread_elements()[1] *= f;
+                        }
+                    }
+
+                    // ---- PV via simdgroup MMA into register accumulators ----
+                    // Fixed order: ascending KV-tile (outer while), single 8-wide
+                    // contraction fragment per tile — fully determined by loop
+                    // structure, independent of timing. Pad q rows' sBuf holds raw
+                    // (finite) scores; they only touch pad rows' lanes (row
+                    // independence of MMA), which are never stored.
+                    {
+                        simdgroup_float8x8 P0;   // P[row, pos]
+                        const float2 p0 = *(threadgroup const float2*)(sBuf + (int)fm * SSTRIDE + fn);
+                        P0.thread_elements()[0] = p0.x; P0.thread_elements()[1] = p0.y;
+                        #pragma unroll
+                        for (int db = 0; db < DB; db++) {
+                            const int outCol = db * 8 + (int)fn;
+                            const half2 v0 = *(threadgroup const half2*)(vStage + (int)fm * KSTRIDE + outCol);
+                            simdgroup_float8x8 V0;   // V[pos, d]: row = pos, col = d
+                            V0.thread_elements()[0] = (float)v0.x;
+                            V0.thread_elements()[1] = (float)v0.y;
+                            simdgroup_multiply_accumulate(oFrag[db], P0, V0, oFrag[db]);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);   // kStage/vStage reused next tile
+
+                    kvStart += TK;
+                }
+
+                // ---- normalise + write (this lane owns row fm, cols db*8+fn/+1) ----
+                const int outRow = qTileStart + (int)fm;
+                if (active && outRow < M) {
+                    const float sum = rowSum[(int)fm];
+                    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                    device half* op = out + (outRow * H + h) * D;
+                    #pragma unroll
+                    for (int db = 0; db < DB; db++) {
+                        op[db * 8 + fn]     = (half)(oFrag[db].thread_elements()[0] * inv);
+                        op[db * 8 + fn + 1] = (half)(oFrag[db].thread_elements()[1] * inv);
+                    }
+                }
+            }
+            """
+            do { let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+                 // Descriptor form: force the compiler to fit 256 threads/tg (8 simdgroups)
+                 // even under the register pressure of the 32 per-lane oFrag accumulators.
+                 let desc = MTLComputePipelineDescriptor()
+                 desc.computeFunction = lib.makeFunction(name: "sdpa_prefill_mma")!
+                 desc.maxTotalThreadsPerThreadgroup = 256
+                 _sdpaPrefillMmaPipeline = try device.makeComputePipelineState(descriptor: desc, options: [], reflection: nil)
+            } catch { print("[raw-sdpa-prefill-mma] compile: \(error)"); return nil }
+        }
+        guard let bq = mtlBuf(q.asType(.float16), device),
+              let bk = mtlBuf(k.asType(.float16), device),
+              let bv = mtlBuf(v.asType(.float16), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * H * D * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(_sdpaPrefillMmaPipeline!)
+        enc.setBuffer(bq, offset: 0, index: 0); enc.setBuffer(bk, offset: 0, index: 1)
+        enc.setBuffer(bv, offset: 0, index: 2); enc.setBuffer(outBuf, offset: 0, index: 3)
+        var gqa = Int32(H / KV), bn = Int32(baseLen)
+        var khs = Int32(totalSeq * D), kss = Int32(D), vhs = Int32(totalSeq * D), vss = Int32(D), sc = scale
+        var mRows = Int32(M), tSeq = Int32(totalSeq), hh = Int32(H)
+        enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&bn, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9)
+        enc.setBytes(&sc, length: 4, index: 10)
+        enc.setBytes(&mRows, length: 4, index: 11); enc.setBytes(&tSeq, length: 4, index: 12)
+        enc.setBytes(&hh, length: 4, index: 13)
+        // Grid: one threadgroup per (kv_head, 8-row q-tile); 8 simdgroups serve the
+        // kv_head's q-heads (kernel-side clamp handles gqa_factor < 8).
+        let numQTiles = max((M + 7) / 8, 1)
+        enc.dispatchThreadgroups(MTLSize(width: KV, height: numQTiles, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H * D)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H * D)), [M * H, D])
+    }
+
     /// D1-4: M-row conv1d+silu. windows[M,K,C] → y[M,C].
     /// New Metal kernel: 2D dispatch (width=C, height=M); row m applies
     /// the K-frame window windows[m*K*C .. (m+1)*K*C]. Bit-exact to M conv1dSilu calls.

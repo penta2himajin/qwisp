@@ -1993,6 +1993,31 @@ public enum SeedlessFusedVerify {
                                  threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
     }
 
+    /// sdpa_prefill_mma(既存 _sdpaPrefillMmaPipeline, notes/20)を encode-only で提供。
+    /// Pattern/param list mirrors encodeSdpaRows exactly (same call-site shape) so callers
+    /// can swap between the two behind a flag. ADDITIVE — only used when
+    /// QWISP_ATTN_MMA_PREFILL=1 (encodeAttnLayerRows' useMmaPrefill branch).
+    static func encodeSdpaPrefillMma(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
+                               H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int) {
+        let p = SeedlessMetalForward._sdpaPrefillMmaPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
+        enc.setBuffer(v, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
+        var gqa = Int32(H / KV), bn = Int32(baseLenPlus1)
+        var khs = Int32(maxLen * D), kss = Int32(D), vhs = Int32(maxLen * D), vss = Int32(D), sc = scale
+        var mRows = Int32(M), totalSeq = Int32(baseLenPlus1 + M - 1), hh = Int32(H)
+        enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&bn, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9)
+        enc.setBytes(&sc, length: 4, index: 10)
+        enc.setBytes(&mRows, length: 4, index: 11); enc.setBytes(&totalSeq, length: 4, index: 12)
+        enc.setBytes(&hh, length: 4, index: 13)
+        // Grid mirrors sdpaPrefillMma: one tg per (kv_head, 8-row q-tile), 8 simdgroups.
+        let numQTiles = max((M + 7) / 8, 1)
+        enc.dispatchThreadgroups(MTLSize(width: KV, height: numQTiles, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
     /// extract_q(既存 aux kernel, 純コピー)を encode-only で提供。qOut[R,qd2] の先頭 headDim 列 → q[R,headDim]。
     static func encodeExtractQ(_ enc: MTLComputeCommandEncoder, qOut: MTLBuffer, q: MTLBuffer,
                                headDim: Int, qd2: Int, total: Int) {
@@ -2273,7 +2298,7 @@ public enum SeedlessFusedVerify {
                                     M: Int, H: Int,
                                     numHeads: Int = 16, numKV: Int = 2, headDim: Int = 256,
                                     ropeDim: Int = 64, ropeBase: Float = 1e7, eps: Float = 1e-6,
-                                    hybridDense: Bool = false) {
+                                    hybridDense: Bool = false, useMmaPrefill: Bool = false) {
         let baseLen = kv.len
         let qd2 = 2 * headDim
         let scale = Float(pow(Double(headDim), -0.5))
@@ -2321,8 +2346,16 @@ public enum SeedlessFusedVerify {
         // v-cache 散布(raw v, always unfused)
         encodeWriteKVRows(enc, src: sc.vOut, cache: kv.vCache, KV: numKV, D: headDim, maxLen: kv.maxLen, pos: baseLen, M: M)
         // ⑤ SDPA(行 m は先頭 baseLen+m+1 key)
-        encodeSdpaRows(enc, q: sc.qRot, k: kv.kCache, v: kv.vCache, out: sc.attnOut,
-                       H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen)
+        // WS-A #137: QWISP_ATTN_MMA_PREFILL default OFF ⇒ always the sdpaRows branch below
+        // (byte-identical to before this kernel existed). ON swaps in the additive
+        // flash-style MMA kernel — ONLY reachable via forwardRowsHybrid's prefill seam.
+        if useMmaPrefill, SeedlessMetalForward._sdpaPrefillMmaPipeline != nil {
+            encodeSdpaPrefillMma(enc, q: sc.qRot, k: kv.kCache, v: kv.vCache, out: sc.attnOut,
+                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen)
+        } else {
+            encodeSdpaRows(enc, q: sc.qRot, k: kv.kCache, v: kv.vCache, out: sc.attnOut,
+                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen)
+        }
         // ⑥ sigmoid gate → o_proj
         encodeSigmoidMul(enc, attnOut: sc.attnOut, qOut: sc.qOut, gated: sc.gated,
                          headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
@@ -2349,6 +2382,16 @@ public enum SeedlessFusedVerify {
             let v = MLXRandom.normal([1, 2, 256]).asType(.float16)
             MLX.eval([q, k, v])
             _ = SeedlessMetalForward.sdpaRows(q, k, v, H: 1, KV: 1, D: 256, baseLen: 2, M: 1, scale: 1.0)
+        }
+        // WS-A #137: warm the MMA-prefill pipeline ONLY when the flag is on — flag-off
+        // must not compile/touch this additive kernel at all (byte-identical guarantee).
+        if ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1",
+           SeedlessMetalForward._sdpaPrefillMmaPipeline == nil {
+            let q = MLXRandom.normal([16, 256]).asType(.float16)
+            let k = MLXRandom.normal([1, 16, 256]).asType(.float16)
+            let v = MLXRandom.normal([1, 16, 256]).asType(.float16)
+            MLX.eval([q, k, v])
+            _ = SeedlessMetalForward.sdpaPrefillMma(q, k, v, H: 1, KV: 1, D: 256, baseLen: 1, M: 16, scale: 1.0)
         }
         return SeedlessMetalForward._rmsPipeline != nil && SeedlessMetalForward._ropeRowsPipeline != nil
             && SeedlessMetalForward._sdpaRowsPipeline != nil
@@ -3353,7 +3396,10 @@ public enum SeedlessFusedVerify {
         }
 
         /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
-        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
+        // useMmaPrefill: default false everywhere; ONLY forwardRowsProfiled threads the env flag
+        // through so the decay bench can A/B the MMA prefill kernel (WS-A #137). The strict
+        // forwardRows/verify call sites never pass it — their bytes are unchanged.
+        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, useMmaPrefill: Bool = false) {
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
             if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
                 SeedlessFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
@@ -3364,7 +3410,8 @@ public enum SeedlessFusedVerify {
             } else if let aw = L.attn, let kv = L.kvCache {
                 SeedlessFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                    M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-                                                   ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
+                                                   ropeDim: ropeDim, ropeBase: ropeBase, eps: eps,
+                                                   useMmaPrefill: useMmaPrefill)
                 kv.len += M
             }
             // F5 (notes/07 §3 Wave 2): fuseGDN 時は gdn_resid_postnorm_rows 1 dispatch で
@@ -4065,7 +4112,8 @@ public enum SeedlessFusedVerify {
                     arrToBuf(yV, attnSc.vOut, M * numKV * headDim)
                     SeedlessFusedVerify.encodeAttnLayerRows(enc(), x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                        M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-                                                       ropeDim: ropeDim, ropeBase: ropeBase, eps: eps, hybridDense: true)
+                                                       ropeDim: ropeDim, ropeBase: ropeBase, eps: eps, hybridDense: true,
+                                                       useMmaPrefill: ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1")
                     kv.len += M
                     flush()
                     arrToBuf(steelQmm(bufToArr(attnSc.gated, M, numHeads * headDim), hwA.o, M: M), mixerOut, M * H)
@@ -4126,8 +4174,11 @@ public enum SeedlessFusedVerify {
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
                 return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
             }
+            // M > 1 only: the decay runner also profiles M=1 decode steps through this
+            // function — the MMA kernel is a prefill-tile kernel and must never see decode.
+            let mmaPrefill = M > 1 && ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1"
             for L in layers {
-                let t1 = timed { enc in self.encodePreMoE(enc, L, M: M) }
+                let t1 = timed { enc in self.encodePreMoE(enc, L, M: M, useMmaPrefill: mmaPrefill) }
                 if L.isLinear { tGdn += t1 } else { tAttn += t1 }
                 tMoe += timed { enc in
                     SeedlessFusedVerify.encodeMoEBlockRows(enc, x: self.postNorm, out: self.moeOut, w: L.moe, sc: self.moeSc,
