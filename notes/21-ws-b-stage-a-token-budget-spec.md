@@ -150,4 +150,6 @@ BEFORE any assignment (`$a` reads as unbound under `set -u`) — split into sepa
 - Do not touch `QWISP_LANE_CTX` or `PrefixRAMStore` admission logic (#121) —
   that is Stage B (ctx-adaptive admission + prefix-aware lane restore).
 - Default OFF via `QWISP_TOKEN_BUDGET_SCHED` (default 0) until GO — mirrors
-  WS-A's flag-off-by-default discipline (notes/20).
+  WS-A's flag-off-by-default discipline (notes/20). **GO declared 2026-07-25**
+  (see "Bench verification results" above) — `QWISP_TOKEN_BUDGET_SCHED` now
+  defaults ON (`=0` opts back out to the old atomic path).

@@ -318,11 +318,14 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         }
         self.slots = slots
         self.laneCtx = ctx
-        // WS-B Stage A (notes/21): opt-in token-budget admission scheduler. Default OFF
-        // (QWISP_TOKEN_BUDGET_SCHED=0) — today's atomic drain-then-step is unchanged
-        // unless explicitly enabled. Gate/size env reads live here only, never inside the
-        // scheduler or LaneBatchSlots, so their self-checks stay deterministic.
-        let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 0) != 0
+        // WS-B Stage A (notes/21): token-budget admission scheduler. Default ON as of the
+        // GO-bar bench (notes/21 "Bench verification results", 2026-07-25): a 24K-token
+        // concurrent admit's worst-case stall on another lane's decode stream drops from
+        // an unbounded ~93.7s to a depth-bounded ~13.5s. QWISP_TOKEN_BUDGET_SCHED=0 opts
+        // back out to the old atomic drain-then-step. Gate/size env reads live here only,
+        // never inside the scheduler or LaneBatchSlots, so their self-checks stay
+        // deterministic.
+        let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
         let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
     }
