@@ -5009,14 +5009,20 @@ public enum SeedlessMetalForward {
     /// fp32 accumulation. Fixed tile geometry always: one threadgroup =
     /// (kv_head, tile of TQ=8 query rows) with NSG=8 simdgroups, one per q-head
     /// of that kv_head (grid = KV × ceil(M/TQ), 256 threads/tg). Each KV tile
-    /// (TK=16 positions) is staged ONCE into threadgroup memory and consumed by
+    /// (TK=8 positions) is staged ONCE into threadgroup memory and consumed by
     /// all 8 q-heads × 8 rows — 64-way K/V reuse, which is what pulls the 47K
     /// DRAM re-read floor under the notes/20 GO budget. Per-head fp32 output
     /// accumulators live in REGISTERS (32 simdgroup_float8x8 fragments per
-    /// simdgroup), not threadgroup memory: with a >16KB TG footprint only one
-    /// threadgroup fits per core, so 8 resident simdgroups (not 1) are also what
-    /// give the core any latency hiding at all (round-2 lesson: the 1-simdgroup
-    /// variant was 4x SLOWER than round 1 from serialized TG-memory chains).
+    /// simdgroup), not threadgroup memory.
+    ///
+    /// TK=8 is deliberate and load-bearing (round 3): with loads in the stream a
+    /// simdgroup is LATENCY-bound (~85 cyc/MMA vs ~4 for a pure-MMA control), so
+    /// throughput ∝ resident simdgroups per core. Apple caps ~8 threadgroups per
+    /// core; TK=8 keeps the TG footprint at ~12.7KB so TWO 8-simdgroup tgs fit
+    /// per core (16 resident sgs) — measured 3.2x over the identical kernel at
+    /// TK=16 (22.7KB, 1 tg/core). Bigger tiles, more register blocking (RB×CB≥4
+    /// d-sliced, round 3), fewer sgs, q-hoisting, and load vectorization all
+    /// measured neutral-to-worse; residency is the only lever that moved.
     /// Bit-exactness to sdpa_rows is NOT required (hardware matrix-unit rounding
     /// differs) — required instead: determinism, chunk-composition invariance,
     /// causal/pad zero-influence, numeric sanity (locked tests 93–96, notes/20).
@@ -5030,16 +5036,13 @@ public enum SeedlessMetalForward {
     /// (e.g. the H=1 pipeline warm-up) leaves the surplus simdgroups computing a
     /// clamped duplicate head that is never stored, so barriers stay uniform.
     ///
-    /// Round-2 perf status (isolated single-layer probe, M=1024 @ baseN=47104,
-    /// GPU-time only): this kernel ~1.7s vs sdpa_rows ~0.8s probe / ~1.77s in the
-    /// 10-layer decay bench (where sdpa_rows is DRAM-crushed and this kernel is
-    /// compute-bound ⇒ decay-flat). A pure-MMA control in the identical grid hits
-    /// 10.1 TFLOPS, so the gap is per-fragment operand handling (~6 loads + 6
-    /// element writes per 2 MMAs), not MMA rate, occupancy, banks, or barriers —
-    /// measured: bank-padding, K-transpose+half2 loads, q-hoist, and 4-way split
-    /// accumulators were all neutral-to-negative. Closing it needs steel-style
-    /// register blocking (RB×CB≥4 operand reuse), which conflicts with the
-    /// register-resident O at D=256 unless output columns are sliced per-simdgroup.
+    /// Perf status (isolated single-layer probe, M=1024 @ baseN=47104, GPU-time
+    /// on pre-uploaded buffers): ~505-525ms vs sdpa_rows ~820ms probe / ~1772ms
+    /// per layer in the 10-layer decay bench at 47K (where sdpa_rows is
+    /// DRAM-crushed while this kernel's 64-way K/V reuse keeps it compute-bound
+    /// and decay-flat) — ≈3.4x on the decay attention term if the driver's AC
+    /// measurement confirms. History: round-2 TK=16 variant ~1.69s; round-3
+    /// d-sliced RB×CB register blocking (4 sgs/core) ~3.2s = NO-GO.
     public static func sdpaPrefillMma(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
                                        H: Int, KV: Int, D: Int,
                                        baseLen: Int, M: Int, scale: Float) -> MLXArray? {
@@ -5070,7 +5073,7 @@ public enum SeedlessMetalForward {
                 ushort sgid [[simdgroup_index_in_threadgroup]],
                 ushort simd_lid [[thread_index_in_simdgroup]])
             {
-                constexpr int TQ = 8, TK = 16, D = 256;   // rows/sg, KV positions/tile
+                constexpr int TQ = 8, TK = 8, D = 256;   // rows/sg, KV positions/tile
                 constexpr int NSG = 8;       // simdgroups per tg = q-heads served per kv_head
                 constexpr int CB = TK / 8;   // 2 KV-position fragments (QK^T cols / PV contraction)
                 constexpr int KF = D / 8;    // 32 contraction fragments (QK^T, over d)
@@ -5086,12 +5089,12 @@ public enum SeedlessMetalForward {
                 const bool active = sg < gqa_factor;
                 const int h = kv_head * gqa_factor + min(sg, gqa_factor - 1);
 
-                // Shared staged K/V (~9K+8K) + per-simdgroup score slices (~4.5K) +
-                // row state (<1K) ≈ 22.7KB. Output accumulators are per-lane REGISTERS.
-                // Row strides are PADDED off the 128B threadgroup-bank period (an
-                // unpadded D*2=512B / TK*4=64B stride would alias every fragment-lane
-                // of a load onto the same banks; padding measured perf-neutral in the
-                // isolated probe but costs ~700B — kept as cheap insurance).
+                // Shared staged K/V (~5K+4.2K) + per-simdgroup score slices (2.5K) +
+                // row state (<1K) ≈ 12.7KB — deliberately ≤16KB so TWO threadgroups
+                // stay resident per core (see header: residency is THE perf lever).
+                // Output accumulators are per-lane REGISTERS. Row strides are PADDED
+                // off the 128B threadgroup-bank period (cheap insurance; measured
+                // perf-neutral).
                 constexpr int KSTRIDE = D + 8;    // half elements per staged V row (pos-major)
                 constexpr int TKS = TK + 2;       // half elements per transposed-K row (d-major)
                 constexpr int SSTRIDE = TK + 2;   // float elements per sBuf row
@@ -5160,9 +5163,8 @@ public enum SeedlessMetalForward {
 
                     // ---- QK^T via simdgroup MMA, fp32 accumulate (K from stage) ----
                     {
-                        simdgroup_float8x8 acc0, acc1;
+                        simdgroup_float8x8 acc0;
                         acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
-                        acc1.thread_elements()[0] = 0.0f; acc1.thread_elements()[1] = 0.0f;
                         #pragma unroll
                         for (int kf = 0; kf < KF; kf++) {
                             device const half* qp = queries + qElemBase + kf * 8;
@@ -5175,21 +5177,13 @@ public enum SeedlessMetalForward {
                             // half2 vector load per fragment instead of two scalars.
                             const int dRow = (kf * 8 + (int)fm) * TKS;
                             const half2 b0 = *(threadgroup const half2*)(kStage + dRow + fn);
-                            const half2 b1 = *(threadgroup const half2*)(kStage + dRow + 8 + fn);
                             simdgroup_float8x8 B0;
                             B0.thread_elements()[0] = (float)b0.x;
                             B0.thread_elements()[1] = (float)b0.y;
                             simdgroup_multiply_accumulate(acc0, A, B0, acc0);
-
-                            simdgroup_float8x8 B1;
-                            B1.thread_elements()[0] = (float)b1.x;
-                            B1.thread_elements()[1] = (float)b1.y;
-                            simdgroup_multiply_accumulate(acc1, A, B1, acc1);
                         }
                         sBuf[(int)fm * SSTRIDE + fn]     = acc0.thread_elements()[0];
                         sBuf[(int)fm * SSTRIDE + fn + 1] = acc0.thread_elements()[1];
-                        sBuf[(int)fm * SSTRIDE + 8 + fn]     = acc1.thread_elements()[0];
-                        sBuf[(int)fm * SSTRIDE + 8 + fn + 1] = acc1.thread_elements()[1];
                     }
                     simdgroup_barrier(mem_flags::mem_threadgroup);   // sBuf is sg-private
 
@@ -5240,31 +5234,23 @@ public enum SeedlessMetalForward {
                     }
 
                     // ---- PV via simdgroup MMA into register accumulators ----
-                    // Fixed order: ascending KV-tile (outer while), then cb=0, cb=1
-                    // inside each accumulator — fully determined by loop structure,
-                    // independent of timing. Pad q rows' sBuf holds raw (finite)
-                    // scores; they only touch pad rows' lanes (row independence of
-                    // MMA), which are never stored.
+                    // Fixed order: ascending KV-tile (outer while), single 8-wide
+                    // contraction fragment per tile — fully determined by loop
+                    // structure, independent of timing. Pad q rows' sBuf holds raw
+                    // (finite) scores; they only touch pad rows' lanes (row
+                    // independence of MMA), which are never stored.
                     {
-                        simdgroup_float8x8 P0, P1;   // P[row, pos]
+                        simdgroup_float8x8 P0;   // P[row, pos]
                         const float2 p0 = *(threadgroup const float2*)(sBuf + (int)fm * SSTRIDE + fn);
-                        const float2 p1 = *(threadgroup const float2*)(sBuf + (int)fm * SSTRIDE + 8 + fn);
                         P0.thread_elements()[0] = p0.x; P0.thread_elements()[1] = p0.y;
-                        P1.thread_elements()[0] = p1.x; P1.thread_elements()[1] = p1.y;
                         #pragma unroll
                         for (int db = 0; db < DB; db++) {
                             const int outCol = db * 8 + (int)fn;
                             const half2 v0 = *(threadgroup const half2*)(vStage + (int)fm * KSTRIDE + outCol);
-                            const half2 v1 = *(threadgroup const half2*)(vStage + (8 + (int)fm) * KSTRIDE + outCol);
                             simdgroup_float8x8 V0;   // V[pos, d]: row = pos, col = d
                             V0.thread_elements()[0] = (float)v0.x;
                             V0.thread_elements()[1] = (float)v0.y;
                             simdgroup_multiply_accumulate(oFrag[db], P0, V0, oFrag[db]);
-
-                            simdgroup_float8x8 V1;
-                            V1.thread_elements()[0] = (float)v1.x;
-                            V1.thread_elements()[1] = (float)v1.y;
-                            simdgroup_multiply_accumulate(oFrag[db], P1, V1, oFrag[db]);
                         }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);   // kStage/vStage reused next tile

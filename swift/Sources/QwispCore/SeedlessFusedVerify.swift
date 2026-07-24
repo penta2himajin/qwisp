@@ -3396,7 +3396,10 @@ public enum SeedlessFusedVerify {
         }
 
         /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
-        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int) {
+        // useMmaPrefill: default false everywhere; ONLY forwardRowsProfiled threads the env flag
+        // through so the decay bench can A/B the MMA prefill kernel (WS-A #137). The strict
+        // forwardRows/verify call sites never pass it — their bytes are unchanged.
+        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, useMmaPrefill: Bool = false) {
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
             if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
                 SeedlessFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
@@ -3407,7 +3410,8 @@ public enum SeedlessFusedVerify {
             } else if let aw = L.attn, let kv = L.kvCache {
                 SeedlessFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                    M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-                                                   ropeDim: ropeDim, ropeBase: ropeBase, eps: eps)
+                                                   ropeDim: ropeDim, ropeBase: ropeBase, eps: eps,
+                                                   useMmaPrefill: useMmaPrefill)
                 kv.len += M
             }
             // F5 (notes/07 §3 Wave 2): fuseGDN 時は gdn_resid_postnorm_rows 1 dispatch で
@@ -4170,8 +4174,9 @@ public enum SeedlessFusedVerify {
                 enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
                 return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
             }
+            let mmaPrefill = ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1"
             for L in layers {
-                let t1 = timed { enc in self.encodePreMoE(enc, L, M: M) }
+                let t1 = timed { enc in self.encodePreMoE(enc, L, M: M, useMmaPrefill: mmaPrefill) }
                 if L.isLinear { tGdn += t1 } else { tAttn += t1 }
                 tMoe += timed { enc in
                     SeedlessFusedVerify.encodeMoEBlockRows(enc, x: self.postNorm, out: self.moeOut, w: L.moe, sc: self.moeSc,
