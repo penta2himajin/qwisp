@@ -5036,13 +5036,22 @@ public enum SeedlessMetalForward {
     /// (e.g. the H=1 pipeline warm-up) leaves the surplus simdgroups computing a
     /// clamped duplicate head that is never stored, so barriers stay uniform.
     ///
-    /// Perf status (isolated single-layer probe, M=1024 @ baseN=47104, GPU-time
-    /// on pre-uploaded buffers): ~505-525ms vs sdpa_rows ~820ms probe / ~1772ms
-    /// per layer in the 10-layer decay bench at 47K (where sdpa_rows is
-    /// DRAM-crushed while this kernel's 64-way K/V reuse keeps it compute-bound
-    /// and decay-flat) — ≈3.4x on the decay attention term if the driver's AC
-    /// measurement confirms. History: round-2 TK=16 variant ~1.69s; round-3
-    /// d-sliced RB×CB register blocking (4 sgs/core) ~3.2s = NO-GO.
+    /// Perf status — NO-GO evidence (round 4, AC power, paired in-situ A/B +
+    /// isolated probes): the kernel is BIMODAL. Deterministic slow mode
+    /// ≈0.12-0.155 ms/pos/layer (all in-situ chunks, all isolated runs at
+    /// ctx ≤8K, and first/most reps at 47K) ⇒ in-situ ON = 0.20-0.46x of
+    /// sdpa_rows — SLOWER. A fast mode ≈0.011 ms/pos appears only on repeated
+    /// identical dispatches with >SLC buffers, unreliably; the encode path
+    /// never enters it. Mechanism bounding (controls in the same 2×128 grid):
+    /// pure-MMA 10.1 TFLOPS stable; +12.7KB TG mem, +per-tile barriers,
+    /// +per-tile 16B/thread device streams — all still ~9-10 TFLOPS. Only the
+    /// full kernel's dependency-chained per-lane fragment gathers collapse
+    /// aggregate throughput to ~½ core-equivalent; no structural variant
+    /// (register blocking, tile sizes, load vectorization, residency) moved it
+    /// past ~2x. sdpa_rows' 1024-wide coalesced GEMV sustains ~1 TFLOPS
+    /// deterministically — on M1-class hardware that shape wins for this op.
+    /// History: round-2 TK=16 ~1.69s@47K; round-3 d-sliced RB×CB blocking
+    /// ~3.2s = NO-GO; round-4 uint4 staging kept (strict improvement).
     public static func sdpaPrefillMma(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
                                        H: Int, KV: Int, D: Int,
                                        baseLen: Int, M: Int, scale: Float) -> MLXArray? {
@@ -5150,14 +5159,30 @@ public enum SeedlessMetalForward {
                 while (kvStart < nMax) {
                     const int kvCount = min(TK, nMax - kvStart);
 
-                    // ---- stage this KV-tile's K/V once (coalesced, all 256 threads);
-                    //      consumed by all NSG q-heads × TQ rows ----
-                    for (int i = flatTid; i < TK * D; i += 32 * NSG) {
-                        const int pos = i / D, d = i - pos * D;
+                    // ---- stage this KV-tile's K/V once, consumed by all NSG q-heads ----
+                    // Exactly one 16B uint4 device read per thread per array (256
+                    // threads × 8 halves = the whole 4KB tile): collapses the round-2
+                    // 8-deep scalar-load chain per thread into one transaction
+                    // (measured: 8K-ctx layer 1345→1015ms). 16B alignment holds — the
+                    // seq/head strides are multiples of D=256 halves and d is a
+                    // multiple of 8. K scatter-writes into its transposed TG layout
+                    // stay scalar (TG SRAM, cheap).
+                    {
+                        const int e8 = flatTid * 8;
+                        const int pos = e8 / D, d = e8 - pos * D;
                         const int gpos = kvStart + pos;
-                        const bool valid = pos < kvCount;
-                        kStage[d * TKS + pos] = valid ? keys[kv_head * k_head_stride + gpos * k_seq_stride + d] : (half)0;
-                        vStage[pos * KSTRIDE + d] = valid ? values[kv_head * v_head_stride + gpos * v_seq_stride + d] : (half)0;
+                        if (pos < kvCount) {
+                            const uint4 kw = *(device const uint4*)(keys + kv_head * k_head_stride + gpos * k_seq_stride + d);
+                            const uint4 vw = *(device const uint4*)(values + kv_head * v_head_stride + gpos * v_seq_stride + d);
+                            *(threadgroup uint4*)(vStage + pos * KSTRIDE + d) = vw;
+                            thread const half* kh = (thread const half*)&kw;
+                            #pragma unroll
+                            for (int j = 0; j < 8; j++) kStage[(d + j) * TKS + pos] = kh[j];
+                        } else {
+                            *(threadgroup uint4*)(vStage + pos * KSTRIDE + d) = uint4(0);
+                            #pragma unroll
+                            for (int j = 0; j < 8; j++) kStage[(d + j) * TKS + pos] = (half)0;
+                        }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
 
