@@ -110,6 +110,28 @@ run_pass() {
 run_pass off "QWISP_TOKEN_BUDGET_SCHED=0"
 run_pass on  ""
 
+# The VALID control for the motivating E2E. The OFF pass is not one: QWISP_LANE_CTX's
+# default flip is unconditional, so flag-off admits the big prompt too. Explicitly
+# restoring the old 16384 eligibility cap is the only way to reproduce the pre-Stage-B
+# state, and it is also the only test of Resolved-ambiguity 6 — an oversized prompt must
+# fail VISIBLY (stderr NOTE + no content), never as a silent empty 200.
+echo ""
+echo "== pass: cap16k (control: QWISP_LANE_CTX=16384, expect VISIBLE refusal) =="
+env QWISP_LANE_CTX=16384 QWISP_MODEL="$MODEL" QWISP_LANES="$LANES" QWISP_PORT="$PORT" "$BIN" serve \
+    > "$OUT/cap16k.server.log" 2>&1 &
+CAPPID=$!
+for _ in $(seq 1 180); do
+    curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && break
+    sleep 2
+done
+node "$REPO/tools/lane_stage_b_probe.mjs" e2e "127.0.0.1:$PORT" "$BIG" 32 \
+    > "$OUT/cap16k.e2e.json" || echo '{"error":"probe failed"}' > "$OUT/cap16k.e2e.json"
+cat "$OUT/cap16k.e2e.json"
+echo "-- stderr NOTE (visible-failure requirement):"
+grep -c "leaves no room to generate" "$OUT/cap16k.server.log" || true
+kill "$CAPPID" 2>/dev/null || true
+wait "$CAPPID" 2>/dev/null || true
+
 echo ""
 echo "== summary =="
 python3 - "$OUT" << 'EOF'

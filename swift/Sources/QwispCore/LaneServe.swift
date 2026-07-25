@@ -174,12 +174,39 @@ public final class LaneBatchSlots: BatchSlots {
         // 4. legacy shape: seqBudget is exactly prompt + 1 + genBudget.
         let p4 = LaneBackend.sizePlan(promptLen: 100, maxTokens: 50, ctxMax: 8_192, genCap: 16_384)
         let c4 = !p4.oversized && p4.seqBudget == 100 + 1 + p4.genBudget
+        // 5-7. Arena ALLOCATION size vs the eligibility cap (notes/22 addendum finding 3).
+        // maxSeqLen is the model-context eligibility cap (262144); using it as the legacy
+        // allocation size allocated 5.37GB per lane, ungated (canAdmit runs only on the
+        // budgeted path) — measured as a flag-off B≥2 throughput collapse. The legacy
+        // sentinel must keep the OLD fixed cap so QWISP_TOKEN_BUDGET_SCHED=0 stays
+        // bit-for-bit legacy, arena included.
+        let c5 = arenaSeqLen(seqBudget: 0, maxSeqLen: 262_144) == legacyArenaCap
+        // A small eligibility cap still wins over the legacy cap (never allocate past it).
+        let c6 = arenaSeqLen(seqBudget: 0, maxSeqLen: 8_192) == 8_192
+        // Budgeted path is unchanged: per-request size, clamped to the eligibility cap.
+        let c7 = arenaSeqLen(seqBudget: 51_385, maxSeqLen: 262_144) == 51_385
+            && arenaSeqLen(seqBudget: 300_000, maxSeqLen: 262_144) == 262_144
         return [
             ("unset_maxtokens", c1),
             ("explicit_capped", c2),
             ("prompt_too_big", c3),
             ("legacy_shape", c4),
+            ("legacy_arena_fixed_cap", c5),
+            ("legacy_arena_respects_ctx", c6),
+            ("budgeted_arena_per_request", c7),
         ]
+    }
+
+    /// WS-B Stage B: the arena ALLOCATION size for one admission. `seqBudget > 0` is the
+    /// budgeted path's per-request size, clamped to the eligibility cap. `seqBudget == 0`
+    /// is the LEGACY SENTINEL and keeps the OLD FIXED CAP — `maxSeqLen` became the
+    /// model-context eligibility cap (262144) in Stage B, so reusing it here allocated a
+    /// 16x arena (335MB → 5.37GB per lane) on a path `canAdmit` never gates. See notes/22
+    /// addendum finding 3 for the measurement.
+    public static let legacyArenaCap = 16_384
+    public static func arenaSeqLen(seqBudget: Int, maxSeqLen: Int) -> Int {
+        seqBudget > 0 ? Swift.min(seqBudget, maxSeqLen)
+                      : Swift.min(legacyArenaCap, maxSeqLen)
     }
 
     /// Fresh lane forward with the canonical hybrid wiring (same trios as TellRuntime's
@@ -247,8 +274,9 @@ public final class LaneBatchSlots: BatchSlots {
         }
     }
 
-    /// Legacy 3-arg entry point: size the arena at the init-time fixed cap (`seqBudget: 0` is
-    /// the LEGACY SENTINEL, not oversized/invalid — WS-B Stage B, notes/22).
+    /// Legacy 3-arg entry point: size the arena at the legacy fixed cap (`seqBudget: 0` is
+    /// the LEGACY SENTINEL, not oversized/invalid — WS-B Stage B, notes/22). See
+    /// `arenaSeqLen` for why that cap is NOT `maxSeqLen` any more.
     public func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int) -> AdmitProgress {
         admitStep(prompt: prompt, slot: slot, tokenBudget: tokenBudget, seqBudget: 0)
     }
@@ -260,14 +288,14 @@ public final class LaneBatchSlots: BatchSlots {
     /// (arena sizing + restore-plan lookup + lane creation) happens once per admission, on the
     /// first call for a slot; `seqBudget` (the caller's `sizePlan` result) sizes THIS lane's
     /// arena, clamped to `maxSeqLen` (now the model-context ELIGIBILITY cap, not the allocation
-    /// size) — `0` reuses `maxSeqLen` verbatim (legacy shape, unchanged behavior).
+    /// size) — `0` falls back to `legacyArenaCap` (see `arenaSeqLen`).
     public func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int, seqBudget: Int) -> AdmitProgress {
         guard slot >= 0, slot < slotCount, !prompt.isEmpty else { return .failed }
         var st: Prefill
         if let existing = prefills[slot] {
             st = existing
         } else {
-            var seqLen = seqBudget > 0 ? Swift.min(seqBudget, maxSeqLen) : maxSeqLen
+            var seqLen = LaneBatchSlots.arenaSeqLen(seqBudget: seqBudget, maxSeqLen: maxSeqLen)
             // Release this candidate's canAdmit hold (same formula, symmetric) now that its
             // first-call setup is actually starting — regardless of whether setup goes on to
             // succeed or fail below, the reservation is resolved either way. seqBudget == 0
