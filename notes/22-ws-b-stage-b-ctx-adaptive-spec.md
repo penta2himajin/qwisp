@@ -230,6 +230,18 @@ All existing `tokenbudget_*` cases stay byte-untouched and green.
    16384" to "eligibility cap override, default = model context". This is
    deliberate (the 16K default IS the bug). Update the main.swift help text
    (~L43-46) accordingly.
+
+   **1 and 2 as originally written contradict each other, and that contradiction
+   shipped a bug** (addendum finding 3): the old 16384 was ONE number doing TWO
+   jobs — the eligibility cap AND the arena allocation size. 2 removes it as a
+   cap; 1 requires it as the flag-off allocation size. Reading only 2, round 1
+   made the legacy path allocate at the 262144 eligibility cap = 5.37GB/lane,
+   ungated. **Binding reconciliation**: they are separate quantities.
+   - *eligibility cap* = `laneCtx` = model context (or `QWISP_LANE_CTX`), BOTH paths.
+   - *allocation size* = per-request `seqBudget` on the budgeted path;
+     `LaneBatchSlots.legacyArenaCap` (16384) on the flag-off path.
+   `LaneBatchSlots.arenaSeqLen(seqBudget:maxSeqLen:)` is the single place this is
+   decided, locked by COMPTEST `lanesize_legacy_arena_*`. Never re-merge them.
 3. **Memory gate is FCFS with head-of-line wait**, not skip-ahead. Matches
    vLLM, preserves the locked fairness test. Head-of-line blocking on a huge
    request is accepted behavior, not a bug to fix this stage.
