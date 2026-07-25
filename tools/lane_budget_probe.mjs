@@ -8,6 +8,7 @@
 // Usage: node tools/lane_budget_probe.mjs <host:port> [bigPromptTokens]
 // Output: one JSON line on stdout: {n, p50, p90, p99, max, gapsMs}
 import http from "node:http";
+import { pathToFileURL } from "node:url";
 
 const hostport = process.argv[2] || "127.0.0.1:8080";
 const bigTokens = parseInt(process.argv[3] || "24000", 10);
@@ -50,10 +51,15 @@ function fireStream(body, onDelta) {
 // multi-chunk prefill; exact token count doesn't matter for the ITL comparison. `reps`
 // is the SENTENCE repeat count (bugfix: the original version repeated the whole
 // multi-word sentence `words` times, inflating the prompt ~14x past the target).
-const sentence = "The quick brown fox jumps over the lazy dog near the riverbank at dusk.";
-const sentenceWords = sentence.split(" ").length;
-const reps = Math.max(1, Math.round(bigTokens / 1.3 / sentenceWords));
-const filler = Array(reps).fill(sentence).join(" ");
+// Exported so lane_stage_b_probe.mjs shares ONE copy of this formula — the
+// sentence-repeat bug above must never be re-derived in a second file.
+export function makeFiller(bigTokens) {
+  const sentence = "The quick brown fox jumps over the lazy dog near the riverbank at dusk.";
+  const sentenceWords = sentence.split(" ").length;
+  const reps = Math.max(1, Math.round(bigTokens / 1.3 / sentenceWords));
+  return Array(reps).fill(sentence).join(" ");
+}
+const filler = makeFiller(bigTokens);
 
 async function main() {
   const gaps = [];
@@ -76,4 +82,7 @@ async function main() {
     max: gaps.length ? gaps[gaps.length - 1] : null, gapsMs: gaps,
   }));
 }
-main().catch((e) => { console.error("[lane_budget_probe] error:", e); process.exit(1); });
+// Only run when invoked directly — importing makeFiller must not fire a probe.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((e) => { console.error("[lane_budget_probe] error:", e); process.exit(1); });
+}

@@ -266,3 +266,79 @@ All existing `tokenbudget_*` cases stay byte-untouched and green.
    (same shape as notes/21's "Bench verification results"), then owner decides
    the default (nothing to flip here — adaptive sizing has no separate flag;
    it rides the Stage A scheduler flag).
+
+---
+
+## Bench verification results (2026-07-25, `scripts/bench_lane_stage_b.sh 35000`, real model)
+
+Model `Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16` (modelCtx 262144),
+64GB M-series, AC power, GPU-exclusive, paired same-session. Filler prompt
+tokenised to **30778 tokens** (serve-log `prompt=`, not the nominal 35000 —
+`makeFiller`'s ~1.3 tok/word estimate runs ~12% optimistic; the number that
+matters is that it is ~1.9x the old 16384 cap). Artifacts: `/tmp/lane-stage-b-151409`.
+
+### 1. The motivating E2E — PASS (on), but the control was INVALID
+
+| pass | deltas | TTFT | decode |
+|---|---|---|---|
+| OFF (`QWISP_TOKEN_BUDGET_SCHED=0`) | 32 | 159,575ms | 27.5 tok/s |
+| ON (default) | 32 | 153,418ms | 34.8 tok/s |
+
+A 30.8K-token prompt now admits and streams a correct completion. **But OFF
+admitted it too**, so this pair does NOT demonstrate the fix. Reason: the
+`QWISP_LANE_CTX` default flip (16384 → modelCtx) is applied in `LaneBackend.init`
+**unconditionally**, not gated on the scheduler flag — so both paths get the cap
+lift. The valid control is `QWISP_LANE_CTX=16384` on the same binary; it is also
+the only way to exercise Resolved-ambiguity 6 (oversized ⇒ visible failure, never
+an empty 200), which NOTHING currently tests. **Still owed.**
+
+### 2. No-regression A/B, short prompts (mean tok/s per stream)
+
+| B | OFF | ON | Δ |
+|---|---|---|---|
+| 1 | 83.89 | 82.79 | **−1.3%** |
+| 2 | 4.88 | 59.60 | +1121% |
+| 3 | 7.22 | 39.12 | +442% |
+| 4 | 4.80 | 30.73 | +540% |
+
+**Only the B=1 row measures what this gate was designed to measure**, and it
+passes: adaptive sizing's own overhead is −1.3%, inside the ±5% bar. The B≥2 rows
+do not show a Stage B win — they show finding 3 below, i.e. the OFF baseline is
+itself broken by this branch. Do not quote them as a speedup.
+
+### 3. REGRESSION (blocking): the flag-off path allocates model-context arenas
+
+`LaneBatchSlots.admitStep`'s legacy 3-arg entry (`seqBudget: 0`) sizes the lane
+arena at `maxSeqLen` verbatim (LaneServe.swift ~270). `maxSeqLen` IS `laneCtx`,
+which this branch changed from 16384 to modelCtx = 262144. With
+`kvBytesPerToken` = 10 attn layers × 2 KV × 256 dim × 2 B × 2 (k+v) = 20,480 B:
+
+- before: 16384 tok × 20KB = **335 MB per lane**
+- after:  262144 tok × 20KB = **5.37 GB per lane** — 16x, and `canAdmit` is
+  called ONLY from `budgetedStep` (ContinuousBatch.swift:217), so the legacy path
+  has no KV byte gate at all.
+
+That is the measured B≥2 collapse above (the wired-page-exhaustion signature of
+memory `strict-streaming-collapse-fix`), and it violates the binding rule that
+`QWISP_TOKEN_BUDGET_SCHED=0` stays bit-for-bit legacy INCLUDING the fixed-cap
+arena path (CLAUDE.md / HANDOFF Do-Not-Touch; this spec's own Resolved-ambiguity
+1, which contradicts its Resolved-ambiguity 2 — the implementation followed 2).
+
+Proposed fix (NOT applied — round 1 is committed; owner decision): decouple the
+eligibility cap from the legacy allocation size, i.e. `seqBudget == 0` sizes at
+`min(16384, maxSeqLen)` rather than `maxSeqLen`. Resolved-ambiguity 1 and 2 must
+also be reconciled in this file so they stop contradicting.
+
+### 4. Footprint gate with 3 simultaneous admits — PASS
+
+3 concurrent 30.8K admits all streamed (`ok=true`, TTFT ~153.9s each, finishing
+within 3ms of one another — the budgeted round-robin). This is the N≥3 case the
+round-1 `reservedBytes` TOCTOU guard needs; no over-admit, no collapse.
+
+Peak `footprint` (never `ps rss`): **39,936 MB** on a 64GB box. That is ~10GB
+ABOVE this spec's stated envelope (8GB KV budget + ~20GB model + ~200MB×B) —
+the arenas themselves are only 3 × 30795 × 20KB ≈ 1.9GB, so the excess is
+prefill/MoE scratch, not KV. The envelope estimate in "Bench verification" item 3
+is simply too small; no failure was observed. `vm.swapusage` showed 5.6GB used
+but that is boot-cumulative and NOT attributable to this run — inconclusive, not
+evidence of a swap storm.
