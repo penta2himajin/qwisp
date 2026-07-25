@@ -7,10 +7,11 @@
 #   OFF = QWISP_TOKEN_BUDGET_SCHED=0 (legacy atomic path, fixed 16K lane cap)
 #   ON  = default (Stage A scheduler + Stage B adaptive sizing)
 # Each pass runs:
-#   1. e2e   — a ~35K prompt. OFF is the POSITIVE CONTROL: it must come back empty
-#              (the silent no-op Stage B fixes). ON must stream real content.
-#   2. tps   — B=1..4 concurrent SHORT prompts; per-B mean tok/s must match within
-#              ±5% (isolates adaptive-sizing overhead; short prompts never resize).
+#   1. e2e   — a ~35K prompt; ON must stream real content. NOTE: OFF is NOT a control
+#              for this — QWISP_LANE_CTX's default flip is unconditional. The real
+#              control is the cap16k pass at the bottom.
+#   2. tps   — B=1..4 concurrent SHORT prompts, after an identical warmup; ON must not
+#              be >5% SLOWER (one-sided bar; ON being faster is not a failure).
 #   3. conc  — ON pass only: 3 SIMULTANEOUS large admits with `footprint` sampled
 #              throughout. 3, not 2: the round-1 reservedBytes TOCTOU guard only
 #              bites when budgetedStep peeks at >=3 free slots in one round.
@@ -24,6 +25,9 @@ BIN="$REPO/swift/.xcode-build-rel/Build/Products/Release/qwisp"
 MODEL="${QWISP_MODEL:-$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16}"
 PORT="${QWISP_PORT:-8099}"
 LANES="${QWISP_LANES:-4}"
+# STAGE_B_PHASES=tps runs ONLY the paired tps rows (skips e2e, conc and the cap16k
+# control) — a ~5min re-measure of the +/-5% gate without re-paying two 155s prefills.
+PHASES="${STAGE_B_PHASES:-all}"
 
 [ -x "$BIN" ] || { echo "ERROR: build the qwisp scheme first"; exit 1; }
 [ -d "$MODEL" ] || { echo "ERROR: model not found at $MODEL (set QWISP_MODEL)"; exit 1; }
@@ -77,10 +81,19 @@ run_pass() {
         sleep 2
     done
 
-    echo "-- e2e ($BIG tok)"
-    node "$REPO/tools/lane_stage_b_probe.mjs" e2e "127.0.0.1:$PORT" "$BIG" 32 \
-        > "$OUT/$label.e2e.json" || echo '{"error":"probe failed"}' > "$OUT/$label.e2e.json"
-    cat "$OUT/$label.e2e.json"
+    if [ "$PHASES" = "all" ]; then
+        echo "-- e2e ($BIG tok)"
+        node "$REPO/tools/lane_stage_b_probe.mjs" e2e "127.0.0.1:$PORT" "$BIG" 32 \
+            > "$OUT/$label.e2e.json" || echo '{"error":"probe failed"}' > "$OUT/$label.e2e.json"
+        cat "$OUT/$label.e2e.json"
+    fi
+
+    # Warm the engine IDENTICALLY in both passes before the tps rows. Without this the
+    # comparison is invalid: post-fix, OFF's e2e short-circuits in <1s (legacy 16K cap
+    # refuses the big prompt) while ON's runs a full ~155s prefill, so the tps rows would
+    # measure warm-vs-cold, not sizing overhead. Observed as a bogus 26.8% "regression".
+    echo "-- warmup"
+    node "$REPO/tools/lane_stage_b_probe.mjs" tps "127.0.0.1:$PORT" 1 32 > /dev/null 2>&1 || true
 
     local b
     for b in 1 2 3 4; do
@@ -90,7 +103,7 @@ run_pass() {
         cat "$OUT/$label.tps$b.json"
     done
 
-    if [ "$label" = "on" ]; then
+    if [ "$label" = "on" ] && [ "$PHASES" = "all" ]; then
         echo "-- conc N=3 ($BIG tok each) + footprint"
         sample_footprint "$pid" "$OUT/footprint.txt" &
         local sampler
@@ -115,6 +128,7 @@ run_pass on  ""
 # restoring the old 16384 eligibility cap is the only way to reproduce the pre-Stage-B
 # state, and it is also the only test of Resolved-ambiguity 6 — an oversized prompt must
 # fail VISIBLY (stderr NOTE + no content), never as a silent empty 200.
+if [ "$PHASES" = "all" ]; then
 echo ""
 echo "== pass: cap16k (control: QWISP_LANE_CTX=16384, expect VISIBLE refusal) =="
 env QWISP_LANE_CTX=16384 QWISP_MODEL="$MODEL" QWISP_LANES="$LANES" QWISP_PORT="$PORT" "$BIN" serve \
@@ -131,6 +145,7 @@ echo "-- stderr NOTE (visible-failure requirement):"
 grep -c "leaves no room to generate" "$OUT/cap16k.server.log" || true
 kill "$CAPPID" 2>/dev/null || true
 wait "$CAPPID" 2>/dev/null || true
+fi
 
 echo ""
 echo "== summary =="
@@ -148,16 +163,21 @@ for lbl in ("off", "on"):
           f"status={d.get('status')} sample={d.get('sample','')!r}")
 print("\n2) No-regression A/B, short prompts (mean tok/s per stream)")
 print(f"  {'B':>2} {'OFF':>8} {'ON':>8} {'Δ%':>7}")
-worst = 0.0
+worstReg = 0.0
+bestImp = 0.0
 for b in (1, 2, 3, 4):
     o, n = load(f"off.tps{b}.json").get("meanTps"), load(f"on.tps{b}.json").get("meanTps")
     if o and n:
         d = (n - o) / o * 100
-        worst = max(worst, abs(d))
+        if d < 0: worstReg = max(worstReg, -d)
+        else: bestImp = max(bestImp, d)
         print(f"  {b:>2} {o:>8.2f} {n:>8.2f} {d:>+6.1f}%")
     else:
         print(f"  {b:>2} {str(o):>8} {str(n):>8} {'n/a':>7}")
-print(f"  worst |Δ| = {worst:.1f}%  (bar: <=5%)")
+    # The bar is one-sided: it asks whether ON (adaptive sizing) is SLOWER. A large
+    # positive delta is ON winning, not a gate failure — reporting |Δ| conflated the two.
+    print(f"  worst REGRESSION (ON slower) = {worstReg:.1f}%  (bar: <=5%)  "
+          f"| best improvement = {bestImp:+.1f}%")
 c = load("on.conc.json")
 print(f"\n3) 3 simultaneous {c.get('promptTokens')}-tok admits: ok={c.get('ok')}")
 for i, s in enumerate(c.get("streams", [])):

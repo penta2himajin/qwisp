@@ -342,3 +342,56 @@ prefill/MoE scratch, not KV. The envelope estimate in "Bench verification" item 
 is simply too small; no failure was observed. `vm.swapusage` showed 5.6GB used
 but that is boot-cumulative and NOT attributable to this run — inconclusive, not
 evidence of a swap storm.
+
+---
+
+## Bench verification — post-fix re-run (2026-07-25, after `d4f7e27`)
+
+Finding 3 above is FIXED (`arenaSeqLen`, legacy sentinel → 16384). Re-measured
+paired same-session; artifacts `/tmp/lane-stage-b-153909` (full) and
+`/tmp/lane-stage-b-154552` (warmed tps A/B).
+
+### 1. Motivating E2E — now properly controlled
+
+| pass | result |
+|---|---|
+| ON (default) | 32 deltas, TTFT 152,673ms, 29.6 tok/s — **admits and streams** |
+| cap16k (`QWISP_LANE_CTX=16384`, the real control) | **0 deltas in 816ms**, stderr `NOTE: prompt (30778 tokens) leaves no room to generate in the 16384-token lane context — request dropped.` |
+| OFF (`..._SCHED=0`) | 0 deltas in 812ms — legacy 16K arena refuses it, as pre-Stage-B |
+
+The cap16k pass is the control the first run lacked. It also gives the only
+evidence for Resolved-ambiguity 6: the refusal IS visible on stderr. **Partial**,
+though — the HTTP response is still an empty 200, not an error status. If "failed
+stream" was meant to include a non-200/`error` SSE frame, that half is NOT done.
+
+### 2. No-regression A/B (warmed, one-sided bar)
+
+The first run's tps rows were invalid: post-fix, OFF's e2e short-circuits in <1s
+while ON's runs a 155s prefill, so the rows compared warm-vs-cold and printed a
+bogus 26.8% "regression". `run_pass` now issues an identical warmup before the
+tps rows. Re-measured:
+
+| B | OFF | ON | Δ |
+|---|---|---|---|
+| 1 | 84.22 | 82.35 | −2.2% |
+| 2 | 51.34 | 52.34 | +1.9% |
+| 3 | 38.55 | 40.81 | +5.9% |
+| 4 | 30.07 | 32.85 | +9.2% |
+
+**PASS.** Worst regression is −2.2%; the rest favour ON (smaller per-request
+arenas → better locality). The bar is one-sided — the summary printed `|Δ|`,
+which conflated "ON slower" with "ON faster"; fixed to report them separately.
+
+### 3. Footprint gate — PASS (unchanged)
+
+3 simultaneous 30.8K admits all stream (TTFT ~155.2s, within 3ms of each other),
+peak `footprint` **37,888 MB**. ON tps is reproducible across runs: 82.79/59.60/
+39.12/30.73 (run 1) vs 84.79/60.99/40.04/34.42 (run 2), ≤2.4% apart at B=1..3.
+
+### Still open
+
+- Resolved-ambiguities 1 and 2 in this file contradict each other (1 says flag-off
+  keeps the 16K cap, 2 says the 16384 default is gone). The code now implements
+  BOTH correctly by splitting eligibility cap from allocation size — but the prose
+  must be reconciled so the next session does not re-derive the same bug.
+- The oversized-prompt HTTP surface (empty 200 vs a real error) per item 6 above.
