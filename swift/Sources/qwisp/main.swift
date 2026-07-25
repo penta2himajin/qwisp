@@ -42,8 +42,11 @@ environment:
                                      bit-exact with single-stream — opt-in)
   QWISP_LANES=<B>                    serve only: lane batching with B raw-engine lanes
                                      (parallel sub-agent fan-out; resident ≥32GB, greedy-only,
-                                     BIT-EXACT with single-stream — opt-in). Per-lane context
-                                     capped by QWISP_LANE_CTX (default 16384)
+                                     BIT-EXACT with single-stream — opt-in). Per-lane arena is
+                                     ctx-adaptive (sized per request, up to the model context);
+                                     QWISP_LANE_CTX=<N> overrides the eligibility cap lower.
+                                     QWISP_LANE_GEN_MAX/QWISP_LANE_KV_MB tune the gen-length cap
+                                     and the aggregate lane KV byte budget
 
 first run: `qwisp pull` downloads ~20GB. The first chat/serve request loads the model, and
 on <32GB machines runs a one-time bolt calibration (a few minutes; progress goes to stderr).
@@ -75,7 +78,7 @@ case "serve":
     } else if let ls = Int(ProcessInfo.processInfo.environment["QWISP_LANES"] ?? ""), ls >= 2 {
         // Lane batching (parallel sub-agent fan-out, opt-in): raw-engine lanes on the
         // continuous scheduler — bit-exact with the default serialize path, resident
-        // tier only, greedy only. Per-lane context capped by QWISP_LANE_CTX (16384).
+        // tier only, greedy only. Per-lane arena is ctx-adaptive (QWISP_LANE_CTX overrides).
         print("[qwisp serve] lane batching: B=\(ls) lanes (raw engine, greedy, bit-exact; requests batch instead of queueing)")
         backend = try LaneBackend(modelDir: model, slots: ls)
         batchMode = true

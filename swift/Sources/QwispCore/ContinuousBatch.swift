@@ -51,6 +51,18 @@ public protocol BatchSlots: AnyObject {
     func step(last: [Int32?]) -> [Int?]
     /// Slot finished — drop its per-slot state so the next admit starts clean.
     func release(slot: Int)
+    /// Ctx-adaptive resumable prefill (WS-B Stage B, notes/22): the 3-arg `admitStep`
+    /// plus `seqBudget` = the arena size this request needs (prompt + 1 + gen budget).
+    /// `seqBudget == 0` is the LEGACY SENTINEL — size the arena at the init-time fixed
+    /// cap, exactly today's behavior. The default extension forwards to the 3-arg
+    /// (ignoring seqBudget) so ContinuousBatchEngine/BatchBackend and the MLX path stay
+    /// untouched — only LaneBatchSlots overrides to size the arena per admit.
+    func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int, seqBudget: Int) -> AdmitProgress
+    /// Aggregate memory gate (WS-B Stage B, the PR #135 collapse guard): can a request
+    /// needing `seqBudget` arena tokens be admitted right now without blowing the lane KV
+    /// budget? Default `true` — non-lane engines (ContinuousBatchEngine) are unbounded as
+    /// before. LaneBatchSlots returns whether the aggregate arena fits its byte budget.
+    func canAdmit(promptLen: Int, seqBudget: Int) -> Bool
 }
 
 public extension BatchSlots {
@@ -62,6 +74,15 @@ public extension BatchSlots {
         guard let t = admit(prompt: prompt, slot: slot) else { return .failed }
         return .done(firstToken: t, consumed: prompt.count)
     }
+    /// Default for engines that don't do ctx-adaptive arena sizing (WS-B Stage B): drop
+    /// `seqBudget` and forward to the 3-arg admitStep. Keeps ContinuousBatchEngine/BatchBackend
+    /// byte-untouched — they inherit this and never override it; only LaneBatchSlots overrides.
+    func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int, seqBudget: Int) -> AdmitProgress {
+        admitStep(prompt: prompt, slot: slot, tokenBudget: tokenBudget)
+    }
+    /// Default memory gate: unbounded (WS-B Stage B). MLX engines admit freely as before;
+    /// only LaneBatchSlots overrides with its aggregate KV-byte budget.
+    func canAdmit(promptLen: Int, seqBudget: Int) -> Bool { true }
 }
 
 // ── Scheduler (pure logic; GPU only through BatchSlots) ───────────────────────
@@ -189,6 +210,12 @@ public final class ContinuousScheduler {
         let B = slots.slotCount
         var owned = Set(pending.map { $0.slot })
         for b in 0 ..< B where active[b] == nil && !owned.contains(b) && !queue.isEmpty {
+            // WS-B Stage B (notes/22): the aggregate KV-budget gate (PR #135 collapse guard).
+            // Peek the queue head — if it can't fit yet, stop admitting entirely this round
+            // (head-of-line FCFS wait), never skip ahead to a smaller item behind it.
+            let head = queue.first!
+            guard slots.canAdmit(promptLen: head.prompt.count,
+                                 seqBudget: head.prompt.count + 1 + head.maxTokens) else { break }
             let req = queue.removeFirst()
             guard req.maxTokens > 0 else { req.finish(); continue }   // 0-token request: instant no-op
             pending.append(Pend(req: req, pos: 0, slot: b))
@@ -200,7 +227,8 @@ public final class ContinuousScheduler {
         var toActivate: [(slot: Int, req: Request, first: Int)] = []
         for p in pending {
             guard pool > 0 else { stillPending.append(p); continue }
-            switch slots.admitStep(prompt: p.req.prompt, slot: p.slot, tokenBudget: pool) {
+            let seqBudget = p.req.prompt.count + 1 + p.req.maxTokens
+            switch slots.admitStep(prompt: p.req.prompt, slot: p.slot, tokenBudget: pool, seqBudget: seqBudget) {
             case .failed:
                 p.req.finish(); slots.release(slot: p.slot)
             case .prefilling(let consumed):
@@ -210,7 +238,9 @@ public final class ContinuousScheduler {
                 // Debit only the real work this call did — NOT prompt.count - p.pos, which
                 // would over-charge by any prefix-cache restore credit the lane applied
                 // internally (Fable review: a 24K prompt with a 20K warm restore is ~4K of
-                // real work, not 24K).
+                // real work, not 24K). Grant site: the #121 fan-out restore ordering (a warm
+                // request completing out of prompt-length order) is an emergent property of
+                // this ceil-grant admit + the FCFS wait above, not a separate mechanism.
                 pool -= consumed
                 toActivate.append((p.slot, p.req, first))
             }
@@ -449,6 +479,116 @@ public final class ContinuousScheduler {
         }
         boundaryOK = boundaryOK && cum == plen4
         result.append(("chunk_boundary_respected", boundaryOK))
+
+        return result
+    }
+
+    // ── WS-B Stage B: aggregate memory gate (lane KV budget, notes/22) ────────────
+    /// Locked self-check (COMPTEST `lanemem_*`, no GPU, no model): the budgeted scheduler
+    /// consults `canAdmit` before admitting a queue head and threads `seqBudget` through the
+    /// 4-arg `admitStep`. Distinct from the Stage A fake: this `MemFake` models a per-slot
+    /// arena-byte budget (`bytesPerToken = 1`, `arenaBytes[slot] = seqBudget` on a completed
+    /// admit, cleared on release) and a settable `budgetBytes`, so a small budget makes the
+    /// gate fire and a huge budget leaves scheduling untouched. Its floor-grant fake semantics
+    /// intentionally differ from the real ceil-grant `LaneBatchSlots.admitStep` (notes/22 B2.3)
+    /// — do not "fix" one to match the other.
+    public static func laneMemSelfCheck() -> [(String, Bool)] {
+        // Resumable + byte-budgeted fake. `admit()` (the 3-arg atomic path, used when the
+        // scheduler does NOT thread seqBudget) prefills atomically and logs NOTHING — so a
+        // scheduler that hasn't wired the 4-arg path yet leaves the admit log empty (RED). The
+        // real 4-arg `admitStep` advances in whole 1024 chunks, records `seqBudget` per call,
+        // and commits `arenaBytes` on completion; `canAdmit` gates on the aggregate.
+        final class MemFake: BatchSlots, @unchecked Sendable {
+            enum Ev: Equatable { case step(slot: Int); case admit(slot: Int, seqBudget: Int, consumed: Int) }
+            let slotCount: Int
+            let chunk = 1024
+            var budgetBytes: Int                 // settable aggregate KV budget (bytesPerToken = 1)
+            var pos: [Int]                        // per-slot resume position
+            var arenaBytes: [Int]                 // per-slot committed arena (0 = free)
+            var log: [Ev] = []
+            init(slots: Int, budgetBytes: Int) {
+                self.slotCount = slots
+                self.budgetBytes = budgetBytes
+                self.pos = Array(repeating: 0, count: slots)
+                self.arenaBytes = Array(repeating: 0, count: slots)
+            }
+            func admit(prompt: [Int32], slot: Int) -> Int? {   // 3-arg atomic path: NO admit log
+                guard slot >= 0, slot < slotCount, !prompt.isEmpty else { return nil }
+                pos[slot] = prompt.count
+                return Int((prompt.first ?? 0) + 1)
+            }
+            func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int, seqBudget: Int) -> AdmitProgress {
+                guard slot >= 0, slot < slotCount, !prompt.isEmpty else { return .failed }
+                let first = Int((prompt.first ?? 0) + 1)
+                let remaining = prompt.count - pos[slot]
+                if remaining <= 0 { arenaBytes[slot] = seqBudget; return .done(firstToken: first, consumed: 0) }
+                let affordable = Swift.max(1, tokenBudget / chunk) * chunk   // ≥1 whole chunk
+                let consumed = Swift.min(affordable, remaining)
+                pos[slot] += consumed
+                log.append(.admit(slot: slot, seqBudget: seqBudget, consumed: consumed))
+                if pos[slot] >= prompt.count { arenaBytes[slot] = seqBudget; return .done(firstToken: first, consumed: consumed) }
+                return .prefilling(consumed: consumed)
+            }
+            func canAdmit(promptLen: Int, seqBudget: Int) -> Bool {
+                arenaBytes.reduce(0, +) + seqBudget <= budgetBytes
+            }
+            func step(last: [Int32?]) -> [Int?] {
+                var out: [Int?] = Array(repeating: nil, count: slotCount)
+                for s in 0 ..< slotCount where last[s] != nil { log.append(.step(slot: s)); out[s] = Int(last[s]!) + 1 }
+                return out
+            }
+            func release(slot: Int) { if slot >= 0, slot < slotCount { pos[slot] = 0; arenaBytes[slot] = 0 } }
+        }
+        /// Ordered list of `seqBudget`s in the admit log (one per completed small-prompt admit).
+        func admitOrder(_ log: [MemFake.Ev]) -> [Int] {
+            log.compactMap { if case let .admit(_, sb, _) = $0 { return sb }; return nil }
+        }
+        var result: [(String, Bool)] = []
+
+        // 5. head_of_line_wait: job0 (small, long-running, budget-heavy) + jobX (small, short)
+        //    both admit round 1; when jobX frees its slot, the queue head job1 STILL can't fit
+        //    alongside the running job0 → the gate blocks it and job2 must NOT jump ahead
+        //    (FCFS). Only after job0 releases does job1 admit, then job2. bytesPerToken = 1 so
+        //    seqBudget == prompt+1+maxTokens is the byte cost.
+        //      job0 = 30+1+40 = 71 ; jobX = 5+1+3 = 9 ; job1(head) = 20+1+40 = 61 ; job2 = 7+1+4 = 12
+        //      budget 100: 71+9=80 ✓ (round-1 pair) ; 71+61=132 ✗ (job1 blocked) ; 61 alone ✓.
+        let f5 = MemFake(slots: 2, budgetBytes: 100)
+        _ = ContinuousScheduler(slots: f5, tokenBudget: 2048).runToCompletion([
+            SchedJob(prompt: Array(repeating: 1, count: 30), maxTokens: 40, stop: []),   // job0
+            SchedJob(prompt: Array(repeating: 2, count: 5),  maxTokens: 3,  stop: []),   // jobX
+            SchedJob(prompt: Array(repeating: 3, count: 20), maxTokens: 40, stop: []),   // job1 (head)
+            SchedJob(prompt: Array(repeating: 4, count: 7),  maxTokens: 4,  stop: []),   // job2
+        ])
+        // FCFS + head-of-line wait: admits land in the exact order [job0, jobX, job1, job2];
+        // job1 (61) admits only after job0/jobX free budget, and job2 (12) never jumps ahead.
+        result.append(("head_of_line_wait", admitOrder(f5.log) == [71, 9, 61, 12]))
+
+        // 6. seqbudget_passthrough: a single budgeted-path admit records seqBudget exactly
+        //    equal to prompt.count + 1 + maxTokens (50 + 1 + 10 = 61).
+        let f6 = MemFake(slots: 2, budgetBytes: 1_000_000)
+        _ = ContinuousScheduler(slots: f6, tokenBudget: 2048).runToCompletion([
+            SchedJob(prompt: Array(repeating: 5, count: 50), maxTokens: 10, stop: []),
+        ])
+        result.append(("seqbudget_passthrough", admitOrder(f6.log) == [61]))
+
+        // 7. unbounded_when_gate_default: with a huge budget the gate never fires, so a large
+        //    prompt still interleaves prefill chunks with a short job's decode (no starvation) —
+        //    proving default-budget behavior is unchanged. This case is RED until the scheduler
+        //    threads the 4-arg admitStep: the 3-arg atomic default prefills the whole prompt in
+        //    one call, so no decode step can land between chunks.
+        let f7 = MemFake(slots: 2, budgetBytes: 1_000_000)
+        let out7 = ContinuousScheduler(slots: f7, tokenBudget: 2048).runToCompletion([
+            SchedJob(prompt: Array(repeating: 7, count: 1024), maxTokens: 8, stop: []),   // slot 0 decode
+            SchedJob(prompt: Array(repeating: 9, count: 6144), maxTokens: 2, stop: []),   // slot 1 chunked prefill
+        ])
+        let admits1 = f7.log.enumerated().compactMap { (i, e) -> Int? in
+            if case .admit(1, _, _) = e { return i }; return nil
+        }
+        var interleaved7 = admits1.count >= 2 && out7.count == 2 && out7[0] == [8, 9, 10, 11, 12, 13, 14, 15]
+        for k in 1 ..< Swift.max(1, admits1.count) {
+            interleaved7 = interleaved7 && f7.log[(admits1[k - 1] + 1) ..< admits1[k]].contains(.step(slot: 0))
+        }
+        result.append(("unbounded_when_gate_default", interleaved7))
 
         return result
     }
