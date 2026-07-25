@@ -19,9 +19,10 @@ import MLX
 //     in B, so idle lanes must not ride along; rebuild cost is two tiny buffers
 //     per lane).
 //   - release = drop the lane forward (caches freed; next admit re-creates).
-//   - Greedy only, resident tier only. Sequence budget per lane =
-//     min(model context, QWISP_LANE_CTX, default 16384) — KV arena is allocated
-//     per admit at this length.
+//   - Greedy only, resident tier only. Sequence budget per lane is ctx-adaptive
+//     (WS-B Stage B, notes/22): sized per admit from the request's own prompt +
+//     gen budget (LaneBackend.sizePlan), capped by the model context /
+//     QWISP_LANE_CTX override — KV arena is allocated per admit at that length.
 public final class LaneBatchSlots: BatchSlots {
     let engine: SeedlessEngine
     let driver: SeedlessFusedVerify.SeedlessFusedForward
@@ -39,9 +40,28 @@ public final class LaneBatchSlots: BatchSlots {
         let chunkSize: Int
         let plan: LaneAdmitPlan
         var pos: Int
+        // Only ever read within the SAME admitStep call that sets it (the final chunk reaching
+        // prompt.count, right before the first-token argmax) — a paused/resumed prefill never
+        // consumes a stale value across the pause boundary.
         var lastNormed: MLXArray?
     }
     private var prefills: [Prefill?]
+    /// WS-B Stage B (notes/22): aggregate lane KV-byte budget (the PR #135 collapse guard).
+    /// `arenaBytes[slot]` is set once the slot's arena is actually allocated (makeLane
+    /// succeeds — ceil-grant, unlike the self-check fake's floor-grant, see canAdmit below)
+    /// and cleared on release.
+    let kvBudgetBytes: Int
+    private var arenaBytes: [Int]
+    /// WS-B Stage B hardening: same-round TOCTOU guard. The scheduler's admission loop can
+    /// call `canAdmit` for MULTIPLE free slots within a single `budgetedStep()` pass, before
+    /// any of those candidates' `admitStep` has actually run — so `arenaBytes` alone is stale
+    /// for the 2nd+ peek in that pass (each would see the same pre-round `committed` total,
+    /// letting several individually-fitting big admits blow the aggregate budget together —
+    /// exactly the concurrent-burst collapse this gate exists to stop). `reservedBytes` holds
+    /// the running total of `canAdmit`-approved-but-not-yet-committed candidates; `admitStep`
+    /// releases a candidate's hold (symmetric subtract, same formula) the moment it starts
+    /// first-call setup for it, whether that setup succeeds or fails.
+    private var reservedBytes: Int = 0
     private var batch: SeedlessLaneBatch? = nil
     private var batchLanes: [ObjectIdentifier] = []   // active-set key for rebuild
     // #121 prefix-cache-aware admission: cross-request decode states (persistentStateData
@@ -57,15 +77,17 @@ public final class LaneBatchSlots: BatchSlots {
     /// Gate observability (mirrors SeedlessBackend.prefixRAMHits): warm restores this process.
     public private(set) var restoreHits = 0
 
-    public init?(store: WeightStore, slots: Int, maxSeqLen: Int) {
+    public init?(store: WeightStore, slots: Int, maxSeqLen: Int, kvBudgetBytes: Int) {
         self.engine = SeedlessEngine.build(store: store)
         // Driver = weights + M=slots scratch; its own caches are never advanced.
         guard let (drv, _) = engine.makeFused(maxM: Swift.max(8, slots), maxSeqLen: 8) else { return nil }
         self.driver = drv
         self.slotCount = slots
         self.maxSeqLen = maxSeqLen
+        self.kvBudgetBytes = kvBudgetBytes
         self.lanes = Array(repeating: nil, count: slots)
         self.prefills = Array(repeating: nil, count: slots)
+        self.arenaBytes = Array(repeating: 0, count: slots)
         // One knob: QWISP_LANE_PREFIX_MB total budget (default 3072, resident tier) —
         // 1/3 recurrence tier, 2/3 conversation tier. 0 disables.
         let mb = Swift.max(0, Tell.envInt("QWISP_LANE_PREFIX_MB", 3072))
@@ -133,13 +155,40 @@ public final class LaneBatchSlots: BatchSlots {
         ]
     }
 
+    /// Pure self-check (no GPU, no model): WS-B Stage B ctx-adaptive sizing policy
+    /// (`LaneBackend.sizePlan`). `oversized` must be computed from headroom ≤ 0 BEFORE
+    /// `cachedGenBudget` (whose `max(1, …)` floor never signals "too big"); the genBudget
+    /// reuses `SeedlessBackend.cachedGenBudget` verbatim (notes/22 fact 3).
+    public static func lanesizeSelfCheck() -> [(String, Bool)] {
+        // 1. unset maxTokens (until-EOS): a 35K prompt in a 262K ctx admits with the gen cap.
+        let p1 = LaneBackend.sizePlan(promptLen: 35_000, maxTokens: -1, ctxMax: 262_144, genCap: 16_384)
+        let c1 = !p1.oversized && p1.genBudget == 16_384 && p1.seqBudget == 35_000 + 1 + 16_384
+        // 2. explicit maxTokens capped by the gen cap; expected genBudget via the real function.
+        let ceiling2 = Swift.min(100_000, 32_768 - 1_000 - 1)
+        let expect2 = SeedlessBackend.cachedGenBudget(promptLen: 1_000, ceiling: ceiling2, arenaMax: 32_768, genCap: 16_384)
+        let p2 = LaneBackend.sizePlan(promptLen: 1_000, maxTokens: 100_000, ctxMax: 32_768, genCap: 16_384)
+        let c2 = !p2.oversized && p2.genBudget == expect2
+        // 3. prompt ≥ ctx: headroom ≤ 0 → oversized (must NOT be masked by the genBudget floor).
+        let p3 = LaneBackend.sizePlan(promptLen: 40_000, maxTokens: -1, ctxMax: 32_768, genCap: 16_384)
+        let c3 = p3.oversized == true
+        // 4. legacy shape: seqBudget is exactly prompt + 1 + genBudget.
+        let p4 = LaneBackend.sizePlan(promptLen: 100, maxTokens: 50, ctxMax: 8_192, genCap: 16_384)
+        let c4 = !p4.oversized && p4.seqBudget == 100 + 1 + p4.genBudget
+        return [
+            ("unset_maxtokens", c1),
+            ("explicit_capped", c2),
+            ("prompt_too_big", c3),
+            ("legacy_shape", c4),
+        ]
+    }
+
     /// Fresh lane forward with the canonical hybrid wiring (same trios as TellRuntime's
     /// hybrid setup). maxM 1024 = the canonical steel-hybrid prefill chunk (the shipped
     /// serialize path prefills hybrid@1024; the canonical greedy stream is defined WITH
     /// it — raw chunked prefill produces the pre-hybrid stream and diverges ~100 tokens
     /// in on f16 near-ties). Costs ~200MB scratch per active lane, resident tier.
-    private func makeLane(hybrid: Bool) -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer)? {
-        guard let (fwd, fnBuf) = engine.makeFused(maxM: 1024, maxSeqLen: maxSeqLen) else { return nil }
+    private func makeLane(hybrid: Bool, seqLen: Int) -> (SeedlessFusedVerify.SeedlessFusedForward, MTLBuffer)? {
+        guard let (fwd, fnBuf) = engine.makeFused(maxM: 1024, maxSeqLen: seqLen) else { return nil }
         if hybrid {
             var hw: [Int: (qkv: (MLXArray, MLXArray, MLXArray), z: (MLXArray, MLXArray, MLXArray), out: (MLXArray, MLXArray, MLXArray))] = [:]
             var aw: [Int: (q: (MLXArray, MLXArray, MLXArray), k: (MLXArray, MLXArray, MLXArray), v: (MLXArray, MLXArray, MLXArray), o: (MLXArray, MLXArray, MLXArray))] = [:]
@@ -164,6 +213,28 @@ public final class LaneBatchSlots: BatchSlots {
         return (fwd, fnBuf)
     }
 
+    /// WS-B Stage B (notes/22): wired KV-cache bytes per token per active lane. attn layers
+    /// only (GDN layers carry conv/rec state, not a per-token growing cache) — numKV=2,
+    /// headDim=256 are this model's fixed attention shape (same constants used throughout
+    /// the engine, e.g. QwispModel/AttentionLayer). f16 K + f16 V = 2 * 2 bytes/element.
+    func kvBytesPerToken() -> Int {
+        let numKV = 2, headDim = 256
+        return engine.layers.reduce(0) { sum, spec in
+            spec.attn != nil ? sum + numKV * headDim * 2 * 2 : sum
+        }
+    }
+
+    /// WS-B Stage B aggregate memory gate (the PR #135 collapse guard): can a request needing
+    /// `seqBudget` arena tokens be admitted without blowing the lane KV byte budget? Ceil-grant
+    /// against the bytes ALREADY committed by other slots' allocated arenas (see `arenaBytes`).
+    public func canAdmit(promptLen: Int, seqBudget: Int) -> Bool {
+        let committed = arenaBytes.reduce(0, +) + reservedBytes
+        let candidate = Swift.min(seqBudget, maxSeqLen) * kvBytesPerToken()
+        guard committed + candidate <= kvBudgetBytes else { return false }
+        reservedBytes += candidate   // hold until this candidate's admitStep resolves it
+        return true
+    }
+
     /// Atomic prefill (thin wrapper, WS-B Stage A): drive `admitStep` to completion with
     /// an effectively-unbounded budget — one call, same result as the old atomic loop.
     public func admit(prompt: [Int32], slot: Int) -> Int? {
@@ -176,20 +247,51 @@ public final class LaneBatchSlots: BatchSlots {
         }
     }
 
-    /// Resumable prefill (WS-B Stage A, notes/21): advances `slot`'s prefill by at most
-    /// `tokenBudget` tokens, always by ≥1 legal chunk (forward-progress guarantee — see
-    /// the `!first` guard below), pausing only at the same internal chunk / `captureAt`
-    /// boundaries the old atomic loop would stop at. Setup (restore-plan lookup + lane
-    /// creation) happens once per admission, on the first call for a slot.
+    /// Legacy 3-arg entry point: size the arena at the init-time fixed cap (`seqBudget: 0` is
+    /// the LEGACY SENTINEL, not oversized/invalid — WS-B Stage B, notes/22).
     public func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int) -> AdmitProgress {
-        guard slot >= 0, slot < slotCount, !prompt.isEmpty, prompt.count < maxSeqLen else { return .failed }
+        admitStep(prompt: prompt, slot: slot, tokenBudget: tokenBudget, seqBudget: 0)
+    }
+
+    /// Resumable, ctx-adaptive prefill (WS-B Stage A notes/21 + Stage B notes/22): advances
+    /// `slot`'s prefill by at most `tokenBudget` tokens, always by ≥1 legal chunk
+    /// (forward-progress guarantee — see the `!first` guard below), pausing only at the same
+    /// internal chunk / `captureAt` boundaries the old atomic loop would stop at. Setup
+    /// (arena sizing + restore-plan lookup + lane creation) happens once per admission, on the
+    /// first call for a slot; `seqBudget` (the caller's `sizePlan` result) sizes THIS lane's
+    /// arena, clamped to `maxSeqLen` (now the model-context ELIGIBILITY cap, not the allocation
+    /// size) — `0` reuses `maxSeqLen` verbatim (legacy shape, unchanged behavior).
+    public func admitStep(prompt: [Int32], slot: Int, tokenBudget: Int, seqBudget: Int) -> AdmitProgress {
+        guard slot >= 0, slot < slotCount, !prompt.isEmpty else { return .failed }
         var st: Prefill
         if let existing = prefills[slot] {
             st = existing
         } else {
+            var seqLen = seqBudget > 0 ? Swift.min(seqBudget, maxSeqLen) : maxSeqLen
+            // Release this candidate's canAdmit hold (same formula, symmetric) now that its
+            // first-call setup is actually starting — regardless of whether setup goes on to
+            // succeed or fail below, the reservation is resolved either way. seqBudget == 0
+            // (legacy sentinel / the 3-arg atomic path) never went through canAdmit, so nothing
+            // to release.
+            if seqBudget > 0 {
+                reservedBytes = Swift.max(0, reservedBytes - seqLen * kvBytesPerToken())
+            }
+            guard prompt.count < seqLen else { return .failed }
+            // Clamp-to-fit: this single request's own arena alone exceeds the aggregate KV
+            // budget — shrink it to what fits rather than refusing outright. Only fails if even
+            // the clamped arena can't hold the prompt plus ≥1 generated token.
+            let perTok = kvBytesPerToken()
+            if perTok > 0, seqLen * perTok > kvBudgetBytes {
+                seqLen = kvBudgetBytes / perTok
+                guard seqLen >= prompt.count + 2 else {
+                    FileHandle.standardError.write(Data(
+                        "[qwisp] NOTE: lane admit dropped — prompt (\(prompt.count) tokens) doesn't fit the lane KV budget (\(kvBudgetBytes) bytes) even after clamping.\n".utf8))
+                    return .failed
+                }
+            }
             let hybrid = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
             let chunkSize = hybrid ? 1024 : 64
-            guard var (fwd, fnBuf) = makeLane(hybrid: hybrid) else { return .failed }
+            guard var (fwd, fnBuf) = makeLane(hybrid: hybrid, seqLen: seqLen) else { return .failed }
             // #121: restore the longest cached prefix, prefill only the delta.
             // Default ON; QWISP_LANE_PREFIX=0 (or _MB=0) opts out. dropLast ⇒ a hit never
             // swallows the whole prompt (the last position is always recomputed for the
@@ -212,12 +314,17 @@ public final class LaneBatchSlots: BatchSlots {
                     } else {
                         // Shape/format mismatch half-writes the arena — this lane is unusable.
                         // Cannot happen with same-engine blobs; rebuild fresh and go cold.
-                        guard let fresh = makeLane(hybrid: hybrid) else { return .failed }
+                        guard let fresh = makeLane(hybrid: hybrid, seqLen: seqLen) else { return .failed }
                         (fwd, fnBuf) = fresh
                         plan.restoreLen = 0
                     }
                 }
             }
+            // Ceil-grant (WS-B Stage B, notes/22 B2.3): commit the arena's bytes as soon as it's
+            // actually allocated, not when the admit finally completes — the self-check's
+            // MemFake deliberately uses floor-grant (commits on .done) for a simpler test model;
+            // do not "fix" one to match the other.
+            arenaBytes[slot] = seqLen * perTok
             st = Prefill(fwd: fwd, fnBuf: fnBuf, hybrid: hybrid, chunkSize: chunkSize,
                         plan: plan, pos: plan.restoreLen, lastNormed: nil)
         }
@@ -285,6 +392,7 @@ public final class LaneBatchSlots: BatchSlots {
         guard slot >= 0, slot < slotCount else { return }
         lanes[slot] = nil
         prefills[slot] = nil   // drop an aborted mid-admission's SeedlessFusedForward
+        arenaBytes[slot] = 0   // WS-B Stage B: free this slot's KV-budget reservation
         batch = nil; batchLanes = []   // active set changed
     }
 }
@@ -297,6 +405,7 @@ public final class LaneBatchSlots: BatchSlots {
 public final class LaneBackend: LLMBackend, @unchecked Sendable {
     let scheduler: ContinuousScheduler
     let laneCtx: Int
+    let genCap: Int
     public let slots: Int
 
     public convenience init(modelDir: String, tier: SeedlessTier) throws {
@@ -310,14 +419,34 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         }
         let store = try WeightStore(modelDir: modelDir)
         store.residentAll()
-        let ctx = Swift.min(SeedlessBackend.readContextLen(modelDir),
-                            Swift.max(2048, Tell.envInt("QWISP_LANE_CTX", 16384)))
-        guard let laneSlots = LaneBatchSlots(store: store, slots: slots, maxSeqLen: ctx) else {
+        // WS-B Stage B (notes/22): QWISP_LANE_CTX is an OVERRIDE-only knob now — unset means
+        // "use the full model context" (ctx-adaptive sizing below decides the real per-request
+        // arena), explicit means "never exceed this, even if the model context is larger".
+        // Tell.envInt's default-fallback can't distinguish unset-vs-explicit, so this one read
+        // goes straight through ProcessInfo. All three env reads for this backend live ONLY
+        // here — never inside ContinuousScheduler or LaneBatchSlots — so their self-checks stay
+        // deterministic.
+        let modelCtx = SeedlessBackend.readContextLen(modelDir)
+        let ctx: Int
+        if let raw = ProcessInfo.processInfo.environment["QWISP_LANE_CTX"], let explicit = Int(raw) {
+            ctx = Swift.min(modelCtx, Swift.max(2048, explicit))
+        } else {
+            ctx = modelCtx
+        }
+        let genCap = Swift.max(1024, Tell.envInt("QWISP_LANE_GEN_MAX", 16384))
+        // KV budget: the PR #135 collapse guard (aggregate lane arenas can otherwise blow past
+        // wired memory on large-context concurrent admits). 8GB default on ≥48GB boxes, 4GB
+        // below — plenty of headroom either way once resident expert weights are accounted for.
+        let kvBudgetBytes = Tell.envInt("QWISP_LANE_KV_MB",
+            DeviceCalibration.physicalRAMGB() >= 48 ? 8192 : 4096) * 1_048_576
+        guard let laneSlots = LaneBatchSlots(store: store, slots: slots, maxSeqLen: ctx,
+                                             kvBudgetBytes: kvBudgetBytes) else {
             throw NSError(domain: "qwisp", code: 7, userInfo: [NSLocalizedDescriptionKey:
                 "lane batching: engine build failed"])
         }
         self.slots = slots
         self.laneCtx = ctx
+        self.genCap = genCap
         // WS-B Stage A (notes/21): token-budget admission scheduler. Default ON as of the
         // GO-bar bench (notes/21 "Bench verification results", 2026-07-25): a 24K-token
         // concurrent admit's worst-case stall on another lane's decode stream drops from
@@ -330,9 +459,29 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
     }
 
+    /// Ctx-adaptive sizing policy (WS-B Stage B, notes/22 Contract B1): from a request's
+    /// prompt length and requested maxTokens, decide the per-admit gen budget and the arena
+    /// size (seqBudget). `oversized` = the prompt leaves no room for even one generated token
+    /// (headroom ≤ 0); the caller must check it FIRST and never submit — the `cachedGenBudget`
+    /// floor of `max(1, …)` would otherwise silently succeed (notes/22 Subtlety 1).
+    public static func sizePlan(promptLen: Int, maxTokens: Int, ctxMax: Int, genCap: Int)
+        -> (genBudget: Int, seqBudget: Int, oversized: Bool) {
+        let headroom = ctxMax - promptLen - 1
+        guard headroom > 0 else { return (genBudget: 0, seqBudget: 0, oversized: true) }
+        let ceiling = maxTokens < 0 ? headroom : Swift.min(maxTokens, headroom)
+        let genBudget = SeedlessBackend.cachedGenBudget(promptLen: promptLen, ceiling: ceiling,
+                                                         arenaMax: ctxMax, genCap: genCap)
+        return (genBudget: genBudget, seqBudget: promptLen + 1 + genBudget, oversized: false)
+    }
+
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
-        let headroom = Swift.max(0, laneCtx - prompt.count - 1)
-        let ceiling = options.maxTokens < 0 ? headroom : Swift.min(options.maxTokens, headroom)
-        return scheduler.submit(prompt: prompt, maxTokens: ceiling, stopIds: options.stopTokens)
+        let plan = LaneBackend.sizePlan(promptLen: prompt.count, maxTokens: options.maxTokens,
+                                        ctxMax: laneCtx, genCap: genCap)
+        guard !plan.oversized else {
+            FileHandle.standardError.write(Data(
+                "[qwisp] NOTE: prompt (\(prompt.count) tokens) leaves no room to generate in the \(laneCtx)-token lane context — request dropped.\n".utf8))
+            return AsyncStream { $0.finish() }
+        }
+        return scheduler.submit(prompt: prompt, maxTokens: plan.genBudget, stopIds: options.stopTokens)
     }
 }

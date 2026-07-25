@@ -141,6 +141,12 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // token-budget admission scheduler (WS-B Stage A; pure logic over a scripted fake).
     for (name, ok) in ContinuousScheduler.tokenBudgetSelfCheck() { check("tokenbudget_\(name)", ok) }
 
+    // ctx-adaptive lane sizing (WS-B Stage B; pure sizing policy, no GPU).
+    for (name, ok) in LaneBatchSlots.lanesizeSelfCheck() { check("lanesize_\(name)", ok) }
+
+    // aggregate lane memory gate (WS-B Stage B; pure scheduler logic over a byte-budgeted fake).
+    for (name, ok) in ContinuousScheduler.laneMemSelfCheck() { check("lanemem_\(name)", ok) }
+
     // incremental detokenizer (server O(n²) fix; pure fake byte-level tokenizer).
     for (name, ok) in StreamDetok.selfCheck() { check("detok_\(name)", ok) }
 
