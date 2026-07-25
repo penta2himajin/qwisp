@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 92
+        let total = 96
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -5775,6 +5775,195 @@ public enum SeedlessVerifyTests {
                 tok = Int32(got[0])
             }
             return (true, "ok")
+        }
+
+        // ── WS-A #137: sdpa_prefill_mma locked tests (notes/20 §Locked tests) ──
+        // WRITE-LOCKED (guarded by total = 96). Do not weaken/skip/delete.
+        // The MMA attention-prefill kernel is ADDITIVE (behind QWISP_ATTN_MMA_PREFILL,
+        // default OFF). These four tests call sdpaPrefillMma directly (unit level,
+        // GPU, no model). Bit-exactness to sdpa_rows is NOT required; what is locked
+        // is determinism + chunk-composition invariance + causal/pad zero-influence +
+        // numeric sanity vs a float64 CPU reference. RED until the kernel is real.
+
+        // Shared config: H=16, KV=2, D=256 → gqa_factor=8 (matches the model's attn).
+        let mH = 16, mKV = 2, mD = 256
+        let mScale = Float(pow(Double(mD), -0.5))
+
+        // Test 93: mma_prefill_determinism — same inputs twice → bit-identical out.
+        // M=33, baseN=277: both deliberately non-multiples of the TQ=16/TK=32 tiles,
+        // so partial tiles are exercised and any tile-placement nondeterminism shows.
+        run("mma_prefill_determinism") {
+            let M = 33, baseN = 277
+            let totalSeq = baseN + M - 1
+            let q     = MLXRandom.normal([M * mH, mD]).asType(.float16)
+            let kFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            let vFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            MLX.eval([q, kFull, vFull])
+            guard let a = SeedlessMetalForward.sdpaPrefillMma(q, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale),
+                  let b = SeedlessMetalForward.sdpaPrefillMma(q, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented") }
+            MLX.eval([a, b])
+            return bitEqual(a, b)
+        }
+
+        // Test 94: mma_prefill_composition_invariant — one M=33 call vs two split
+        // calls (M=16 at baseN, M=17 at baseN+16) → per-row bit-identical. Row m's
+        // bits must depend only on (q_m, KV prefix length N_m), never on M or on the
+        // chunk/tile the row lands in. K/V is the SAME buffer, sliced to each call's
+        // prefix (mirrors sdpa_rows_bitexact's KV slicing).
+        run("mma_prefill_composition_invariant") {
+            let baseN = 277
+            let M1 = 16, M2 = 17, M = M1 + M2          // 33
+            let totalSeq = baseN + M - 1                // 309
+            let q     = MLXRandom.normal([M * mH, mD]).asType(.float16)
+            let kFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            let vFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            MLX.eval([q, kFull, vFull])
+            // Whole: rows 0..32 in one call.
+            guard let whole = SeedlessMetalForward.sdpaPrefillMma(q, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented (whole)") }
+            whole.eval()
+            // Split 1: rows 0..15, baseN=277, needs prefix up to 277+15=292.
+            let s1 = baseN + M1 - 1
+            let q1 = q[0 ..< M1 * mH]
+            let k1 = kFull[0..., 0 ..< s1]
+            let v1 = vFull[0..., 0 ..< s1]
+            MLX.eval([q1, k1, v1])
+            guard let p1 = SeedlessMetalForward.sdpaPrefillMma(q1, k1, v1,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M1, scale: mScale)
+            else { return (false, "not implemented (split1)") }
+            // Split 2: rows 16..32, baseN=277+16=293, needs prefix up to 293+16=309.
+            let q2 = q[M1 * mH ..< M * mH]
+            guard let p2 = SeedlessMetalForward.sdpaPrefillMma(q2, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN + M1, M: M2, scale: mScale)
+            else { return (false, "not implemented (split2)") }
+            let split = MLX.concatenated([p1, p2], axis: 0); split.eval()   // [M*H, D]
+            return bitEqual(split, whole)
+        }
+
+        // Test 95: mma_prefill_causal_and_pad — causal-masked positions and padding
+        // rows have ZERO bit influence.
+        // (a) mutate k/v at positions ≥ N_0 (= baseN) → row 0 bits unchanged (row 0
+        //     attends only [0, baseN); the mutated tail is fully masked for it).
+        // (b) append NaN/garbage q rows past M (a full extra TQ tile) with M unchanged
+        //     → the M real rows are unchanged (pad content is irrelevant).
+        run("mma_prefill_causal_and_pad") {
+            let M = 33, baseN = 277
+            let totalSeq = baseN + M - 1               // 309
+            let q     = MLXRandom.normal([M * mH, mD]).asType(.float16)
+            let kFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            let vFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            MLX.eval([q, kFull, vFull])
+            guard let base = SeedlessMetalForward.sdpaPrefillMma(q, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented (base)") }
+            base.eval()
+            let row0Base = base[0 ..< mH]; row0Base.eval()   // [H, D]
+
+            // (a) Overwrite the causal tail [baseN, totalSeq) of k/v with fresh noise.
+            let tailLen = totalSeq - baseN            // 32 = M-1
+            let kTail = MLXRandom.normal([mKV, tailLen, mD]).asType(.float16)
+            let vTail = MLXRandom.normal([mKV, tailLen, mD]).asType(.float16)
+            let kMut = MLX.concatenated([kFull[0..., 0 ..< baseN], kTail], axis: 1)
+            let vMut = MLX.concatenated([vFull[0..., 0 ..< baseN], vTail], axis: 1)
+            MLX.eval([kMut, vMut])
+            guard let mut = SeedlessMetalForward.sdpaPrefillMma(q, kMut, vMut,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented (mut)") }
+            mut.eval()
+            let row0Mut = mut[0 ..< mH]; row0Mut.eval()
+            let (okA, dA) = bitEqual(row0Mut, row0Base)
+            if !okA { return (false, "causal(a) row0 changed: \(dA)") }
+
+            // (b) Pad q with a full extra TQ=16 tile of NaN rows; keep M=33.
+            let padRows = 16
+            let nanPad = MLXArray(Array(repeating: Float.nan, count: padRows * mH * mD),
+                                  [padRows * mH, mD]).asType(.float16)
+            let qPadded = MLX.concatenated([q, nanPad], axis: 0); qPadded.eval()  // [(M+16)*H, D]
+            guard let padded = SeedlessMetalForward.sdpaPrefillMma(qPadded, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented (pad)") }
+            padded.eval()
+            let (okB, dB) = bitEqual(padded, base)   // both [M*H, D]
+            if !okB { return (false, "pad(b) real rows changed: \(dB)") }
+            return (true, "ok")
+        }
+
+        // Test 96: mma_prefill_reference_sanity — vs float64 CPU reference.
+        // M=8, baseN=300 → N ≤ 307 ≤ 512. Two guards: (1) max|Δ| ≤ 2e-2 on the half
+        // outputs; (2) argmax over a fixed random [D→P] projection agrees on ≥99% of
+        // the M*H rows (catches sign / off-by-one / head-mixup bugs tolerance misses).
+        run("mma_prefill_reference_sanity") {
+            let M = 8, baseN = 300
+            let totalSeq = baseN + M - 1              // 307 (≤512)
+            let gqa = mH / mKV
+            let q     = MLXRandom.normal([M * mH, mD]).asType(.float16)
+            let kFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            let vFull = MLXRandom.normal([mKV, totalSeq, mD]).asType(.float16)
+            MLX.eval([q, kFull, vFull])
+            guard let got = SeedlessMetalForward.sdpaPrefillMma(q, kFull, vFull,
+                          H: mH, KV: mKV, D: mD, baseLen: baseN, M: M, scale: mScale)
+            else { return (false, "not implemented") }
+            got.eval()
+
+            // float64 CPU reference (read as Float32, accumulate in Double).
+            let qA = q.asType(.float32).asArray(Float.self)
+            let kA = kFull.asType(.float32).asArray(Float.self)   // [KV, totalSeq, D]
+            let vA = vFull.asType(.float32).asArray(Float.self)
+            let sc = Double(mScale)
+            var ref = [Float](repeating: 0, count: M * mH * mD)
+            for m in 0 ..< M {
+                let N = baseN + m
+                for h in 0 ..< mH {
+                    let kvh = h / gqa
+                    let qBase = (m * mH + h) * mD
+                    // scores over j in [0, N); online-free two-pass softmax in Double.
+                    var scores = [Double](repeating: 0, count: N)
+                    var maxS = -Double.infinity
+                    for j in 0 ..< N {
+                        let kBase = (kvh * totalSeq + j) * mD
+                        var s = 0.0
+                        for d in 0 ..< mD { s += Double(qA[qBase + d]) * Double(kA[kBase + d]) }
+                        s *= sc
+                        scores[j] = s
+                        if s > maxS { maxS = s }
+                    }
+                    var sum = 0.0
+                    for j in 0 ..< N { let e = exp(scores[j] - maxS); scores[j] = e; sum += e }
+                    let inv = sum == 0 ? 0 : 1.0 / sum
+                    let oBase = (m * mH + h) * mD
+                    for d in 0 ..< mD {
+                        var acc = 0.0
+                        for j in 0 ..< N {
+                            let vBase = (kvh * totalSeq + j) * mD
+                            acc += scores[j] * Double(vA[vBase + d])
+                        }
+                        ref[oBase + d] = Float(acc * inv)
+                    }
+                }
+            }
+            // (1) max|Δ| on half outputs.
+            let gotA = got.asType(.float32).asArray(Float.self)
+            var maxAbs: Float = 0
+            for i in 0 ..< M * mH * mD { maxAbs = max(maxAbs, abs(gotA[i] - ref[i])) }
+            if maxAbs > 2e-2 { return (false, "max|Δ|=\(maxAbs) > 2e-2") }
+            // (2) argmax agreement over a fixed random [D→P] projection.
+            let P = 128
+            let proj = MLXRandom.normal([mD, P]).asType(.float32); proj.eval()
+            let refArr = MLXArray(ref, [M * mH, mD]).asType(.float32)
+            let gotArr = got.asType(.float32)
+            let refArg = MLX.argMax(MLX.matmul(refArr, proj), axis: 1)
+            let gotArg = MLX.argMax(MLX.matmul(gotArr, proj), axis: 1)
+            MLX.eval([refArg, gotArg])
+            let ra = refArg.asArray(Int32.self), ga = gotArg.asArray(Int32.self)
+            var agree = 0
+            for i in 0 ..< ra.count where ra[i] == ga[i] { agree += 1 }
+            let frac = Double(agree) / Double(ra.count)
+            if frac < 0.99 { return (false, "argmax agree \(agree)/\(ra.count) = \(frac) < 0.99") }
+            return (true, "ok maxΔ=\(maxAbs) agree=\(agree)/\(ra.count)")
         }
 
         // ── Summary ───────────────────────────────────────────────────────
