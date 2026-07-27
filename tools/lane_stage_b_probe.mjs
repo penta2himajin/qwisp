@@ -104,6 +104,39 @@ async function main() {
     }));
     return;
   }
+  if (mode === "ratchet") {
+    // Arena-size-churn probe. Hypothesis: Stage B sizes each lane arena per request,
+    // so MLX's buffer pool cannot recycle a freed arena of size X for a later request
+    // needing size Y, and the pool ratchets up (LLMBackend.swift:473-481 documents the
+    // same pool behavior on the serialize path, where it is fixed with Memory.clearCache;
+    // LaneServe's release() has no such call).
+    //   vary  = every round uses a DIFFERENT prompt size -> distinct arena sizes
+    //   fixed = every round uses the SAME prompt size    -> identical arena sizes
+    // Both use distinct prompt CONTENT so the prefix cache grows equally in each and
+    // cannot explain a difference between them.
+    const rounds = parseInt(process.argv[4] || "10", 10);
+    const shape = process.argv[5] || "vary";   // vary | fixed | fixeduniq
+    const base = parseInt(process.argv[6] || "1500", 10);
+    const conc = parseInt(process.argv[7] || "2", 10);
+    const out = [];
+    for (let r = 0; r < rounds; r++) {
+      const toks = shape === "vary" ? base + r * 1000 : base;
+      const filler = makeFiller(toks);
+      // The round marker must lead, not trail: with a trailing marker every "fixed"
+      // round shares the same long prefix and the prefix cache serves it, so the pass
+      // does almost no prefill and the vary/fixed comparison comes out confounded
+      // (observed 2026-07-25: fixed finished in 8 samples vs vary's 62).
+      // "fixeduniq" = constant SIZE, unique CONTENT -> same prefill work as vary,
+      // same arena size every round. That is the one that isolates size churn.
+      const lead = shape === "fixed" ? "" : `Session ${r}-${base}-${r * 7919 % 10007}. `;
+      const rs = await Promise.all(Array.from({ length: conc }, (_, i) =>
+        fireStream(`${lead}${filler} Round ${r} item ${i}. Reply with the round number.`, 8)));
+      out.push({ round: r, promptTokens: toks, deltas: rs.map((x) => x.deltas), ttftMs: rs.map((x) => x.ttftMs) });
+      console.error(`[ratchet] round ${r} size=${toks} done`);
+    }
+    console.log(JSON.stringify({ mode, shape, rounds, out }));
+    return;
+  }
   console.error("usage: lane_stage_b_probe.mjs e2e|tps|conc <host:port> ...");
   process.exit(2);
 }
