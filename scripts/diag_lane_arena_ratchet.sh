@@ -2,20 +2,33 @@
 # Diagnostic for the 2026-07-25 trial-server OOM (HANDOFF RED block): does the lane
 # path's per-request arena sizing ratchet MLX's buffer pool upward?
 #
-# Hypothesis: LaneServe.release() drops the lane forward but never calls
-# Memory.clearCache(). MLX keeps freed buffers pooled (LLMBackend.swift:473-481
-# documents exactly this on the serialize path, where it IS cleared: "observed
-# 2026-07-22: 39GB IOAccelerator after growth rebuilds on a 64GB box -> swap thrash,
-# prefill 1 tok/s"). Before Stage B every lane arena was the same 16384 tokens, so
-# the pool recycled perfectly. Stage B sizes each arena per request, so a freed
-# size-X buffer cannot serve a later size-Y request.
+# ORIGINAL HYPOTHESIS (DISPROVED 2026-07-27, kept for the record): that per-request
+# arena sizing ratchets MLX's buffer pool, fixable with Memory.clearCache() on lane
+# release. Both halves are wrong. Bounding MLX's pool (Memory.cacheLimit=2GB) held
+# cacheMemory at ~2,050MB and did NOT stop the growth; and the growth is not driven by
+# arena size at all.
 #
-# A/B (two fresh servers, footprint sampled throughout):
-#   vary  = prompt grows +1000 tok each round -> a DIFFERENT arena size every admit
-#   fixed = same prompt size every round      -> IDENTICAL arena sizes
-# Prompt CONTENT is distinct in both, so prefix-cache growth is common-mode and
-# cannot explain a divergence. If `vary` ratchets and `fixed` stays flat, the
-# hypothesis holds and the fix is a clearCache on lane release.
+# WHAT THIS SCRIPT ACTUALLY MEASURES (see issue #148): the retained quantity follows
+#     nonMLXmetal ~= 19,750MB + concurrency * promptLen(current round) * ~2.03MB/token
+# i.e. it tracks the PROMPT LENGTH of the round being sampled, not cumulative admissions
+# and not arena size. `vary` grows prompt and arena together, so this A/B never actually
+# isolated arena size — the two were confounded. `fixeduniq` is not "no leak"; it is the
+# same law pinned at a constant prompt length (its flat 44.1GB is exactly where `vary`
+# passes as its prompt crosses ~6,000 tokens).
+#
+# Root cause: the steel-hybrid prefill wraps per-layer MLX temporaries in noCopy
+# MTLBuffers that are autoreleased, and the decode thread's autorelease pool drains only
+# at thread exit (= the round boundary). Hence footprint SAWTOOTHS to a constant floor
+# rather than ratcheting — read the full fp.txt series, not just first/last/peak, which
+# is how this was missed initially. Fixed by draining per prefill chunk
+# (QWISP_LANE_CHUNK_POOL, default ON): peak 46,080 -> 24,576MB on the `vary` shape.
+#
+# A/B (fresh server per shape, footprint sampled throughout):
+#   vary      = prompt grows +1000 tok each round (prompt AND arena size both vary)
+#   fixeduniq = constant prompt size, unique content (equal prefill work, no prefix reuse)
+#   fixed     = constant prompt, SHARED prefix -> prefix cache serves it, almost no
+#               prefill happens. CONFOUNDED; do not quote it as a control.
+# Regression check for #148: `vary` peak footprint must stay near the floor.
 #
 # Usage: scripts/diag_lane_arena_ratchet.sh [rounds] [baseTokens] [concurrency]
 set -euo pipefail
@@ -91,8 +104,9 @@ for shape in os.environ.get("SHAPES", "vary fixed").split():
         print(f"{shape}: no samples"); continue
     print(f"{shape:>5}: first={v[0]:.0f}MB  last={v[-1]:.0f}MB  peak={max(v):.0f}MB  "
           f"growth={v[-1]-v[0]:+.0f}MB  n={len(v)}")
-print("\nIf vary grows substantially and fixed stays flat, the per-request arena size")
-print("churn is ratcheting MLX's buffer pool -> fix is Memory.clearCache() on lane release.")
+print("\n(#148) vary's peak should now sit near its floor. A returning ramp means the")
+print("per-chunk autoreleasepool drain regressed. Always read the full fp.txt series —")
+print("this summary hides the per-round sawtooth that made the bug unreadable at first.")
 EOF
 echo ""
 echo "artifacts: $OUT"
