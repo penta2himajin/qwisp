@@ -349,6 +349,17 @@ public enum SeedlessFusedVerify {
     /// When the MOE2 fold is active, encodeMoEGatherRowsRange skips the separate combine dispatch
     /// and the count stays at 0 for that block call.
     nonisolated(unsafe) public static var _combineRowsDispatchCount: Int = 0
+    /// Testable seams for the cross-layer fold (#144, same idiom as _combineRowsDispatchCount).
+    /// The fold replaces one `resid_add` + one `rmsnorm_rows` per LAYER BOUNDARY with a single
+    /// `gdn_resid_postnorm_rows`, so what a test can assert is the SUM of these two dropping by
+    /// exactly (layers - 1). Counting the pair rather than the fold kernel is deliberate: the
+    /// fold kernel is also used mid-layer for the mixer residual, so its own count is not a
+    /// clean signal. #143's P1 (a full 694/token census) is deliberately NOT attempted — it
+    /// would need a seam in ~80 encode helpers and a single miss silently under-counts; the
+    /// delta these two give is what calibrates the inventory (see #143 comment).
+    nonisolated(unsafe) public static var _residAddDispatchCount: Int = 0
+    nonisolated(unsafe) public static var _rmsNormRowsDispatchCount: Int = 0
+    nonisolated(unsafe) public static var _gdnResidPostNormRowsDispatchCount: Int = 0
     nonisolated(unsafe) static var _finalCombineRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _writeKVRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _convHistRowsPipeline: MTLComputePipelineState?
@@ -1351,6 +1362,7 @@ public enum SeedlessFusedVerify {
     static func encodeGdnResidPostNormRows(_ enc: MTLComputeCommandEncoder,
                                            h: MTLBuffer, r: MTLBuffer, w: MTLBuffer,
                                            postNorm: MTLBuffer, M: Int, H: Int, eps: Float) {
+        _gdnResidPostNormRowsDispatchCount += 1   // testable seam (#144)
         let p = _gdnResidPostNormRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(h,        offset: 0, index: 0); enc.setBuffer(r,        offset: 0, index: 1)
@@ -1947,6 +1959,7 @@ public enum SeedlessFusedVerify {
     /// weight は非 nil buffer(no-weight は ones を渡す)。promoteF32 は _rmsPipelineF32(out f32)。
     static func encodeRmsNormRows(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, w: MTLBuffer, out: MTLBuffer,
                                   rows: Int, D: Int, eps: Float, promoteF32: Bool = false) {
+        _rmsNormRowsDispatchCount += 1   // testable seam (#144)
         let p = promoteF32 ? SeedlessMetalForward._rmsPipelineF32! : SeedlessMetalForward._rmsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(w, offset: 0, index: 1); enc.setBuffer(out, offset: 0, index: 2)
@@ -3038,6 +3051,7 @@ public enum SeedlessFusedVerify {
 
     /// resid_add(既存 aux kernel, in-place h[i]+=r[i])を encode-only で提供。
     static func encodeResidAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, r: MTLBuffer, total: Int) {
+        _residAddDispatchCount += 1   // testable seam (#144)
         let p = SeedlessMetalForward._residAddPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(h, offset: 0, index: 0); enc.setBuffer(r, offset: 0, index: 1)
@@ -3084,6 +3098,27 @@ public enum SeedlessFusedVerify {
         /// flag-off で encodeGdnLayerRows は既存経路のままで byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseGDN =
             ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] != "0"
+
+        /// 層跨ぎ融合(#144): 層 i 末尾の resid_add と層 i+1 先頭の input rmsnorm を、既にこの
+        /// ファイルが持つ gdn_resid_postnorm_rows(h += r; out = rmsnorm(h, w))の 1 dispatch に
+        /// 畳む。同カーネルは同じ encodeLayer 内の mixer 側 residual で既に使われており、
+        /// 構造的に同一な 2 箇所のうち片方にだけ適用されていなかった、というのが #144。
+        /// −1 dispatch/層境界 ⇒ 40 層で −39/token。
+        /// bit-exact: 当該カーネルは residual 和を half に丸めて格納し、正規化はその格納済み
+        /// half を読み戻す(:907/:936)。分離版の resid も half 書き出し(SeedlessMetalForward:1019)
+        /// なので「レジスタ保持 vs 格納・再読込」の差が存在しない。新カーネルも演算列変更も無し。
+        /// 適用範囲は encodeLayer / encodeLayerBolt 経路のみ。chunked streaming 経路(自前で
+        /// resid→次層 encodePreMoE を並べる)は意図的に対象外＝bytes 不変。
+        /// **既定 OFF**(`QWISP_FUSE_XLAYER=1` で opt-in)。正しさは証明済みだが速度は未証明、
+        /// というのが 2026-08-01 の測定結論。実モデル 192tok × 5rep で ON median 72.04 /
+        /// OFF 70.73 tok/s だが、ON は 68.7→72.7 と単調増加・OFF は 71.3→68.9 と単調減少して
+        /// おり、アーム順序と暖機ドリフトが交絡している。アーム内変動(4.0/2.4)が主張したい差
+        /// (1.3)より大きく、別回では −0.7% と符号すら反転した。1% 級はこのハーネスの分解能外。
+        /// 測定で勝てなかったものは flag-off で出荷し再入点として残す、という WS-A の前例
+        /// (notes/20)に従う。#143 U2(serial encoder barrier に実コストがあるか)の対照ノブとして
+        /// 有用: bit 同一のまま barrier を 39 個消せる唯一の実装済みレバー。
+        nonisolated(unsafe) public static var fuseXLayer =
+            ProcessInfo.processInfo.environment["QWISP_FUSE_XLAYER"] == "1"
 
         /// attn 層融合(notes/08 §3)へ分岐。既定 ON。QWISP_FUSE_ATTN=0 で opt-out。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
@@ -3356,9 +3391,28 @@ public enum SeedlessFusedVerify {
 
         /// 1 層を encoder に encode(norm→mixer→resid→postNorm→MoE→resid)。resident/bolt 経路のみ。
         func encodeLayer(_ enc: MTLComputeCommandEncoder, _ L: Layer, li: Int, M: Int) {
-            encodePreMoE(enc, L, M: M)
+            let folded = foldPrevResid(enc, L, li: li, M: M)
+            encodePreMoE(enc, L, M: M, skipInputNorm: folded)
             SeedlessFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
+            emitOrDeferResid(enc, li: li, M: M)
+        }
+
+        /// #144 前半: 前層が持ち越した MoE residual を、この層の input norm と 1 dispatch で畳む。
+        /// `moeOut` は層共有バッファだが、同一 encoder 内は serial 実行なので前層が書いた値を
+        /// この層の encodeMoEBlockRows が上書きする前に読む順序が保証される。
+        /// 戻り値 true = `normed` を書いたので呼び出し側は input rmsnorm を出さない。
+        private func foldPrevResid(_ enc: MTLComputeCommandEncoder, _ L: Layer, li: Int, M: Int) -> Bool {
+            guard SeedlessFusedForward.fuseXLayer, li > 0 else { return false }
+            SeedlessFusedVerify.encodeGdnResidPostNormRows(enc, h: hBuf, r: moeOut, w: L.inputLN,
+                                                           postNorm: normed, M: M, H: H, eps: eps)
+            return true
+        }
+
+        /// #144 後半: 融合時は resid を次層へ持ち越す(dispatch を出さない)。最終層だけは
+        /// 持ち越し先が無いので必ず出す — ここを落とすと hBuf が最後の MoE 分だけ古くなる。
+        private func emitOrDeferResid(_ enc: MTLComputeCommandEncoder, li: Int, M: Int) {
+            guard !SeedlessFusedForward.fuseXLayer || li == layers.count - 1 else { return }
             SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
         }
 
@@ -3375,7 +3429,8 @@ public enum SeedlessFusedVerify {
 
         /// bolt 層: resident と同一だが MoE gather 前に全 inds を GPU remap する。
         func encodeLayerBolt(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, li: Int) {
-            encodePreMoE(enc, L, M: M)
+            let folded = foldPrevResid(enc, L, li: li, M: M)
+            encodePreMoE(enc, L, M: M, skipInputNorm: folded)
             var diag: (indsDst: MTLBuffer, indsOff: Int, indsCount: Int,
                        glDst: MTLBuffer, glOff: Int, glCount: Int)? = nil
             if let bufs = diagRouteBufs, M <= diagObsMaxM {
@@ -3392,15 +3447,20 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeMoEBlockRows(enc, x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                               M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H,
                                               slotTable: slotTables[li], diag: diag, bias: biasTuple)
-            SeedlessFusedVerify.encodeResidAdd(enc, h: hBuf, r: moeOut, total: M * H)
+            emitOrDeferResid(enc, li: li, M: M)
         }
 
         /// MoE 前半 encode: norm → mixer(+cache bookkeeping) → resid → postNorm。
         // useMmaPrefill: default false everywhere; ONLY forwardRowsProfiled threads the env flag
         // through so the decay bench can A/B the MMA prefill kernel (WS-A #137). The strict
         // forwardRows/verify call sites never pass it — their bytes are unchanged.
-        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, useMmaPrefill: Bool = false) {
-            SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
+        /// skipInputNorm: #144 の層跨ぎ融合が呼び出し側で既に `normed` を書いている場合のみ true。
+        /// 既定 false なので、この関数を直接呼ぶ他経路(chunked streaming の次層連結など)は不変。
+        func encodePreMoE(_ enc: MTLComputeCommandEncoder, _ L: Layer, M: Int, useMmaPrefill: Bool = false,
+                          skipInputNorm: Bool = false) {
+            if !skipInputNorm {
+                SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
+            }
             if L.isLinear, let gw = L.gdn, let gc = L.gdnCache {
                 SeedlessFusedVerify.encodeGdnLayerRows(enc, x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
                                                   M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
