@@ -422,6 +422,36 @@ public final class LaneBatchSlots: BatchSlots {
         prefills[slot] = nil   // drop an aborted mid-admission's SeedlessFusedForward
         arenaBytes[slot] = 0   // WS-B Stage B: free this slot's KV-budget reservation
         batch = nil; batchLanes = []   // active set changed
+        reportIdleMemory()
+    }
+
+    // ── #148 diagnostic: what actually retains lane memory? ───────────────────
+    // footprint alone cannot tell "MLX pooled the freed buffers" from "something still
+    // references them" — both read as growth. MLX.Memory splits them: activeMemory =
+    // live MLXArrays, cacheMemory = MLX's free-buffer pool. Sampled at a FULLY IDLE
+    // point (every lane released) so the only live MLX memory should be model residency.
+    //   QWISP_LANE_MEMDBG=1 → observe only (natural active/cache split per idle point)
+    //   QWISP_LANE_MEMDBG=2 → observe, clearCache(), observe again (the discriminating
+    //                         experiment: does the pool actually give the memory back?)
+    // Interpretation: active flat + cache ratcheting + clear drops it ⇒ allocator
+    // retention (bound Memory.cacheLimit). active ratcheting ⇒ live references, and
+    // cacheLimit is a no-op. Neither ⇒ raw MTLBuffer / CPU Data, MLX is not the holder.
+    private var memDbgIdleCount = 0
+    private func reportIdleMemory() {
+        let mode = Tell.envInt("QWISP_LANE_MEMDBG", 0)
+        guard mode > 0 else { return }
+        guard lanes.allSatisfy({ $0 == nil }), prefills.allSatisfy({ $0 == nil }) else { return }
+        memDbgIdleCount += 1
+        func mb(_ b: Int) -> String { String(format: "%.0fMB", Double(b) / 1_048_576) }
+        let before = MLX.Memory.snapshot()
+        var line = "[lane-memdbg] idle#\(memDbgIdleCount) active=\(mb(before.activeMemory))"
+            + " cache=\(mb(before.cacheMemory)) peak=\(mb(before.peakMemory))"
+        if mode >= 2 {
+            MLX.Memory.clearCache()
+            let after = MLX.Memory.snapshot()
+            line += " | after clearCache: active=\(mb(after.activeMemory)) cache=\(mb(after.cacheMemory))"
+        }
+        FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
 
