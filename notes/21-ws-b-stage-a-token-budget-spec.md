@@ -34,9 +34,10 @@ already-active requests on the same server.
 
 Replace `ContinuousScheduler.loop()`'s "drain queue → run each admit to
 completion → one step" sequence with a single per-iteration token budget
-(default 2048 — matches the existing hybrid chunk size and `QWISP_LANE_PREFIX`
+(originally 2048 — matches the existing hybrid chunk size and `QWISP_LANE_PREFIX`
 snapshot stride, so boundary alignment is free; tunable via
-`QWISP_TOKEN_BUDGET`):
+`QWISP_TOKEN_BUDGET`. **The default is 1024 as of 2026-08-01 — see the addendum's
+DECISION section at the end of this file.**):
 
 1. RUNNING slots (active decode) get their share first — 1 token each, up to
    `slotCount` tokens total.
@@ -289,9 +290,28 @@ while cutting the worst stall 2.5x.
    4,590ms to 3,359ms — better only because *every* stall shrinks, while more of them
    land in the sample. It is the right direction for `max` (8,328 → 4,397).
 
-### Open: default budget
+### DECISION 2026-08-01: default budget 1024 (was 2048)
 
-`QWISP_TOKEN_BUDGET` default is still 2048. 4096 is the only measured point that
-restores p90 at short L while keeping a max win over OFF; 2048 keeps the smallest max.
-Deferred to an owner decision — do not change the default on the strength of this
-addendum alone.
+`QWISP_TOKEN_BUDGET` default is now **1024** — exactly one hybrid chunk, and the floor
+the forward-progress rule (>=1 legal chunk per `admitStep`) permits, so it is the end of
+the frontier rather than a midpoint. Owner decision, rationale: minimise the worst
+single wait so the streaming lane's pacing stays predictable. This follows directly from
+adopting `max` as the SLO metric — summed stall is conserved, so the only thing the
+budget chooses is how the same ~34s is sliced, and 1024 makes the largest slice as small
+as the mechanism allows (4.5s vs OFF's 33.9s, a 7.5x reduction).
+
+**Accepted costs — record these, do not later report them as regressions:**
+- p99 ITL at L=500 goes 22ms (OFF) / 4,802ms (2048) -> **3,658ms**. More waits land
+  inside the sample: pollution 1.4% -> 2.4%. p99 is worse than 4096's 23ms.
+- Summed stall +8% vs OFF (36.9s vs 34.1s) from chunking overhead. This is TTFT paid by
+  the ADMITTING request in order to protect the already-streaming one — a deliberate
+  transfer, not a loss.
+- p90 is unchanged (13ms) at L=500 and is 3,359ms at L=45; per this addendum p90 at
+  short L is not a scheduler property and must not be used to re-open this decision.
+
+Alternatives rejected: **4096** — reproduces OFF's whole percentile profile (p99 23ms)
+while still cutting max 2.5x, the best choice if aggregate smoothness were the goal;
+rejected because it triples the worst wait (4.5s -> 13.7s) against the stated SLO.
+**2048** (previous default) — dominated at realistic L: worse max (8.5s) AND worse p99
+(4,802ms) than 4096, with no metric where it wins. **8192 / OFF** — worst-wait 23.4s /
+33.9s, the failure mode Stage A exists to remove.
