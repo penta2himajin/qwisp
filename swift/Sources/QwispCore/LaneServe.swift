@@ -364,14 +364,15 @@ public final class LaneBatchSlots: BatchSlots {
         // `first` gates the check, not the loop entry.
         var consumed = 0
         var first = true
-        while st.pos < prompt.count {
-            if !first, consumed >= tokenBudget { break }
+        // One prefill chunk. Extracted so the whole body can optionally run inside an
+        // autoreleasepool (#148 probe below) — returns false on engine error.
+        func runChunk() -> Bool {
             var end = Swift.min(st.pos + st.chunkSize, prompt.count)
             if let c = st.plan.captureAt, st.pos < c { end = Swift.min(end, c) }
             let x = engine.embed(tokens: Array(prompt[st.pos ..< end]))
             guard let normed = st.hybrid ? st.fwd.forwardRowsHybrid(x, M: end - st.pos, finalNormW: st.fnBuf)
                                           : st.fwd.forwardRows(x, M: end - st.pos, finalNormW: st.fnBuf)
-            else { prefills[slot] = nil; return .failed }
+            else { return false }
             st.lastNormed = normed[end - st.pos - 1]
             consumed += end - st.pos
             st.pos = end
@@ -381,6 +382,34 @@ public final class LaneBatchSlots: BatchSlots {
             if st.pos == st.plan.captureAt {
                 sharedStore.save(tokens: Array(prompt[0 ..< st.pos]), state: st.fwd.persistentStateData())
             }
+            return true
+        }
+        // ── #148 FIX: drain the prefill's autoreleased Metal wrappers every chunk ────────
+        // The steel-hybrid prefill wraps every per-layer MLX temporary in a noCopy MTLBuffer
+        // (`arrToBuf` → `asMTLBuffer`), ~2.29MB per prompt token by static count. Those
+        // wrappers are autoreleased, and the decode thread's autorelease pool drains only at
+        // THREAD EXIT — which for ContinuousScheduler is when the queue fully drains. So a
+        // whole prefill's wrappers accumulate live: measured law
+        //     retained Metal ≈ concurrency × promptLen × ~2.03MB/token
+        // (fits both the vary and fixeduniq A/B to within ~100MB at every point). At agentic
+        // prompt sizes × lanes that is tens of GB simultaneously, which is what killed the
+        // trial server on a 14.9MB allocation. NOT a permanent leak — footprint sawtooths
+        // back to a constant floor each round — but the in-round peak is fatal on its own.
+        //
+        // Draining per chunk bounds it to one chunk's wrappers. Measured (vary, 10 rounds x 2
+        // concurrent): peak footprint 46,080 → 24,576MB, growth +20,480 → +1,024MB, and the
+        // per-token term vanishes (nonMLXmetal +36,521MB → +310MB, i.e. only the constant
+        // driver-wrapper base remains). Pure lifetime change, no math touched: verified
+        // byte-identical generation with the flag off vs on (lanes=2, greedy) plus
+        // RAWTESTS 97/97 / COMPTEST 93/93 / BENCHBATCHTEST.
+        //
+        // Default ON. QWISP_LANE_CHUNK_POOL=0 restores the pre-fix behavior for A/B only —
+        // it reinstates the OOM, so never run a real server with it off.
+        let chunkPool = Tell.envInt("QWISP_LANE_CHUNK_POOL", 1) != 0
+        while st.pos < prompt.count {
+            if !first, consumed >= tokenBudget { break }
+            let ok = chunkPool ? autoreleasepool { runChunk() } : runChunk()
+            if !ok { prefills[slot] = nil; return .failed }
         }
         guard st.pos >= prompt.count else {
             prefills[slot] = st
@@ -422,6 +451,44 @@ public final class LaneBatchSlots: BatchSlots {
         prefills[slot] = nil   // drop an aborted mid-admission's SeedlessFusedForward
         arenaBytes[slot] = 0   // WS-B Stage B: free this slot's KV-budget reservation
         batch = nil; batchLanes = []   // active set changed
+        reportIdleMemory()
+    }
+
+    // ── #148 diagnostic: what actually retains lane memory? ───────────────────
+    // footprint alone cannot tell "MLX pooled the freed buffers" from "something still
+    // references them" — both read as growth. MLX.Memory splits them: activeMemory =
+    // live MLXArrays, cacheMemory = MLX's free-buffer pool. Sampled at a FULLY IDLE
+    // point (every lane released) so the only live MLX memory should be model residency.
+    //   QWISP_LANE_MEMDBG=1 → observe only (natural active/cache split per idle point)
+    //   QWISP_LANE_MEMDBG=2 → observe, clearCache(), observe again (the discriminating
+    //                         experiment: does the pool actually give the memory back?)
+    // Interpretation: active flat + cache ratcheting + clear drops it ⇒ allocator
+    // retention (bound Memory.cacheLimit). active ratcheting ⇒ live references, and
+    // cacheLimit is a no-op. Neither ⇒ raw MTLBuffer / CPU Data, MLX is not the holder.
+    private var memDbgIdleCount = 0
+    private func reportIdleMemory() {
+        let mode = Tell.envInt("QWISP_LANE_MEMDBG", 0)
+        guard mode > 0 else { return }
+        guard lanes.allSatisfy({ $0 == nil }), prefills.allSatisfy({ $0 == nil }) else { return }
+        memDbgIdleCount += 1
+        func mb(_ b: Int) -> String { String(format: "%.0fMB", Double(b) / 1_048_576) }
+        let before = MLX.Memory.snapshot()
+        // metal = EVERY Metal allocation on this device, MLX's included. The lane path also
+        // allocates raw MTLBuffers directly (KV arena via makeKVCacheBufs, the maxM=1024
+        // attn/gdn/moe scratch, per-lane staging) which MLX neither tracks nor pools, so
+        // `metal − (active+cache)` is the non-MLX Metal footprint. Needed because the
+        // 2026-07-27 vary run showed footprint ratcheting to 47GB while MLX accounted for
+        // only 21GB — a ~26GB hole that Memory.cacheLimit cannot reach.
+        let metal = driver.device.currentAllocatedSize
+        var line = "[lane-memdbg] idle#\(memDbgIdleCount) active=\(mb(before.activeMemory))"
+            + " cache=\(mb(before.cacheMemory)) peak=\(mb(before.peakMemory))"
+            + " metal=\(mb(metal)) nonMLXmetal=\(mb(metal - before.activeMemory - before.cacheMemory))"
+        if mode >= 2 {
+            MLX.Memory.clearCache()
+            let after = MLX.Memory.snapshot()
+            line += " | after clearCache: active=\(mb(after.activeMemory)) cache=\(mb(after.cacheMemory))"
+        }
+        FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
 
@@ -485,6 +552,25 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
         let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
+        // Bound MLX's free-buffer pool. This is NOT the #148 leak fix (that is the per-chunk
+        // autoreleasepool in admitStep) — it is the SECOND consumer, which only became
+        // visible once the wrapper leak was gone and the crash configuration was measured
+        // directly (lanes=4, prefix store ON, 6-15K prompts). There, post-fix:
+        //   unbounded: cacheMemory 11,903 → 26,361MB, footprint peak 49,152MB (+26,624MB),
+        //              ttft mean 49,546ms / total 991s / max 117,017ms
+        //   2GB bound: cacheMemory pinned ~2,050MB, footprint peak 26,624MB (+3,072MB),
+        //              ttft mean 44,688ms / total 894s / max 92,534ms
+        // i.e. −22.5GB peak AND ~10% FASTER (max ttft −21%). The pool is not free at this
+        // size: 26GB of pool on top of 19GB of resident weights puts a 64GB box into memory
+        // pressure, which is what the ttft difference is. MLX's own docs recommend a lower
+        // limit for long inference runs. Lane-scoped (LaneBackend is only built under
+        // QWISP_LANES); the serialize path is untouched. 0 disables the bound. Setting the
+        // limit does not purge what is already pooled, hence the clearCache().
+        let mlxCacheMB = Swift.max(0, Tell.envInt("QWISP_LANE_MLX_CACHE_MB", 2048))
+        if mlxCacheMB > 0 {
+            MLX.Memory.cacheLimit = mlxCacheMB * 1_048_576
+            MLX.Memory.clearCache()
+        }
     }
 
     /// Ctx-adaptive sizing policy (WS-B Stage B, notes/22 Contract B1): from a request's

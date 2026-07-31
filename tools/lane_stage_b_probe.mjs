@@ -105,15 +105,20 @@ async function main() {
     return;
   }
   if (mode === "ratchet") {
-    // Arena-size-churn probe. Hypothesis: Stage B sizes each lane arena per request,
-    // so MLX's buffer pool cannot recycle a freed arena of size X for a later request
-    // needing size Y, and the pool ratchets up (LLMBackend.swift:473-481 documents the
-    // same pool behavior on the serialize path, where it is fixed with Memory.clearCache;
-    // LaneServe's release() has no such call).
-    //   vary  = every round uses a DIFFERENT prompt size -> distinct arena sizes
-    //   fixed = every round uses the SAME prompt size    -> identical arena sizes
-    // Both use distinct prompt CONTENT so the prefix cache grows equally in each and
-    // cannot explain a difference between them.
+    // Memory-growth probe for #148. Its ORIGINAL hypothesis — that per-request arena
+    // sizing ratchets MLX's buffer pool, fixable with Memory.clearCache() — is DISPROVED:
+    // bounding the pool (Memory.cacheLimit=2GB) pinned cacheMemory at ~2,050MB and did
+    // not stop the growth. Measured law instead:
+    //     nonMLXmetal ~= 19,750MB + concurrency * promptLen(this round) * ~2.03MB/token
+    // i.e. it tracks the PROMPT LENGTH of the round being sampled, not arena size and not
+    // cumulative admissions. Root cause was autoreleased noCopy MTLBuffer wrappers from
+    // the steel-hybrid prefill, held until the decode thread exited; fixed by draining per
+    // prefill chunk (QWISP_LANE_CHUNK_POOL). This probe is now the #148 regression check.
+    //   vary      = prompt grows each round (prompt AND arena size vary TOGETHER — this
+    //               A/B therefore never isolated arena size; the two are confounded)
+    //   fixeduniq = constant SIZE, unique CONTENT -> equal prefill work, no prefix reuse
+    //   fixed     = constant size, SHARED prefix -> the prefix cache serves it and the
+    //               pass does almost no prefill. CONFOUNDED; do not quote as a control.
     const rounds = parseInt(process.argv[4] || "10", 10);
     const shape = process.argv[5] || "vary";   // vary | fixed | fixeduniq
     const base = parseInt(process.argv[6] || "1500", 10);
