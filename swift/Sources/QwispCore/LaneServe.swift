@@ -552,17 +552,21 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
         let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
-        // Optional MLX free-buffer-pool bound. NOT the #148 fix (that is the per-chunk
-        // autoreleasepool in admitStep) — measured OFF by default because its benefit is
-        // unmeasured POST-fix and its throughput cost is untested. History: bounding this
-        // to 2GB held cacheMemory at ~2,050MB vs a 15,798MB convergence unbounded, with no
-        // regression in activeMemory/peakMemory, but it did NOT stop the ratchet (the pool
-        // was never the leak). Whether the pool still grows once the wrapper churn is gone
-        // is an open question — measure before flipping this on. MLX's docs do recommend a
-        // lower limit for long inference runs. Lane-scoped (LaneBackend is only built under
-        // QWISP_LANES); the serialize path is untouched. Setting the limit does not purge
-        // what is already pooled, hence the clearCache().
-        let mlxCacheMB = Swift.max(0, Tell.envInt("QWISP_LANE_MLX_CACHE_MB", 0))
+        // Bound MLX's free-buffer pool. This is NOT the #148 leak fix (that is the per-chunk
+        // autoreleasepool in admitStep) — it is the SECOND consumer, which only became
+        // visible once the wrapper leak was gone and the crash configuration was measured
+        // directly (lanes=4, prefix store ON, 6-15K prompts). There, post-fix:
+        //   unbounded: cacheMemory 11,903 → 26,361MB, footprint peak 49,152MB (+26,624MB),
+        //              ttft mean 49,546ms / total 991s / max 117,017ms
+        //   2GB bound: cacheMemory pinned ~2,050MB, footprint peak 26,624MB (+3,072MB),
+        //              ttft mean 44,688ms / total 894s / max 92,534ms
+        // i.e. −22.5GB peak AND ~10% FASTER (max ttft −21%). The pool is not free at this
+        // size: 26GB of pool on top of 19GB of resident weights puts a 64GB box into memory
+        // pressure, which is what the ttft difference is. MLX's own docs recommend a lower
+        // limit for long inference runs. Lane-scoped (LaneBackend is only built under
+        // QWISP_LANES); the serialize path is untouched. 0 disables the bound. Setting the
+        // limit does not purge what is already pooled, hence the clearCache().
+        let mlxCacheMB = Swift.max(0, Tell.envInt("QWISP_LANE_MLX_CACHE_MB", 2048))
         if mlxCacheMB > 0 {
             MLX.Memory.cacheLimit = mlxCacheMB * 1_048_576
             MLX.Memory.clearCache()

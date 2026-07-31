@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Diagnostic for the 2026-07-25 trial-server OOM (HANDOFF RED block): does the lane
-# path's per-request arena sizing ratchet MLX's buffer pool upward?
+# Memory-growth diagnostic + #148 regression check for the lane serving path.
+# (Name kept for continuity with issue #148; "arena ratchet" is the DISPROVED original
+# hypothesis, not what this measures — see below.)
 #
 # ORIGINAL HYPOTHESIS (DISPROVED 2026-07-27, kept for the record): that per-request
 # arena sizing ratchets MLX's buffer pool, fixable with Memory.clearCache() on lane
@@ -81,7 +82,7 @@ run_shape() {
 }
 
 # SHAPES overrides the pass list, e.g. SHAPES="fixeduniq" to re-run one control only.
-for sh in ${SHAPES:-vary fixed}; do run_shape "$sh"; done
+for sh in ${SHAPES:-vary fixeduniq}; do run_shape "$sh"; done
 
 echo ""
 echo "== summary (footprint MB over time) =="
@@ -98,7 +99,7 @@ def series(shape):
         v = v / 1024 if m.group(2) == "KB" else v * 1024 if m.group(2) == "GB" else v
         vals.append(v)
     return vals
-for shape in os.environ.get("SHAPES", "vary fixed").split():
+for shape in os.environ.get("SHAPES", "vary fixeduniq").split():
     v = series(shape)
     if not v:
         print(f"{shape}: no samples"); continue
