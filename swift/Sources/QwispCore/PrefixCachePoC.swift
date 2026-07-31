@@ -1335,8 +1335,10 @@ extension Tell {
         let nLayers = engine.layers.count
         let expectedDelta = nLayers - 1
         let chunkM = 256                       // prefill chunk; MUST be <= maxM or forwardRows returns nil
-        // Rollback resets every arm to `ctx`, so the cache never grows past ctx + steps.
-        guard let (fwd, _) = engine.makeFused(maxM: chunkM, maxSeqLen: ctx + steps + 64) else {
+        // Preheat steps run AFTER the restore and BEFORE the timer, so they consume cache too.
+        let preheat = Swift.max(0, Tell.envInt("QWISP_DISPATCH_PREHEAT", 4))
+        // Rollback resets every arm to `ctx`, so the cache never grows past ctx + preheat + steps.
+        guard let (fwd, _) = engine.makeFused(maxM: chunkM, maxSeqLen: ctx + preheat + steps + 64) else {
             return "[dispatch-cost] makeFused nil\nDISPATCHCOST done"
         }
         func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
@@ -1356,16 +1358,38 @@ extension Tell {
 
         /// One sample: restore to the snapshot, then `steps` M=1 decode steps on a fixed token
         /// stream. Returns (ms/step, dispatches/sample, last output) — the caller checks all three.
-        func sample(_ fold: Bool, salt: Int) -> (ms: Double, disp: Int, out: MLXArray)? {
+        // Fault injection, permanent on purpose: QWISP_DISPATCH_FAULT=1 makes both arms run the
+        // SAME configuration while the probe still believes it is contrasting two. That is exactly
+        // the v1 failure class — a perturbation that silently stops applying, which the timings
+        // render as an innocent-looking null result. A self-check that has never been SEEN to fire
+        // is an assumption, not a check; run this knob after touching this probe and confirm it
+        // reports VOID. If it reports numbers, the alarm is broken and nothing here is trustworthy.
+        let faultInject = Tell.envInt("QWISP_DISPATCH_FAULT", 0) != 0
+        func sample(_ fold: Bool, salt: Int) -> (ms: Double, gpuMs: Double, disp: Int, out: [Float16])? {
             guard fwd.restorePersistentState(snapshot) else { return nil }
-            SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer = fold
+            SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer = faultInject ? false : fold
+            // Preheat: untimed steps at THIS arm's configuration, after the restore, before t0.
+            // Without them arm 1 starts from a longer and differently-composed idle gap than arm 2
+            // (arm 1 is preceded by the previous pair's comparison + stats), so the GPU is at a
+            // lower p-state when arm 1's timer starts. That showed up as a within-pair order effect
+            // ~3x the size of the effect being measured, which ABBA then had to cancel exactly.
+            // Equalising the pre-timer state is better than relying on that cancellation.
+            for s in 0..<preheat {
+                guard fwd.forwardRows(engine.embed(tokens: tok(1, salt &- 1 &- s)), M: 1) != nil else { return nil }
+            }
             SeedlessFusedVerify._residAddDispatchCount = 0
             SeedlessFusedVerify._rmsNormRowsDispatchCount = 0
             SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount = 0
             var last: MLXArray? = nil
+            var gpu = 0.0
             let t0 = DispatchTime.now().uptimeNanoseconds       // monotonic; Date() is wall clock
             for s in 0..<steps {
                 guard let out = fwd.forwardRows(engine.embed(tokens: tok(1, salt &+ s)), M: 1) else { return nil }
+                // GPU-ONLY time for this step's command buffer. This is the number that decides
+                // #143 U2: the fold removes CPU encode calls AND (maybe) GPU serialization, and
+                // MTLDispatchType.concurrent can only ever address the latter. If the wall-clock
+                // win does not appear here, U2 is closed without a further experiment.
+                gpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
                 last = out                                       // forwardRows already commits+waits
             }
             let dt = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
@@ -1373,23 +1397,33 @@ extension Tell {
             let disp = SeedlessFusedVerify._residAddDispatchCount
                      + SeedlessFusedVerify._rmsNormRowsDispatchCount
                      + SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount
-            return (dt / Double(steps), disp, out)
+            // Pull the array out HERE, inside the arm. The bit-compare must not run MLX graph ops
+            // in the gap between pairs — that touches the MLX buffer pool and does its own GPU
+            // round-trip, which is part of what made the two arms' pre-timer environments differ.
+            return (dt / Double(steps), gpu / Double(steps), disp, out.asArray(Float16.self))
         }
         _ = sample(false, salt: 1); _ = sample(true, salt: 1)    // warm-up, both arms, never recorded
 
         var deltas: [Double] = [], onMs: [Double] = [], offMs: [Double] = []
+        var gpuDeltas: [Double] = [], gpuOn: [Double] = [], gpuOff: [Double] = []
         var fail: [String] = []
         var refOffDisp: Int? = nil
         for r in 0..<reps {
-            let salt = 1000 &+ r &* 64                           // SAME for both arms of this pair
+            // Stride 63, NOT 64: with stride 64 and tok()'s %5000, even and odd reps drew DISJOINT
+            // token bands, so the even/odd order diagnostic was confounded with token content (and
+            // therefore with MoE routing). 63 is coprime with the parity, so both parities sample
+            // the same token space. The pair itself still shares one salt across both arms.
+            let salt = 1000 &+ r &* 63                           // SAME for both arms of this pair
             var mOn = 0.0, mOff = 0.0, dOn = 0, dOff = 0
-            var outOn: MLXArray? = nil, outOff: MLXArray? = nil
+            var gOn = 0.0, gOff = 0.0
+            var outOn: [Float16]? = nil, outOff: [Float16]? = nil
             for first in [true, false] {
                 let fold = (r % 2 == 0) ? !first : first          // ABBA
                 guard let s = sample(fold, salt: salt) else {
                     return "[dispatch-cost] sample nil rep=\(r) fold=\(fold)\nDISPATCHCOST done"
                 }
-                if fold { mOn = s.ms; dOn = s.disp; outOn = s.out } else { mOff = s.ms; dOff = s.disp; outOff = s.out }
+                if fold { mOn = s.ms; gOn = s.gpuMs; dOn = s.disp; outOn = s.out }
+                else     { mOff = s.ms; gOff = s.gpuMs; dOff = s.disp; outOff = s.out }
             }
             if dOff % steps != 0 || dOn % steps != 0 {
                 fail.append("rep=\(r): dispatches/sample not a multiple of steps (OFF=\(dOff) ON=\(dOn) steps=\(steps))")
@@ -1402,14 +1436,15 @@ extension Tell {
             }
             refOffDisp = refOffDisp ?? dOff
             if let a = outOn, let b = outOff {
-                a.eval(); b.eval()
-                let d = MLX.sum(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
-                if d != 0 { fail.append("rep=\(r): fold changed the output under this probe (sum|Δ|=\(d))") }
+                if a.count != b.count || zip(a, b).contains(where: { $0 != $1 }) {
+                    fail.append("rep=\(r): fold changed the output under this probe (hidden state differs)")
+                }
             }
             onMs.append(mOn); offMs.append(mOff); deltas.append(mOn - mOff)
+            gpuOn.append(gOn); gpuOff.append(gOff); gpuDeltas.append(gOn - gOff)
             if fail.count > 3 { break }
         }
-        func mean(_ v: [Double]) -> Double { v.reduce(0, +) / Double(v.count) }
+        func mean(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0, +) / Double(v.count) }
         func sd(_ v: [Double]) -> Double {
             guard v.count > 1 else { return 0 }
             let m = mean(v); return (v.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(v.count - 1)).squareRoot()
@@ -1419,34 +1454,82 @@ extension Tell {
             return n % 2 == 1 ? s[n/2] : (s[n/2 - 1] + s[n/2]) / 2
         }
         let n = deltas.count
-        let mD = mean(deltas), sD = sd(deltas), se = sD / Double(n).squareRoot()
-        let lo = mD - 1.96 * se, hi = mD + 1.96 * se
         let evens = stride(from: 0, to: n, by: 2).map { deltas[$0] }
         let odds  = stride(from: 1, to: n, by: 2).map { deltas[$0] }
-        var lines = ["[dispatch-cost] #143 U2 instrument v2 — paired, per-pair rollback, shared token stream",
-                     "  layers=\(nLayers) expectedDispatchDelta=\(expectedDelta)/step  ctx=\(ctx) pairs=\(n) steps/sample=\(steps)"]
+        // Order-blocked estimate: the within-pair order effect is a known nuisance term, so model
+        // it instead of letting it inflate the pooled sd. Point estimate is unchanged (ABBA is
+        // balanced); the CI tightens slightly. Residuals are delta minus its own parity's mean.
+        let mE = evens.isEmpty ? 0 : evens.reduce(0,+) / Double(evens.count)
+        let mO = odds.isEmpty  ? 0 : odds.reduce(0,+)  / Double(odds.count)
+        var resid: [Double] = []
+        for (i, d) in deltas.enumerated() { resid.append(d - (i % 2 == 0 ? mE : mO)) }
+        /// Lag-1 autocorrelation of the order-adjusted residuals. The CI below assumes pairs are
+        /// independent; they are adjacent in time on a thermally-managed GPU, so they may not be.
+        /// This matters more than it looks: at this effect size an SE inflation of only ~3% moves
+        /// the upper bound onto zero, and rho ~ 0.03 is enough to do it. Print it so the reader can
+        /// discount the CI instead of trusting it blindly.
+        func lag1(_ v: [Double]) -> Double {
+            guard v.count > 2 else { return 0 }
+            let m = mean(v)
+            var num = 0.0, den = 0.0
+            for i in 0..<v.count { den += (v[i] - m) * (v[i] - m) }
+            for i in 1..<v.count { num += (v[i] - m) * (v[i-1] - m) }
+            return den == 0 ? 0 : num / den
+        }
+        /// AR(1)-ADJUSTED CI. Adjacent pairs run back-to-back on a thermally-managed GPU, so the
+        /// independence the naive CI assumes does not hold — the v3 run measured rho=+0.29 on the
+        /// wall residuals, ~10x the level at which this effect size stops being significant. The
+        /// inflation factor sqrt((1+rho)/(1-rho)) is the standard AR(1) correction for the variance
+        /// of a mean. Applying it in the code rather than leaving it to the reader is the point:
+        /// the previous version printed rho next to an unadjusted interval, which invites reading
+        /// the interval and ignoring the footnote.
+        func ci(_ v: [Double], residuals: [Double]? = nil) -> (m: Double, s: Double, lo: Double, hi: Double, rho: Double) {
+            let r = residuals ?? v
+            let m = mean(v), sv = sd(r)
+            let rho = Swift.max(-0.95, Swift.min(0.95, lag1(r)))
+            let inflate = ((1 + rho) / (1 - rho)).squareRoot()
+            let se = sv / Double(v.count).squareRoot() * inflate
+            return (m, sv, m - 1.96 * se, m + 1.96 * se, rho)
+        }
+        var gResid: [Double] = []
+        let gE = mean(stride(from: 0, to: n, by: 2).map { gpuDeltas[$0] })
+        let gO = mean(stride(from: 1, to: n, by: 2).map { gpuDeltas[$0] })
+        for (i, d) in gpuDeltas.enumerated() { gResid.append(d - (i % 2 == 0 ? gE : gO)) }
+        let wall = ci(deltas, residuals: resid)          // order-blocked residuals, AR(1)-adjusted
+        let gpu  = ci(gpuDeltas, residuals: gResid)      // its OWN autocorrelation, not the wall's
+        let rho  = wall.rho
+        var lines = ["[dispatch-cost] #143 U2 instrument v4 — paired, rollback, preheat, wall+GPU split, AR(1)-adjusted",
+                     "  layers=\(nLayers) expectedDispatchDelta=\(expectedDelta)/step  ctx=\(ctx) pairs=\(n) steps/sample=\(steps) preheat=\(preheat)"]
         if !fail.isEmpty {
             lines.append("  SELF-CHECK FAIL (timings below are VOID, do NOT read them as a null result):")
             for f in fail.prefix(4) { lines.append("    - \(f)") }
             return lines.joined(separator: "\n") + "\nDISPATCHCOST done"
         }
         lines.append("  self-check OK: dispatch delta exact every pair, OFF count stable at \(refOffDisp ?? -1)/sample, outputs bit-identical")
-        lines.append(String(format: "  median ms/step   OFF=%.4f  ON=%.4f", median(offMs), median(onMs)))
-        lines.append(String(format: "  paired delta (ON-OFF): mean=%+.4f ms  sd=%.4f  95%%CI=[%+.4f, %+.4f] ms",
-                            mD, sD, lo, hi))
-        lines.append(String(format: "  relative: %+.3f%%  [%+.3f%%, %+.3f%%]",
-                            100 * mD / mean(offMs), 100 * lo / mean(offMs), 100 * hi / mean(offMs)))
-        let sig = (lo < 0 && hi < 0) ? "SIGNIFICANT (fold faster)"
-                : (lo > 0 && hi > 0) ? "SIGNIFICANT (fold slower)" : "NOT SIGNIFICANT (CI spans 0)"
-        lines.append("  verdict: \(sig)")
-        lines.append(String(format: "  cross-checks: sign %d/%d pairs fold-faster · order effect mean(even)=%+.4f mean(odd)=%+.4f ms",
-                            deltas.filter { $0 < 0 }.count, n, mean(evens), mean(odds)))
-        lines.append(String(format: "  per-BOUNDARY saving = %+.4f us (= mean delta / %d). This is NOT 'per dispatch':",
-                            1000 * mD / Double(expectedDelta), expectedDelta))
-        lines.append("    the fold replaces TWO small kernels with ONE, so it also changes kernel execution")
-        lines.append("    time and occupancy, not just launch count. Treat it as an UPPER BOUND on what")
-        lines.append("    removing one dispatch is worth. Same for the regime: this is 1 CB/step with a full")
-        lines.append("    sync per step; production decode chains steps per CB and would see less.")
+        lines.append(String(format: "  wall ms/step  OFF=%.4f ON=%.4f   |   GPU ms/step  OFF=%.4f ON=%.4f",
+                            median(offMs), median(onMs), median(gpuOff), median(gpuOn)))
+        lines.append(String(format: "  WALL delta (ON-OFF): mean=%+.4f ms  sd_resid=%.4f  95%%CI=[%+.4f, %+.4f]  (%+.3f%%)",
+                            wall.m, wall.s, wall.lo, wall.hi, 100 * wall.m / mean(offMs)))
+        lines.append(String(format: "  GPU  delta (ON-OFF): mean=%+.4f ms  sd_resid=%.4f  95%%CI=[%+.4f, %+.4f]  (%+.3f%%)",
+                            gpu.m, gpu.s, gpu.lo, gpu.hi, mean(gpuOff) == 0 ? 0 : 100 * gpu.m / mean(gpuOff)))
+        func verdict(_ c: (m: Double, s: Double, lo: Double, hi: Double, rho: Double)) -> String {
+            (c.lo < 0 && c.hi < 0) ? "fold faster" : (c.lo > 0 && c.hi > 0) ? "fold slower" : "not significant (CI spans 0)"
+        }
+        lines.append("  verdict: WALL = \(verdict(wall))  |  GPU = \(verdict(gpu))")
+        lines.append(String(format: "  CIs above are AR(1)-adjusted: rho(wall)=%+.3f rho(GPU)=%+.3f, SE inflated by sqrt((1+r)/(1-r))",
+                            wall.rho, gpu.rho))
+        lines.append("    (adjacent pairs are not independent on a thermally-managed GPU; at this effect size the")
+        lines.append("     unadjusted interval is optimistic and can flip a verdict on its own)")
+        lines.append(String(format: "  cross-checks: sign %d/%d wall-faster · order effect mean(even)=%+.4f mean(odd)=%+.4f ms",
+                            deltas.filter { $0 < 0 }.count, n, mE, mO))
+        lines.append(String(format: "  per-BOUNDARY: wall %+.4f us, GPU %+.4f us (= mean delta / %d)",
+                            1000 * wall.m / Double(expectedDelta), 1000 * gpu.m / Double(expectedDelta), expectedDelta))
+        lines.append("  HOW TO READ FOR #143 U2: the WALL delta includes CPU encode work the fold removes")
+        lines.append("    (39 x setPipelineState+setBuffer+dispatch per step). MTLDispatchType.concurrent is a")
+        lines.append("    GPU-side change and can address ONLY the GPU delta. If GPU is ~0 while WALL is not,")
+        lines.append("    the saving is CPU-side and U2 is closed. Both numbers remain UPPER bounds: the fold")
+        lines.append("    also swaps two kernels for one, and this regime (1 CB/step, full sync, no lm_head)")
+        lines.append("    maximizes per-dispatch overhead relative to the chained production path.")
         return lines.joined(separator: "\n") + "\nDISPATCHCOST done"
     }
 }
