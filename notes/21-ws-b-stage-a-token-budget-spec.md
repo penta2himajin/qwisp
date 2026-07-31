@@ -235,6 +235,33 @@ Budget sweep at L=45 (the 2026-07-25 stream length, kept for comparability):
 | 4096 | 4 | 9% | 12 | **24** | 13,579 | 33.4s |
 | 8192 | 3 | 7% | 12 | **19** | 22,780 | 33.0s |
 
+Same sweep at L=500 (the realistic-stream counterpart; both sweeps are the same
+12,000-token admit, AC power, same session per sweep):
+
+| budget | k | pollution | p50 | p90 | p99 | max | summed stall |
+|---|---|---|---|---|---|---|---|
+| OFF | 2 | 0.4% | 12 | 13 | 22 | **33,879** | 34.1s |
+| 1024 | 12 | 2.4% | 12 | 13 | 3,658 | **4,544** | 36.9s |
+| 2048 (default) | 7 | 1.4% | 12 | 13 | 4,802 | **8,511** | 35.0s |
+| 4096 | 4 | 0.8% | 12 | 13 | 23 | **13,655** | 34.0s |
+| 8192 | 3 | 0.6% | 12 | 13 | 19 | **23,392** | 33.7s |
+
+The stall series is the decision-relevant form of this table — a budget choice is a
+choice of how many waits and how long each is, for the same conserved total:
+
+| budget | stalls (s), L=500 |
+|---|---|
+| OFF | 0.2, **33.9** |
+| 1024 | 0.2, 2.1, 2.6, 2.6, 2.6, 2.9, 3.1, 3.7, 4.0, 4.2, 4.3, **4.5** |
+| 2048 | 0.2, 2.2, 4.8, 5.1, 6.6, 7.6, **8.5** |
+| 4096 | 0.2, 10.0, 10.2, **13.7** |
+| 8192 | 0.2, 10.1, **23.4** |
+
+Note `p90 = 13ms` for EVERY arm including OFF at this stream length: at L=500 p90 no
+longer discriminates at all, and `p99` is the percentile the budget moves. 4096 is the
+notable point — it reproduces OFF's whole percentile profile (p99 23ms vs OFF's 22ms)
+while cutting the worst stall 2.5x.
+
 ### What this changes
 
 1. **The p90 regression is a stream-length artifact.** At L=500 the default already
