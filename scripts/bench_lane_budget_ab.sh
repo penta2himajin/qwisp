@@ -54,19 +54,38 @@ run_pass() {
     cat "$out"
 }
 
-run_pass off ""
-run_pass on  "QWISP_TOKEN_BUDGET_SCHED=1"
+# BUDGETS: one ON pass per value (sweep in ONE session so all arms share the OFF
+# control and the same thermal state — separate invocations would re-pay the ~95s
+# OFF pass per arm and compare across sessions, which notes/20's paired-A/B
+# discipline forbids). STEADY_TOKENS (read by the probe) sets lane 0's stream length.
+BUDGETS="${BUDGETS:-2048}"
+FILES=("/tmp/lane-budget-ab-$TS-off.json")
+# MUST pass =0 explicitly: QWISP_TOKEN_BUDGET_SCHED defaults to 1 since the 2026-07-25
+# GO (LaneServe.swift, notes/21). An empty env here silently ran the ON path as the
+# "OFF" control — both arms then measured identical (k=12, sum within 2.5%).
+run_pass off "QWISP_TOKEN_BUDGET_SCHED=0"
+for b in $BUDGETS; do
+    run_pass "on$b" "QWISP_TOKEN_BUDGET_SCHED=1 QWISP_TOKEN_BUDGET=$b"
+    FILES+=("/tmp/lane-budget-ab-$TS-on$b.json")
+done
 
 echo ""
-echo "== summary =="
-python3 - "/tmp/lane-budget-ab-$TS-off.json" "/tmp/lane-budget-ab-$TS-on.json" << 'EOF'
-import json, sys
-off = json.load(open(sys.argv[1]))
-on = json.load(open(sys.argv[2]))
-print(f"{'':>6} {'n':>4} {'p50':>8} {'p90':>8} {'p99':>8} {'max':>8}  (ms)")
-for name, d in (("OFF", off), ("ON", on)):
-    print(f"{name:>6} {d['n']:>4} {d['p50']:>8} {d['p90']:>8} {d['p99']:>8} {d['max']:>8}")
-if off['p99'] and on['p99']:
-    print(f"\np99 ratio (ON/OFF): {on['p99']/off['p99']:.2f}x")
-    print(f"max ratio (ON/OFF): {on['max']/off['max']:.2f}x")
+echo "== summary (steady stream = ${STEADY_TOKENS:-45} tokens, big prompt = $BIG) =="
+python3 - "${FILES[@]}" << 'EOF'
+import json, sys, os, re
+rows = []
+for path in sys.argv[1:]:
+    label = re.sub(r'^.*?-\d{6}-(.*)\.json$', r'\1', os.path.basename(path))
+    rows.append((label, json.load(open(path))))
+print(f"{'':>9} {'n':>4} {'p50':>8} {'p90':>8} {'p99':>8} {'max':>8}  (ms)")
+for name, d in rows:
+    print(f"{name:>9} {d['n']:>4} {d['p50']:>8} {d['p90']:>8} {d['p99']:>8} {d['max']:>8}")
+# Polluted-gap count is the model's real observable: gaps an order of magnitude above
+# p50 are the prefill-bearing rounds (k). Predicted k = ceil(promptLen / budget).
+print("")
+for name, d in rows:
+    gaps = d.get('gapsMs') or []
+    big = [g for g in gaps if d['p50'] and g > 10 * d['p50']]
+    void = "" if d.get('bTokens') else "   <-- VOID: big admit produced 0 tokens (dropped)"
+    print(f"{name:>9} polluted gaps k={len(big):>3} / n={d['n']:<4} ({100*len(big)/max(1,d['n']):.0f}%)  sum={sum(big)/1000:.1f}s{void}")
 EOF
