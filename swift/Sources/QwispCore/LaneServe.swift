@@ -186,6 +186,29 @@ public final class LaneBatchSlots: BatchSlots {
         // Budgeted path is unchanged: per-request size, clamped to the eligibility cap.
         let c7 = arenaSeqLen(seqBudget: 51_385, maxSeqLen: 262_144) == 51_385
             && arenaSeqLen(seqBudget: 300_000, maxSeqLen: 262_144) == 262_144
+        // 8-11. #151: eligibility must not promise more than the path will allocate.
+        // Regression under test: flag-off admitted a 24K prompt (eligible against the
+        // 262K ctx), then admitStep allocated legacyArenaCap and returned .failed, which
+        // ContinuousBatch.loop() turns into an empty 200 with no NOTE. Capping eligibility
+        // to the allocation makes sizePlan refuse it VISIBLY instead.
+        let c8 = eligibilityCtx(budgetSchedOn: false, ctx: 262_144) == legacyArenaCap
+        // Flag-ON is untouched — the budgeted path sizes each arena from its own seqBudget.
+        let c9 = eligibilityCtx(budgetSchedOn: true, ctx: 262_144) == 262_144
+        // The general invariant, stated once: on the flag-off path the arena actually
+        // allocated for an eligible prompt always covers the whole eligibility window.
+        let c10 = [8_192, 16_384, 32_768, 262_144].allSatisfy { ctx in
+            let elig = eligibilityCtx(budgetSchedOn: false, ctx: ctx)
+            return arenaSeqLen(seqBudget: 0, maxSeqLen: elig) == elig
+        }
+        // The reproduction itself: 24K prompt, model-context ctx. Refused when flag-off,
+        // still served when flag-on.
+        let off11 = LaneBackend.sizePlan(promptLen: 24_000, maxTokens: 3,
+                                         ctxMax: eligibilityCtx(budgetSchedOn: false, ctx: 262_144),
+                                         genCap: 16_384)
+        let on11 = LaneBackend.sizePlan(promptLen: 24_000, maxTokens: 3,
+                                        ctxMax: eligibilityCtx(budgetSchedOn: true, ctx: 262_144),
+                                        genCap: 16_384)
+        let c11 = off11.oversized == true && on11.oversized == false
         return [
             ("unset_maxtokens", c1),
             ("explicit_capped", c2),
@@ -194,6 +217,10 @@ public final class LaneBatchSlots: BatchSlots {
             ("legacy_arena_fixed_cap", c5),
             ("legacy_arena_respects_ctx", c6),
             ("budgeted_arena_per_request", c7),
+            ("flagoff_eligibility_matches_arena", c8),
+            ("flagon_eligibility_unchanged", c9),
+            ("flagoff_arena_covers_eligibility", c10),
+            ("flagoff_24k_refused_visibly", c11),
         ]
     }
 
@@ -207,6 +234,18 @@ public final class LaneBatchSlots: BatchSlots {
     public static func arenaSeqLen(seqBudget: Int, maxSeqLen: Int) -> Int {
         seqBudget > 0 ? Swift.min(seqBudget, maxSeqLen)
                       : Swift.min(legacyArenaCap, maxSeqLen)
+    }
+
+    /// The ELIGIBILITY cap that must pair with `arenaSeqLen`'s ALLOCATION cap (#151).
+    /// Stage B split the two and only the budgeted path re-coupled them (its `seqBudget`
+    /// IS the allocation size). The flag-off path allocates at `legacyArenaCap` via the
+    /// legacy sentinel, so admitting anything longer produced a `.failed` admitStep →
+    /// `ContinuousBatch.loop()`'s `req.finish()` → an empty 200 with no NOTE, for every
+    /// prompt over 16K. Capping eligibility to match routes those prompts to `sizePlan`'s
+    /// EXISTING visible refusal instead. Keep this the only source of that pairing: the
+    /// escape hatch's arena stays bit-for-bit legacy (d4f7e27), it just stops over-promising.
+    public static func eligibilityCtx(budgetSchedOn: Bool, ctx: Int) -> Int {
+        budgetSchedOn ? ctx : Swift.min(ctx, legacyArenaCap)
     }
 
     /// Fresh lane forward with the canonical hybrid wiring (same trios as TellRuntime's
@@ -540,7 +579,12 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
                 "lane batching: engine build failed"])
         }
         self.slots = slots
-        self.laneCtx = ctx
+        // #151: eligibility must match the arena the SELECTED path will actually allocate,
+        // so the flag decision has to be read before laneCtx is fixed. `laneSlots` above
+        // keeps the full `ctx` as its maxSeqLen — that is the allocation CLAMP, and the
+        // legacy sentinel narrows it to legacyArenaCap on its own.
+        let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
+        self.laneCtx = LaneBatchSlots.eligibilityCtx(budgetSchedOn: budgetSchedOn, ctx: ctx)
         self.genCap = genCap
         // WS-B Stage A (notes/21): token-budget admission scheduler. Default ON as of the
         // GO-bar bench (notes/21 "Bench verification results", 2026-07-25): a 24K-token
@@ -549,7 +593,6 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         // back out to the old atomic drain-then-step. Gate/size env reads live here only,
         // never inside the scheduler or LaneBatchSlots, so their self-checks stay
         // deterministic.
-        let budgetSchedOn = Tell.envInt("QWISP_TOKEN_BUDGET_SCHED", 1) != 0
         let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
         // Bound MLX's free-buffer pool. This is NOT the #148 leak fix (that is the per-chunk
