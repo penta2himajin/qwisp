@@ -587,13 +587,28 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         self.laneCtx = LaneBatchSlots.eligibilityCtx(budgetSchedOn: budgetSchedOn, ctx: ctx)
         self.genCap = genCap
         // WS-B Stage A (notes/21): token-budget admission scheduler. Default ON as of the
-        // GO-bar bench (notes/21 "Bench verification results", 2026-07-25): a 24K-token
-        // concurrent admit's worst-case stall on another lane's decode stream drops from
-        // an unbounded ~93.7s to a depth-bounded ~13.5s. QWISP_TOKEN_BUDGET_SCHED=0 opts
-        // back out to the old atomic drain-then-step. Gate/size env reads live here only,
-        // never inside the scheduler or LaneBatchSlots, so their self-checks stay
-        // deterministic.
-        let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 2048)) : 0
+        // GO-bar bench (2026-07-25): a concurrent admit's worst-case stall on another
+        // lane's decode stream stops scaling with that request's whole prompt.
+        // QWISP_TOKEN_BUDGET_SCHED=0 opts back out to the old atomic drain-then-step.
+        //
+        // Budget default 1024 = exactly one hybrid chunk, the floor the forward-progress
+        // rule (>=1 legal chunk per admitStep) allows — i.e. the end of the frontier, not
+        // a midpoint. Chosen 2026-08-01 from the measured sweep (notes/21 addendum, 12K
+        // admit, AC): the budget buys nothing in aggregate — summed stall is CONSERVED at
+        // 34+-3s across every setting — it only chooses how that total is sliced:
+        //   1024: 12 waits, worst 4.5s   |  4096: 4 waits, worst 13.7s
+        //   2048:  7 waits, worst 8.5s   |  8192: 3 waits, worst 23.4s  | off: 1, worst 33.9s
+        // Owner decision: minimise the worst single wait so pacing stays predictable.
+        // Accepted cost, do not treat as regression: p99 ITL 22ms -> 3,658ms (more waits
+        // land inside the sample) and ~8% more summed stall from chunking overhead, which
+        // is TTFT paid by the ADMITTING request to protect the streaming one.
+        // Percentiles here are only meaningful with the stream length quoted (p90 is 13ms
+        // for every setting at L=500) — `max` is the stream-length-independent metric and
+        // the SLO for this scheduler. See the addendum before changing this number.
+        //
+        // Gate/size env reads live here only, never inside the scheduler or
+        // LaneBatchSlots, so their self-checks stay deterministic.
+        let budget = budgetSchedOn ? Swift.max(1, Tell.envInt("QWISP_TOKEN_BUDGET", 1024)) : 0
         self.scheduler = ContinuousScheduler(slots: laneSlots, tokenBudget: budget)
         // Bound MLX's free-buffer pool. This is NOT the #148 leak fix (that is the per-chunk
         // autoreleasepool in admitStep) — it is the SECOND consumer, which only became

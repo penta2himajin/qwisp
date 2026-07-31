@@ -65,8 +65,16 @@ FILES=("/tmp/lane-budget-ab-$TS-off.json")
 # "OFF" control — both arms then measured identical (k=12, sum within 2.5%).
 run_pass off "QWISP_TOKEN_BUDGET_SCHED=0"
 for b in $BUDGETS; do
-    run_pass "on$b" "QWISP_TOKEN_BUDGET_SCHED=1 QWISP_TOKEN_BUDGET=$b"
-    FILES+=("/tmp/lane-budget-ab-$TS-on$b.json")
+    # "default" = leave QWISP_TOKEN_BUDGET unset, so the pass measures the SHIPPED
+    # default rather than a value this script pinned. Without this the sweep can
+    # never catch a default that failed to change (or silently changed).
+    if [ "$b" = default ]; then
+        run_pass "ondefault" "QWISP_TOKEN_BUDGET_SCHED=1"
+        FILES+=("/tmp/lane-budget-ab-$TS-ondefault.json")
+    else
+        run_pass "on$b" "QWISP_TOKEN_BUDGET_SCHED=1 QWISP_TOKEN_BUDGET=$b"
+        FILES+=("/tmp/lane-budget-ab-$TS-on$b.json")
+    fi
 done
 
 echo ""

@@ -34,9 +34,10 @@ already-active requests on the same server.
 
 Replace `ContinuousScheduler.loop()`'s "drain queue → run each admit to
 completion → one step" sequence with a single per-iteration token budget
-(default 2048 — matches the existing hybrid chunk size and `QWISP_LANE_PREFIX`
+(originally 2048 — matches the existing hybrid chunk size and `QWISP_LANE_PREFIX`
 snapshot stride, so boundary alignment is free; tunable via
-`QWISP_TOKEN_BUDGET`):
+`QWISP_TOKEN_BUDGET`. **The default is 1024 as of 2026-08-01 — see the addendum's
+DECISION section at the end of this file.**):
 
 1. RUNNING slots (active decode) get their share first — 1 token each, up to
    `slotCount` tokens total.
@@ -92,6 +93,13 @@ token-times), not by the other request's entire prefill duration (today's
 behavior — unbounded stall).
 
 ## Bench verification results (2026-07-25, `scripts/bench_lane_budget_ab.sh 24000`, real model, QWISP_LANE_CTX=32768 for the measurement only)
+
+> **READ THE 2026-08-01 ADDENDUM AT THE END OF THIS FILE BEFORE QUOTING ANY NUMBER
+> BELOW.** These measurements are real, but the p90 and p99 figures describe the
+> 45-token probe stream as much as the scheduler: percentile cleanliness is set by
+> `k/L` (rounds spanned / stream length), so both invert at realistic stream lengths.
+> `max` is the only stream-length-independent metric here. The addendum also records
+> that this run's harness had the OFF arm mis-wired from the GO onward.
 
 Paired same-session run: lane 0 streams 45 tokens (`Count slowly from 1 to 45...`),
 lane 1 admits a real ~24K-token prompt ~600ms in. Inter-token gaps (ms) of lane 0's
@@ -153,3 +161,157 @@ BEFORE any assignment (`$a` reads as unbound under `set -u`) — split into sepa
   WS-A's flag-off-by-default discipline (notes/20). **GO declared 2026-07-25**
   (see "Bench verification results" above) — `QWISP_TOKEN_BUDGET_SCHED` now
   defaults ON (`=0` opts back out to the old atomic path).
+
+---
+
+## Addendum 2026-08-01: AC re-measurement, budget sweep, and what the 2026-07-25 table actually showed
+
+The 2026-07-25 table above is **not wrong**, but it was read wrong, by us, for a week.
+It was measured with a 45-token steady stream, and at that length two of its three
+headline numbers are artifacts of the stream length rather than properties of the
+scheduler. This addendum records the AC re-measurement that establishes which claims
+survive. It supersedes the "Actionable lever for a follow-up" paragraph above.
+
+### Three harness defects found first (all fixed, PR #152)
+
+Every one of these made a pass look valid while measuring something else. They are
+listed first because the p90 topic existed for a week on top of them.
+
+1. `scripts/bench_lane_budget_ab.sh` ran its OFF arm with **no env at all**. The
+   2026-07-25 GO flipped `QWISP_TOKEN_BUDGET_SCHED`'s default to 1, so from that
+   commit onward the "OFF" arm silently ran the **ON** path. Both arms then measured
+   k=12 and summed stalls within 2.5% of each other — identical, because they *were*
+   identical.
+2. `tools/lane_budget_probe.mjs` discarded the big-prompt stream entirely, so a
+   dropped admit was invisible: stream A measured an **idle server** and reported it
+   as a clean latency profile. This is how the flag-off arm read as a 13s pass with
+   no stall, which is what surfaced #151.
+3. `max_tokens: 45` was hardcoded in both the request and its prompt text. Since the
+   percentiles are computed over exactly those gaps, **the stream length is the
+   percentile denominator** — see the law below.
+
+### The law (confirmed at 6 measured points)
+
+Let `S` = total prefill compute the admitting request needs, `k` = the number of
+scheduler rounds it spans, `L` = the steady stream's length in tokens.
+
+- `k = promptLen / QWISP_TOKEN_BUDGET`. Measured at 12K prompt: budget
+  1024/2048/4096/8192 → k = 12/7/4/3. **k does not depend on L** (k=11 at L=45 and
+  k=12 at L=500 for the same 24K/2048 configuration).
+- One decode token is emitted per round, so exactly `k` of the stream's gaps carry
+  prefill work. **Pollution rate = k/L.**
+- Percentile `p` is clean iff `k/L < 1-p`. Measured crossover for p90 sits between
+  k=4 (clean, 24ms) and k=7 (broken, 4,590ms) at L=45 — i.e. straddling the predicted
+  `k ≤ 0.1L = 4.4`.
+- **`S` is conserved**: the scheduler redistributes stall, it does not remove it.
+  Summed stall across the whole sweep was 32.8 / 34.6 / 33.8 / 33.4 / 33.0s for
+  OFF / 1024 / 2048 / 4096 / 8192 — within 5%. The ~13% excess ON carries over OFF at
+  L=500 (32.1 → 36.4s) is chunking overhead.
+- Therefore `max ≥ S/k`: fewer, larger slices trade percentile cleanliness for a worse
+  worst case, monotonically. There is no setting that improves both.
+
+### AC measurements (2026-08-01, `bench_lane_budget_ab.sh 12000`, real model, AC power)
+
+12,000-token admit, not 24,000: **since #151 the flag-off path caps eligibility at
+`legacyArenaCap` = 16,384**, so the 24K A/B of 2026-07-25 is no longer reproducible on
+the OFF arm — it is now refused visibly. Any future paired A/B must stay under 16K.
+
+Steady stream L=500 (a realistic agentic stream), `QWISP_TOKEN_BUDGET=2048`:
+
+| | n | p50 | p90 | p99 | max | k | summed stall |
+|---|---|---|---|---|---|---|---|
+| OFF | 499 | 12 | 13 | 14 | **31,888** | 2 | 32.1s |
+| ON | 499 | 12 | 13 | 4,733 | **8,471** | 7 | 36.4s |
+
+Stall series — OFF `[204, 31888]` (one atomic block), ON `[201, 2303, 4733, 5341,
+6984, 8326, 8471]` (the growing per-round series, as at 24K).
+
+Budget sweep at L=45 (the 2026-07-25 stream length, kept for comparability):
+
+| budget | k | pollution | p50 | **p90** | p99 = max | summed stall |
+|---|---|---|---|---|---|---|
+| OFF | 2 | 5% | 12 | **13** | 32,589 | 32.8s |
+| 1024 | 12 | 27% | 12 | 3,359 | 4,397 | 34.6s |
+| 2048 (default) | 7 | 16% | 12 | **4,590** | 8,328 | 33.8s |
+| 4096 | 4 | 9% | 12 | **24** | 13,579 | 33.4s |
+| 8192 | 3 | 7% | 12 | **19** | 22,780 | 33.0s |
+
+Same sweep at L=500 (the realistic-stream counterpart; both sweeps are the same
+12,000-token admit, AC power, same session per sweep):
+
+| budget | k | pollution | p50 | p90 | p99 | max | summed stall |
+|---|---|---|---|---|---|---|---|
+| OFF | 2 | 0.4% | 12 | 13 | 22 | **33,879** | 34.1s |
+| 1024 | 12 | 2.4% | 12 | 13 | 3,658 | **4,544** | 36.9s |
+| 2048 (default) | 7 | 1.4% | 12 | 13 | 4,802 | **8,511** | 35.0s |
+| 4096 | 4 | 0.8% | 12 | 13 | 23 | **13,655** | 34.0s |
+| 8192 | 3 | 0.6% | 12 | 13 | 19 | **23,392** | 33.7s |
+
+The stall series is the decision-relevant form of this table — a budget choice is a
+choice of how many waits and how long each is, for the same conserved total:
+
+| budget | stalls (s), L=500 |
+|---|---|
+| OFF | 0.2, **33.9** |
+| 1024 | 0.2, 2.1, 2.6, 2.6, 2.6, 2.9, 3.1, 3.7, 4.0, 4.2, 4.3, **4.5** |
+| 2048 | 0.2, 2.2, 4.8, 5.1, 6.6, 7.6, **8.5** |
+| 4096 | 0.2, 10.0, 10.2, **13.7** |
+| 8192 | 0.2, 10.1, **23.4** |
+
+Note `p90 = 13ms` for EVERY arm including OFF at this stream length: at L=500 p90 no
+longer discriminates at all, and `p99` is the percentile the budget moves. 4096 is the
+notable point — it reproduces OFF's whole percentile profile (p99 23ms vs OFF's 22ms)
+while cutting the worst stall 2.5x.
+
+### What this changes
+
+1. **The p90 regression is a stream-length artifact.** At L=500 the default already
+   measures p90 = 13ms, identical to OFF. The 9,983ms in the table above is what a
+   45-token stream reports for the same engine behaviour.
+2. **So is the p99 win.** At L=45, ON beats OFF on p99 (both polluted, ON's stalls are
+   smaller). At L=500 the ordering **inverts** — OFF's p99 is clean at 14ms while ON's
+   is 4,733ms, because OFF pollutes 2 gaps (0.4%) and ON pollutes 7 (1.4%). Neither
+   direction is a property of the scheduler; both are k/L crossing 1%.
+3. **Percentile comparisons between OFF and ON are therefore not stable and must not be
+   quoted without L.** The L-independent statements are exactly three: `p50` is
+   identical (12ms), summed stall is conserved, and **`max` — the worst single stall —
+   is where ON wins unconditionally** (31.9s → 8.5s at L=500), with a bound that does
+   not grow with the admitting prompt's length. **Adopt `max` as the SLO metric for
+   this scheduler** (owner agreed 2026-08-01); report percentiles only alongside L.
+4. **Correction to the analysis that opened this topic.** "Restore p90 while keeping the
+   p99/max win is arithmetically impossible" was too strong. The identities
+   (`max ≥ S/k`, p90-clean ⟺ `k ≤ 0.1L`) hold, but "keeping the win" was anchored to
+   ON@2048's specific max rather than to *beating OFF*. Under the honest definition
+   `budget = 4096` satisfies both at L=45: p90 4,590 → **24ms** while max stays
+   **2.4x better than OFF** (13,579 vs 32,589). The frontier is real and reachable;
+   only the target was mis-stated.
+5. **The "halve the budget to 1024" lever suggested above is the wrong direction for
+   p90** and is now measured: it triples pollution (16% → 27%) and moves p90 from
+   4,590ms to 3,359ms — better only because *every* stall shrinks, while more of them
+   land in the sample. It is the right direction for `max` (8,328 → 4,397).
+
+### DECISION 2026-08-01: default budget 1024 (was 2048)
+
+`QWISP_TOKEN_BUDGET` default is now **1024** — exactly one hybrid chunk, and the floor
+the forward-progress rule (>=1 legal chunk per `admitStep`) permits, so it is the end of
+the frontier rather than a midpoint. Owner decision, rationale: minimise the worst
+single wait so the streaming lane's pacing stays predictable. This follows directly from
+adopting `max` as the SLO metric — summed stall is conserved, so the only thing the
+budget chooses is how the same ~34s is sliced, and 1024 makes the largest slice as small
+as the mechanism allows (4.5s vs OFF's 33.9s, a 7.5x reduction).
+
+**Accepted costs — record these, do not later report them as regressions:**
+- p99 ITL at L=500 goes 22ms (OFF) / 4,802ms (2048) -> **3,658ms**. More waits land
+  inside the sample: pollution 1.4% -> 2.4%. p99 is worse than 4096's 23ms.
+- Summed stall +8% vs OFF (36.9s vs 34.1s) from chunking overhead. This is TTFT paid by
+  the ADMITTING request in order to protect the already-streaming one — a deliberate
+  transfer, not a loss.
+- p90 is unchanged (13ms) at L=500 and is 3,359ms at L=45; per this addendum p90 at
+  short L is not a scheduler property and must not be used to re-open this decision.
+
+Alternatives rejected: **4096** — reproduces OFF's whole percentile profile (p99 23ms)
+while still cutting max 2.5x, the best choice if aggregate smoothness were the goal;
+rejected because it triples the worst wait (4.5s -> 13.7s) against the stated SLO.
+**2048** (previous default) — dominated at realistic L: worse max (8.5s) AND worse p99
+(4,802ms) than 4096, with no metric where it wins. **8192 / OFF** — worst-wait 23.4s /
+33.9s, the failure mode Stage A exists to remove.
