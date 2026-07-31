@@ -1283,4 +1283,170 @@ extension Tell {
         PREFIXPOC \(pass ? "PASS" : "FAIL")   (both paths must be byte-identical to full prefill)
         """
     }
+
+    /// #143 U2 instrument: what does removing a Metal dispatch actually buy inside one CB?
+    ///
+    /// v2, after an adversarial peer review of v1 found the instrument itself was lying. v1's
+    /// prefill was a SILENT NO-OP (it chunked by 1024 into a `maxM: 8` forward, so every call hit
+    /// `guard M <= maxM` and returned nil, which v1 discarded with `_ =`). It printed "ctx=512"
+    /// while measuring decode from an empty context, and v1's self-check passed anyway because it
+    /// only verified the PERTURBATION, never the ENVIRONMENT. That is the same failure recorded in
+    /// notes/21 (a harness quietly measuring something other than its stated condition), reproduced
+    /// one level up. Every v1 number was discarded. Keep that in mind before trusting any change
+    /// to this function: an instrument that cannot fail loudly is worse than no instrument.
+    ///
+    /// DESIGN. Both arms are measured in one process and one model load, so drift is common-mode.
+    /// `fuseXLayer` is a mutable static read at encode time, which is what makes interleaving legal.
+    /// The two structural confounds v1 had are removed at the source rather than corrected for:
+    ///  - PER-PAIR ROLLBACK. Each arm restores the same post-prefill snapshot before running, so
+    ///    both arms of a pair start at an IDENTICAL cache position. v1 let the second arm of every
+    ///    pair run +`steps` tokens deeper, a bias that cancels in the mean but not in the median or
+    ///    the sign test — the two statistics v1 actually reported.
+    ///  - SHARED TOKEN STREAM. Both arms decode the SAME token ids. v1 derived the salt from the
+    ///    arm, so the fold arm deterministically drew a different token band, routing to different
+    ///    MoE experts. That is an arm-level systematic difference, not noise; more reps would not
+    ///    have averaged it away.
+    /// Arm order still alternates (ABBA) so residual time-ordered drift cancels across pairs.
+    ///
+    /// SELF-CHECKS (all must hold or the timings are reported VOID, never as a null result — a
+    /// silently-ineffective flag looks exactly like "no effect", the most dangerous outcome):
+    ///  1. dispatches/sample is an exact multiple of `steps` (v1's `disp / steps` truncation hid
+    ///     up to `steps-1` stray dispatches per sample).
+    ///  2. the ON arm emits exactly `layers-1` fewer dispatches per step than OFF, every pair.
+    ///  3. the absolute OFF-arm count is identical across every pair (catches drift in what is
+    ///     being encoded, which check 2's delta alone cannot see).
+    ///  4. ON and OFF produce BIT-IDENTICAL output under this probe's own conditions. Bit identity
+    ///     was proven elsewhere; this asserts it here, so a timing delta can never come from the
+    ///     fold quietly computing something else.
+    ///
+    /// REGIME CAVEAT, print it and mean it: this measures one-CB-per-step with a full sync per step
+    /// (`forwardRows` commits and waits). Production decode chains multiple steps per CB. A
+    /// per-dispatch cost measured here is an UPPER BOUND on what the chained path would see.
+    ///
+    /// Knobs: QWISP_DISPATCH_REPS (pairs, default 100), QWISP_DISPATCH_STEPS (steps/sample,
+    /// default 32), QWISP_DISPATCH_CTX (prefill depth, default 512).
+    public static func dispatchCostProbe(modelDir: String) -> String {
+        guard let store = try? WeightStore(modelDir: modelDir) else { return "[dispatch-cost] load fail\nDISPATCHCOST done" }
+        store.residentAll()
+        let engine = SeedlessEngine.build(store: store)
+        let reps = Swift.max(4, Tell.envInt("QWISP_DISPATCH_REPS", 100))
+        let steps = Swift.max(4, Tell.envInt("QWISP_DISPATCH_STEPS", 32))
+        let ctx = Swift.max(0, Tell.envInt("QWISP_DISPATCH_CTX", 512))
+        let nLayers = engine.layers.count
+        let expectedDelta = nLayers - 1
+        let chunkM = 256                       // prefill chunk; MUST be <= maxM or forwardRows returns nil
+        // Rollback resets every arm to `ctx`, so the cache never grows past ctx + steps.
+        guard let (fwd, _) = engine.makeFused(maxM: chunkM, maxSeqLen: ctx + steps + 64) else {
+            return "[dispatch-cost] makeFused nil\nDISPATCHCOST done"
+        }
+        func tok(_ n: Int, _ salt: Int) -> [Int32] { (0..<n).map { Int32((($0 &* 7 &+ salt) % 5000) + 100) } }
+        // Prefill. A nil here is a HARD FAILURE — v1 discarded it and measured a fiction.
+        let pre = tok(ctx, 13); var pos = 0
+        while pos < ctx {
+            let end = Swift.min(pos + chunkM, ctx)
+            guard fwd.forwardRows(engine.embed(tokens: Array(pre[pos ..< end])), M: end - pos) != nil else {
+                return "[dispatch-cost] prefill returned nil at pos=\(pos) M=\(end - pos) (chunk > maxM?)\nDISPATCHCOST done"
+            }
+            pos = end
+        }
+        let snapshot = fwd.persistentStateData()
+        guard !snapshot.isEmpty else { return "[dispatch-cost] empty snapshot\nDISPATCHCOST done" }
+        let saved = SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer
+        defer { SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer = saved }
+
+        /// One sample: restore to the snapshot, then `steps` M=1 decode steps on a fixed token
+        /// stream. Returns (ms/step, dispatches/sample, last output) — the caller checks all three.
+        func sample(_ fold: Bool, salt: Int) -> (ms: Double, disp: Int, out: MLXArray)? {
+            guard fwd.restorePersistentState(snapshot) else { return nil }
+            SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer = fold
+            SeedlessFusedVerify._residAddDispatchCount = 0
+            SeedlessFusedVerify._rmsNormRowsDispatchCount = 0
+            SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount = 0
+            var last: MLXArray? = nil
+            let t0 = DispatchTime.now().uptimeNanoseconds       // monotonic; Date() is wall clock
+            for s in 0..<steps {
+                guard let out = fwd.forwardRows(engine.embed(tokens: tok(1, salt &+ s)), M: 1) else { return nil }
+                last = out                                       // forwardRows already commits+waits
+            }
+            let dt = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+            guard let out = last else { return nil }
+            let disp = SeedlessFusedVerify._residAddDispatchCount
+                     + SeedlessFusedVerify._rmsNormRowsDispatchCount
+                     + SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount
+            return (dt / Double(steps), disp, out)
+        }
+        _ = sample(false, salt: 1); _ = sample(true, salt: 1)    // warm-up, both arms, never recorded
+
+        var deltas: [Double] = [], onMs: [Double] = [], offMs: [Double] = []
+        var fail: [String] = []
+        var refOffDisp: Int? = nil
+        for r in 0..<reps {
+            let salt = 1000 &+ r &* 64                           // SAME for both arms of this pair
+            var mOn = 0.0, mOff = 0.0, dOn = 0, dOff = 0
+            var outOn: MLXArray? = nil, outOff: MLXArray? = nil
+            for first in [true, false] {
+                let fold = (r % 2 == 0) ? !first : first          // ABBA
+                guard let s = sample(fold, salt: salt) else {
+                    return "[dispatch-cost] sample nil rep=\(r) fold=\(fold)\nDISPATCHCOST done"
+                }
+                if fold { mOn = s.ms; dOn = s.disp; outOn = s.out } else { mOff = s.ms; dOff = s.disp; outOff = s.out }
+            }
+            if dOff % steps != 0 || dOn % steps != 0 {
+                fail.append("rep=\(r): dispatches/sample not a multiple of steps (OFF=\(dOff) ON=\(dOn) steps=\(steps))")
+            }
+            if (dOff - dOn) / steps != expectedDelta {
+                fail.append("rep=\(r): dispatch delta/step = \((dOff - dOn) / steps), want \(expectedDelta)")
+            }
+            if let ref = refOffDisp, ref != dOff {
+                fail.append("rep=\(r): OFF dispatches/sample drifted \(ref) -> \(dOff)")
+            }
+            refOffDisp = refOffDisp ?? dOff
+            if let a = outOn, let b = outOff {
+                a.eval(); b.eval()
+                let d = MLX.sum(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
+                if d != 0 { fail.append("rep=\(r): fold changed the output under this probe (sum|Δ|=\(d))") }
+            }
+            onMs.append(mOn); offMs.append(mOff); deltas.append(mOn - mOff)
+            if fail.count > 3 { break }
+        }
+        func mean(_ v: [Double]) -> Double { v.reduce(0, +) / Double(v.count) }
+        func sd(_ v: [Double]) -> Double {
+            guard v.count > 1 else { return 0 }
+            let m = mean(v); return (v.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(v.count - 1)).squareRoot()
+        }
+        func median(_ v: [Double]) -> Double {
+            let s = v.sorted(); let n = s.count
+            return n % 2 == 1 ? s[n/2] : (s[n/2 - 1] + s[n/2]) / 2
+        }
+        let n = deltas.count
+        let mD = mean(deltas), sD = sd(deltas), se = sD / Double(n).squareRoot()
+        let lo = mD - 1.96 * se, hi = mD + 1.96 * se
+        let evens = stride(from: 0, to: n, by: 2).map { deltas[$0] }
+        let odds  = stride(from: 1, to: n, by: 2).map { deltas[$0] }
+        var lines = ["[dispatch-cost] #143 U2 instrument v2 — paired, per-pair rollback, shared token stream",
+                     "  layers=\(nLayers) expectedDispatchDelta=\(expectedDelta)/step  ctx=\(ctx) pairs=\(n) steps/sample=\(steps)"]
+        if !fail.isEmpty {
+            lines.append("  SELF-CHECK FAIL (timings below are VOID, do NOT read them as a null result):")
+            for f in fail.prefix(4) { lines.append("    - \(f)") }
+            return lines.joined(separator: "\n") + "\nDISPATCHCOST done"
+        }
+        lines.append("  self-check OK: dispatch delta exact every pair, OFF count stable at \(refOffDisp ?? -1)/sample, outputs bit-identical")
+        lines.append(String(format: "  median ms/step   OFF=%.4f  ON=%.4f", median(offMs), median(onMs)))
+        lines.append(String(format: "  paired delta (ON-OFF): mean=%+.4f ms  sd=%.4f  95%%CI=[%+.4f, %+.4f] ms",
+                            mD, sD, lo, hi))
+        lines.append(String(format: "  relative: %+.3f%%  [%+.3f%%, %+.3f%%]",
+                            100 * mD / mean(offMs), 100 * lo / mean(offMs), 100 * hi / mean(offMs)))
+        let sig = (lo < 0 && hi < 0) ? "SIGNIFICANT (fold faster)"
+                : (lo > 0 && hi > 0) ? "SIGNIFICANT (fold slower)" : "NOT SIGNIFICANT (CI spans 0)"
+        lines.append("  verdict: \(sig)")
+        lines.append(String(format: "  cross-checks: sign %d/%d pairs fold-faster · order effect mean(even)=%+.4f mean(odd)=%+.4f ms",
+                            deltas.filter { $0 < 0 }.count, n, mean(evens), mean(odds)))
+        lines.append(String(format: "  per-BOUNDARY saving = %+.4f us (= mean delta / %d). This is NOT 'per dispatch':",
+                            1000 * mD / Double(expectedDelta), expectedDelta))
+        lines.append("    the fold replaces TWO small kernels with ONE, so it also changes kernel execution")
+        lines.append("    time and occupancy, not just launch count. Treat it as an UPPER BOUND on what")
+        lines.append("    removing one dispatch is worth. Same for the regime: this is 1 CB/step with a full")
+        lines.append("    sync per step; production decode chains steps per CB and would see less.")
+        return lines.joined(separator: "\n") + "\nDISPATCHCOST done"
+    }
 }
