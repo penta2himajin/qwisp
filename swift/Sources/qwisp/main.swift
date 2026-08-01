@@ -123,7 +123,21 @@ case "chat":
         }
     }
     let promptText = rest.joined(separator: " ")
-    let prompt = promptText.isEmpty ? (readLine(strippingNewline: true) ?? "") : promptText
+    // Piped stdin is a documented input path ("or pipe text via stdin" in the usage line), and
+    // readLine() takes only the FIRST line — `cat spec.md | qwisp chat` silently answered on
+    // line 1 and exited 0 (#166; it ingested 52 tokens of a 35K-token file while reporting a
+    // healthy run). Read to EOF when stdin is not a TTY; keep readLine() interactively, where
+    // one line IS what the user means and reading to EOF would block until ^D.
+    let prompt: String
+    if !promptText.isEmpty {
+        prompt = promptText
+    } else if isatty(FileHandle.standardInput.fileDescriptor) == 1 {
+        prompt = readLine(strippingNewline: true) ?? ""
+    } else {
+        let piped = FileHandle.standardInput.readDataToEndOfFile()
+        prompt = String(decoding: piped, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     if prompt.isEmpty {
         print("usage: qwisp chat [--max-tokens N] [--lossless] <prompt>   (or pipe text via stdin)")
     } else {

@@ -22,4 +22,20 @@ total="$(printf '%s\n' "$line" | sed 's|COMPTEST ||' | cut -d/ -f2)"
 if printf '%s\n' "$out" | grep -q 'FAIL' || [ "$passed" != "$total" ]; then
     echo "RESULT: FAIL ($line)"; exit 1
 fi
+# ── #166: piped stdin must be read to EOF, not truncated to the first line ──────────
+# QWISP_FAKE=1 uses FakeBackend: no model weights, no GPU — only the tokenizer this gate
+# already requires. Asserts a strict increase rather than an exact count so it does not
+# encode the tokenizer's segmentation. Before the fix both arms reported 11 tok.
+tok_of() {
+    printf '%b' "$1" | QWISP_FAKE=1 QWISP_MODEL="$MODEL" "$BIN" chat --max-tokens 2 2>&1 \
+        | sed -n 's/.*prompt \([0-9]*\) tok.*/\1/p'
+}
+one="$(tok_of 'alpha\n')"
+two="$(tok_of 'alpha\nbeta gamma delta epsilon zeta eta theta iota kappa lambda\n')"
+if [ -z "$one" ] || [ -z "$two" ] || [ "$two" -le "$one" ]; then
+    echo "RESULT: FAIL (piped stdin truncated to line 1: 1-line=${one:-NA} tok, 2-line=${two:-NA} tok — #166)"
+    exit 1
+fi
+echo "[stdin] piped multi-line read to EOF: 1-line=$one tok < 2-line=$two tok  ok"
+
 echo "RESULT: PASS ($line)"
