@@ -506,6 +506,47 @@ extension Tell {
     /// mtpHead/mtpFwd (①③ Step 5): ingest prompt pairs (h_i, id_{i+1}) per chunk —
     /// pLen-1 pairs total; the final position's pair (h_last, u) is fed by the spec
     /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
+
+    // ── #150 observability: where does serialize prefill's footprint actually go? ───────
+    // Measured 2026-08-01 on this path: a 35,178-token prefill grew footprint 19,456 ->
+    // 35,840MB, i.e. **477 KB/token**, against a KV cost of only 20KB/token. So ~15.7GB of
+    // that growth is unattributed, and the lane fix (#148/#149, a per-chunk autoreleasepool
+    // around noCopy MTLBuffer wrappers) may or may not be the right instrument here — the
+    // lane coefficient was 2.03 MB/token, 4.4x larger, so it is NOT the same magnitude and
+    // "same mechanism" is a reading, not a measurement. This hook exists so the fix site is
+    // chosen from a breakdown rather than from an analogy.
+    //
+    // Same contract as LaneBackend's QWISP_LANE_MEMDBG, and the same interpretation rules:
+    //   active ratcheting                       => LIVE REFERENCES (Memory.cacheLimit is a no-op)
+    //   active flat + cache ratcheting + clear drops it => allocator retention (cacheLimit helps)
+    //   neither, but metal/footprint ratcheting  => raw MTLBuffer / CPU Data; MLX is not the holder
+    // `nonMLXmetal = metal - active - cache` is the quantity that exposed #148's ~26GB hole.
+    //   QWISP_PREFILL_MEMDBG=1 → observe only
+    //   QWISP_PREFILL_MEMDBG=2 → observe, clearCache(), observe again (does the pool give it back?)
+    //   QWISP_PREFILL_MEMDBG_EVERY=<n> → report every n chunks (default 4); the final chunk
+    //     always reports, so the peak is never missed by sampling.
+    nonisolated(unsafe) private static var prefillMemDbgN = 0
+    static func reportPrefillMemory(pos: Int, total: Int) {
+        let mode = Tell.envInt("QWISP_PREFILL_MEMDBG", 0)
+        guard mode > 0 else { return }
+        prefillMemDbgN += 1
+        let every = Swift.max(1, Tell.envInt("QWISP_PREFILL_MEMDBG_EVERY", 4))
+        guard prefillMemDbgN % every == 0 || pos >= total else { return }
+        func mb(_ b: Int) -> String { String(format: "%.0f", Double(b) / 1_048_576) }
+        let before = MLX.Memory.snapshot()
+        let metal = SeedlessMetalForward.ensure()?.0.currentAllocatedSize ?? 0
+        var line = "[prefill-memdbg] pos=\(pos)/\(total) active=\(mb(before.activeMemory))"
+            + " cache=\(mb(before.cacheMemory)) peak=\(mb(before.peakMemory))"
+            + " metal=\(mb(metal))"
+            + " nonMLXmetal=\(mb(metal - before.activeMemory - before.cacheMemory))"
+        if mode >= 2 {
+            MLX.Memory.clearCache()
+            let after = MLX.Memory.snapshot()
+            line += " | afterClear: active=\(mb(after.activeMemory)) cache=\(mb(after.cacheMemory))"
+        }
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
                         mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
@@ -517,10 +558,15 @@ extension Tell {
         var lastNormed: MLXArray? = nil
         var pos = 0
         prefillProgress?(0, pLen)
-        while pos < pLen {
+        // One prefill chunk. Extracted so the whole body can run inside an autoreleasepool —
+        // same shape as the lane fix (PR #149, LaneBatchSlots.admitStep). Returns false on
+        // engine error. `lastNormed` crosses the pool boundary: safe because MLXArray is an
+        // ARC-managed Swift object, not an autoreleased ObjC one — the pool drains the noCopy
+        // MTLBuffer wrappers, not the arrays.
+        func runChunk() -> Bool {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
-            guard let normed = fwdFn(chunk) else { return nil }
+            guard let normed = fwdFn(chunk) else { return false }
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
@@ -534,6 +580,47 @@ extension Tell {
             lastNormed = normed[chunk.count - 1]    // [H]
             pos = end
             prefillProgress?(pos, pLen)
+            reportPrefillMemory(pos: pos, total: pLen)
+            return true
+        }
+        // ── #150 FIX: drain the prefill's autoreleased Metal wrappers every chunk ───────────
+        // Same mechanism #148 found on the lane path, now measured HERE rather than assumed.
+        // 35,178-token serialize prefill, breakdown at every 4th chunk (QWISP_PREFILL_MEMDBG):
+        //     active     20,036 → 21,019MB   (flat — NOT live MLX references)
+        //     cache      ~4.8GB flat, clearCache() drops it to 0 every time (not the holder)
+        //     nonMLXmetal 25,936 → 100,816MB (ratcheting — raw MTLBuffer accumulation)
+        // That is the third row of the lane hook's own interpretation table: MLX is not the
+        // holder, so Memory.cacheLimit is a no-op here and only draining works. The wrappers
+        // accumulate ACROSS Tell.prefill calls too — the server prefills in 2048-token windows
+        // and nonMLXmetal rises monotonically through all of them, because the pool drains at
+        // THREAD exit and the request thread outlives every window.
+        //
+        // MEASURED A/B, same binary, QWISP_PREFILL_CHUNK_POOL=0 vs 1, 35,178-token prefill:
+        //     nonMLXmetal   OFF 25,936 -> 101,645MB (+75.7GB) | ON 23,596 -> 21,269MB (flat)
+        //     footprint     OFF peak 35,840MB       | ON peak 35,840MB   <- BYTE-IDENTICAL
+        // So the pool kills the wrapper ratchet completely and buys ZERO physical memory here.
+        // Do not describe this as a memory fix. Those wrappers alias existing pages: they
+        // inflate MTLDevice.currentAllocatedSize (to 100+GB) without costing resident memory.
+        // It ships because it is a free lifetime change that removes a 100GB bookkeeping
+        // ratchet, not because it relieves pressure.
+        //
+        // Where the serialize prefill's ~16GB (477 KB/token) ACTUALLY goes, by `footprint`
+        // category diff (baseline vs peak, no code change): IOAccelerator (graphics) +15,360MB
+        // over +2,151 regions = 94% of it; all MALLOC categories together < 0.8GB, which
+        // refutes the CPU-side prefix-blob hypothesis. Of that GPU growth, MLX accounts for
+        // ~8.1GB (cache +7.7, active +0.4) and ~7.3GB is GPU memory that neither MLX nor
+        // currentAllocatedSize reports — still unattributed, see #150.
+        //
+        // The serialize footprint coefficient is 4.4x SMALLER than the lane path's (0.47 vs
+        // 2.03 MB/token), which is why a 48K prefill lands near 41GB instead of the ~100GB the
+        // lane law would predict — i.e. why this survived unnoticed on a 64GB box. #150 asked
+        // whether the mechanism was shared: the wrapper mechanism is, its cost is not.
+        //
+        // Default ON. QWISP_PREFILL_CHUNK_POOL=0 restores the pre-fix behavior for A/B only.
+        let chunkPool = Tell.envInt("QWISP_PREFILL_CHUNK_POOL", 1) != 0
+        while pos < pLen {
+            let ok = chunkPool ? autoreleasepool { runChunk() } : runChunk()
+            if !ok { return nil }
         }
         return lastNormed.map { $0.reshaped([1, SeedlessEngine.H]) }   // [1, H]
     }
