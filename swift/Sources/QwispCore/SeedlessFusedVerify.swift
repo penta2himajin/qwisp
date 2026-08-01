@@ -3119,11 +3119,16 @@ public enum SeedlessFusedVerify {
         /// 独立検証: モデル無しの conc-bench が serial encoder の per-dispatch を 2.02-2.07us と
         /// 測っており、ここでの per-boundary 2.5us と同オーダー。手法の異なる2測定の一致が
         /// default を動かす根拠。
-        /// 留保(効果の大きさのみ。符号ではない): 上記はプローブの regime(1 CB/step・毎回フル同期・
-        /// 最終 norm と lm_head を含まない)で取られており、dispatch オーバヘッドが最も有利に出る
-        /// 条件。本番の chained CB(K=8)では同期回数が 1/8 になるぶん利得は縮む。それでも ON に
-        /// するのは、この融合が strictly 仕事を減らす(カーネル1個と h の 1 パス分)ため遅くなる
-        /// 経路が無く、CI もゼロを跨がないから。chained regime での再測は歓迎する follow-up。
+        /// 本番 regime(chainedStepArgmax K=8、head 込み、QWISP_DISPATCH_CHAIN_K=8)でも再測した:
+        ///   wall -0.0999 ms/token CI [-0.150, -0.050] -0.898% / GPU -0.0762 CI [-0.122, -0.031]
+        /// ただし**同一条件の2回目の run では GPU が有意でなかった**(-0.0414、CI [-0.103,+0.020])。
+        /// 点推定は両方負だが約2倍違い、rho の差(+0.235 vs -0.013)が CI 幅を変えて判定を反転させる。
+        /// つまりこの効果量は 200 ペアの単発 run では決着しない。防御できるのは次の2点のみ:
+        ///   - WALL は per-step/chained 計3 run すべてで一貫して負(-0.7〜-0.9%)。tok/s に出るのはこれ
+        ///   - GPU は chained では marginal(-0.38〜-0.71%)で有意性が不安定
+        /// default ON の根拠は WALL の再現性。GPU 側が揺れるのは節約の一部が CPU の encode 削減
+        /// (39×setPipelineState+setBuffer+dispatch/token)であることを示すが、それも実時間である。
+        /// なお per-boundary GPU は per-step 2.54us → chained 1.95us と、予想どおり縮んだ。
         nonisolated(unsafe) public static var fuseXLayer =
             ProcessInfo.processInfo.environment["QWISP_FUSE_XLAYER"] != "0"
 
