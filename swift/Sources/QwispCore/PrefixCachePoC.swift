@@ -1337,6 +1337,13 @@ extension Tell {
         let chunkM = 256                       // prefill chunk; MUST be <= maxM or forwardRows returns nil
         // Preheat steps run AFTER the restore and BEFORE the timer, so they consume cache too.
         let preheat = Swift.max(0, Tell.envInt("QWISP_DISPATCH_PREHEAT", 4))
+        // 0 = per-step forwardRows (one CB per token, full sync each token, no head).
+        // >0 = PRODUCTION regime: chainedStepArgmax with this K, i.e. K tokens per command
+        // buffer including embed/final-norm/lm_head/argmax. The per-step regime maximizes
+        // per-dispatch overhead — it pays a full sync every token — so a win measured there
+        // overstates what production sees. This arm exists so a default can be decided on
+        // production-shaped numbers rather than the probe's convenient ones.
+        let chainK = Swift.max(0, Tell.envInt("QWISP_DISPATCH_CHAIN_K", 0))
         // Rollback resets every arm to `ctx`, so the cache never grows past ctx + preheat + steps.
         guard let (fwd, _) = engine.makeFused(maxM: chunkM, maxSeqLen: ctx + preheat + steps + 64) else {
             return "[dispatch-cost] makeFused nil\nDISPATCHCOST done"
@@ -1365,7 +1372,7 @@ extension Tell {
         // is an assumption, not a check; run this knob after touching this probe and confirm it
         // reports VOID. If it reports numbers, the alarm is broken and nothing here is trustworthy.
         let faultInject = Tell.envInt("QWISP_DISPATCH_FAULT", 0) != 0
-        func sample(_ fold: Bool, salt: Int) -> (ms: Double, gpuMs: Double, disp: Int, out: [Float16])? {
+        func sample(_ fold: Bool, salt: Int) -> (ms: Double, gpuMs: Double, disp: Int, out: [Double])? {
             guard fwd.restorePersistentState(snapshot) else { return nil }
             SeedlessFusedVerify.SeedlessFusedForward.fuseXLayer = faultInject ? false : fold
             // Preheat: untimed steps at THIS arm's configuration, after the restore, before t0.
@@ -1375,32 +1382,55 @@ extension Tell {
             // ~3x the size of the effect being measured, which ABBA then had to cancel exactly.
             // Equalising the pre-timer state is better than relying on that cancellation.
             for s in 0..<preheat {
-                guard fwd.forwardRows(engine.embed(tokens: tok(1, salt &- 1 &- s)), M: 1) != nil else { return nil }
+                if chainK > 0 {
+                    guard fwd.chainedStepArgmax(tok(1, salt &- 1 &- s)[0], K: chainK) != nil else { return nil }
+                } else {
+                    guard fwd.forwardRows(engine.embed(tokens: tok(1, salt &- 1 &- s)), M: 1) != nil else { return nil }
+                }
             }
             SeedlessFusedVerify._residAddDispatchCount = 0
             SeedlessFusedVerify._rmsNormRowsDispatchCount = 0
             SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount = 0
-            var last: MLXArray? = nil
+            var lastHidden: MLXArray? = nil
+            var tokensOut: [Double] = []
             var gpu = 0.0
             let t0 = DispatchTime.now().uptimeNanoseconds       // monotonic; Date() is wall clock
-            for s in 0..<steps {
-                guard let out = fwd.forwardRows(engine.embed(tokens: tok(1, salt &+ s)), M: 1) else { return nil }
-                // GPU-ONLY time for this step's command buffer. This is the number that decides
-                // #143 U2: the fold removes CPU encode calls AND (maybe) GPU serialization, and
-                // MTLDispatchType.concurrent can only ever address the latter. If the wall-clock
-                // win does not appear here, U2 is closed without a further experiment.
-                gpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
-                last = out                                       // forwardRows already commits+waits
+            if chainK > 0 {
+                // PRODUCTION regime. One CB per K tokens; profLastGPUMs is per CB, so it is
+                // summed over calls and divided by TOKENS, keeping the reported unit comparable
+                // with the per-step arm.
+                let calls = Swift.max(1, steps / chainK)
+                for c in 0..<calls {
+                    guard let toks = fwd.chainedStepArgmax(tok(1, salt &+ c)[0], K: chainK) else { return nil }
+                    gpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                    tokensOut.append(contentsOf: toks.map(Double.init))
+                }
+            } else {
+                for s in 0..<steps {
+                    guard let out = fwd.forwardRows(engine.embed(tokens: tok(1, salt &+ s)), M: 1) else { return nil }
+                    // GPU-ONLY time for this step's CB. This is the number that decides #143 U2:
+                    // the fold removes CPU encode calls AND (maybe) GPU serialization, and
+                    // MTLDispatchType.concurrent can only ever address the latter.
+                    gpu += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                    lastHidden = out                             // forwardRows already commits+waits
+                }
             }
             let dt = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
-            guard let out = last else { return nil }
+            let n = chainK > 0 ? Double(tokensOut.count) : Double(steps)
+            guard n > 0 else { return nil }
             let disp = SeedlessFusedVerify._residAddDispatchCount
                      + SeedlessFusedVerify._rmsNormRowsDispatchCount
                      + SeedlessFusedVerify._gdnResidPostNormRowsDispatchCount
-            // Pull the array out HERE, inside the arm. The bit-compare must not run MLX graph ops
-            // in the gap between pairs — that touches the MLX buffer pool and does its own GPU
-            // round-trip, which is part of what made the two arms' pre-timer environments differ.
-            return (dt / Double(steps), gpu / Double(steps), disp, out.asArray(Float16.self))
+            // Pull the comparison payload out HERE, inside the arm: the bit-compare must not run
+            // MLX graph ops in the gap between pairs (that touches the MLX buffer pool and does
+            // its own GPU round-trip, part of what made the arms' pre-timer environments differ).
+            // Chained mode compares the emitted TOKEN STREAM, which is a stronger identity check
+            // than a hidden state — it is the thing the lossless guarantee is defined on.
+            // Float16 -> Double is exact, so equality still means bit-identity.
+            let payload: [Double] = chainK > 0 ? tokensOut
+                                               : (lastHidden?.asArray(Float16.self).map { Double($0) } ?? [])
+            guard !payload.isEmpty else { return nil }
+            return (dt / n, gpu / n, disp, payload)
         }
         _ = sample(false, salt: 1); _ = sample(true, salt: 1)    // warm-up, both arms, never recorded
 
@@ -1416,7 +1446,7 @@ extension Tell {
             let salt = 1000 &+ r &* 63                           // SAME for both arms of this pair
             var mOn = 0.0, mOff = 0.0, dOn = 0, dOff = 0
             var gOn = 0.0, gOff = 0.0
-            var outOn: [Float16]? = nil, outOff: [Float16]? = nil
+            var outOn: [Double]? = nil, outOff: [Double]? = nil
             for first in [true, false] {
                 let fold = (r % 2 == 0) ? !first : first          // ABBA
                 guard let s = sample(fold, salt: salt) else {
@@ -1425,11 +1455,12 @@ extension Tell {
                 if fold { mOn = s.ms; gOn = s.gpuMs; dOn = s.disp; outOn = s.out }
                 else     { mOff = s.ms; gOff = s.gpuMs; dOff = s.disp; outOff = s.out }
             }
-            if dOff % steps != 0 || dOn % steps != 0 {
-                fail.append("rep=\(r): dispatches/sample not a multiple of steps (OFF=\(dOff) ON=\(dOn) steps=\(steps))")
+            let tokens = chainK > 0 ? (Swift.max(1, steps / chainK) * chainK) : steps
+            if dOff % tokens != 0 || dOn % tokens != 0 {
+                fail.append("rep=\(r): dispatches/sample not a multiple of tokens (OFF=\(dOff) ON=\(dOn) tokens=\(tokens))")
             }
-            if (dOff - dOn) / steps != expectedDelta {
-                fail.append("rep=\(r): dispatch delta/step = \((dOff - dOn) / steps), want \(expectedDelta)")
+            if (dOff - dOn) / tokens != expectedDelta {
+                fail.append("rep=\(r): dispatch delta/token = \((dOff - dOn) / tokens), want \(expectedDelta)")
             }
             if let ref = refOffDisp, ref != dOff {
                 fail.append("rep=\(r): OFF dispatches/sample drifted \(ref) -> \(dOff)")
@@ -1437,7 +1468,7 @@ extension Tell {
             refOffDisp = refOffDisp ?? dOff
             if let a = outOn, let b = outOff {
                 if a.count != b.count || zip(a, b).contains(where: { $0 != $1 }) {
-                    fail.append("rep=\(r): fold changed the output under this probe (hidden state differs)")
+                    fail.append("rep=\(r): fold changed the output under this probe (\(chainK > 0 ? "token stream" : "hidden state") differs)")
                 }
             }
             onMs.append(mOn); offMs.append(mOff); deltas.append(mOn - mOff)
@@ -1499,14 +1530,14 @@ extension Tell {
         let gpu  = ci(gpuDeltas, residuals: gResid)      // its OWN autocorrelation, not the wall's
         let rho  = wall.rho
         var lines = ["[dispatch-cost] #143 U2 instrument v4 — paired, rollback, preheat, wall+GPU split, AR(1)-adjusted",
-                     "  layers=\(nLayers) expectedDispatchDelta=\(expectedDelta)/step  ctx=\(ctx) pairs=\(n) steps/sample=\(steps) preheat=\(preheat)"]
+                     "  layers=\(nLayers) expectedDispatchDelta=\(expectedDelta)/token  ctx=\(ctx) pairs=\(n) steps/sample=\(steps) preheat=\(preheat) " + (chainK > 0 ? "regime=CHAINED K=\(chainK) (production: K tokens/CB, head included)" : "regime=per-step (1 CB/token, full sync, no head)")]
         if !fail.isEmpty {
             lines.append("  SELF-CHECK FAIL (timings below are VOID, do NOT read them as a null result):")
             for f in fail.prefix(4) { lines.append("    - \(f)") }
             return lines.joined(separator: "\n") + "\nDISPATCHCOST done"
         }
         lines.append("  self-check OK: dispatch delta exact every pair, OFF count stable at \(refOffDisp ?? -1)/sample, outputs bit-identical")
-        lines.append(String(format: "  wall ms/step  OFF=%.4f ON=%.4f   |   GPU ms/step  OFF=%.4f ON=%.4f",
+        lines.append(String(format: "  wall ms/token OFF=%.4f ON=%.4f   |   GPU ms/token OFF=%.4f ON=%.4f",
                             median(offMs), median(onMs), median(gpuOff), median(gpuOn)))
         lines.append(String(format: "  WALL delta (ON-OFF): mean=%+.4f ms  sd_resid=%.4f  95%%CI=[%+.4f, %+.4f]  (%+.3f%%)",
                             wall.m, wall.s, wall.lo, wall.hi, 100 * wall.m / mean(offMs)))
