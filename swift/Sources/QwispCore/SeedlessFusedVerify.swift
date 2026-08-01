@@ -3109,16 +3109,23 @@ public enum SeedlessFusedVerify {
         /// なので「レジスタ保持 vs 格納・再読込」の差が存在しない。新カーネルも演算列変更も無し。
         /// 適用範囲は encodeLayer / encodeLayerBolt 経路のみ。chunked streaming 経路(自前で
         /// resid→次層 encodePreMoE を並べる)は意図的に対象外＝bytes 不変。
-        /// **既定 OFF**(`QWISP_FUSE_XLAYER=1` で opt-in)。正しさは証明済みだが速度は未証明、
-        /// というのが 2026-08-01 の測定結論。実モデル 192tok × 5rep で ON median 72.04 /
-        /// OFF 70.73 tok/s だが、ON は 68.7→72.7 と単調増加・OFF は 71.3→68.9 と単調減少して
-        /// おり、アーム順序と暖機ドリフトが交絡している。アーム内変動(4.0/2.4)が主張したい差
-        /// (1.3)より大きく、別回では −0.7% と符号すら反転した。1% 級はこのハーネスの分解能外。
-        /// 測定で勝てなかったものは flag-off で出荷し再入点として残す、という WS-A の前例
-        /// (notes/20)に従う。#143 U2(serial encoder barrier に実コストがあるか)の対照ノブとして
-        /// 有用: bit 同一のまま barrier を 39 個消せる唯一の実装済みレバー。
+        /// **既定 ON**(`QWISP_FUSE_XLAYER=0` で opt-out)。当初は flag-off で出荷した — 正しさは
+        /// 証明済み(locked test + 実モデル byte 同一)だが、当時のハーネスが 1% 級を解像できず
+        /// 「測定で勝てなかったものは flag-off」という WS-A の前例(notes/20)に従ったため。
+        /// その理由は #143 U2 用に作った計測器(QWISP_RUN=dispatch-cost、ペア交互 ABBA・ペア毎
+        /// state rollback・同一トークン列・preheat・AR(1)補正 CI)で解消した。実モデル 200 ペア:
+        ///   GPU  -0.0990 ms/step  CI [-0.132, -0.066]  -1.012%
+        ///   wall -0.0896 ms/step  CI [-0.155, -0.024]  -0.785%
+        /// 独立検証: モデル無しの conc-bench が serial encoder の per-dispatch を 2.02-2.07us と
+        /// 測っており、ここでの per-boundary 2.5us と同オーダー。手法の異なる2測定の一致が
+        /// default を動かす根拠。
+        /// 留保(効果の大きさのみ。符号ではない): 上記はプローブの regime(1 CB/step・毎回フル同期・
+        /// 最終 norm と lm_head を含まない)で取られており、dispatch オーバヘッドが最も有利に出る
+        /// 条件。本番の chained CB(K=8)では同期回数が 1/8 になるぶん利得は縮む。それでも ON に
+        /// するのは、この融合が strictly 仕事を減らす(カーネル1個と h の 1 パス分)ため遅くなる
+        /// 経路が無く、CI もゼロを跨がないから。chained regime での再測は歓迎する follow-up。
         nonisolated(unsafe) public static var fuseXLayer =
-            ProcessInfo.processInfo.environment["QWISP_FUSE_XLAYER"] == "1"
+            ProcessInfo.processInfo.environment["QWISP_FUSE_XLAYER"] != "0"
 
         /// attn 層融合(notes/08 §3)へ分岐。既定 ON。QWISP_FUSE_ATTN=0 で opt-out。
         /// flag-on でも各融合原子は既存 kernel 連鎖と bit-exact(G1 gate)なので OUT byte 不変(G2)。
