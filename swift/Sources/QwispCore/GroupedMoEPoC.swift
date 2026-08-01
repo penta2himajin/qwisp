@@ -789,3 +789,153 @@ public enum GroupedMoEPoC {
         return out.joined(separator: "\n")
     }
 }
+
+/// Paired-measurement statistics shared by the #143 U2 instruments. Extracted so the two
+/// probes cannot drift apart: this is the part that has to be RIGHT, and duplicating it is
+/// how one copy quietly keeps an unadjusted CI after the other is fixed.
+public enum BenchStats {
+    public static func mean(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0, +) / Double(v.count) }
+    public static func sd(_ v: [Double]) -> Double {
+        guard v.count > 1 else { return 0 }
+        let m = mean(v); return (v.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(v.count - 1)).squareRoot()
+    }
+    public static func median(_ v: [Double]) -> Double {
+        let s = v.sorted(); let k = s.count
+        guard k > 0 else { return 0 }
+        return k % 2 == 1 ? s[k/2] : (s[k/2 - 1] + s[k/2]) / 2
+    }
+    /// Lag-1 autocorrelation. Adjacent samples on a thermally-managed GPU are not independent;
+    /// at ~1% effect sizes an SE inflation of a few percent is enough to flip a verdict.
+    public static func lag1(_ v: [Double]) -> Double {
+        guard v.count > 2 else { return 0 }
+        let m = mean(v)
+        var num = 0.0, den = 0.0
+        for i in 0..<v.count { den += (v[i] - m) * (v[i] - m) }
+        for i in 1..<v.count { num += (v[i] - m) * (v[i-1] - m) }
+        return den == 0 ? 0 : num / den
+    }
+    /// Residuals after removing a known even/odd (ABBA order) nuisance term.
+    public static func orderResiduals(_ v: [Double]) -> [Double] {
+        let e = mean(stride(from: 0, to: v.count, by: 2).map { v[$0] })
+        let o = mean(stride(from: 1, to: v.count, by: 2).map { v[$0] })
+        return v.enumerated().map { $1 - ($0 % 2 == 0 ? e : o) }
+    }
+    /// AR(1)-adjusted 95% CI of the mean. `residuals` supplies the dispersion (order-blocked);
+    /// the inflation sqrt((1+rho)/(1-rho)) is the standard correction for a correlated mean.
+    public static func ci(_ v: [Double], residuals: [Double]? = nil)
+        -> (m: Double, s: Double, lo: Double, hi: Double, rho: Double) {
+        let r = residuals ?? v
+        let m = mean(v), sv = sd(r)
+        let rho = Swift.max(-0.95, Swift.min(0.95, lag1(r)))
+        let se = sv / Double(v.count).squareRoot() * ((1 + rho) / (1 - rho)).squareRoot()
+        return (m, sv, m - 1.96 * se, m + 1.96 * se, rho)
+    }
+    public static func verdict(_ c: (m: Double, s: Double, lo: Double, hi: Double, rho: Double),
+                              faster: String = "A faster", slower: String = "A slower") -> String {
+        (c.lo < 0 && c.hi < 0) ? faster : (c.lo > 0 && c.hi > 0) ? slower : "not significant (CI spans 0)"
+    }
+}
+
+extension GroupedMoEPoC {
+    /// #143 U2 CEILING experiment. What is the most that making the compute encoder concurrent
+    /// could ever buy? No model, no engine, no frozen-path risk — just N dispatches with NO data
+    /// dependencies in one command buffer, `MTLDispatchType.serial` vs `.concurrent`.
+    ///
+    /// WHY THIS AND NOT MORE ENGINE MEASUREMENT. The in-engine probe (Tell.dispatchCostProbe)
+    /// established that removing 39 dispatches/step is worth ~2.5 us each of GPU time — i.e.
+    /// dispatches are NOT free, which refuted the cheap way to close U2. But concurrency does not
+    /// remove dispatches; it only lets INDEPENDENT ones overlap. qwisp's forward is a near-total
+    /// sequential chain (norm -> mixer -> resid -> MoE -> resid per layer), so the overlappable
+    /// fraction is small and unmeasured. This bench brackets the question from above: it is the
+    /// best case that cannot occur in the real forward — every dispatch independent, every kernel
+    /// deliberately tiny (ONE threadgroup of 32 threads, so it leaves the GPU almost entirely
+    /// idle, the condition under which overlap should pay most, and the shape of the real
+    /// single-threadgroup kernels #143 calls out, e.g. route_top8). If concurrency cannot win
+    /// HERE, it cannot win in the engine, and U2 closes without touching a single dispatch site.
+    ///
+    /// Reported per N: GPU time (cb.gpuEndTime - gpuStartTime) per dispatch, paired and
+    /// interleaved ABBA, AR(1)-adjusted CI. Self-check: both arms must produce the CORRECT
+    /// output buffer — a concurrent encoder that raced would otherwise be timed as a "win".
+    ///
+    /// Knobs: QWISP_CONC_REPS (default 200), QWISP_CONC_N (comma list, default "64,256,694").
+    public static func dispatchConcurrencyBench() -> String {
+        guard let (device, queue) = SeedlessMetalForward.ensure() else { return "[conc-bench] no device\nCONCBENCH done" }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // Deliberately trivial and deliberately tiny: the point is per-dispatch cost, not work.
+        // Each dispatch is bound to its OWN 32-float slice via a buffer offset, so there is no
+        // data dependency between dispatches and a concurrent encoder needs no barriers.
+        kernel void tiny_indep(device float* out [[buffer(0)]],
+                               uint tid [[thread_position_in_grid]]) {
+            out[tid] = float(tid) * 2.0f + 1.0f;
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: src, options: nil),
+              let fn = lib.makeFunction(name: "tiny_indep"),
+              let pipe = try? device.makeComputePipelineState(function: fn) else {
+            return "[conc-bench] pipeline build failed\nCONCBENCH done"
+        }
+        let reps = Swift.max(4, Tell.envInt("QWISP_CONC_REPS", 200))
+        let nList = (ProcessInfo.processInfo.environment["QWISP_CONC_N"] ?? "64,256,694")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }.filter { $0 > 0 }
+        let lanes = 32                                   // floats per dispatch slice
+        var lines = ["[conc-bench] #143 U2 ceiling — N independent tiny dispatches, serial vs concurrent encoder",
+                     "  device=\(device.name) reps=\(reps) threadsPerDispatch=\(lanes) (1 threadgroup)"]
+        for N in nList {
+            guard let buf = device.makeBuffer(length: N * lanes * MemoryLayout<Float>.size,
+                                              options: .storageModeShared) else {
+                lines.append("  N=\(N): buffer alloc failed"); continue
+            }
+            /// One command buffer with N independent dispatches. Returns GPU ms, or nil on a
+            /// wrong result — a raced concurrent encoder must never be reported as a fast one.
+            func run(_ concurrent: Bool) -> Double? {
+                memset(buf.contents(), 0, buf.length)
+                guard let cb = queue.makeCommandBuffer() else { return nil }
+                let enc = concurrent
+                    ? cb.makeComputeCommandEncoder(dispatchType: .concurrent)
+                    : cb.makeComputeCommandEncoder()
+                guard let e = enc else { return nil }
+                e.setComputePipelineState(pipe)
+                for i in 0..<N {
+                    e.setBuffer(buf, offset: i * lanes * MemoryLayout<Float>.size, index: 0)
+                    e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1))
+                }
+                e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                let p = buf.contents().bindMemory(to: Float.self, capacity: N * lanes)
+                for i in 0..<(N * lanes) where p[i] != Float(i % lanes) * 2.0 + 1.0 { return nil }
+                return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            }
+            _ = run(false); _ = run(true)                // warm-up, both arms
+            var deltas: [Double] = [], ser: [Double] = [], con: [Double] = []
+            var bad = false
+            for r in 0..<reps {
+                var s = 0.0, c = 0.0
+                for first in [true, false] {
+                    let isConc = (r % 2 == 0) ? !first : first     // ABBA
+                    guard let t = run(isConc) else { bad = true; break }
+                    if isConc { c = t } else { s = t }
+                }
+                if bad { break }
+                ser.append(s); con.append(c); deltas.append(c - s)   // negative = concurrent faster
+            }
+            if bad || deltas.isEmpty {
+                lines.append("  N=\(N): SELF-CHECK FAIL — a run produced wrong output (encoder raced?). VOID.")
+                continue
+            }
+            let stat = BenchStats.ci(deltas, residuals: BenchStats.orderResiduals(deltas))
+            let mSer = BenchStats.mean(ser)
+            lines.append(String(format: "  N=%4d  serial=%.4f ms  concurrent=%.4f ms  delta=%+.4f ms [%+.4f, %+.4f] (%+.2f%%) rho=%+.3f  %@",
+                                N, mSer, BenchStats.mean(con), stat.m, stat.lo, stat.hi,
+                                mSer == 0 ? 0 : 100 * stat.m / mSer, stat.rho,
+                                BenchStats.verdict(stat, faster: "concurrent faster", slower: "concurrent SLOWER")))
+            lines.append(String(format: "         per-dispatch: serial=%.4f us  delta=%+.4f us",
+                                1000 * mSer / Double(N), 1000 * stat.m / Double(N)))
+        }
+        lines.append("  READ: this is the CEILING. Every dispatch here is independent and tiny; the real")
+        lines.append("    forward is a near-total sequential chain, so its overlappable fraction is a small")
+        lines.append("    subset of N. If the delta here is already ~0, #143 U2 is closed.")
+        return lines.joined(separator: "\n") + "\nCONCBENCH done"
+    }
+}

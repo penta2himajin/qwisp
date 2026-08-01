@@ -61,8 +61,12 @@ if CommandLine.arguments.contains("stream") {
         Runner(name: "prefix-cache-poc", desc: "snapshot/restore byte-identity micro-PoC (design validation, pre-e2e)",
                run: { md, _ in Tell.prefixCachePoC(modelDir: md) }),
         // ── kernel micro-benchmarks (no model) ──
+        Runner(name: "dispatch-cost", desc: "what one Metal dispatch costs inside a CB (#143 U2): paired interleaved ABBA A/B over QWISP_FUSE_XLAYER, self-checked via dispatch seams (QWISP_DISPATCH_REPS/STEPS/CTX)",
+               run: { md, _ in Tell.dispatchCostProbe(modelDir: md) }),
         Runner(name: "lane-kernel-bench", desc: "per-lane sequence-coupled kernel µs at real dims (Stage 1b go/no-go: dispatch tax vs state bandwidth; GPU, no model; QWISP_LANE_CTX)",
                run: { _, _ in Tell.laneKernelBench() }),
+        Runner(name: "conc-bench", desc: "#143 U2 CEILING: N independent tiny dispatches, serial vs concurrent encoder (GPU, no model; QWISP_CONC_REPS/N)",
+               run: { _, _ in GroupedMoEPoC.dispatchConcurrencyBench() }),
         Runner(name: "grouped-moe-bench", desc: "grouped MoE expert kernel micro-bench",
                run: { _, _ in GroupedMoEPoC.bench() }),
         Runner(name: "dense-tiled-bench", desc: "dense tiled matmul micro-bench",
