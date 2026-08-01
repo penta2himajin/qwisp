@@ -1,0 +1,43 @@
+{
+ "issue": 156,
+ "title": "[benchtest] Apple M1 Pro (14-core GPU) \u00b7 32GB \u00b7 resident",
+ "version": "0.3.9",
+ "chip": "Apple M1 Pro",
+ "gpu_cores": 14,
+ "ram_gb": 32,
+ "macos": "Version 26.6 (Build 25G72)",
+ "nvme": "APPLE SSD AP0512R",
+ "read_gbs": 5.2,
+ "power": "battery, thermal nominal",
+ "model": "Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
+ "tier": "resident C=256 \u2192 strict (lossless)",
+ "rows": [
+  {
+   "test": "code-256",
+   "mode": "strict",
+   "ttft_s": 1.7,
+   "tok_s": 53.6,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "nl-256",
+   "mode": "strict",
+   "ttft_s": 1.5,
+   "tok_s": 56.4,
+   "tokens": 256,
+   "stable": true,
+   "ratio": 1.0
+  },
+  {
+   "test": "long-600",
+   "mode": "strict",
+   "ttft_s": 1.6,
+   "tok_s": 52.0,
+   "tokens": 600,
+   "stable": true,
+   "ratio": 0.97
+  }
+ ]
+}
