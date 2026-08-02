@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 99
+        let total = 100
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -6278,6 +6278,34 @@ public enum SeedlessVerifyTests {
             a.record("second-fault")
             guard a.fault?.contains("test-injected") == true else {
                 return (false, "first fault was overwritten: \(a.fault ?? "nil")")
+            }
+            return (true, "ok")
+        }
+
+        // WRITE-LOCKED (guarded by total = 100). Do not weaken/skip/delete.
+        // The checkpoint ships a vision encoder qwisp never reads. residentNonExperts()
+        // filtered only on `.switch_mlp.`, so 852 MB of vision_tower.* were eval'd resident
+        // on every run of every tier — on the 8GB tier that is more than the entire deficit
+        // that made the tier not fit. This asserts the predicate keeps engine tensors and
+        // drops vision ones; a regression here silently costs 852 MB again.
+        run("100 weight-store drops the unused vision encoder") {
+            let keep = [
+                "language_model.model.embed_tokens.weight",
+                "language_model.lm_head.scales",
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight",
+                "language_model.model.layers.7.linear_attn.in_proj_qkv.weight",
+                "language_model.model.layers.3.mlp.gate.weight",
+            ]
+            let drop = [
+                "vision_tower.merger.linear_fc1.weight",
+                "vision_tower.blocks.0.mlp.linear_fc2.scales",
+                "model.visual.patch_embed.proj.weight",
+            ]
+            for k in keep where !WeightStore.isUsedByEngine(k) {
+                return (false, "dropped an engine tensor: \(k)")
+            }
+            for k in drop where WeightStore.isUsedByEngine(k) {
+                return (false, "kept a vision tensor: \(k)")
             }
             return (true, "ok")
         }

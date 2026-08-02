@@ -9,6 +9,19 @@ import MLXFast
 public final class WeightStore {
     public private(set) var arrays: [String: MLXArray] = [:]
 
+    /// The checkpoint ships a vision encoder. qwisp is a text-only engine and never reads a
+    /// single one of those tensors — but `residentNonExperts()` filtered only on `.switch_mlp.`,
+    /// so all 852 MB of `vision_tower.*` were handed to MLX.eval and made resident on every run,
+    /// on every tier. Measured: active 7,071 MB (8GB tier) = arena 4,320 + language_model
+    /// non-expert 1,325 + vision 852 + scratch 574; the 16GB tier's 11,391 MB decomposes the
+    /// same way. Dropping them is free — there is no quality knob involved.
+    ///
+    /// Filtered at load rather than at eval: keeping the MLXArray alive holds its mmap slice,
+    /// so excluding it from eval alone would not have returned the bytes.
+    public static func isUsedByEngine(_ tensorName: String) -> Bool {
+        !(tensorName.hasPrefix("vision_tower") || tensorName.contains("visual"))
+    }
+
     public init(modelDir: String) throws {
         let dir = URL(fileURLWithPath: modelDir)
         let idxURL = dir.appendingPathComponent("model.safetensors.index.json")
@@ -16,9 +29,17 @@ public final class WeightStore {
         let top = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
         let wm = (top["weight_map"] as? [String: String]) ?? [:]
         let shards = Set(wm.values)
+        var dropped = 0
         for shard in shards.sorted() {
             let m = try loadArrays(url: dir.appendingPathComponent(shard))
-            for (k, v) in m { arrays[k] = v }
+            for (k, v) in m {
+                guard WeightStore.isUsedByEngine(k) else { dropped += 1; continue }
+                arrays[k] = v
+            }
+        }
+        if dropped > 0 {
+            FileHandle.standardError.write(Data(
+                "[qwisp] skipped \(dropped) vision-encoder tensors (text-only engine)\n".utf8))
         }
     }
 
