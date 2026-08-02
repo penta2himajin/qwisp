@@ -39,7 +39,11 @@ public enum SeedlessMetalForward {
     /// 実モデル重みの per-call copy(254MB 級)を排除する perf 用。数値へは無影響(同一バイト)。
     static func mtlBuf(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
         if let b = a.asMTLBuffer(device: device, noCopy: true) { return b }
-        return mtlBuf(a, device)
+        // #177: this fallback used to call mtlBuf(a, device) — the same arguments — so the
+        // documented copy path was an infinite recursion. Latent only because mlx-swift
+        // currently copies internally rather than returning nil; a version that returns nil
+        // would have turned every one of the 267 call sites into a stack overflow.
+        return a.asMTLBuffer(device: device, noCopy: false)
     }
 
     static func mlxMatchCompileOpts() -> MTLCompileOptions {
