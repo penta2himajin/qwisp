@@ -7,9 +7,9 @@ final class FakeBackend: LLMBackend {
     let script: [Int]
     init(modelDir: String, tier: SeedlessTier) throws { self.script = [] }   // unused in tests
     init(script: [Int]) { self.script = script }
-    func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
+    func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
         let script = self.script
-        return AsyncStream { cont in
+        return AsyncThrowingStream { cont in
             var n = 0
             for id in script {
                 if options.stopTokens.contains(id) { break }

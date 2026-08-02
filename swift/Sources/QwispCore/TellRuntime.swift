@@ -104,6 +104,10 @@ extension Tell {
         // Option B GPU sampler: (tokens, draftPerRow, invT, seed, basePos) → per-row
         // (full sample, residual sample, accept). Returns the decision on-GPU, tiny readback.
         var stepSampleRows: (([Int32], [Int], Float, UInt64, Int, [Float]?, Float) -> (full: [Int], resid: [Int], accept: [Bool])?)? = nil
+        /// GPU failure firewall (#169): non-nil result = this backend is poisoned and every
+        /// step from here returns nil. The decode loop cannot distinguish "EOS" from "the GPU
+        /// stopped answering" without it, which is how a failed command buffer became `!`x N.
+        var gpuFault: (() -> String?)? = nil
     }
 
     /// forward + lm_head logits, read back to CPU per row (for speculative sampling).
@@ -186,6 +190,7 @@ extension Tell {
         // here is what makes an instrumentation attempt land on the path that actually executes.
         FileHandle.standardError.write(Data(
             "[qwisp] decode path: \(fwd.head != nil ? "raw-fused-step" : "mlx-composed") (streamingBackend)\n".utf8))
+        let faultAccessor: () -> String? = { fwd.gpuFault.fault }
         var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
@@ -243,6 +248,7 @@ extension Tell {
                 fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
         }
+        backend.gpuFault = faultAccessor
         return (backend, fwd)
     }
 
@@ -289,6 +295,7 @@ extension Tell {
         // here is what makes an instrumentation attempt land on the path that actually executes.
         FileHandle.standardError.write(Data(
             "[qwisp] decode path: \(fwd.head != nil ? "raw-fused-step" : "mlx-composed") (streamingBackend)\n".utf8))
+        let faultAccessor: () -> String? = { fwd.gpuFault.fault }
         var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
@@ -453,6 +460,7 @@ extension Tell {
             backend.stepArgmax = traced
             backend.chainedStepArgmax = nil
         }
+        backend.gpuFault = faultAccessor
         return backend
     }
 

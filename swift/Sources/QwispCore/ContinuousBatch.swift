@@ -116,8 +116,8 @@ public final class ContinuousScheduler {
         self.tokenBudget = tokenBudget
     }
 
-    public func submit(prompt: [Int], maxTokens: Int, stopIds: [Int]) -> AsyncStream<Int> {
-        AsyncStream { cont in
+    public func submit(prompt: [Int], maxTokens: Int, stopIds: [Int]) -> AsyncThrowingStream<Int, Error> {
+        AsyncThrowingStream { cont in
             let req = Request(prompt: prompt.map { Int32($0) }, maxTokens: Swift.max(0, maxTokens),
                               stop: Set(stopIds), yield: { cont.yield($0) }, finish: { cont.finish() })
             self.cond.lock()
@@ -293,11 +293,11 @@ public final class ContinuousScheduler {
         let box = Box()
         for i in 0 ..< 5 {
             let s = sched.submit(prompt: [100 * i], maxTokens: 4, stopIds: [])
-            Task.detached { for await t in s { box.streams[i].append(t) }; sem.signal() }
+            Task.detached { do { for try await t in s { box.streams[i].append(t) } } catch {}; sem.signal() }
         }
         // request 5: stop token cuts the stream after 2 tokens (503 is not emitted).
         let s5 = sched.submit(prompt: [500], maxTokens: 100, stopIds: [503])
-        Task.detached { for await t in s5 { box.streams[5].append(t) }; sem.signal() }
+        Task.detached { do { for try await t in s5 { box.streams[5].append(t) } } catch {}; sem.signal() }
         for _ in 0 ..< 6 { sem.wait() }
         var allLen = true
         for i in 0 ..< 5 {
@@ -704,7 +704,7 @@ public final class BatchBackend: LLMBackend, @unchecked Sendable {
     private var sharedPrefixSeen = 0
     private var warnedSharedPrefix = false
 
-    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
         if !warnedSharedPrefix {
             let head = Array(prompt.prefix(4096))
             var lcp = 0

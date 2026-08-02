@@ -673,7 +673,7 @@ extension Tell {
             let box = Box()
             let sem = DispatchSemaphore(value: 0)
             let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
-            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            Task { do { for try await t in stream { box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait()
             return box.v
         }
@@ -727,7 +727,7 @@ extension Tell {
             let box = Box()
             let sem = DispatchSemaphore(value: 0)
             let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
-            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            Task { do { for try await t in stream { box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait()
             return box.v
         }
@@ -790,7 +790,7 @@ extension Tell {
             let box = Box()
             let sem = DispatchSemaphore(value: 0)
             let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
-            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            Task { do { for try await t in stream { box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait()
             return box.v
         }
@@ -856,7 +856,7 @@ extension Tell {
             let box = Box()
             let sem = DispatchSemaphore(value: 0)
             let stream = backend.generate(p, options: GenerateOptions(maxTokens: maxTok, promptContentLen: cl))
-            Task { for await t in stream { box.v.append(t) }; sem.signal() }
+            Task { do { for try await t in stream { box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait()
             return box.v
         }
@@ -904,7 +904,7 @@ extension Tell {
             setenv("QWISP_BOLT_PREFIX", prefix ? "1" : "0", 1)
             let box = Box(); let sem = DispatchSemaphore(value: 0)
             let s = b.generate(p, options: GenerateOptions(maxTokens: 24, promptContentLen: p.count - 8))
-            Task.detached { for await t in s { box.v.append(t) }; sem.signal() }
+            Task.detached { do { for try await t in s { box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait()
             return box.v
         }
@@ -942,7 +942,7 @@ extension Tell {
         func ttft(_ p: [Int], _ cl: Int) -> Double {
             let box = Box(); let sem = DispatchSemaphore(value: 0); let t0 = Date()
             let stream = backend.generate(p, options: GenerateOptions(maxTokens: 4, promptContentLen: cl))
-            Task { for await t in stream { if box.v.isEmpty { box.ttft = Date().timeIntervalSince(t0) }; box.v.append(t) }; sem.signal() }
+            Task { do { for try await t in stream { if box.v.isEmpty { box.ttft = Date().timeIntervalSince(t0) }; box.v.append(t) } } catch { box.v = [] }; sem.signal() }
             sem.wait(); return box.ttft
         }
 

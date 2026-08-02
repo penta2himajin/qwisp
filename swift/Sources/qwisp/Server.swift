@@ -191,7 +191,9 @@ final class QwispEngine: @unchecked Sendable {
         // Incremental detokenize (StreamDetok): full re-decode per token was O(n²) in the
         // generation length — the dominant share of the measured 14-25% per-token server tax.
         var detok = StreamDetok(decode: { self.tokenizer.decode($0) })
-        for await tok in backend.generate(p.ids, options: opts) {
+        // #169: streamSSE is `async throws` — a GPU failure propagates to the HTTP layer
+        // rather than ending the stream as if the model had finished.
+        for try await tok in backend.generate(p.ids, options: opts) {
             if p.stop.contains(tok) { finish = "stop"; break }
             outIds.append(tok)
             if tFirst == nil { tFirst = Date() }
