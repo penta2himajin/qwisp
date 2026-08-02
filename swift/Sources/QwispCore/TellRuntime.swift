@@ -121,6 +121,21 @@ extension Tell {
         return { tokens in
             guard let n = forward(tokens), let l = engine.logits(n, M: tokens.count) else { return nil }
             MLX.eval([l])
+            if SeedlessFusedVerify.logitDbg {
+                for m in 0 ..< tokens.count {
+                    let row = l[m].asArray(Float.self)
+                    var mn = Float.infinity, mx = -Float.infinity, nan = 0, zero = 0, i0 = -1
+                    for (v, x) in row.enumerated() {
+                        if x.isNaN { nan += 1; continue }
+                        if x == 0 { zero += 1 }
+                        if x < mn { mn = x }
+                        if x > mx { mx = x; i0 = v }
+                    }
+                    let line = "[logit-dbg mlx] m=\(m) V=\(row.count) min=\(mn) max=\(mx) "
+                        + "nan=\(nan) zero=\(zero) top1=(\(i0), \(mx))\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
             return (0 ..< tokens.count).map { MLX.argMax(l[$0], axis: -1).item(Int.self) }
         }
     }
@@ -166,6 +181,11 @@ extension Tell {
         } else {
             step = makeStepArgmax(engine: engine, forward: forward)
         }
+        // Always on (#169): the same logical op has three implementations (raw fused step,
+        // GPU chain, MLX-composed fallback) and which one runs is decided at runtime. One line
+        // here is what makes an instrumentation attempt land on the path that actually executes.
+        FileHandle.standardError.write(Data(
+            "[qwisp] decode path: \(fwd.head != nil ? "raw-fused-step" : "mlx-composed") (streamingBackend)\n".utf8))
         var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
@@ -264,6 +284,11 @@ extension Tell {
         } else {
             step = makeStepArgmax(engine: engine, forward: forward)
         }
+        // Always on (#169): the same logical op has three implementations (raw fused step,
+        // GPU chain, MLX-composed fallback) and which one runs is decided at runtime. One line
+        // here is what makes an instrumentation attempt land on the path that actually executes.
+        FileHandle.standardError.write(Data(
+            "[qwisp] decode path: \(fwd.head != nil ? "raw-fused-step" : "mlx-composed") (streamingBackend)\n".utf8))
         var backend = SpecBackend(
             forward: forward,
             stepArgmax: step,
@@ -587,10 +612,16 @@ extension Tell {
         // Same mechanism #148 found on the lane path, now measured HERE rather than assumed.
         // 35,178-token serialize prefill, breakdown at every 4th chunk (QWISP_PREFILL_MEMDBG):
         //     active     20,036 → 21,019MB   (flat — NOT live MLX references)
-        //     cache      ~4.8GB flat, clearCache() drops it to 0 every time (not the holder)
+        //     cache      OBSERVER-CONTAMINATED on the first read: taken under MEMDBG=2, whose
+        //                per-report clearCache() pinned it near 4.8GB and made it look flat.
+        //                Re-read under MEMDBG=1 it GROWS +7.7GB (4,845 → 12,523MB) — the figure
+        //                at the "MLX accounts for ~8.1GB" line below, and the premise of #162.
         //     nonMLXmetal 25,936 → 100,816MB (ratcheting — raw MTLBuffer accumulation)
-        // That is the third row of the lane hook's own interpretation table: MLX is not the
-        // holder, so Memory.cacheLimit is a no-op here and only draining works. The wrappers
+        // The wrapper ratchet is the third row of the lane hook's interpretation table: raw
+        // MTLBuffers, which only draining reaches — that is what THIS fix addresses. It does
+        // not license "Memory.cacheLimit is a no-op here": that conclusion came off the
+        // contaminated cache row, and bounding the pool is measured separately in #162 (knob:
+        // QWISP_PREFILL_MLX_CACHE_MB, SeedlessBackend.init). The wrappers
         // accumulate ACROSS Tell.prefill calls too — the server prefills in 2048-token windows
         // and nonMLXmetal rises monotonically through all of them, because the pool drains at
         // THREAD exit and the request thread outlives every window.
