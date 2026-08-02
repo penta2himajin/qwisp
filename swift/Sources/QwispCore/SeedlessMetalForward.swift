@@ -2359,10 +2359,12 @@ public enum SeedlessMetalForward {
     ///   各層 MoE residual は次層 mixer 先頭で hBuf に畳む（pendingResid=scratch.combined）。最終層は末尾 flush。
     nonisolated(unsafe) static var fusedNumCB = 1   // 層を G 個の CB に分割。実測 G>1 は inter-CB gap で逆効果＝1 が最速
 
+    /// Returns nil on success, or a fault description (#169). Callers must not read the
+    /// output buffers when it is non-nil.
     static func fusedForwardGPU(hBuf: MTLBuffer, layers: [GPULayer], scratch: GPUScratch,
                                 H: Int, E: Int, K: Int, eps: Float, decode: Bool = false, pos: Int = 0,
-                                finalNormW: MTLBuffer? = nil) {
-        guard let (_, queue) = ensure() else { return }
+                                finalNormW: MTLBuffer? = nil) -> String? {
+        guard let (_, queue) = ensure() else { return "fusedForwardGPU: no Metal device" }
         // ★ 多 command buffer: 各 CB を commit(待たず)→GPU が CB_g を実行中に CPU が CB_{g+1} を encode＝
         //   CPU-encode bubble を GPU-exec の裏に隠す。同一 queue の CB は commit 順に serial 実行＋メモリ整合。
         let G = max(1, min(fusedNumCB, layers.count))
@@ -2388,7 +2390,14 @@ public enum SeedlessMetalForward {
             cbs.append(cb)
         }
         cbs.last?.waitUntilCompleted()        // 最後だけ wait
+        // #169: the queue is in-order, so waiting on the last CB means every earlier one has a
+        // final status — but NOT that they succeeded. An earlier CB can fail while the last one
+        // completes, which is exactly the partial-forward case. Check all of them, not `.last`.
+        for cb in cbs where cb.status != .completed || cb.error != nil {
+            return "fusedForwardGPU: status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
+        }
         if let f = cbs.first, let l = cbs.last { lastGPUExecMs = (l.gpuEndTime - f.gpuStartTime) * 1000.0 }
+        return nil
     }
 
     /// ★ issue#7 style A milestone A3b: streaming 版 1-CB forward（per-layer arena gather + GPU slot-remap +

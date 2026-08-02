@@ -417,8 +417,8 @@ public final class QwispModel {
         if hBuf == nil { hBuf = SeedlessMetalForward.makeResidentBuffer(H * 2) }
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         SeedlessMetalForward.writeBuffer(hb, e, H)
-        SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
-                                        finalNormW: ensureFinalNorm())
+        if SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8,
+                                                eps: eps, finalNormW: ensureFinalNorm()) != nil { return nil }
         let fn = SeedlessMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
@@ -432,8 +432,9 @@ public final class QwispModel {
         guard let hb = hBuf, let sc = gpuScratch else { return nil }
         let e = embed(MLXArray([tokenId], [1, 1]))
         SeedlessMetalForward.writeBuffer(hb, e, H)
-        SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8, eps: eps,
-                                        decode: true, pos: pos, finalNormW: ensureFinalNorm())
+        if SeedlessMetalForward.fusedForwardGPU(hBuf: hb, layers: layers, scratch: sc, H: H, E: 256, K: 8,
+                                                eps: eps, decode: true, pos: pos,
+                                                finalNormW: ensureFinalNorm()) != nil { return nil }
         let fn = SeedlessMetalForward.readBuffer(sc.normed, H)   // final norm 同梱済（CB 内）
         return headProj().apply(fn.reshaped([1, 1, H]))
     }
