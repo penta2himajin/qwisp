@@ -368,6 +368,52 @@ public enum SeedlessFusedVerify {
     nonisolated(unsafe) static var _computeGBetaRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _embedRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _argmaxRowsPipeline: MTLComputePipelineState?
+    /// QWISP_LOGIT_DBG=1: dump per-row logit stats after each stepArgmax (diagnostic only, default OFF).
+    /// Distinguishes "constant/zero logit row" (argmax_rows tie-breaks to index 0) from a genuine
+    /// index-0 peak — the open question in the bolt long-prompt collapse. Off = zero cost.
+    static let logitDbg = Tell.envFlag("QWISP_LOGIT_DBG")
+
+    // ── GPU failure firewall (#169) ──────────────────────────────────────────
+    // A command buffer that fails (GPU OOM, fault) leaves its output buffers untouched.
+    // Shared buffers are zero-initialised, so a caller that reads them anyway gets an
+    // all-zero logit row, which argmax tie-breaks to index 0 — token id 0 forever.
+    // Nothing in this codebase inspected cb.status before #169.
+    //
+    // Contract: callers MUST NOT read output buffers when commitAndWaitChecked returns false.
+    // A failure POISONS the process: chain/verify have already advanced CPU-side state
+    // (KV length, ping-pong slots) at encode time, so continuing or retrying on the same
+    // backend is unsound. Recovery requires rebuilding the backend.
+    /// Per-backend fault state. NOT process-global: a failed request must not kill a
+    /// long-running server, so the poison lives on the backend instance that failed.
+    public final class GPUFaultState {
+        public private(set) var fault: String?
+        public var isPoisoned: Bool { fault != nil }
+        public init() {}
+        /// Records the first fault and reports it once. Later faults do not overwrite it.
+        public func record(_ msg: String) {
+            guard fault == nil else { return }
+            fault = msg
+            let out = "[qwisp] GPU command buffer FAILED — \(msg)\n"
+                + "[qwisp] this backend is poisoned; generation stops here rather than emit "
+                + "tokens from buffers the GPU never wrote.\n"
+            FileHandle.standardError.write(Data(out.utf8))
+        }
+    }
+
+    /// Test-only: force the next checked commit to be treated as failed.
+    nonisolated(unsafe) static var injectCBFailure = false
+
+    /// commit + wait, then verify the buffer actually completed.
+    /// Returns nil on success, or a fault description. A non-nil result means the caller
+    /// MUST NOT read any output buffer of this command buffer.
+    static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String) -> String? {
+        cb.commit()
+        cb.waitUntilCompleted()
+        guard !injectCBFailure, cb.status == .completed, cb.error == nil else {
+            return "\(label): status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
+        }
+        return nil
+    }
     nonisolated(unsafe) static var _convShiftFusedRowsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _normGateFusedPipeline: MTLComputePipelineState?        // f16 weight (non-promote)
     nonisolated(unsafe) static var _normGateFusedF32Pipeline: MTLComputePipelineState?    // f32 weight (promote)
@@ -3063,6 +3109,10 @@ public enum SeedlessFusedVerify {
     /// verifyForwardRows と同一 op 列の M-row fused forward。全層を単一 CB に encode し、
     /// residual stream h は GPU 常駐 buffer。cache(KV/conv/rec)も常駐で複数 step チェーン可。
     public final class SeedlessFusedForward {
+        /// GPU failure firewall (#169). Per-instance so one failed request poisons only its own
+        /// backend — a long-running server stays up and rebuilds rather than dying process-wide.
+        public let gpuFault = SeedlessFusedVerify.GPUFaultState()
+
         struct Layer {
             let isLinear: Bool
             let inputLN: MTLBuffer, postLN: MTLBuffer
@@ -3760,6 +3810,7 @@ public enum SeedlessFusedVerify {
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
         public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
+            guard !gpuFault.isPoisoned else { return nil }
             guard let hd = head, tokens.count <= maxM else { return nil }
             let M = tokens.count
             hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM).update(from: tokens, count: M)
@@ -3812,7 +3863,10 @@ public enum SeedlessFusedVerify {
                 encodeEmbed(enc)
                 for (li, L) in layers.enumerated() { encodeLayer(enc, L, li: li, M: M) }
                 encodeFinalOps(enc)
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                enc.endEncoding()
+                if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "stepArgmax(.resident, M=\(M))") {
+                    gpuFault.record(f); return nil
+                }
                 SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .bolt:
@@ -3821,15 +3875,56 @@ public enum SeedlessFusedVerify {
                 encodeEmbed(enc)
                 for (li, L) in layers.enumerated() { encodeLayerBolt(enc, L, M: M, li: li) }
                 encodeFinalOps(enc)
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                enc.endEncoding()
+                if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "stepArgmax(.bolt, M=\(M))") {
+                    gpuFault.record(f); return nil
+                }
                 SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .strict:
                 runStrictLayers(M: M, firstCBExtra: encodeEmbed, finalCBExtra: encodeFinalOps)
             }
 
+            if SeedlessFusedVerify.logitDbg { dumpLogitStats(hd, M: M, tag: "step") }
             let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: maxM)
             return (0 ..< M).map { Int(ptr[$0]) }
+        }
+
+        /// Diagnostic (QWISP_LOGIT_DBG): min/max/#NaN/#zero over the first n f16 elements of a buffer.
+        private func dumpF16Stats(_ b: MTLBuffer, n: Int, tag: String) {
+            let p = b.contents().bindMemory(to: Float16.self, capacity: n)
+            var mn = Float.infinity, mx = -Float.infinity, nan = 0, zero = 0
+            for i in 0 ..< n {
+                let x = Float(p[i])
+                if x.isNaN { nan += 1; continue }
+                if x == 0 { zero += 1 }
+                if x < mn { mn = x }
+                if x > mx { mx = x }
+            }
+            let line = "[logit-dbg \(tag)] n=\(n) min=\(mn) max=\(mx) nan=\(nan) zero=\(zero)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+
+        /// Diagnostic (QWISP_LOGIT_DBG): per-row min/max/#NaN/#zero + top-2 of the logit row.
+        private func dumpLogitStats(_ hd: HeadBufs, M: Int, tag: String) {
+            let V = hd.vocab
+            let lp = hd.logits.contents().bindMemory(to: Float16.self, capacity: maxM * V)
+            for m in 0 ..< M {
+                let row = lp + m * V
+                var mn = Float.infinity, mx = -Float.infinity, nan = 0, zero = 0
+                var b0 = -Float.infinity, b1 = -Float.infinity, i0 = -1, i1 = -1
+                for v in 0 ..< V {
+                    let x = Float(row[v])
+                    if x.isNaN { nan += 1; continue }
+                    if x == 0 { zero += 1 }
+                    if x < mn { mn = x }
+                    if x > mx { mx = x }
+                    if x > b0 { b1 = b0; i1 = i0; b0 = x; i0 = v } else if x > b1 { b1 = x; i1 = v }
+                }
+                let line = "[logit-dbg \(tag)] m=\(m) V=\(V) min=\(mn) max=\(mx) nan=\(nan) zero=\(zero) "
+                    + "top1=(\(i0), \(b0)) top2=(\(i1), \(b1))\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
         }
 
         /// Option B GPU sampler: same 1-CB forward as stepArgmax, but the final op is spec_sample_rows
@@ -4295,6 +4390,7 @@ public enum SeedlessFusedVerify {
         /// STUB — implementation pending.
         /// NOTE: Delegation to forwardRows or stepArgmax in this stub is FORBIDDEN per §4-G1.
         public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
+            guard !gpuFault.isPoisoned else { return nil }
             guard let hd = head, K > 0 else { return nil }
             guard streamMode == .resident || streamMode == .bolt else { return nil }
 
@@ -4376,9 +4472,21 @@ public enum SeedlessFusedVerify {
             }
 
             if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            enc.endEncoding()
+            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "chainedStepArgmax(K=\(K))") {
+                gpuFault.record(f); return nil
+            }
             SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
+            // QWISP_LOGIT_DBG: hd.logits holds the LAST chain step's row (reused per k) — enough
+            // to tell a constant/zero row from a genuine peak.
+            if SeedlessFusedVerify.logitDbg {
+                let line = "[logit-dbg chain] cb.status=\(cb.status.rawValue) cb.error=\(String(describing: cb.error))\n"
+                FileHandle.standardError.write(Data(line.utf8))
+                dumpF16Stats(hBuf, n: H, tag: "chain k=\(K - 1) hBuf(pre-fnorm hidden)")
+                dumpF16Stats(normed, n: H, tag: "chain k=\(K - 1) normed(lm_head input)")
+                dumpLogitStats(hd, M: 1, tag: "chain last k=\(K - 1)")
+            }
             let ptr = chainBuf.contents().bindMemory(to: Int32.self, capacity: K)
             return (0 ..< K).map { Int(ptr[$0]) }
         }

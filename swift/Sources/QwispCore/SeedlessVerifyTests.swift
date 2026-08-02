@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 98
+        let total = 99
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -6231,6 +6231,53 @@ public enum SeedlessVerifyTests {
                                    "OFF=\(nOff) ON=\(nOn) want ON = OFF - \(boundaries) " +
                                    "(fold did not fire on every boundary)")
                 }
+            }
+            return (true, "ok")
+        }
+
+        // WRITE-LOCKED (guarded by total = 99). Do not weaken/skip/delete.
+        // GPU failure firewall (#169): a failed command buffer must never be read from.
+        // Before this, nothing inspected cb.status — a GPU OOM left the shared logits buffer
+        // at its zero-initialised state, argmax tie-broke to index 0, and the engine emitted
+        // token id 0 (`!`) forever with no error anywhere. Asserts the three contract points:
+        // a healthy commit passes and leaves no fault, an injected failure is reported as
+        // failure, and a failure POISONS the process so later steps refuse rather than
+        // read stale/never-written buffers.
+        run("99 gpu-failure-firewall (cb.status checked, failure poisons the backend)") {
+            guard let (_, queue) = SeedlessMetalForward.ensure() else { return (false, "no device") }
+            defer { SeedlessFusedVerify.injectCBFailure = false }
+
+            func emptyCB() -> MTLCommandBuffer? {
+                guard let cb = queue.makeCommandBuffer(), let e = cb.makeBlitCommandEncoder() else { return nil }
+                e.endEncoding()
+                return cb
+            }
+
+            // 1. healthy commit → nil (no fault)
+            SeedlessFusedVerify.injectCBFailure = false
+            guard let cb1 = emptyCB() else { return (false, "cb1 nil") }
+            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb1, "test-healthy") {
+                return (false, "healthy commit reported failure: \(f)")
+            }
+
+            // 2. injected failure → non-nil, labelled
+            SeedlessFusedVerify.injectCBFailure = true
+            guard let cb2 = emptyCB() else { return (false, "cb2 nil") }
+            guard let fault = SeedlessFusedVerify.commitAndWaitChecked(cb2, "test-injected") else {
+                return (false, "injected failure reported success")
+            }
+            guard fault.contains("test-injected") else { return (false, "fault not labelled: \(fault)") }
+
+            // 3. the fault state is per-instance, sticky, and does not leak between instances
+            let a = SeedlessFusedVerify.GPUFaultState()
+            let b = SeedlessFusedVerify.GPUFaultState()
+            if a.isPoisoned || b.isPoisoned { return (false, "fresh state already poisoned") }
+            a.record(fault)
+            guard a.isPoisoned else { return (false, "record did not poison") }
+            guard !b.isPoisoned else { return (false, "poison leaked to another backend") }
+            a.record("second-fault")
+            guard a.fault?.contains("test-injected") == true else {
+                return (false, "first fault was overwritten: \(a.fault ?? "nil")")
             }
             return (true, "ok")
         }
