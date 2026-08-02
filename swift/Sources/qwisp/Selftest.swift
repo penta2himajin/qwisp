@@ -22,7 +22,7 @@ final class FakeBackend: LLMBackend {
 }
 
 /// Completion-core self-test (GPU-free): real tokenizer for decode + FakeBackend.
-func runCompletionSelftest(modelDir: String) async -> String {
+func runCompletionSelftest(modelDir: String) async throws -> String {
     var passed = 0, total = 0
     var lines: [String] = []
     func check(_ name: String, _ ok: Bool) {
@@ -37,14 +37,14 @@ func runCompletionSelftest(modelDir: String) async -> String {
 
     // 1. basic: script decodes back to its text; finish=stop; token count matches.
     let helloIds = tok.encode("hello world")
-    let r1 = await runGeneration(promptIds: [], maxTokens: 128, stopIds: [],
+    let r1 = try await runGeneration(promptIds: [], maxTokens: 128, stopIds: [],
                                  decode: decode, backend: FakeBackend(script: helloIds)) { _ in }
     check("roundtrip_text", r1.text.contains("hello world") && r1.finishReason == "stop"
                             && r1.completionTokens == helloIds.count)
 
     // 2. maxTokens → finish=length, exactly maxTokens emitted.
     let longIds = tok.encode("one two three four five six seven eight")
-    let r2 = await runGeneration(promptIds: [], maxTokens: 3, stopIds: [],
+    let r2 = try await runGeneration(promptIds: [], maxTokens: 3, stopIds: [],
                                  decode: decode, backend: FakeBackend(script: longIds)) { _ in }
     check("maxtokens_length", r2.completionTokens == 3 && r2.finishReason == "length")
 
@@ -52,14 +52,14 @@ func runCompletionSelftest(modelDir: String) async -> String {
     let stopId = 999_999   // synthetic id not in "hi"
     let hiIds = tok.encode("hi")
     let script3 = hiIds + [stopId] + tok.encode("SHOULDNOTAPPEAR")
-    let r3 = await runGeneration(promptIds: [], maxTokens: 128, stopIds: [stopId],
+    let r3 = try await runGeneration(promptIds: [], maxTokens: 128, stopIds: [stopId],
                                  decode: decode, backend: FakeBackend(script: script3)) { _ in }
     check("eos_stop", r3.finishReason == "stop" && !r3.text.contains("SHOULDNOTAPPEAR")
                       && r3.completionTokens == hiIds.count)
 
     // 4. streaming deltas concatenate to the full text.
     var streamed = ""
-    let r4 = await runGeneration(promptIds: [], maxTokens: 128, stopIds: [],
+    let r4 = try await runGeneration(promptIds: [], maxTokens: 128, stopIds: [],
                                  decode: decode, backend: FakeBackend(script: helloIds)) { streamed += $0 }
     check("delta_concat", streamed == r4.text && !streamed.isEmpty)
 
@@ -69,7 +69,7 @@ func runCompletionSelftest(modelDir: String) async -> String {
     // (streamSSE) or duplicate (this path). Deltas must concat to the exact text.
     let frags: [[UInt8]] = [Array("a".utf8) + [0xF0, 0x9F], [0x9A, 0x80] + Array("x".utf8)]
     var mbStreamed = ""
-    let r4b = await runGeneration(promptIds: [], maxTokens: 8, stopIds: [],
+    let r4b = try await runGeneration(promptIds: [], maxTokens: 8, stopIds: [],
                                   decode: { ids in String(decoding: ids.flatMap { frags[$0] }, as: UTF8.self) },
                                   backend: FakeBackend(script: [0, 1])) { mbStreamed += $0 }
     check("delta_multibyte_split", mbStreamed == "a🚀x" && r4b.text == "a🚀x")

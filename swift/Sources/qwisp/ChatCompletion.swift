@@ -151,7 +151,8 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
     // only the answer while the thinking still streams to the terminal.
     var full = "", sentR = "", sentC = ""
     var tFirst: Date? = nil
-    let r = await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
+    let r: CompletionResult
+    do { r = try await runGeneration(promptIds: promptIds, maxTokens: maxTokens, stopIds: tokenizer.stopTokenIds,
                             decode: { tokenizer.decode($0) }, backend: backend,
                             temperature: temperature, topP: topP, seed: seed,
                             frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
@@ -165,6 +166,11 @@ func runChat(prompt: String, tokenizer: QwispTokenizer, backend: any LLMBackend,
         if c.count > sentC.count, c.hasPrefix(sentC) {
             fputs(String(c.dropFirst(sentC.count)), stdout); fflush(stdout); sentC = c
         }
+    } } catch {
+        // #169 (CLI): a GPU failure is not a short answer. Report it and stop rather than
+        // letting a truncated stream look like a completed one.
+        fputs("\nchat: generation failed: \(error)\n", stderr)
+        return
     }
     fputs("\n", stdout)
     // Exit-teardown fix (#47 handoff): join the decode thread before main returns —
@@ -194,7 +200,7 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
                    temperature: Double = 0, topP: Double = 1.0, seed: UInt64 = 0,
                    frequencyPenalty: Double = 0, presencePenalty: Double = 0,
                    logitBias: [Int: Double] = [:], promptContentLen: Int? = nil,
-                   onDelta: (String) -> Void) async -> CompletionResult {
+                   onDelta: (String) -> Void) async throws -> CompletionResult {
     let opts = GenerateOptions(maxTokens: maxTokens, stopTokens: stopIds,
                                temperature: temperature, topP: topP, seed: seed,
                                frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
@@ -221,9 +227,11 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
         if maxTokens >= 0 && outIds.count >= maxTokens { finish = "length"; break }  // <0 = until EOS/context
     }
     } catch {
-        // #169: surface the GPU failure instead of returning a truncated answer.
+        // #169: rethrow. Swallowing this here would hand the caller a short answer plus
+        // finish="error", which the HTTP layer cannot turn into a status code — the failure
+        // has to stay an error all the way out.
         FileHandle.standardError.write(Data("[qwisp] generation failed: \(error)\n".utf8))
-        finish = "error"
+        throw error
     }
     // Flush anything still held in the pending window (finalized ⊆ text always).
     let final = detok.text

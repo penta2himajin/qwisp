@@ -142,7 +142,7 @@ final class QwispEngine: @unchecked Sendable {
         let s = sampling(req)
         if serialize { await lock.acquire() }
         let t0 = Date(); var tFirst: Date? = nil
-        let r = await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
+        let r = try await runGeneration(promptIds: p.ids, maxTokens: p.maxTokens, stopIds: p.stop,
                                     decode: { self.tokenizer.decode($0) }, backend: backend,
                                     temperature: s.temperature, topP: s.topP, seed: s.seed,
                                     frequencyPenalty: s.frequencyPenalty, presencePenalty: s.presencePenalty,
@@ -165,6 +165,25 @@ final class QwispEngine: @unchecked Sendable {
 
     /// Streaming completion: writes OpenAI SSE chunks to the response writer.
     /// Mirrors runGeneration's loop (async writes preclude reusing its sync onDelta).
+    /// OpenAI-compatible error envelope. #169: a GPU failure must reach the client as an
+    /// error, not as a short completion — a truncated answer that looks successful is exactly
+    /// the failure mode the command-buffer firewall exists to remove.
+    struct APIError: Encodable {
+        struct Body: Encodable { let message: String; let type: String; let code: String? }
+        let error: Body
+        init(_ message: String, type: String = "server_error", code: String? = nil) {
+            self.error = Body(message: message, type: type, code: code)
+        }
+    }
+
+    static func errorPayload(_ error: Error) -> (APIError, HTTPResponse.Status) {
+        if let gpu = error as? GPUGenerationFailure {
+            return (APIError(gpu.description, type: "insufficient_gpu_memory", code: "gpu_command_buffer_failed"),
+                    .serviceUnavailable)
+        }
+        return (APIError("\(error)"), .internalServerError)
+    }
+
     func streamSSE(_ req: ChatCompletionRequest, writer: inout some ResponseBodyWriter) async throws {
         let p = try prompt(req)
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
@@ -259,15 +278,33 @@ func makeRouter(engine: QwispEngine, modelID: String) -> Router<BasicRequestCont
             headers[.contentType] = "text/event-stream"
             headers[.cacheControl] = "no-cache"
             let body = ResponseBody { writer in
-                try await engine.streamSSE(req, writer: &writer)
+                // #169: the 200 + SSE headers are already on the wire by the time generation
+                // runs, so a mid-stream GPU failure cannot change the status code. Emit it as
+                // an error event (the OpenAI streaming convention) so the client sees a failure
+                // rather than a stream that simply stops looking like a finished answer.
+                do {
+                    try await engine.streamSSE(req, writer: &writer)
+                } catch {
+                    let (payload, _) = QwispEngine.errorPayload(error)
+                    let json = String(data: (try? JSONEncoder().encode(payload)) ?? Data(), encoding: .utf8) ?? "{}"
+                    try? await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
+                    try? await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
+                }
                 try await writer.finish(nil)   // terminate the chunked body (not auto-called)
             }
             return Response(status: .ok, headers: headers, body: body)
         } else {
-            let resp = try await engine.complete(req)
             headers[.contentType] = "application/json"
-            let data = try JSONEncoder().encode(resp)
-            return Response(status: .ok, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+            do {
+                let resp = try await engine.complete(req)
+                let data = try JSONEncoder().encode(resp)
+                return Response(status: .ok, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+            } catch {
+                // #169: no bytes written yet, so this one can carry a real status code.
+                let (payload, status) = QwispEngine.errorPayload(error)
+                let data = (try? JSONEncoder().encode(payload)) ?? Data()
+                return Response(status: status, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+            }
         }
     }
 
