@@ -193,7 +193,7 @@ case "version", "--version", "-v":
 case "selftest":
     print(await runTokenizerSelftest(modelDir: model))
 case "comptest":
-    print(await runCompletionSelftest(modelDir: model))
+    print(try await runCompletionSelftest(modelDir: model))
 case "sampletest":
     let (passed, total, log) = Sampler.selfCheck()   // GPU-free sampling-math check
     print(log.joined(separator: "\n") + "\nSAMPLETEST \(passed)/\(total)")
