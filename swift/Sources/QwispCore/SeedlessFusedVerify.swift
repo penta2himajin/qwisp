@@ -3696,9 +3696,15 @@ public enum SeedlessFusedVerify {
             }
             func flushCB() {
                 curEnc!.endEncoding()
-                curCB!.commit()
-                curCB!.waitUntilCompleted()
-                gpuMs += (curCB!.gpuEndTime - curCB!.gpuStartTime) * 1000.0
+                // #169: strict splits the forward across many command buffers. Any one of them
+                // can fail, and a partial forward is worse than a whole one — the surviving
+                // layers sit on top of state the failed CB never wrote. Record and let
+                // stepArgmax refuse; do not read anything downstream.
+                if let f = SeedlessFusedVerify.commitAndWaitChecked(curCB!, "runStrictLayers(M=\(M))") {
+                    gpuFault.record(f)
+                } else {
+                    gpuMs += (curCB!.gpuEndTime - curCB!.gpuStartTime) * 1000.0
+                }
                 curEnc = nil; curCB = nil
             }
 
@@ -3883,6 +3889,7 @@ public enum SeedlessFusedVerify {
 
             case .strict:
                 runStrictLayers(M: M, firstCBExtra: encodeEmbed, finalCBExtra: encodeFinalOps)
+                if gpuFault.isPoisoned { return nil }
             }
 
             if SeedlessFusedVerify.logitDbg { dumpLogitStats(hd, M: M, tag: "step") }
