@@ -18,7 +18,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BASELINE=89
+BASELINE=87
 
 count=$(grep -rn "waitUntilCompleted" --include='*.swift' swift/Sources \
         | grep -vc "commitAndWaitChecked" || true)

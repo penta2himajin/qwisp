@@ -3639,6 +3639,7 @@ public enum SeedlessFusedVerify {
         /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
         /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
         public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
+            guard !gpuFault.isPoisoned else { return nil }
             guard M <= maxM else { return nil }
             // hBuf upload(resident/bolt/strict 共通)
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
@@ -3653,7 +3654,13 @@ public enum SeedlessFusedVerify {
                 if let fw = finalNormW {
                     SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
                 }
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                enc.endEncoding()
+                // #169: prefill runs first and is far larger than a decode step. A failure here
+                // is not "no tokens" — it is a KV/GDN state the GPU never wrote, on top of which
+                // decode then runs happily and produces confident nonsense.
+                if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "forwardRows(.resident, M=\(M))") {
+                    gpuFault.record(f); return nil
+                }
                 SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .bolt:
@@ -3663,7 +3670,13 @@ public enum SeedlessFusedVerify {
                 if let fw = finalNormW {
                     SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
                 }
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                enc.endEncoding()
+                // #169: prefill runs first and is far larger than a decode step. A failure here
+                // is not "no tokens" — it is a KV/GDN state the GPU never wrote, on top of which
+                // decode then runs happily and produces confident nonsense.
+                if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "forwardRows(.bolt, M=\(M))") {
+                    gpuFault.record(f); return nil
+                }
                 SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
             case .strict:
@@ -3673,6 +3686,7 @@ public enum SeedlessFusedVerify {
                                                          rows: M, D: self.H, eps: self.eps)
                     }
                 })
+                if gpuFault.isPoisoned { return nil }
             }
 
             let src = finalNormW != nil ? normed : hBuf
