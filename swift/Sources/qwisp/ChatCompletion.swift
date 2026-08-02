@@ -205,7 +205,8 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
     // Incremental detokenize (StreamDetok, O(n²) fix): push() returns the same text as
     // decode(outIds) at every step (TOKTEST-locked contract), multi-token characters included.
     var detok = StreamDetok(decode: decode)
-    for await id in backend.generate(promptIds, options: opts) {
+    do {
+    for try await id in backend.generate(promptIds, options: opts) {
         // Defensive: the backend must already honor stopTokens/maxTokens, but guard here too.
         if stopIds.contains(id) { finish = "stop"; break }
         outIds.append(id)
@@ -218,6 +219,11 @@ func runGeneration(promptIds: [Int], maxTokens: Int, stopIds: [Int],
         emitted = full
         if !delta.isEmpty { onDelta(delta) }
         if maxTokens >= 0 && outIds.count >= maxTokens { finish = "length"; break }  // <0 = until EOS/context
+    }
+    } catch {
+        // #169: surface the GPU failure instead of returning a truncated answer.
+        FileHandle.standardError.write(Data("[qwisp] generation failed: \(error)\n".utf8))
+        finish = "error"
     }
     // Flush anything still held in the pending window (finalized ⊆ text always).
     let final = detok.text

@@ -166,7 +166,8 @@ private func benchRun(name: String, mode: String, prompt: String, maxTokens: Int
     var outIds: [Int] = []
     let t0 = Date()
     var tFirst: Date? = nil
-    for await id in backend.generate(promptIds, options: opts) {
+    do {
+    for try await id in backend.generate(promptIds, options: opts) {
         if tFirst == nil { tFirst = Date() }
         // Mirror runGeneration's defensive stop/max guards: the spec loop streams tokens
         // in accepted-draft/chain granularity, so the raw stream can overshoot EOS and
@@ -174,6 +175,11 @@ private func benchRun(name: String, mode: String, prompt: String, maxTokens: Int
         if tokenizer.stopTokenIds.contains(id) { break }
         outIds.append(id)
         if outIds.count >= maxTokens { break }
+    }
+    } catch {
+        // #169: a GPU failure is not a short answer. A censored run is not a result.
+        note("[bench] \(name)/\(mode): generation FAILED — \(error)")
+        return nil
     }
     let tEnd = Date()
     guard let tf = tFirst, outIds.count > 1 else { return nil }

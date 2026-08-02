@@ -57,9 +57,23 @@ public struct GenerateOptions {
 
 /// Coarse backend protocol: load + generate + tier. Both a future MLXBackend and
 /// SeedlessBackend conform, so the server picks a backend in one line.
+/// A generation that stopped because the GPU stopped answering, not because the model
+/// finished (#169). Carried as a thrown error so callers cannot silently treat a failed
+/// run as a short answer — the whole point of the firewall is that this is unignorable.
+public struct GPUGenerationFailure: Error, CustomStringConvertible {
+    /// Raw fault: which command buffer, its MTLCommandBufferStatus, and the Metal error.
+    public let fault: String
+    public init(fault: String) { self.fault = fault }
+    public var description: String {
+        "GPU command buffer failed — \(fault). "
+        + "The most common cause is running out of GPU memory at this context length; "
+        + "a shorter prompt, --lossless, or a smaller resident budget will get past it."
+    }
+}
+
 public protocol LLMBackend {
     init(modelDir: String, tier: SeedlessTier) throws
-    func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int>
+    func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
 }
 
 // ponytail: SeedlessBackend is a thin LLMBackend conformer that holds the built
@@ -209,9 +223,22 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         }
         self.store = store
         self.engine = SeedlessEngine.build(store: store)
+        // #162 measurement knob. The lane path bounds MLX's free-buffer pool in
+        // LaneBackend.init (QWISP_LANE_MLX_CACHE_MB, default 2048, −22.5GB peak there); the
+        // serialize path never did, and #150 measured the pool growing +7.7GB (cache 4,845 →
+        // 12,523MB) across a 35,178-token prefill. DEFAULT 0 = unbounded = today's behaviour:
+        // whether bounding helps HERE is unmeasured — serialize holds one request's working
+        // set, not B lanes', so the same bound may cost time rather than save it. #162's
+        // pre-registered kill criteria decide it (>2% decode tok/s at resident tier ⇒ close).
+        // Setting the limit does not purge what is already pooled, hence the clearCache().
+        let mlxCacheMB = Swift.max(0, Tell.envInt("QWISP_PREFILL_MLX_CACHE_MB", 0))
+        if mlxCacheMB > 0 {
+            Memory.cacheLimit = mlxCacheMB * 1_048_576
+            Memory.clearCache()
+        }
     }
 
-    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
         // c / maxK / maxM / isStreaming are prompt-length independent; only maxSeqLen (per
         // segment, below) tracks the growing sequence. Resolve those once.
         let cfg = SeedlessBackend.config(tier: tier, promptLen: 0, maxTokens: 0)
@@ -242,7 +269,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         // First KV arena budget; grows geometrically to `ceiling` only if generation needs it.
         let baseline = Swift.max(1, Tell.envInt("QWISP_CTX_BASELINE", 8192))
         let cancel = CancelFlag()
-        return AsyncStream { continuation in
+        return AsyncThrowingStream { continuation in
             // Consumer dropped the stream (EOS at the consumer / client disconnect) → cancel the
             // detached decode so it stops at the next spec-step boundary instead of running to the
             // ceiling on the (exclusive) GPU and overlapping the next request's decode.
@@ -258,6 +285,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // changes (frozen forward path). The spec backend is also rebuilt per segment — fine for
             // a single-user server; a persistent per-instance backend is the throughput lever.
             // QWISP_FORCE_SAMPLE=1 forces the sampling loop even at temperature 0 (T=0-equivalence gate).
+            // #169: the SpecBackend is scoped to the segment loop; keep its fault accessor
+            // so the stream can tell EOS apart from "the GPU stopped answering".
+            var lastFault: (() -> String?)? = nil
             let forceSample = Tell.envFlag("QWISP_FORCE_SAMPLE")
             let wantSample = options.sampling || forceSample
             // Productization tier→mode: streaming tiers (<32GB) decode with bolt (near-lossless
@@ -385,6 +415,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                             maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
+                    lastFault = backend.gpuFault
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
                     // per segment (RNG restarts, so vary the seed by `produced` to avoid reusing the
                     // same stream across segment boundaries). ponytail: penalty counts reset per
@@ -441,7 +472,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     budget = Swift.min(budget * 2, 65536)
                 }
                 if let g = lguard { for t in g.flush() { continuation.yield(t) } }
-                continuation.finish()
+                // #169: a poisoned backend returns nil from every step, which the decode loop
+                // sees as "no more tokens" — indistinguishable from EOS without this check.
+                if let f = lastFault?() { continuation.finish(throwing: GPUGenerationFailure(fault: f)) }
+                else { continuation.finish() }
             }
         }
     }
@@ -450,9 +484,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // to fit each request, plus stride-aligned restore points along the current path. Restores the
     // longest cached prefix of the new content and re-prefills only the delta. Greedy only; provably
     // lossless — SuffixSpec verifies every drafted token (see prefix-cache-poc).
-    private func generateCached(prompt: [Int], contentLen: Int, ceiling: Int, cfg: Config) -> AsyncStream<Int> {
+    private func generateCached(prompt: [Int], contentLen: Int, ceiling: Int, cfg: Config) -> AsyncThrowingStream<Int, Error> {
         let cancel = CancelFlag()
-        return AsyncStream { continuation in
+        return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in cancel.cancel() }
             Thread.detachNewThread {
                 self.segGate.wait()           // same gate as generate() — one decode thread at a time
@@ -621,7 +655,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                      N: genBudget, maxK: maxK, prefillTokens: genSuffix,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
-                continuation.finish()
+                if let f = backend.gpuFault?() { continuation.finish(throwing: GPUGenerationFailure(fault: f)) }
+                else { continuation.finish() }
             }
         }
     }

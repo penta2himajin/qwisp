@@ -646,13 +646,13 @@ public final class LaneBackend: LLMBackend, @unchecked Sendable {
         return (genBudget: genBudget, seqBudget: promptLen + 1 + genBudget, oversized: false)
     }
 
-    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
         let plan = LaneBackend.sizePlan(promptLen: prompt.count, maxTokens: options.maxTokens,
                                         ctxMax: laneCtx, genCap: genCap)
         guard !plan.oversized else {
             FileHandle.standardError.write(Data(
                 "[qwisp] NOTE: prompt (\(prompt.count) tokens) leaves no room to generate in the \(laneCtx)-token lane context — request dropped.\n".utf8))
-            return AsyncStream { $0.finish() }
+            return AsyncThrowingStream { $0.finish() }
         }
         return scheduler.submit(prompt: prompt, maxTokens: plan.genBudget, stopIds: options.stopTokens)
     }
