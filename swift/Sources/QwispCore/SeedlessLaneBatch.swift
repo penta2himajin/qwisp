@@ -857,7 +857,10 @@ public final class SeedlessLaneBatch {
         let cb = driver.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         encodeAllLayers(enc)
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        enc.endEncoding()
+        if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "forwardRowsBatch(B=\(B))") {
+            driver.gpuFault.record(f); return nil
+        }
         SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
         let ptr = driver.hBuf.contents().bindMemory(to: Float16.self, capacity: driver.maxM * H)
@@ -919,7 +922,12 @@ public final class SeedlessLaneBatch {
         var vv = UInt32(hd.vocab); enc.setBytes(&vv, length: 4, index: 2)
         enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        enc.endEncoding()
+        // #169: same firewall as the solo funnels — a failed batch CB leaves tokensOut at
+        // whatever it held, and every lane would take a token the GPU never produced.
+        if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "stepArgmaxBatch(B=\(B))") {
+            driver.gpuFault.record(f); return nil
+        }
         SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
 
         let ptr = hd.tokensOut.contents().bindMemory(to: Int32.self, capacity: driver.maxM)
