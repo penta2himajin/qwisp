@@ -34,13 +34,21 @@ public final class WeightStore {
             let m = try loadArrays(url: dir.appendingPathComponent(shard))
             for (k, v) in m {
                 guard WeightStore.isUsedByEngine(k) else { dropped += 1; continue }
-                arrays[k] = v
+                // MTPLX ships F16 scales/biases/norms; some Hub 4-bit exports store the same
+                // tensors as BF16. Seedless Metal binds them as `half` — BF16 bit patterns
+                // read as F16 yield garbage (mlx_lm is fine: it honors dtype). Cast by dtype.
+                arrays[k] = WeightStore.metalF16(v)
             }
         }
         if dropped > 0 {
             FileHandle.standardError.write(Data(
                 "[qwisp] skipped \(dropped) vision-encoder tensors (text-only engine)\n".utf8))
         }
+    }
+
+    /// Cast BF16 → F16 for Metal `half` kernels; leave other dtypes untouched.
+    public static func metalF16(_ a: MLXArray) -> MLXArray {
+        a.dtype == .bfloat16 ? a.asType(.float16) : a
     }
 
     public func get(_ name: String) -> MLXArray? { arrays[name] }
