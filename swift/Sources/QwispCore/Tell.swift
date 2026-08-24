@@ -56,6 +56,46 @@ public enum Tell {
             && window.reduce(0, +) < specGateThreshold(histLen: histLen) * window.count
     }
 
+    // ── SCORE predictive gate (ported from qwisp-dense / SuffixDecoding §3) ───────
+    // Reactive #119 alone loses on short agentic / longctx: the attempt window fills late
+    // (or never), while wide drafts still pay linear verify. SCORE is the tree's expected
+    // accept length, available at draft time with zero extra I/O.
+    //   SCORE > r·D  → verify; else discard draft and chain (speed only; lossless either way).
+    // QWISP_SPEC_GATE_SCORE=0 falls back to #119-only. Ornith 4-regime A/B (2026-08-23):
+    // r=478‰ (dense) wins code/longctx/shortnl while SCORE still zeros verify on agentic;
+    // r=550/650 over-suppresses Spec wins on longctx without lifting the agentic chain floor.
+    static let specGateUseScore = envInt("QWISP_SPEC_GATE_SCORE", 1) != 0
+    /// 1 draft row cost / AR step cost, permille. Default 478 (dense / Ornith A/B).
+    static let specGateRowCostPermille = Swift.max(1, envInt("QWISP_SPEC_GATE_ROWCOST", 478))
+    /// Laplace add-k on sibling counts — without it alive=1 → C=1 and SCORE saturates (dense §10).
+    static let specGateSmoothK = Swift.max(0, envInt("QWISP_SPEC_SMOOTH_K", 1))
+    /// SpecDec++ marginal truncation (separate r from the gate — do not unify).
+    static let specTruncEnabled = envInt("QWISP_SPEC_TRUNC", 1) != 0
+    static let specTruncRowCostPermille = Swift.max(1, envInt("QWISP_SPEC_TRUNC_ROWCOST", 790))
+    /// Stop drafting when the winning vote has fewer than this many agreeing occurrences
+    /// (tinycodr minSupport). Default 1 = historical; 2 cuts template-hole waste.
+    static let suffixMinSupport = Swift.max(1, envInt("QWISP_SUFFIX_MINSUPPORT", 1))
+    /// Accept-gated adaptive maxK (qwisp-sk). ON by default: clamp draftK to recent accept+grace.
+    static let adaptiveKEnabled = envInt("QWISP_ADAPTIVE_K", 1) != 0
+    static let adaptiveKWindow = Swift.max(1, envInt("QWISP_ADAPT_WINDOW", 8))
+    static let adaptiveKGrace = Swift.max(0, envInt("QWISP_ADAPT_GRACE", 2))
+    /// Expected accept tokens of the most recent suffixDraft (SCORE).
+    nonisolated(unsafe) static var lastDraftScore: Double = 0
+
+    static func specGateShouldDraft(score: Double, drafted: Int) -> Bool {
+        guard drafted > 0 else { return true }
+        return score * 1000.0 > Double(drafted * specGateRowCostPermille)
+    }
+    static func specGateShouldExtend(dRunning: Double) -> Bool {
+        dRunning * 1000.0 > Double(specTruncRowCostPermille)
+    }
+    /// Soft maxK from recent accepted lengths (sk ADAPTIVE_K).
+    static func adaptiveDraftK(cap: Int, recentAccepts: [Int]) -> Int {
+        guard adaptiveKEnabled, !recentAccepts.isEmpty, cap > 1 else { return cap }
+        let mean = recentAccepts.reduce(0, +) / recentAccepts.count
+        return Swift.max(1, Swift.min(cap, mean + adaptiveKGrace))
+    }
+
     /// Pure self-check (no GPU) for the gate arithmetic.
     public static func specGateSelfCheck() -> [(String, Bool)] {
         let bad = Array(repeating: 4, count: specGateWindow)      // 4 acc/attempt
@@ -74,6 +114,16 @@ public enum Tell {
             ("keep_bad_short", !specGateShouldSuspend(window: bad, histLen: 0)),   // 4 ≥ threshold 4
             ("no_suspend_before_window_short", !specGateShouldSuspend(window: [0], histLen: 0)),
             ("rolling_recovers", !specGateShouldSuspend(window: Array(bad.dropFirst(4)) + [40, 40, 40, 40], histLen: 48000)),
+            // SCORE gate (r=0.478)
+            ("score_d4_above", specGateShouldDraft(score: 2.0, drafted: 4)),       // 2.0 > 1.912
+            ("score_d4_below", !specGateShouldDraft(score: 1.8, drafted: 4)),
+            ("score_reject_wide_low", !specGateShouldDraft(score: 11.0, drafted: 52)),
+            ("score_reject_agentic", !specGateShouldDraft(score: 1.0, drafted: 28)),
+            ("score_perfect_passes", specGateShouldDraft(score: 32.0, drafted: 32)),
+            ("trunc_above", specGateShouldExtend(dRunning: 0.80)),
+            ("trunc_below", !specGateShouldExtend(dRunning: 0.78)),
+            ("adapt_k_clamps", adaptiveDraftK(cap: 96, recentAccepts: [2, 3, 2]) == 2 + adaptiveKGrace
+                || !adaptiveKEnabled),
         ]
     }
 
@@ -106,6 +156,7 @@ public enum Tell {
                             traceAlts: Bool = false) -> [Int] {
         let n = seq.count
         if traceAlts { lastDraftAlts = [] }
+        lastDraftScore = 0
         if n < minMatch + 1 { return [] }
         var m = Swift.min(maxMatch, n - 1)
         while m >= minMatch {
@@ -122,6 +173,8 @@ public enum Tell {
                 let cap = Swift.min(draftK, suffixAlpha * m)   // α·p length cap
                 var draft: [Int] = []
                 var alive = occ                                // draft と継続一致中の位置（最近順）
+                var dRunning = 1.0                             // D(N): product of C along the path
+                var score = 0.0                                // SCORE = Σ D(N) = E[accepted]
                 while draft.count < cap && !alive.isEmpty {
                     var counts: [Int: Int] = [:]
                     var next: [Int] = []                       // alive[k] の提案 token（-1=尽きた）
@@ -161,12 +214,28 @@ public enum Tell {
                         if best != countBest { reuseFlips += 1 }
                     }
                     if best < 0 { break }                      // 全 alive が末尾到達
+                    if countBestCnt < suffixMinSupport { break }  // tinycodr confidence stop
+                    // SuffixDecoding D(N)/SCORE accumulated while extending (paper §3).
+                    // C(N) = COUNT(best) / (Σ siblings + Laplace k); D = D_parent · C; SCORE += D.
+                    let sibling = counts.values.reduce(0, +)
+                    if sibling > 0, let c = counts[best] {
+                        // Trunc uses unsmoothed C: Laplace k=1 makes alive=1 → C=0.5, which is
+                        // always < trunc-r (790‰) and empties every singleton draft (Ornith code
+                        // A/B: SMOOTH_K=0 restored verify; k=1+trunc → verify=0). SCORE still
+                        // uses Laplace so alive=1 does not saturate the gate (dense §10).
+                        let dRaw = dRunning * Double(c) / Double(sibling)
+                        if specTruncEnabled && !specGateShouldExtend(dRunning: dRaw) { break }
+                        let d = dRunning * Double(c) / Double(sibling + specGateSmoothK)
+                        dRunning = d
+                        score += dRunning
+                    }
                     if traceAlts { lastDraftAlts.append(second) }
                     draft.append(best)
                     var kept: [Int] = []
                     for k in 0 ..< alive.count where next[k] == best { kept.append(alive[k]) }
                     alive = kept
                 }
+                lastDraftScore = score
                 return draft
             }
             m -= 1

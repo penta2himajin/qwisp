@@ -759,13 +759,21 @@ extension Tell {
         let gateOn = Tell.specGateEnabled && !useA3
         var gateWindow: [Int] = []
         var gateSuspendedUntil = -1
+        // sk-style adaptive maxK: clamp draftK to recent accept + grace (feeds SCORE trunc too).
+        var recentAccepts: [Int] = []
 
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
             let tD = prof ? Date() : Date.distantPast
+            let effK = Tell.adaptiveDraftK(cap: maxK, recentAccepts: recentAccepts)
             var drafts = (gateOn && out.count < gateSuspendedUntil) ? []
-                : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
+                : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: effK, minMatch: Tell.suffixMinMatch,
                                    traceAlts: Tell.traceAltsEnabled)
+            // SCORE predictive discard (dense): if E[accept] can't cover verify cost, chain instead.
+            if gateOn, Tell.specGateUseScore, !drafts.isEmpty,
+               !Tell.specGateShouldDraft(score: Tell.lastDraftScore, drafted: drafts.count) {
+                drafts = []
+            }
             if prof { pfDraft += Date().timeIntervalSince(tD) * 1000 }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
@@ -852,6 +860,9 @@ extension Tell {
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
                 stAccepted += p
+                // Feed adaptive-K window (accepted length this attempt, including 0).
+                recentAccepts.append(p)
+                if recentAccepts.count > Tell.adaptiveKWindow { recentAccepts.removeFirst() }
                 // #119 gate: record this attempt's yield; suspend drafting when the rolling
                 // mean falls under the ctx-scaled break-even. Window survives suspension →
                 // a still-bad regime re-suspends after one probe attempt.
@@ -1131,7 +1142,6 @@ extension Tell {
         let promptIds: [Int32] = promptArr.asType(.int32).asArray(Int32.self)
         let gRefIds:   [Int]   = gRefArr.asType(.int32).asArray(Int32.self).map { Int($0) }
         let N    = Swift.min(Tell.envInt("QWISP_GEN", 48), gRefIds.count)
-        // streaming tier の default maxK: C*3/8(MLX strict と同一の動作点)。resident は 96 のまま。
         let maxK = isStreaming
             ? Tell.envInt("QWISP_DRAFT_K", Swift.max(4, rawC * 3 / 8))
             : Tell.envInt("QWISP_DRAFT_K", 96)

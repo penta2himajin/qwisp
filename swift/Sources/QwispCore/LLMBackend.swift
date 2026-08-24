@@ -102,7 +102,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         case .streaming(let x): c = x
         }
         let isStreaming = c > 0 && c < 256
-        let maxK = isStreaming ? Swift.max(4, c * 3 / 8) : 96
+        let maxK = isStreaming
+            ? Swift.max(4, c * 3 / 8)
+            // Resident: SCORE+trunc discard low-accept drafts before verify, so wide K recovers
+            // Spec wins on code/longctx without the chibi agentic/longctx verify tax. Cap 96
+            // matches dense; QWISP_DRAFT_K overrides.
+            : Tell.envInt("QWISP_DRAFT_K", 96)
         let pendingCap = 24
         let maxM = Swift.max(pendingCap + maxK + 1, 64)
         let maxSeqLen = promptLen + maxTokens + maxK + 64

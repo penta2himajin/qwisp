@@ -12,11 +12,13 @@ enum ModelStore {
         FileManager.default.fileExists(atPath: path + "/config.json")
     }
 
-    /// The engine is specialised to the MTPLX checkpoint layout; anything else must be
-    /// rejected HERE with a real message — engine preconditions die as a bare trace trap
-    /// (issue #51: an oQ4 requant of the same base model SIGTRAPed benchtest). The MTPLX
-    /// pipeline stamps `mtplx_policy` into config.json; that key is the format signature
-    /// (the oQ4 repo lacks it while matching everything else).
+    /// The engine is specialised to the MTPLX *quant layout* (4-bit affine gs=64 dens/experts;
+    /// router + shared_expert_gate only at 8-bit). Anything else must be rejected HERE with a
+    /// real message — engine preconditions die as a bare trace trap (issue #51: an oQ4 requant
+    /// of the same base SIGTRAPed). Acceptance:
+    ///   1. `mtplx_policy` stamp (canonical Youssofal MTPLX), OR
+    ///   2. the same quant recipe detected from `quantization` (e.g. Ornith-1.5 / mlx-community
+    ///      plain 4-bit). Mixed-precision recipes (Nail/OptiQ with 8-bit attn) stay rejected.
     static func requireSupported(_ modelDir: String) {
         let url = URL(fileURLWithPath: modelDir).appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: url),
@@ -24,16 +26,77 @@ enum ModelStore {
             FileHandle.standardError.write(Data("cannot read \(url.path) — not a model directory?\n".utf8))
             exit(1)
         }
-        guard top["mtplx_policy"] == nil else { return }
+        if isSupportedCheckpoint(top) { return }
         FileHandle.standardError.write(Data("""
         Unsupported checkpoint: \(modelDir)
-        qwisp is single-model-specialised: it supports the MTPLX build of Qwen3.6-35B-A3B only
-        (\(defaultRepo)). This directory is a different model or a different quant layout of the
-        same base model, and the engine's kernels are shaped for the MTPLX layout exactly.
+        qwisp needs the MTPLX quant layout of Qwen3.5/3.6-35B-A3B (4-bit affine gs=64; only
+        mlp.gate + shared_expert_gate at 8-bit). This directory is a different architecture or
+        a different quant recipe, and the engine's kernels are shaped for that layout exactly.
             qwisp pull    # download the supported checkpoint (~20 GB) + write config
 
         """.utf8))
         exit(1)
+    }
+
+    /// Pure gate: true iff `config.json` is the MTPLX stamp or an equivalent quant recipe.
+    static func isSupportedCheckpoint(_ top: [String: Any]) -> Bool {
+        if top["mtplx_policy"] != nil { return true }
+        return matchesMTPLXQuantRecipe(top["quantization"] as? [String: Any])
+    }
+
+    /// MTPLX / mlx-community-4bit / Ornith-MLX-4bit recipe: default 4/64/affine, and every
+    /// per-tensor override is bits=8 on `….mlp.gate` or `….mlp.shared_expert_gate` only.
+    /// At least one router-gate override is required so uniform-4bit (gates packed as 4)
+    /// cannot pass and then SIGTRAP in `qmm8`.
+    static func matchesMTPLXQuantRecipe(_ q: [String: Any]?) -> Bool {
+        guard let q else { return false }
+        guard intVal(q["bits"]) == 4, intVal(q["group_size"]) == 64 else { return false }
+        if let mode = q["mode"] as? String, mode != "affine" { return false }
+        var sawRouterGate = false
+        for (k, v) in q {
+            if k == "bits" || k == "group_size" || k == "mode" { continue }
+            guard let ov = v as? [String: Any], intVal(ov["bits"]) == 8 else { return false }
+            let isRouter = k.hasSuffix(".mlp.gate")
+            let isSharedGate = k.hasSuffix(".mlp.shared_expert_gate")
+            guard isRouter || isSharedGate else { return false }
+            if isRouter { sawRouterGate = true }
+        }
+        return sawRouterGate
+    }
+
+    /// JSONSerialization boxes numbers as NSNumber; accept Int bridging either way.
+    private static func intVal(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let n = v as? NSNumber { return n.intValue }
+        return nil
+    }
+
+    /// GPU-free gate self-check (COMPTEST / Selftest).
+    static func selfCheck() -> [(String, Bool)] {
+        func cfg(_ bits: Int, overrides: [String: [String: Any]] = [:], policy: Bool = false) -> [String: Any] {
+            var q: [String: Any] = ["bits": bits, "group_size": 64, "mode": "affine"]
+            for (k, v) in overrides { q[k] = v }
+            var top: [String: Any] = ["quantization": q]
+            if policy { top["mtplx_policy"] = ["name": "test"] }
+            return top
+        }
+        let gate8: [String: Any] = ["bits": 8, "group_size": 64]
+        let ornith = cfg(4, overrides: [
+            "language_model.model.layers.0.mlp.gate": gate8,
+            "language_model.model.layers.0.mlp.shared_expert_gate": gate8,
+        ])
+        let nailish = cfg(4, overrides: [
+            "language_model.model.layers.0.mlp.gate": gate8,
+            "language_model.model.layers.0.linear_attn.in_proj_qkv": gate8,
+        ])
+        return [
+            ("mtplx_stamp", isSupportedCheckpoint(cfg(4, policy: true))),
+            ("ornith_recipe", isSupportedCheckpoint(ornith)),
+            ("reject_uniform_4bit", !isSupportedCheckpoint(cfg(4))),
+            ("reject_nail_attn8", !isSupportedCheckpoint(nailish)),
+            ("reject_8bit_default", !isSupportedCheckpoint(cfg(8))),
+            ("reject_no_quant", !isSupportedCheckpoint([:])),
+        ]
     }
 
     // Download `repo` and point the config file at it. Returns the local model path.

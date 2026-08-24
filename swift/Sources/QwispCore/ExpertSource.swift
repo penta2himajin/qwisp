@@ -55,6 +55,11 @@ public final class ExpertSource {
         }
     }
 
+    /// BF16 bit pattern → F16 bit pattern via f32 (Metal kernels bind scales/biases as `half`).
+    static func bf16BitsToF16Bits(_ bits: UInt16) -> UInt16 {
+        Float16(Float(bitPattern: UInt32(bits) << 16)).bitPattern
+    }
+
     static func itemSize(_ s: String) -> Int {
         switch s { case "U32", "F32": return 4; case "F16", "BF16": return 2; default: return 1 }
     }
@@ -125,7 +130,9 @@ public final class ExpertSource {
         guard let shard = wm[name], let t = try header(shard).meta[name] else {
             throw NSError(domain: "ExpertSource", code: 2)
         }
-        return ExpertSource.dtype(t.dtype)
+        // preadInto normalizes BF16 → F16 in the arena slot; report the post-convert dtype.
+        let dt = ExpertSource.dtype(t.dtype)
+        return dt == .bfloat16 ? .float16 : dt
     }
 
     /// expert e の (layer,proj,part) の絶対バイト範囲（shard パス, offset, length）。device probe 用。
@@ -154,6 +161,15 @@ public final class ExpertSource {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let n = pread(fd(shard), buf, stride, off_t(offset))
         if n != stride { throw NSError(domain: "ExpertSource", code: 3) }
+        // Same BF16→F16 normalize as WeightStore.metalF16: streamed expert scales/biases
+        // are bound as Metal `half`. Leave U32 weight packs untouched.
+        if t.dtype == "BF16" {
+            let count = stride / 2
+            let p = buf.assumingMemoryBound(to: UInt16.self)
+            for i in 0 ..< count {
+                p[i] = Self.bf16BitsToF16Bits(p[i])
+            }
+        }
         let dt = DispatchTime.now().uptimeNanoseconds - t0
         if ExpertSource.acct {
             ExpertSource.throttleLock.lock()
@@ -191,8 +207,15 @@ public final class ExpertSource {
         let buf = UnsafeMutableRawPointer.allocate(byteCount: stride, alignment: 16)
         let n = pread(fd(shard), buf, stride, off_t(offset))
         if n != stride { buf.deallocate(); throw NSError(domain: "ExpertSource", code: 3) }
+        var dt = ExpertSource.dtype(t.dtype)
+        if t.dtype == "BF16" {
+            let count = stride / 2
+            let p = buf.assumingMemoryBound(to: UInt16.self)
+            for i in 0 ..< count { p[i] = Self.bf16BitsToF16Bits(p[i]) }
+            dt = .float16
+        }
         let restShape = [1] + Array(t.shape.dropFirst())
-        return MLXArray(rawPointer: buf, restShape, dtype: ExpertSource.dtype(t.dtype)) {
+        return MLXArray(rawPointer: buf, restShape, dtype: dt) {
             buf.deallocate()
         }
     }
