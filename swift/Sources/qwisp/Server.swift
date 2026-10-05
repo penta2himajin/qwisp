@@ -250,6 +250,16 @@ final class QwispEngine: @unchecked Sendable {
         }
         if !toolCalls.isEmpty { finish = "tool_calls" }
         try await send(Delta(), finish)
+        // #181: OpenAI emits a final usage-only chunk (empty choices) before [DONE]
+        // when the request sets stream_options.include_usage. Non-streaming already
+        // returns usage; without this, streaming clients see output_tokens=0.
+        if req.stream_options?.include_usage == true {
+            var last = ChatCompletionChunk(id: id, created: created, model: modelID, choices: [])
+            last.usage = Usage(prompt_tokens: p.ids.count, completion_tokens: outIds.count,
+                               total_tokens: p.ids.count + outIds.count)
+            let json = String(data: (try? enc.encode(last)) ?? Data(), encoding: .utf8) ?? "{}"
+            try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
+        }
         try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
         logPerf("stream", prompt: p.ids.count, gen: outIds.count, t0: t0, tFirst: tFirst)
     }

@@ -96,6 +96,11 @@ func runCompletionSelftest(modelDir: String) async throws -> String {
     let plainReq = try? JSONDecoder().decode(ChatCompletionRequest.self, from: Data(
         #"{"messages":[{"role":"user","content":"hi"}]}"#.utf8))
     check("kwargs_omitted_thinking_on", plainReq?.thinkingDisabled == false)
+    // #181: stream_options.include_usage must survive decoding (currently dropped as an unknown key).
+    let usageReq = try? JSONDecoder().decode(ChatCompletionRequest.self, from: Data(
+        #"{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#.utf8))
+    let reenc181 = ((try? JSONEncoder().encode(usageReq)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
+    check("stream_options_roundtrip", reenc181.contains("stream_options") && reenc181.contains("include_usage"))
     let so = splitOutput("The direct answer.", thinkingDisabled: true)
     check("split_nothink_all_content", so.content == "The direct answer." && so.reasoning.isEmpty)
     let so2 = splitOutput("pondering</think>\nAnswer.", thinkingDisabled: false)
