@@ -42,6 +42,9 @@ struct ChatCompletionRequest: Codable {
     let model: String?
     let messages: [ChatMessage]
     let stream: Bool?
+    // #181: OpenAI `stream_options: {"include_usage": true}` — when set on a streaming
+    // request, the final SSE chunk before [DONE] carries the usage object.
+    var stream_options: StreamOptions? = nil
     let max_tokens: Int?
     // temperature / top_p / seed / penalties / logit_bias are HONORED via speculative sampling
     // (Option B). n > 1 is still ignored (single completion).
@@ -104,6 +107,8 @@ struct ChatCompletionResponse: Codable {
 }
 
 // ── Response (streaming chunk) ───────────────────────────────────────────────
+/// #181: `stream_options: {"include_usage": true}` on the request.
+struct StreamOptions: Codable { var include_usage: Bool? = nil }
 struct Delta: Codable { var role: String? = nil; var content: String? = nil; var reasoning_content: String? = nil; var tool_calls: [ToolCallDelta]? = nil }
 struct ChunkChoice: Codable { let index: Int; let delta: Delta; let finish_reason: String? }
 struct ChatCompletionChunk: Codable {
@@ -112,6 +117,10 @@ struct ChatCompletionChunk: Codable {
     let created: Int
     let model: String
     let choices: [ChunkChoice]
+    // #181: present only on the final chunk before [DONE], and only when the
+    // request set stream_options.include_usage. Omitted on all other chunks
+    // (nil optional → encodeIfPresent skips the key).
+    var usage: Usage? = nil
 }
 
 /// One prefill progress line (issue #86): "prefill 4096/14490 (28%) · 27 tok/s".
