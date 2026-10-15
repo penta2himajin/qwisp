@@ -406,8 +406,13 @@ public enum SeedlessFusedVerify {
     /// commit + wait, then verify the buffer actually completed.
     /// Returns nil on success, or a fault description. A non-nil result means the caller
     /// MUST NOT read any output buffer of this command buffer.
-    static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String) -> String? {
+    static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String, spin: Bool = false) -> String? {
         cb.commit()
+        if spin {
+            // Busy-poll instead of sleeping in waitUntilCompleted: the wake-up after a ~140 ms
+            // chain CB was measured as idle GPU time between chain calls.
+            while cb.status != .completed && cb.status != .error { }
+        }
         cb.waitUntilCompleted()
         guard !injectCBFailure, cb.status == .completed, cb.error == nil else {
             return "\(label): status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
@@ -3146,6 +3151,7 @@ public enum SeedlessFusedVerify {
         public var retainedArrays: [MLXArray] = []
         /// profile: 直近 step の全 CB GPU-exec 合計 ms。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
+        nonisolated(unsafe) public static var profLastEncodeMs = 0.0
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
@@ -3168,6 +3174,7 @@ public enum SeedlessFusedVerify {
         /// matrix-unit gather_qmm only when tile rows >= get_qmv_batch_limit (14 on M1/M2 base/Pro,
         /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
         static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
+        static let chainSpinWait = Tell.envInt("QWISP_CHAIN_SPIN", 0) != 0
         /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
         /// split over this many threadgroups per (head, row); 1 = original single-pass kernel.
         static let sdpaSplitParts: Int = {
@@ -4491,6 +4498,7 @@ public enum SeedlessFusedVerify {
                 length: K * MemoryLayout<Int32>.stride, options: .storageModeShared
             ) else { return nil }
 
+            let tEnc0 = DispatchTime.now().uptimeNanoseconds
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
 
@@ -4561,7 +4569,8 @@ public enum SeedlessFusedVerify {
 
             if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
             enc.endEncoding()
-            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "chainedStepArgmax(K=\(K))") {
+            SeedlessFusedForward.profLastEncodeMs = Double(DispatchTime.now().uptimeNanoseconds - tEnc0) / 1e6
+            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "chainedStepArgmax(K=\(K))", spin: SeedlessFusedForward.chainSpinWait) {
                 gpuFault.record(f); return nil
             }
             SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0

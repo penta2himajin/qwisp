@@ -762,6 +762,7 @@ extension Tell {
         let prof = Tell.envFlag("QWISP_SPEC_PROFILE")
         var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0
         var pfChainCalls = 0
+        var pfChainGPU = 0.0, pfChainEnc = 0.0
         let tLoop0 = Date()
 
         // #119 speculation gate state (see Tell.specGate*): rolling accepted-per-attempt
@@ -799,7 +800,9 @@ extension Tell {
                 let tC = prof ? Date() : Date.distantPast
                 if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
                    let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
-                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1 }
+                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1
+                              pfChainGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                              pfChainEnc += SeedlessFusedVerify.SeedlessFusedForward.profLastEncodeMs }
                     out.append(u); hist.append(u)
                     let addN = Swift.min(chainResult.count - 1, N - out.count)
                     for i in 0 ..< addN {
@@ -913,9 +916,9 @@ extension Tell {
             let total = Date().timeIntervalSince(tLoop0) * 1000
             let other = total - pfDraft - pfChain - pfVerify - pfRebuild
             FileHandle.standardError.write(Data(String(format:
-                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
+                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f (gpu %.0f, encode %.0f) + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
                 promptIds.count, out.count, stSteps, pfChainCalls,
-                total, pfDraft, pfChain, pfVerify, pfRebuild, other,
+                total, pfDraft, pfChain, pfChainGPU, pfChainEnc, pfVerify, pfRebuild, other,
                 out.isEmpty ? 0 : total / Double(out.count)).utf8))
         }
         return Array(out.prefix(N))
