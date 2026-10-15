@@ -3149,6 +3149,15 @@ public enum SeedlessFusedVerify {
         nonisolated(unsafe) public static var fuseGDN =
             ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] != "0"
 
+        /// QWISP_PREFILL_PROF=1: measurement-only wall-clock split of forwardRowsHybrid per stage
+        /// (stderr, one line per call). Adds one CB boundary per layer so the MoE tail gets its own
+        /// bucket; kernels, encode order and numerics are unchanged.
+        static let prefillProf = ProcessInfo.processInfo.environment["QWISP_PREFILL_PROF"] == "1"
+        /// QWISP_STEEL_R (experiment): rows per steel-CSR MoE tile, default 16. MLX picks the
+        /// matrix-unit gather_qmm only when tile rows >= get_qmv_batch_limit (14 on M1/M2 base/Pro,
+        /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
+        static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
+
         /// 層跨ぎ融合(#144): 層 i 末尾の resid_add と層 i+1 先頭の input rmsnorm を、既にこの
         /// ファイルが持つ gdn_resid_postnorm_rows(h += r; out = rmsnorm(h, w))の 1 dispatch に
         /// 畳む。同カーネルは同じ encodeLayer 内の mixer 側 residual で既に使われており、
@@ -4172,8 +4181,9 @@ public enum SeedlessFusedVerify {
         // (2.24x @T=1024 vs per-pair qmv). Reads sc.inds (route must be flushed), writes sc.d in mk
         // order; scores/shared/combine stay raw. Deterministic + tile-composition-invariant.
         private func steelMoEGather(M: Int, E: Int, Ktop: Int,
-                                    mw: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))) {
-            let R = 16
+                                    mw: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray)),
+                                    onMark: ((String) -> Void)? = nil) {
+            let R = SeedlessFusedForward.steelTileR
             let ip = moeSc.inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
             var byE = [[Int32]](repeating: [], count: E)
             for mk in 0 ..< (M * Ktop) { byE[Int(ip[mk])].append(Int32(mk)) }
@@ -4195,9 +4205,11 @@ public enum SeedlessFusedVerify {
                 }
             }
             let Gt = tileE.count
+            onMark?("moe.tileCPU")
             let xa = bufToArr(postNorm, M, H)
             let xg = MLX.take(xa, MLXArray(rowSrc), axis: 0).reshaped([Gt, R, H])
             let te = MLXArray(tileE)
+            if onMark != nil { MLX.eval([xg, te]); onMark?("moe.xin") }
             func gq(_ x: MLXArray, _ w: (MLXArray, MLXArray, MLXArray)) -> MLXArray {
                 MLX.gatherQuantizedMatmul(x, w.0, scales: w.1, biases: w.2, rhsIndices: te,
                                           transpose: true, groupSize: 64, bits: 4, mode: .affine,
@@ -4207,7 +4219,9 @@ public enum SeedlessFusedVerify {
             let h = g * MLX.sigmoid(g) * u
             let d = gq(h, mw.d)
             let dm = MLX.take(d.reshaped([Gt * R, H]), MLXArray(invIdx), axis: 0)
+            if onMark != nil { MLX.eval([dm]); onMark?("moe.mlx") }
             arrToBuf(dm, moeSc.d, M * Ktop * H)
+            onMark?("moe.out")
         }
 
         // Steel qmm with M pinned into the steel kernel class (M>=14) by zero-padding — per-element
@@ -4233,6 +4247,7 @@ public enum SeedlessFusedVerify {
                let src = v.asMTLBuffer(device: device, noCopy: true) {
                 memcpy(b.contents(), src.contents(), count * 2)
             } else {
+                if SeedlessFusedForward.prefillProf { FileHandle.standardError.write(Data("[prefill-prof] arrToBuf fallback copy\n".utf8)) }
                 let arr = v.reshaped([-1]).asArray(Float16.self)
                 b.contents().bindMemory(to: Float16.self, capacity: count).update(from: arr, count: count)
             }
@@ -4248,9 +4263,19 @@ public enum SeedlessFusedVerify {
             guard M <= maxM else { return nil }
             if hybridGdnW.isEmpty { return forwardRows(x, M: M, finalNormW: finalNormW) }
             if case .resident = streamMode {} else { return forwardRows(x, M: M, finalNormW: finalNormW) }
+            let prof = SeedlessFusedForward.prefillProf
+            var profT = DispatchTime.now().uptimeNanoseconds
+            var profMs: [String: Double] = [:]
+            func mark(_ k: String) {
+                guard prof else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                profMs[k, default: 0] += Double(now - profT) / 1e6
+                profT = now
+            }
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
             hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H).update(from: arr, count: M * H)
+            mark("in")
 
             var curCB: MTLCommandBuffer? = nil
             var curEnc: MTLComputeCommandEncoder? = nil
@@ -4270,18 +4295,22 @@ public enum SeedlessFusedVerify {
                 if L.isLinear, let gw = L.gdn, let gc = L.gdnCache, let hw = hybridGdnW[li] {
                     SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
                     flush()
+                    mark("gdn.norm")
                     let xa = bufToArr(normed, M, H)
                     let yQkv = steelQmm(xa, hw.qkv, M: M), yZ = steelQmm(xa, hw.z, M: M)
                     MLX.eval([yQkv, yZ])
                     arrToBuf(yQkv, gdnSc.qkv, M * convDim)
                     arrToBuf(yZ, gdnSc.z, M * valueDim)
+                    mark("gdn.steelIn")
                     SeedlessFusedVerify.encodeGdnLayerRows(enc(), x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
                                                       M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                       headKDim: headKDim, headVDim: headVDim,
                                                       convKernel: convKernel, eps: eps, hybridDense: true)
                     gc.swapState()
                     flush()
+                    mark("gdn.raw")
                     arrToBuf(steelQmm(bufToArr(gdnSc.outV, M, valueDim), hw.out, M: M), mixerOut, M * H)
+                    mark("gdn.steelOut")
                     if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
                         SeedlessFusedVerify.encodeGdnResidPostNormRows(enc(), h: hBuf, r: mixerOut,
                                                                   w: L.postLN, postNorm: postNorm, M: M, H: H, eps: eps)
@@ -4292,19 +4321,23 @@ public enum SeedlessFusedVerify {
                 } else if !L.isLinear, let aw = L.attn, let kv = L.kvCache, let hwA = hybridAttnW[li] {
                     SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
                     flush()
+                    mark("attn.norm")
                     let xa = bufToArr(normed, M, H)
                     let yQ = steelQmm(xa, hwA.q, M: M), yK = steelQmm(xa, hwA.k, M: M), yV = steelQmm(xa, hwA.v, M: M)
                     MLX.eval([yQ, yK, yV])
                     arrToBuf(yQ, attnSc.qOut, M * numHeads * headDim * 2)
                     arrToBuf(yK, attnSc.kOut, M * numKV * headDim)
                     arrToBuf(yV, attnSc.vOut, M * numKV * headDim)
+                    mark("attn.steelIn")
                     SeedlessFusedVerify.encodeAttnLayerRows(enc(), x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                        M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
                                                        ropeDim: ropeDim, ropeBase: ropeBase, eps: eps, hybridDense: true,
                                                        useMmaPrefill: ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1")
                     kv.len += M
                     flush()
+                    mark("attn.raw")
                     arrToBuf(steelQmm(bufToArr(attnSc.gated, M, numHeads * headDim), hwA.o, M: M), mixerOut, M * H)
+                    mark("attn.steelOut")
                     if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
                         SeedlessFusedVerify.encodeGdnResidPostNormRows(enc(), h: hBuf, r: mixerOut,
                                                                   w: L.postLN, postNorm: postNorm, M: M, H: H, eps: eps)
@@ -4320,7 +4353,8 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoERouteRows(enc(), x: postNorm, w: L.moe, sc: moeSc,
                                                       M: M, E: L.E, H: H, Ktop: L.Ktop)
                     flush()
-                    steelMoEGather(M: M, E: L.E, Ktop: L.Ktop, mw: mw)
+                    mark("moe.route")
+                    steelMoEGather(M: M, E: L.E, Ktop: L.Ktop, mw: mw, onMark: prof ? { mark($0) } : nil)
                     // combine (sc.d × scores → sc.y) lives inside encodeMoEGatherRowsRange in the raw
                     // path, which the hybrid skips — encode it here or sharedRows reads stale sc.y.
                     SeedlessFusedVerify.encodeCombineRows(enc(), d: moeSc.d, scores: moeSc.scores, y: moeSc.y,
@@ -4329,6 +4363,7 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoESharedRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                        M: M, I: L.I, H: H, Ktop: L.Ktop)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
+                    if prof { flush(); mark("moe.tail") }
                 } else {
                     SeedlessFusedVerify.encodeMoEBlockRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                       M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
@@ -4341,7 +4376,16 @@ public enum SeedlessFusedVerify {
             flush()
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
-            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+            let out = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+            if prof {
+                mark("out")
+                let total = profMs.values.reduce(0, +)
+                let parts = profMs.sorted { $0.value > $1.value }
+                    .map { String(format: "%@ %.0f", $0.key, $0.value) }.joined(separator: " | ")
+                FileHandle.standardError.write(Data(String(format: "[prefill-prof] M=%d total %.0fms (%.0f tok/s) | %@\n",
+                                                           M, total, Double(M) * 1000 / total, parts).utf8))
+            }
+            return out
         }
 
         /// Measurement-only prefill profiler: resident forward with per-stage CB splits, bucketing
