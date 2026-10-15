@@ -2038,6 +2038,17 @@ public enum SeedlessFusedVerify {
     /// (stride を maxLen 基準で渡す — 論理位置の値列は composed と同一なので bit 一致)。
     static func encodeSdpaRows(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
                                H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int) {
+        if SeedlessFusedForward.sdpaSplitParts > 1, M <= SeedlessMetalForward.sdpaSplitMaxM,
+           H <= SeedlessMetalForward.sdpaSplitMaxH, D == 256, SeedlessMetalForward.ensureSdpaSplit() {
+            // Bit-exact two-pass form (see SeedlessMetalForward.ensureSdpaSplit).
+            SeedlessMetalForward.encodeSdpaRowsSplit(enc, q: q, k: k, v: v, out: out, H: H, KV: KV,
+                                                     baseN: baseLenPlus1, M: M, scale: scale,
+                                                     kHeadStride: maxLen * D, kSeqStride: D,
+                                                     vHeadStride: maxLen * D, vSeqStride: D,
+                                                     parts: SeedlessFusedForward.sdpaSplitParts,
+                                                     headsPerSG: SeedlessFusedForward.sdpaHeadsPerSG)
+            return
+        }
         let p = SeedlessMetalForward._sdpaRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
@@ -3157,6 +3168,18 @@ public enum SeedlessFusedVerify {
         /// matrix-unit gather_qmm only when tile rows >= get_qmv_batch_limit (14 on M1/M2 base/Pro,
         /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
         static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
+        /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
+        /// split over this many threadgroups per (head, row); 1 = original single-pass kernel.
+        static let sdpaSplitParts: Int = {
+            let p = Tell.envInt("QWISP_SDPA_SPLIT_PARTS", 8)
+            return [1, 2, 4, 8, 16, 32].contains(p) ? p : 1
+        }()
+        /// QWISP_SDPA_HEADS_PER_SG: query heads per simdgroup in the split kernel (K/V loaded once
+        /// and reused across them; per-head arithmetic unchanged → still byte-identical).
+        static let sdpaHeadsPerSG: Int = {
+            let g = Tell.envInt("QWISP_SDPA_HEADS_PER_SG", 2)
+            return [1, 2, 4, 8].contains(g) ? g : 1
+        }()
 
         /// 層跨ぎ融合(#144): 層 i 末尾の resid_add と層 i+1 先頭の input rmsnorm を、既にこの
         /// ファイルが持つ gdn_resid_postnorm_rows(h += r; out = rmsnorm(h, w))の 1 dispatch に

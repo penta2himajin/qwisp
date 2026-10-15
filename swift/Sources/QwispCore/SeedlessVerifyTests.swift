@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 100
+        let total = 101
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -233,6 +233,40 @@ public enum SeedlessVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // sdpa_rows_split_bitexact — WRITE-LOCKED (guarded by total = 101). Do not weaken/skip/delete.
+        // The two-pass split decode attention (SeedlessMetalForward.ensureSdpaSplit) must be
+        // byte-identical to sdpa_rows for every split count, row count and KV length, including
+        // N < 32 (simdgroups with no positions) and N not a multiple of 32.
+        run("sdpa_rows_split_bitexact") {
+            let H = 16, KV = 2, D = 256
+            let scale = Float(pow(Double(D), -0.5))
+            for L0 in [1, 31, 64, 1000] {
+                for M in [1, 2, 9, 16] {
+                    let totalSeq = L0 + M - 1
+                    let q     = MLXRandom.normal([M * H, D]).asType(.float16)
+                    let kFull = MLXRandom.normal([KV, totalSeq, D]).asType(.float16)
+                    let vFull = MLXRandom.normal([KV, totalSeq, D]).asType(.float16)
+                    MLX.eval([q, kFull, vFull])
+                    guard let ref = SeedlessMetalForward.sdpaRows(q, kFull, vFull, H: H, KV: KV, D: D,
+                                                                  baseLen: L0, M: M, scale: scale)
+                    else { return (false, "sdpaRows nil L0=\(L0) M=\(M)") }
+                    ref.eval()
+                    for parts in [2, 4, 8] {
+                        for g in [1, 2, 4, 8] {
+                            guard let got = SeedlessMetalForward.sdpaRowsSplit(q, kFull, vFull, H: H, KV: KV, D: D,
+                                                                               baseLen: L0, M: M, scale: scale, parts: parts,
+                                                                               headsPerSG: g)
+                            else { return (false, "sdpaRowsSplit nil L0=\(L0) M=\(M) parts=\(parts) G=\(g)") }
+                            got.eval()
+                            let (ok, d) = bitEqual(got, ref)
+                            if !ok { return (false, "L0=\(L0) M=\(M) parts=\(parts) G=\(g): \(d)") }
+                        }
+                    }
+                }
             }
             return (true, "ok")
         }
