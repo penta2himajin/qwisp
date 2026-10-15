@@ -96,6 +96,8 @@ extension Tell {
         // Steel-prefill hybrid (QWISP_HYBRID_PREFILL=1): prefill-scoped forward with GDN dense
         // matmuls via MLX steel. nil → prefill uses `forward`. Decode/verify NEVER use this.
         var forwardHybrid: (([Int32]) -> MLXArray?)? = nil
+        /// Called once when Tell.prefill finishes all chunks (fast prefill drops its MLX mirror).
+        var prefillEnded: (() -> Void)? = nil
         var hybridChunk: Int = 64
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
@@ -236,6 +238,13 @@ extension Tell {
                 return fwd.forwardRowsHybrid(x, M: tokens.count, finalNormW: fnBuf)
             }
             backend.hybridChunk = Swift.min(1024, maxM)
+            // Non-strict fast prefill (QWISP_FAST_PREFILL=1): whole-chunk MLX graph, state handed
+            // to the Seedless buffers; decode unchanged. Off → this block is skipped.
+            if FastPrefill.enabled, let fp = FastPrefill(fwd: fwd, reference: backend.forwardHybrid) {
+                backend.forwardHybrid = { fp.forward($0) }
+                backend.prefillEnded = { fp.prefillEnded() }
+                backend.hybridChunk = FastPrefill.chunk
+            }
         }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
@@ -657,6 +666,8 @@ extension Tell {
         //
         // Default ON. QWISP_PREFILL_CHUNK_POOL=0 restores the pre-fix behavior for A/B only.
         let chunkPool = Tell.envInt("QWISP_PREFILL_CHUNK_POOL", 1) != 0
+        FastPrefill.wiredBegin()
+        defer { backend.prefillEnded?(); FastPrefill.wiredEnd() }
         while pos < pLen {
             let ok = chunkPool ? autoreleasepool { runChunk() } : runChunk()
             if !ok { return nil }

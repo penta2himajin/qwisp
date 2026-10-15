@@ -78,15 +78,37 @@ public struct MoEBlock {
         return moeExperts(x, inds: inds, scores: scores)
     }
 
+    /// Fast-prefill (non-strict) opt-in: mlx-lm SwitchGLU `_gather_sort` layout — (token, k) pairs
+    /// sorted by expert so gather_qmm runs its sorted-rhs matrix-unit path. Off → unchanged.
+    nonisolated(unsafe) public static var sortedGather = false
+
     /// expert 計算（gather swiglu + shared）。routing(inds/scores)は呼び元で決定。
     private func moeExperts(_ x: MLXArray, inds: MLXArray, scores: MLXArray) -> MLXArray {
 
-        // switch_mlp: xe [T,1,1,H]
-        let xe = x.expandedDimensions(axes: [-2, -3])
-        let g = gatherQmm(xe, swGateW, swGateS, swGateB, inds)
-        let u = gatherQmm(xe, swUpW, swUpS, swUpB, inds)
-        let h = (g * MLX.sigmoid(g)) * u                                 // silu(g)*u
-        let d = gatherQmm(h, swDownW, swDownS, swDownB, inds).squeezed(axis: -2)  // [T,K,H]
+        let d: MLXArray
+        if MoEBlock.sortedGather && inds.size >= 64 {
+            let T = x.dim(0), K = inds.dim(-1)
+            let flat = inds.reshaped([-1])                                // [T*K]
+            let order = MLX.argSort(flat)
+            let invOrder = MLX.argSort(order)
+            let xs = MLX.take(x, MLX.floorDivide(order, K), axis: 0).expandedDimensions(axis: -2)  // [T*K,1,H]
+            let idx = MLX.take(flat, order)
+            func gs(_ v: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray) -> MLXArray {
+                gatherQuantizedMatmul(v, w, scales: s, biases: b, rhsIndices: idx,
+                                      transpose: true, groupSize: expertGroupSize, bits: expertBits,
+                                      mode: .affine, sortedIndices: true)
+            }
+            let g = gs(xs, swGateW, swGateS, swGateB), u = gs(xs, swUpW, swUpS, swUpB)
+            let ds = gs((g * MLX.sigmoid(g)) * u, swDownW, swDownS, swDownB).squeezed(axis: -2)  // [T*K,H]
+            d = MLX.take(ds, invOrder, axis: 0).reshaped([T, K, -1])     // [T,K,H]
+        } else {
+            // switch_mlp: xe [T,1,1,H]
+            let xe = x.expandedDimensions(axes: [-2, -3])
+            let g = gatherQmm(xe, swGateW, swGateS, swGateB, inds)
+            let u = gatherQmm(xe, swUpW, swUpS, swUpB, inds)
+            let h = (g * MLX.sigmoid(g)) * u                             // silu(g)*u
+            d = gatherQmm(h, swDownW, swDownS, swDownB, inds).squeezed(axis: -2)  // [T,K,H]
+        }
         let y = (d * scores.expandedDimensions(axis: -1)).sum(axis: -2)  // [T,H]
 
         // shared expert（dense swiglu）+ gate
