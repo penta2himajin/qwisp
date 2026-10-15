@@ -2,8 +2,8 @@
 
 Status: research survey; no implementation decision  
 Date: 2026-10-15  
-Qwisp baseline: `05e745b` (working tree on `claude/m3pro-prefill-profile`, with the uncommitted
-non-strict `FastPrefill.swift` probe)
+Qwisp baseline: `05e745b` (branch `claude/m3pro-prefill-profile`; the non-strict fast prefill tier
+landed on the same branch, see [Measured follow-ups](#measured-follow-ups-2026-10-15-m3-pro))
 
 ## 日本語サマリ
 
@@ -467,6 +467,22 @@ survey's arithmetic, not measurements.
 | 10 | Native MTP / DFlash drafter on the serving path | Re-enable MTP-D1 or the z-lab DFlash drafter | Lossless (exact verify) | mlx-lm #990: 1.04x on 35B-A3B (M4 Pro) despite 85% acceptance; internal DFlash NO-GO at M=1 (#98) | High / high | **P2** (keep parked) |
 | 11 | Few-row MMA verify kernels | Dequant-once multi-row kernel for verify rows | Only if row-exact vs M=1 decode (oMLX `row_exact_qmv` pattern); MMA form needs joint re-canonicalization | llama.cpp #29869: batch-8 decode 38.6→119.7 t/s (M3 Ultra, dense 27B). Qwisp's own B-exact variants lost in-chain at B=3 | High / medium | **P2** |
 | 12 | Lossy prefill/verify shortcuts (SpecPrefill token dropping, A8 activations, MoE-Spec expert capping, approximate triangular inverse) | Bolt tier at most | No | oMLX SpecPrefill (experimental, off by default) keeps 20% of tokens above 8192 (lossy, `model_settings.py`); MoE-Spec retains about 95% quality on Qwen3 | — | Not promoted |
+
+## Measured follow-ups (2026-10-15, M3 Pro)
+
+Measured on the target machine after this survey was written (M3 Pro 14-core GPU, 36 GB,
+macOS 27, Ornith-1.5-35B-A3B MLX 4-bit, fans pinned at max). These settle or revise items above.
+
+| Survey item | Measurement | Result |
+|---|---|---|
+| #1/#2 strict tile below the `qmv` threshold | `QWISP_STEEL_R=32` vs 16, strict prefill | The threshold reading is correct (`get_qmv_batch_limit` = 18 here), but R=32 alone moved strict prefill only 148→164 tok/s (3.2K prompt) and 126→131 (8.4K). The tile kernel is not the main cost of strict prefill on this machine. |
+| #5 MLX version | Same code on mlx-swift 0.31.4 vs 0.32.3, fast prefill tier | No gain from 0.32 (16K: 517 vs 499 tok/s; 32K: 435 vs 421). 0.32 still routes head_dim-256 prefill SDPA to the unfused path on pre-M5 GPUs. 0.32 also changes the strict stream on all four bench regimes, so the bump was not kept. |
+| Memory | `/usr/bin/footprint`, `vmmap`, `vm_stat` during deep prefill | Unwired MLX weights were being compressed under ordinary desktop load (system compressor ~18 GB while qwisp ran unwired vs 4 GB wired). The MLX free-buffer pool also grew ~8 GB per long prefill. Wiring weights + 4 GB only around prefill and capping the pool fixed the instability; wiring through decode made the raw decode ~20% slower (21.9 vs 17.9 ms/token). |
+| #9 attention memory | Unfused D256 SDPA at 32K builds a ~2 GB `[heads, 2048, S]` score tensor per layer | Query-blocking the causal SDPA (512 rows) removed the deep-context collapse in the fast tier (32K: erratic 18–331 → 421–435 tok/s). |
+
+Fast prefill tier vs mlx-lm 0.32 on the same prompts (prefill tok/s): 16K 499–517 vs 538, 32K
+421–435 vs 457. Strict prefill: 145 (16K), 56 (32K). Decode: unchanged by the tier, parity with
+mlx-lm at shallow context (≈17.5–18 ms/token).
 
 ## Unverified or dropped claims
 
