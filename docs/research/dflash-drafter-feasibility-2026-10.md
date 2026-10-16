@@ -28,8 +28,9 @@ speed figure below that is not quoted from a source is an **estimate** and is la
 - 実測（§8、oMLX 0.7.0、M3 Pro）: 3 種の drafter のうち速くなったのは agentic だけだった
   （incoai の DFlash2、block 8、4-bit で 56.8 → 68.8 tok/s、+21%）。code と shortnl は 5〜13% 遅くなり、
   1 サイクルあたりの出力トークン数は 2.3〜2.9 にとどまった（agentic だけ 3.8〜4.0）。block 16 は block 8
-  より長く受理されなかった。したがって drafter の有効化は端末単位ではなく、要求ごとの受理の実測で
-  切り替える必要がある。
+  より長く受理されなかった。block を 4 に縮めると code +15%、agentic +18%、longctx +13% になり、
+  shortnl だけが 10〜13% 遅いまま残った。drafter は 4-bit（group 64）が最速で、8-bit と受理は変わらない。
+  したがって drafter の有効化と深さは、端末単位ではなく、要求ごとの受理の実測で切り替える必要がある。
 
 ## 1. Download and availability
 
@@ -573,11 +574,29 @@ Other runs: the same three drafters in BF16 were all at or below the no-drafter 
 quantization was erratic (code 17-20 tok/s, draft phase 1.0-1.6 s per request); it was not
 investigated further.
 
+Block size and drafter quantization (incoai DFlash2, same setup, `dflash_block_size` set
+explicitly; decode tok/s, mean of two runs, tokens/cycle in parentheses):
+
+| | code | agentic | longctx | shortnl |
+|---|---|---|---|---|
+| no drafter | 59.9 | 56.8 | 52.8 | 59.4 |
+| 4-bit g64, block 4 | **69.0** (2.93) | 67.2 (3.20) | **59.6** (2.87) | 51.4 (2.19) |
+| 4-bit g64, block 6 | 64.0 (2.87) | **71.2** (3.92) | 55.4 (2.87) | 53.2 (2.36) |
+| 4-bit g64, block 8 (default) | 56.8 (2.61) | 68.8 (4.00) | 55.9 (2.93) | 51.9 (2.34) |
+| 8-bit g64, block 4 | 66.8 (2.93) | 66.4 (3.23) | 58.4 (2.87) | 51.2 (2.22) |
+| 4-bit g32, block 4 | 68.1 (2.91) | 62.8 (3.17) | 59.0 (2.84) | 50.9 (2.19) |
+| BF16, block 8 | 52.0 | 59.8 | 50.6 | 46.5 |
+
+4-bit g64 is the fastest drafter format and does not lower tokens/cycle relative to 8-bit.
+A rerun of DFlash v1 with 4-bit draft quantization (block 16) gave 60.7 / 44.3 / 43.4 / 47.0,
+so the 17-20 tok/s in the first run was transient, not a property of the format.
+
 What this shows on this machine:
 
-1. Only the agentic regime gains (+21 % with the incoai drafter, the one with 4.0 tokens per
-   cycle). Code and shortnl lose 5-13 %, longctx gains ≤ 6 %. A drafter has to be gated by
-   measured acceptance per request (or per stream window), not switched on per device.
+1. At oMLX's default block 8 only agentic gains (+21 %). With block 4, code (+15 %), agentic
+   (+18 %) and longctx (+13 %) all gain; block 6 is best for agentic (+25 %). Shortnl loses
+   10-13 % at every block size (2.2-2.4 tokens/cycle). The drafter, and its depth, have to be
+   gated by measured acceptance per request (or per stream window), not switched on per device.
 2. Block 16 does not buy longer accepted runs than block 8 here (2.6-2.9 tokens/cycle on
    code for all three), so block 16 only adds verify and draft cost. The Qwen3.6-trained
    incoai drafter is at least as good on Ornith as the Ornith-trained jzinno one.
