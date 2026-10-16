@@ -54,7 +54,7 @@ public enum SeedlessMetalForward {
             guard let b = a.asMTLBuffer(device: device, noCopy: true) else { continue }
             weightWrappers[WrapperKey(ptr: UInt(bitPattern: b.contents()), len: b.length)] = b
         }
-        guard Tell.envInt("QWISP_RESIDENCY_SET", 0) != 0, #available(macOS 15.0, *), weightResidencySet == nil else { return }
+        guard Tell.envInt("QWISP_RESIDENCY_SET", 1) != 0, #available(macOS 15.0, *), weightResidencySet == nil else { return }
         let desc = MTLResidencySetDescriptor()
         desc.initialCapacity = weightWrappers.count
         guard let rs = try? device.makeResidencySet(descriptor: desc) else { return }

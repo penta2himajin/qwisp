@@ -3281,7 +3281,7 @@ public enum SeedlessFusedVerify {
         static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
         static let steelPad = Swift.max(1, Tell.envInt("QWISP_STEEL_PAD", 32))
         static let chainSpinWait = Tell.envInt("QWISP_CHAIN_SPIN", 0) != 0
-        static let chainAhead = Tell.envInt("QWISP_CHAIN_AHEAD", 0) != 0
+        static let chainAhead = Tell.envInt("QWISP_CHAIN_AHEAD", 1) != 0
         /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
         /// split over this many threadgroups per (head, row); 1 = original single-pass kernel.
         static let sdpaSplitParts: Int = {
