@@ -25,6 +25,11 @@ speed figure below that is not quoted from a source is an **estimate** and is la
   ほぼ同じで、端末間の差を生むのは (1) M=8〜16 の verify が compute-bound に転じるかどうか、
   (2) step あたりの固定オーバーヘッド、(3) RAM tier（streaming では不可）の 3 つ。判定には、実測の
   r_B から求める損益分岐受理長 T* を DeviceCalibration に持たせるのがよい。
+- 実測（§8、oMLX 0.7.0、M3 Pro）: 3 種の drafter のうち速くなったのは agentic だけだった
+  （incoai の DFlash2、block 8、4-bit で 56.8 → 68.8 tok/s、+21%）。code と shortnl は 5〜13% 遅くなり、
+  1 サイクルあたりの出力トークン数は 2.3〜2.9 にとどまった（agentic だけ 3.8〜4.0）。block 16 は block 8
+  より長く受理されなかった。したがって drafter の有効化は端末単位ではなく、要求ごとの受理の実測で
+  切り替える必要がある。
 
 ## 1. Download and availability
 
@@ -539,6 +544,49 @@ measured on the device.
    Calibration only sets the prior r(k) table and the startup recommendation.
 4. `DeviceCalibration.describeAll()` / `qwisp` device inspector prints `u1`, `κ8`, and `T*`
    alongside the RAM tier.
+
+## 8. Measured: oMLX 0.7.0 with three drafters on the M3 Pro (2026-10-16)
+
+Setup: oMLX 0.7.0 (`omlx-cli serve --no-cache --memory-guard off`; the default guard aborted
+the agentic request at ~22 GB), target Ornith-1.5-35B-A3B-uncensored MLX 4-bit, greedy,
+`max_tokens` 384, the four qwisp bench regimes, two runs each, auto fans. Decode tok/s is
+`usage.generation_tokens_per_second`; acceptance and cycles come from oMLX's
+"DFlash generation complete" log line (acceptance = share of output tokens that came from
+the drafter; tokens/cycle = output tokens / cycles). `dflash_verify_mode` was left at the
+default ("adaptive"). Outputs are not bit-exact with the no-drafter run.
+
+| decode tok/s | code | agentic | longctx | shortnl |
+|---|---|---|---|---|
+| no drafter | 59.7 / 60.0 | 56.9 / 56.7 | 53.2 / 52.4 | 59.3 / 59.4 |
+| DFlash v1, ornith-ai, b16, BF16 | 59.8 / 59.3 | 43.0 / 42.0 | 45.5 / 45.5 | 43.9 / 43.9 |
+| DFlash2, jzinno (Ornith), b16, 4-bit | 56.2 / 55.7 | 53.8 / 54.1 | 43.2 / 43.0 | 43.4 / 43.0 |
+| DFlash2, incoai (Qwen3.6), b8, 4-bit | 56.6 / 57.0 | **69.1 / 68.5** | 55.7 / 56.1 | 52.1 / 51.6 |
+
+| tokens/cycle | code | agentic | longctx | shortnl |
+|---|---|---|---|---|
+| DFlash v1, b16, BF16 | 2.84 | 2.88 | 2.80 | 2.26 |
+| DFlash2 jzinno, b16, 4-bit | 2.80 | 3.84 | 2.63 | 2.37 |
+| DFlash2 incoai, b8, 4-bit | 2.61 | 4.00 | 2.93 | 2.34 |
+
+Other runs: the same three drafters in BF16 were all at or below the no-drafter row
+(incoai BF16: 53.8/50.2, 55.3/64.3, 50.4/50.8, 45.2/47.7). DFlash v1 with oMLX's 4-bit draft
+quantization was erratic (code 17-20 tok/s, draft phase 1.0-1.6 s per request); it was not
+investigated further.
+
+What this shows on this machine:
+
+1. Only the agentic regime gains (+21 % with the incoai drafter, the one with 4.0 tokens per
+   cycle). Code and shortnl lose 5-13 %, longctx gains ≤ 6 %. A drafter has to be gated by
+   measured acceptance per request (or per stream window), not switched on per device.
+2. Block 16 does not buy longer accepted runs than block 8 here (2.6-2.9 tokens/cycle on
+   code for all three), so block 16 only adds verify and draft cost. The Qwen3.6-trained
+   incoai drafter is at least as good on Ornith as the Ornith-trained jzinno one.
+3. The tokens-per-cycle figures are below the τ ≈ 4-6 the drafter cards report on GPUs. With
+   qwisp's measured r_M on this machine (M=4: 1.86, M=9: 3.92), a verify of the full block
+   cannot pay for 2.6 tokens/cycle; verifying 3-4 rows (r ≈ 1.6-1.9) is the only shape that
+   can win on code-like text, and then only narrowly. The §5.3 estimates for code (1.2-1.45×)
+   are optimistic for the M3 Pro; agentic (≈ 1.55×) is consistent with the measured +21 %
+   given oMLX's higher per-cycle overhead.
 
 ## Sources
 
