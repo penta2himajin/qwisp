@@ -161,6 +161,92 @@ public enum SeedlessFusedVerify {
     }
 
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _routeRowsSGPipeline: MTLComputePipelineState?
+    /// QWISP_ROUTE_SG=1: route_top8_rows as ONE simdgroup per row (N == 256). route_top8_rows runs
+    /// 256 threads through ~100 threadgroup barriers (max tree, sum tree, K argmax trees): 18 µs per
+    /// layer at M=1 on an M3 Pro for 512 bytes of input. Here lane l owns elements l + 32j; the first
+    /// three tree levels (s = 128, 64, 32) are evaluated in registers with exactly the original
+    /// pairings and the last five with simd_shuffle_down, so every float sum is grouped as before
+    /// and every argmax keeps the original "right replaces left only if strictly greater" order.
+    static let routeSG = Tell.envInt("QWISP_ROUTE_SG", 1) != 0
+    static func ensureRouteSG() -> Bool {
+        if _routeRowsSGPipeline != nil { return true }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Cand { float v; int i; };
+        inline Cand best(Cand a, Cand b) { return (b.v > a.v) ? b : a; }   // a = left (lower tree slot)
+        kernel void route_top8_rows_sg(device const half* logits [[buffer(0)]],
+                                       device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                                       constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                                       uint tgid [[threadgroup_position_in_grid]],
+                                       uint l [[thread_index_in_simdgroup]]) {
+            const device half* lgrow = logits + tgid * N;
+            device int* indrow = inds + tgid * K;
+            device half* scrow = scores + tgid * K;
+            float lg[8], e[8], g[8], w[8];
+            for (int j = 0; j < 8; j++) lg[j] = (float)lgrow[l + 32 * j];
+            // max tree: s=128 pairs (i, i+128), s=64 (i, i+64), s=32 (i, i+32), then 16..1
+            float a0 = max(lg[0], lg[4]), a1 = max(lg[1], lg[5]), a2 = max(lg[2], lg[6]), a3 = max(lg[3], lg[7]);
+            float c = max(max(a0, a2), max(a1, a3));
+            for (ushort s = 16; s > 0; s >>= 1) c = max(c, simd_shuffle_down(c, s));
+            float m = simd_broadcast(c, 0);
+            for (int j = 0; j < 8; j++) e[j] = precise::exp(lg[j] - m);
+            float b0 = (e[0] + e[4]) + (e[2] + e[6]);
+            float b1 = (e[1] + e[5]) + (e[3] + e[7]);
+            float t = b0 + b1;
+            for (ushort s = 16; s > 0; s >>= 1) t = t + simd_shuffle_down(t, s);
+            float Z = simd_broadcast(t, 0);
+            for (int j = 0; j < 8; j++) { g[j] = (float)(half)(e[j] / Z); w[j] = lg[j]; }
+            for (uint k = 0; k < K; k++) {
+                Cand A0 = best(Cand{w[0], int(l)}, Cand{w[4], int(l + 128)});
+                Cand A1 = best(Cand{w[1], int(l + 32)}, Cand{w[5], int(l + 160)});
+                Cand A2 = best(Cand{w[2], int(l + 64)}, Cand{w[6], int(l + 192)});
+                Cand A3 = best(Cand{w[3], int(l + 96)}, Cand{w[7], int(l + 224)});
+                Cand C = best(best(A0, A2), best(A1, A3));
+                for (ushort s = 16; s > 0; s >>= 1) {
+                    Cand o = Cand{simd_shuffle_down(C.v, s), simd_shuffle_down(C.i, s)};
+                    C = best(C, o);
+                }
+                int bi = simd_broadcast(C.i, 0);
+                float gv = simd_shuffle(g[bi / 32], ushort(bi % 32));
+                if (int(l) == bi % 32) w[bi / 32] = -INFINITY;
+                if (l == 0) { indrow[k] = bi; scrow[k] = (half)gv; }
+            }
+            if (l == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
+            _routeRowsSGPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows_sg")!)
+        } catch { print("[raw-route-sg] compile: \\(error)"); return false }
+        return true
+    }
+    /// Test helper: same contract as routeTop8Rows, through the simdgroup kernel.
+    public static func routeTop8RowsSG(_ logits: MLXArray, M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
+        guard N == 256, ensureRouteSG(), let (device, queue) = SeedlessMetalForward.ensure(),
+              let bl = SeedlessMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        let bInds = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeRouteTop8RowsSG(enc, logits: bl, inds: bInds, scores: bScores, M: M, N: N, K: K)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ip = bInds.contents().bindMemory(to: Int32.self, capacity: M * K)
+        let sp = bScores.contents().bindMemory(to: Float16.self, capacity: M * K)
+        return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: M * K)), [M, K]),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: M * K)), [M, K]))
+    }
+    static func encodeRouteTop8RowsSG(_ enc: MTLComputeCommandEncoder, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+                                      M: Int, N: Int, K: Int) {
+        enc.setComputePipelineState(_routeRowsSGPipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K)
+        enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
     nonisolated(unsafe) static var _routeRowsBiasPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _fmmRowsPipeline: MTLComputePipelineState?  // fmm_rows: out[M,N]=x[M,K]@W[N,K]^T (F16, M-invariant per-thread dot)
     nonisolated(unsafe) static var _mtpCopyRowPipeline: MTLComputePipelineState?   // mtp_copy_row_f16: extract row[rowOff..rowOff+H) → dst[0..H)
@@ -1502,14 +1588,15 @@ public enum SeedlessFusedVerify {
     static func encodeQmm8Rows(_ enc: MTLComputeCommandEncoder,
                                w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                                x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int) {
-        enc.setComputePipelineState(SeedlessMetalForward._qmm8Pipeline!)
+        let r1 = SeedlessMetalForward.qmm8R1 && SeedlessMetalForward._qmm8R1Pipeline != nil
+        enc.setComputePipelineState(r1 ? SeedlessMetalForward._qmm8R1Pipeline! : SeedlessMetalForward._qmm8Pipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
         enc.setBuffer(out, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
         SeedlessMetalForward.bindStop(enc, 16)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / (r1 ? 2 : 8), depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
@@ -1517,6 +1604,9 @@ public enum SeedlessFusedVerify {
     static func encodeRouteTop8Rows(_ enc: MTLComputeCommandEncoder,
                                     logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
                                     M: Int, N: Int, K: Int) {
+        if routeSG && N == 256 && ensureRouteSG() {
+            encodeRouteTop8RowsSG(enc, logits: logits, inds: inds, scores: scores, M: M, N: N, K: K); return
+        }
         enc.setComputePipelineState(_routeRowsPipeline!)
         enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
         enc.setBuffer(scores, offset: 0, index: 2)

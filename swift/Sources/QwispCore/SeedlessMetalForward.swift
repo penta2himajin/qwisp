@@ -397,6 +397,9 @@ public enum SeedlessMetalForward {
     /// 8bit qmv_fast 移植（router gate: postNorm[H]→gate_logits[N], f16）。MLX qmv_fast<half,gs=64,bits=8>。
     /// bits=8 は load_vector/qdot が単純（x_thread=x そのまま、accum=Σ x·w_byte）。fast 条件 N%8==0 && K%512==0。
     /// 単一 encoder 融合用に encodeQmm8 も提供。
+    nonisolated(unsafe) static var _qmm8R1Pipeline: MTLComputePipelineState?
+    /// QWISP_QMM8_R1=1: route qmm8 dispatches through qmm8_r1 (1 row per simdgroup).
+    static let qmm8R1 = Tell.envInt("QWISP_QMM8_R1", 1) != 0
     static func compileQmm8() -> Bool {
         guard let (device, _) = ensure() else { return false }
         if _qmm8Pipeline != nil { return true }
@@ -467,15 +470,73 @@ public enum SeedlessMetalForward {
                 if (simd_lid == 0) y[row] = (half)result[row];
             }
         }
+        // qmm8_r1: qmm8 with ONE output row per simdgroup (4x the simdgroups). Per-row arithmetic
+        // (lane split, k-block order, qd8, simd_sum) is unchanged → byte-identical rows.
+        kernel void qmm8_r1(device const uint32_t* w      [[buffer(0)]],
+                         device const half*     scales [[buffer(1)]],
+                         device const half*     biases [[buffer(2)]],
+                         device const half*     x      [[buffer(3)]],
+                         device half*           y      [[buffer(4)]],
+                         constant int&          in_vec_size  [[buffer(5)]],   // K
+                         constant int&          out_vec_size [[buffer(6)]],   // N
+                         device const int*      stopFlag [[buffer(16)]],   // ★ A4
+                         uint3 tid      [[threadgroup_position_in_grid]],
+                         uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                         uint  simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4 stop flag guard
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 1;
+            constexpr int pack_factor = 4;             // 32/8
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 8;       // pack_factor*packs_per_thread
+            constexpr int block_size = 256;            // vpt*SIMD_SIZE
+            constexpr int scale_step_per_thread = 8;   // gs(64)/vpt(8)
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[8];
+            thread U result[1] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;   // K bytes
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            x += tid.x * in_vec_size + simd_lid * values_per_thread;
+            y += tid.x * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld8(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U b = bl[0];
+                    result[row] += qd8(wl, x_thread, s, b, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
             _qmm8Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm8")!)
+            _qmm8R1Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm8_r1")!)
             return true
         } catch { print("[raw-qmm8] compile: \(error)"); return false }
     }
 
     static func qmm8(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int) -> MLXArray? {
+        qmm8Variant(x, wq, scales: scales, biases: biases, M: M, K: K, N: N, r1: false)
+    }
+    public static func qmm8Variant(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int,
+                                   r1: Bool) -> MLXArray? {
         guard let (device, queue) = ensure(), compileQmm8() else { return nil }
         guard N % 8 == 0, K % 512 == 0 else { print("[raw-qmm8] 非fast N=\(N) K=\(K)"); return nil }
         guard let bx = mtlBuf(x.asType(.float16), device),
@@ -484,12 +545,12 @@ public enum SeedlessMetalForward {
               let bbi = mtlBuf(biases.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_qmm8Pipeline!)
+        enc.setComputePipelineState(r1 ? _qmm8R1Pipeline! : _qmm8Pipeline!)
         enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
         enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3); enc.setBuffer(outBuf, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
         bindStop(enc, 16)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / (r1 ? 2 : 8), depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])

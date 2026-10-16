@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 101
+        let total = 103
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -267,6 +267,43 @@ public enum SeedlessVerifyTests {
                         }
                     }
                 }
+            }
+            return (true, "ok")
+        }
+
+        // route_top8_rows_sg_bitexact — WRITE-LOCKED (guarded by total = 102). Do not weaken/skip/delete.
+        // The one-simdgroup router (SeedlessFusedVerify.ensureRouteSG) must reproduce route_top8_rows
+        // byte-for-byte (inds AND renormalized scores), including heavy ties: logits are quantized to a
+        // coarse grid so equal maxima are common, exercising the original tree's tie order.
+        run("route_top8_rows_sg_bitexact") {
+            for (M, grid) in [(1, Float(0)), (7, Float(0)), (5, Float(0.25)), (33, Float(1.0)), (16, Float(4.0))] {
+                var lg = MLXRandom.normal([M, 256]) * 3
+                if grid > 0 { lg = MLX.round(lg / grid) * grid }
+                let l16 = lg.asType(.float16); l16.eval()
+                guard let (ri, rs) = SeedlessFusedVerify.routeTop8Rows(l16, M: M),
+                      let (gi, gs) = SeedlessFusedVerify.routeTop8RowsSG(l16, M: M)
+                else { return (false, "nil M=\(M)") }
+                let (okI, dI) = bitEqual(gi.asType(.float32), ri.asType(.float32))
+                if !okI { return (false, "inds M=\(M) grid=\(grid): \(dI)") }
+                let (okS, dS) = bitEqual(gs, rs)
+                if !okS { return (false, "scores M=\(M) grid=\(grid): \(dS)") }
+            }
+            return (true, "ok")
+        }
+
+        // qmm8_r1_bitexact — WRITE-LOCKED (guarded by total = 103). Do not weaken/skip/delete.
+        // qmm8_r1 (1 output row per simdgroup) must equal qmm8 (4 rows per simdgroup) byte-for-byte.
+        run("qmm8_r1_bitexact") {
+            for (M, K, N) in [(1, 2048, 256), (3, 2048, 256), (1, 2048, 8), (2, 1024, 64)] {
+                let wf = MLXRandom.normal([N, K]).asType(.float16)
+                let (wq, sc, bi) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine)
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                MLX.eval([wq, sc, bi!, x])
+                guard let a = SeedlessMetalForward.qmm8Variant(x, wq, scales: sc, biases: bi!, M: M, K: K, N: N, r1: false),
+                      let b = SeedlessMetalForward.qmm8Variant(x, wq, scales: sc, biases: bi!, M: M, K: K, N: N, r1: true)
+                else { return (false, "nil M=\(M) N=\(N)") }
+                let (ok, d) = bitEqual(b, a)
+                if !ok { return (false, "M=\(M) K=\(K) N=\(N): \(d)") }
             }
             return (true, "ok")
         }
