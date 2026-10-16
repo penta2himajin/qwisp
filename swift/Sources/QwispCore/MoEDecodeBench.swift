@@ -160,6 +160,109 @@ extension Tell {
             SeedlessFusedVerify.encodeQmmRows(enc, w: L.moe.shDW, scales: L.moe.shDS, biases: L.moe.shDB,
                                               x: sc.shAct, out: sc.sharedY, M: 1, K: I, N: H)
         }))
+        // ── rest of the decode step: GDN mixers (30), attention mixers (10, shallow ctx), lm_head ──
+        func bufBytes(_ v: Any) -> (all: Double, packed: Double) {
+            var all = 0.0, packed = 0.0
+            for c in Mirror(reflecting: v).children {
+                if let b = c.value as? MTLBuffer {
+                    all += Double(b.length)
+                    if let l = c.label, l.hasSuffix("W") || l.hasSuffix("Wq") { packed += Double(b.length) }
+                }
+            }
+            return (all, packed)
+        }
+        let gdnLayers = fwd.layers.filter { $0.isLinear }, attnLayers = fwd.layers.filter { !$0.isLinear }
+        if let g0 = gdnLayers.first?.gdn, let gc = gdnLayers.first?.gdnCache {
+            let wb = bufBytes(g0), stateB = Double(gc.Hv * gc.Dv * gc.Dk * 4 * 2 + (gc.K - 1) * gc.C * 2 * 2)
+            let us = { () -> Double in
+                _ = gpuMs { enc in for L in gdnLayers { fwd.encodePreMoE(enc, L, M: 1) } }
+                return gpuMs { enc in for _ in 0 ..< reps { for L in gdnLayers { fwd.encodePreMoE(enc, L, M: 1) } } }
+                    * 1000 / Double(reps * gdnLayers.count)
+            }()
+            // bytes from model dims (the buffer set also holds fused concat copies of the same weights)
+            let q4 = 0.5625   // 4-bit + f16 scale/bias per 64
+            let gdnParams = Double((2 * gc.Hv * gc.Dk / 2 + gc.Hv * gc.Dv + gc.Hv * gc.Dv + 2 * gc.Hv) * H + H * gc.Hv * gc.Dv)
+            _ = wb
+            let bytes = gdnParams * q4 + stateB, flops = 2.0 * gdnParams
+            lines.append(String(format: "  %-18@ %7.1f µs/layer  %6.2f MB  %6.1f GB/s (%3.0f%% of copy)  %5.2f FLOP/B  x%d = %5.2f ms   (weights %.2f MB + state r/w %.2f MB)",
+                                "gdn mixer" as NSString, us, bytes / 1e6, bytes / (us * 1e-6) / 1e9, 100 * bytes / (us * 1e-6) / 1e9 / bwBest,
+                                flops / bytes, gdnLayers.count, us * Double(gdnLayers.count) / 1000, gdnParams * q4 / 1e6, stateB / 1e6))
+        }
+        // GDN sub-kernels (fuseGDN path), over the 30 GDN layers
+        if SeedlessFusedVerify.SeedlessFusedForward.fuseGDN {
+            let gs = fwd.gdnSc
+            let keyDim = fwd.headKDim * fwd.numKHeads, valueDim = fwd.headVDim * fwd.numVHeads, convDim = 2 * keyDim + valueDim
+            let invScale = Float(pow(Double(fwd.headKDim), -0.5))
+            func gstage(_ name: String, bytes: Double, flops: Double,
+                        _ body: (MTLComputeCommandEncoder, SeedlessFusedVerify.SeedlessFusedForward.Layer) -> Void) -> String {
+                _ = gpuMs { enc in for L in gdnLayers { body(enc, L) } }
+                let us = gpuMs { enc in for _ in 0 ..< reps { for L in gdnLayers { body(enc, L) } } } * 1000 / Double(reps * gdnLayers.count)
+                return String(format: "    %-16@ %7.1f µs/layer  %6.2f MB  %6.1f GB/s  %5.2f FLOP/B  x%d = %5.2f ms",
+                              name as NSString, us, bytes / 1e6, bytes / (us * 1e-6) / 1e9, bytes > 0 ? flops / bytes : 0,
+                              gdnLayers.count, us * Double(gdnLayers.count) / 1000)
+            }
+            let inN = Double(convDim + valueDim + 2 * fwd.numVHeads)
+            lines.append(gstage("gdn.inproj", bytes: inN * Double(H) * 0.5625, flops: 2 * inN * Double(H)) { enc, L in
+                let w = L.gdn!
+                SeedlessFusedVerify.encodeQmmInProjDemuxRows(enc, w: w.catInProjW!, scales: w.catInProjS!, biases: w.catInProjB!, x: fwd.normed,
+                                                             outQkv: gs.qkv, outZ: gs.z, outB: gs.bP, outA: gs.aP, M: 1, K: H,
+                                                             dims: (qkv: convDim, z: valueDim, b: fwd.numVHeads, a: fwd.numVHeads))
+            })
+            lines.append(gstage("gdn.convshift", bytes: Double(convDim * (fwd.convKernel * 2 + 2) * 2), flops: 0) { enc, L in
+                SeedlessFusedVerify.encodeGdnFusionConvShift(enc, hist: L.gdnCache!.convHist, qkv: gs.qkv, w: L.gdn!.conv1dW,
+                                                             convOut: gs.convOut, histOut: L.gdnCache!.convHistOut,
+                                                             M: 1, K: fwd.convKernel, C: convDim)
+            })
+            lines.append(gstage("gdn.prep", bytes: Double(convDim * 2 * 2), flops: 0) { enc, L in
+                let w = L.gdn!
+                SeedlessFusedVerify.encodeGdnPrepRows(enc, convOut: gs.convOut, aP: gs.aP, bP: gs.bP, aLog: w.aLog, dtBias: w.dtBias,
+                                                      qn: gs.qn, kn: gs.kn, v: gs.v1, g: gs.g, beta: gs.beta,
+                                                      M: 1, numKH: fwd.numKHeads, headKD: fwd.headKDim, numVH: fwd.numVHeads,
+                                                      keyDim: keyDim, valDim: valueDim, eps: fwd.eps,
+                                                      qScale: invScale * invScale, kScale: invScale)
+            })
+            let stB = Double(fwd.numVHeads * fwd.headVDim * fwd.headKDim * 4 * 2)
+            lines.append(gstage("gdn.deltastep", bytes: stB, flops: 6.0 * Double(fwd.numVHeads * fwd.headVDim * fwd.headKDim)) { enc, L in
+                let c = L.gdnCache!
+                SeedlessFusedVerify.encodeGatedDeltaStepRows(enc, q: gs.qn, k: gs.kn, v: gs.v1, g: gs.g, beta: gs.beta,
+                                                             stateIn: c.state, stateOut: c.stateOut, y: gs.coreOut,
+                                                             T: 1, B: 1, Hv: fwd.numVHeads, Dv: fwd.headVDim)
+            })
+            lines.append(gstage("gdn.normgate", bytes: Double(valueDim * 2 * 3), flops: 0) { enc, L in
+                let w = L.gdn!
+                SeedlessFusedVerify.encodeGdnNormGateRows(enc, coreOut: gs.coreOut, z: gs.z, normWeight: w.normWeight,
+                                                          outV: gs.outV, M: 1, Hv: fwd.numVHeads, Dv: fwd.headVDim,
+                                                          eps: fwd.eps, promoteF32: w.promoteRMS)
+            })
+            lines.append(gstage("gdn.outproj", bytes: Double(valueDim * H) * 0.5625, flops: 2.0 * Double(valueDim * H)) { enc, L in
+                let w = L.gdn!
+                SeedlessFusedVerify.encodeQmmRows(enc, w: w.outW, scales: w.outS, biases: w.outB, x: gs.outV, out: fwd.mixerOut,
+                                                  M: 1, K: valueDim, N: H)
+            })
+        }
+        if let a0 = attnLayers.first?.attn {
+            let wb = bufBytes(a0)
+            let us = { () -> Double in
+                _ = gpuMs { enc in for L in attnLayers { fwd.encodePreMoE(enc, L, M: 1) } }
+                return gpuMs { enc in for _ in 0 ..< reps { for L in attnLayers { fwd.encodePreMoE(enc, L, M: 1) } } }
+                    * 1000 / Double(reps * attnLayers.count)
+            }()
+            _ = wb
+            let nh = fwd.numHeads, nkv = fwd.numKV, hd = fwd.headDim
+            let attnParams = Double((nh * hd * 2 + 2 * nkv * hd) * H + H * nh * hd)
+            let ab = attnParams * 0.5625, flops = 2.0 * attnParams
+            lines.append(String(format: "  %-18@ %7.1f µs/layer  %6.2f MB  %6.1f GB/s (%3.0f%% of copy)  %5.2f FLOP/B  x%d = %5.2f ms   (weights only; ctx <= %d)",
+                                "attn mixer" as NSString, us, ab / 1e6, ab / (us * 1e-6) / 1e9, 100 * ab / (us * 1e-6) / 1e9 / bwBest,
+                                flops / ab, attnLayers.count, us * Double(attnLayers.count) / 1000, 2 * reps + 2))
+        }
+        if let hd = fwd.head {
+            let bytes = Double(hd.lmW.length + hd.lmS.length + hd.lmB.length)
+            _ = gpuMs { enc in SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB, x: fwd.normed, out: hd.logits, M: 1, K: H, N: hd.vocab) }
+            let us = gpuMs { enc in for _ in 0 ..< reps { SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB, x: fwd.normed, out: hd.logits, M: 1, K: H, N: hd.vocab) } } * 1000 / Double(reps)
+            lines.append(String(format: "  %-18@ %7.1f µs/token  %6.2f MB  %6.1f GB/s (%3.0f%% of copy)  %5.2f FLOP/B",
+                                "lm_head" as NSString, us, bytes / 1e6, bytes / (us * 1e-6) / 1e9, 100 * bytes / (us * 1e-6) / 1e9 / bwBest,
+                                2.0 * Double(hd.lmW.length) * 2 / bytes))
+        }
         lines.append("MOEROOFLINE done")
         return lines.joined(separator: "\n")
     }
