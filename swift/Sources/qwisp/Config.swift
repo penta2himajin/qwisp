@@ -16,6 +16,8 @@ struct QwispConfig: Codable {
     var model: String?
     var port: Int?
     var lossless: Bool?
+    /// "fast" enables the non-bit-exact speed tier; anything else / absent = default.
+    var mode: String? = nil
 }
 
 enum Config {
@@ -58,6 +60,25 @@ enum Config {
         env["QWISP_LOSSLESS"] != nil ? "env" : (config.lossless != nil ? "config" : "default")
     }
 
+    /// --fast: non-bit-exact speed tier (MLX-graph prefill + prefill-scoped wired limit; more
+    /// non-strict accelerators join here). env QWISP_FAST=1 > config "mode": "fast" > false.
+    /// Lossless always wins: when lossless resolves true the fast tier is off.
+    static func resolveFast(env: [String: String], config: QwispConfig) -> Bool {
+        if resolveLossless(env: env, config: config) { return false }
+        if let e = env["QWISP_FAST"] { return e == "1" }
+        return config.mode == "fast"
+    }
+    static func sourceOfFast(env: [String: String], config: QwispConfig) -> String {
+        if resolveLossless(env: env, config: config) { return "off: lossless" }
+        return env["QWISP_FAST"] != nil ? "env" : (config.mode != nil ? "config" : "default")
+    }
+    /// Expand the fast tier into its per-feature switches, without overriding any switch the
+    /// user set explicitly. Must run before the engine reads them (they are read once).
+    static func applyFastTier() {
+        for (k, v) in [("QWISP_FAST_PREFILL", "1"), ("QWISP_MLX_WIRED", "1")] { setenv(k, v, 0) }
+        FileHandle.standardError.write(Data("[qwisp] fast tier ON (not bit-exact): MLX-graph prefill, prefill-scoped wired limit\n".utf8))
+    }
+
     // Where each effective value came from — for `qwisp config` transparency.
     static func sourceOfModel(env: [String: String], config: QwispConfig) -> String {
         env["QWISP_MODEL"] != nil ? "env" : (config.model != nil ? "config" : "default")
@@ -95,6 +116,7 @@ enum Config {
           model    = \(m)  [\(sourceOfModel(env: env, config: config))]
           port     = \(p)  [\(sourceOfPort(env: env, config: config))]
           lossless = \(l)  [\(sourceOfLossless(env: env, config: config))]
+          fast     = \(resolveFast(env: env, config: config))  [\(sourceOfFast(env: env, config: config))]
         """
     }
 
@@ -126,6 +148,13 @@ enum Config {
         check("env wins lossless",     resolveLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == true)
         check("env 0 beats config",    resolveLossless(env: ["QWISP_LOSSLESS": "0"], config: cfg) == false)
         check("config lossless",       resolveLossless(env: [:], config: cfg) == true)
+        // fast tier resolution (env > config "mode" > off; lossless always wins)
+        var fastCfg = empty; fastCfg.mode = "fast"
+        check("fast default off",      resolveFast(env: [:], config: empty) == false)
+        check("fast env",              resolveFast(env: ["QWISP_FAST": "1"], config: empty) == true)
+        check("fast config mode",      resolveFast(env: [:], config: fastCfg) == true)
+        check("fast env off wins",     resolveFast(env: ["QWISP_FAST": "0"], config: fastCfg) == false)
+        check("lossless beats fast",   resolveFast(env: ["QWISP_FAST": "1", "QWISP_LOSSLESS": "1"], config: empty) == false)
         check("default lossless off",  resolveLossless(env: [:], config: empty) == false)
         check("source lossless env",   sourceOfLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == "env")
         check("source lossless config", sourceOfLossless(env: [:], config: cfg) == "config")
