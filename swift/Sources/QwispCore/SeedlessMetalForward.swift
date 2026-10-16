@@ -37,8 +37,43 @@ public enum SeedlessMetalForward {
 
     /// buffer 化: MLX 常駐テンソルは可能なら zero-copy(unified memory 直参照)、不可なら copy。
     /// 実モデル重みの per-call copy(254MB 級)を排除する perf 用。数値へは無影響(同一バイト)。
+    // ── Persistent-weight wrappers + one process-wide residency set (QWISP_RESIDENCY_SET=1) ──
+    // Every forward used to wrap the same WeightStore memory in fresh noCopy MTLBuffers (~2,100
+    // allocations per command buffer), and Metal paid per-allocation residency work at every
+    // commit: 3.4-4.8 ms from commit to GPU start per decode chain CB on an M3 Pro. Weights are
+    // registered ONCE here (arrays that live as long as the backend), mtlBuf() hands back the
+    // registered wrapper for the same (address, length), and a single residency set holding only
+    // those wrappers is attached to the queue. Transient arrays are never registered.
+    struct WrapperKey: Hashable { let ptr: UInt; let len: Int }
+    nonisolated(unsafe) static var weightWrappers: [WrapperKey: MTLBuffer] = [:]
+    nonisolated(unsafe) static var weightResidencySet: AnyObject?
+
+    public static func registerPersistentWeights(_ arrays: [MLXArray]) {
+        guard let (device, queue) = ensure() else { return }
+        for a in arrays {
+            guard let b = a.asMTLBuffer(device: device, noCopy: true) else { continue }
+            weightWrappers[WrapperKey(ptr: UInt(bitPattern: b.contents()), len: b.length)] = b
+        }
+        guard Tell.envInt("QWISP_RESIDENCY_SET", 1) != 0, #available(macOS 15.0, *), weightResidencySet == nil else { return }
+        let desc = MTLResidencySetDescriptor()
+        desc.initialCapacity = weightWrappers.count
+        guard let rs = try? device.makeResidencySet(descriptor: desc) else { return }
+        for b in weightWrappers.values { rs.addAllocation(b) }
+        rs.commit()
+        rs.requestResidency()
+        queue.addResidencySet(rs)
+        weightResidencySet = rs
+        let bytes = weightWrappers.values.reduce(0) { $0 + $1.length }
+        FileHandle.standardError.write(Data(String(format: "[qwisp] weight residency set: %d buffers, %.1f GB\n",
+                                                   weightWrappers.count, Double(bytes) / 1073741824).utf8))
+    }
+
     static func mtlBuf(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
-        if let b = a.asMTLBuffer(device: device, noCopy: true) { return b }
+        if let b = a.asMTLBuffer(device: device, noCopy: true) {
+            if !weightWrappers.isEmpty,
+               let w = weightWrappers[WrapperKey(ptr: UInt(bitPattern: b.contents()), len: b.length)] { return w }
+            return b
+        }
         // #177: this fallback used to call mtlBuf(a, device) — the same arguments — so the
         // documented copy path was an infinite recursion. Latent only because mlx-swift
         // currently copies internally rather than returning nil; a version that returns nil
@@ -362,6 +397,9 @@ public enum SeedlessMetalForward {
     /// 8bit qmv_fast 移植（router gate: postNorm[H]→gate_logits[N], f16）。MLX qmv_fast<half,gs=64,bits=8>。
     /// bits=8 は load_vector/qdot が単純（x_thread=x そのまま、accum=Σ x·w_byte）。fast 条件 N%8==0 && K%512==0。
     /// 単一 encoder 融合用に encodeQmm8 も提供。
+    nonisolated(unsafe) static var _qmm8R1Pipeline: MTLComputePipelineState?
+    /// QWISP_QMM8_R1=1: route qmm8 dispatches through qmm8_r1 (1 row per simdgroup).
+    static let qmm8R1 = Tell.envInt("QWISP_QMM8_R1", 1) != 0
     static func compileQmm8() -> Bool {
         guard let (device, _) = ensure() else { return false }
         if _qmm8Pipeline != nil { return true }
@@ -432,15 +470,73 @@ public enum SeedlessMetalForward {
                 if (simd_lid == 0) y[row] = (half)result[row];
             }
         }
+        // qmm8_r1: qmm8 with ONE output row per simdgroup (4x the simdgroups). Per-row arithmetic
+        // (lane split, k-block order, qd8, simd_sum) is unchanged → byte-identical rows.
+        kernel void qmm8_r1(device const uint32_t* w      [[buffer(0)]],
+                         device const half*     scales [[buffer(1)]],
+                         device const half*     biases [[buffer(2)]],
+                         device const half*     x      [[buffer(3)]],
+                         device half*           y      [[buffer(4)]],
+                         constant int&          in_vec_size  [[buffer(5)]],   // K
+                         constant int&          out_vec_size [[buffer(6)]],   // N
+                         device const int*      stopFlag [[buffer(16)]],   // ★ A4
+                         uint3 tid      [[threadgroup_position_in_grid]],
+                         uint  simd_gid [[simdgroup_index_in_threadgroup]],
+                         uint  simd_lid [[thread_index_in_simdgroup]]) {
+            if (stopFlag[0] != 0) return;              // ★ A4 stop flag guard
+            constexpr int packs_per_thread = 2;
+            constexpr int num_simdgroups = 2;
+            constexpr int results_per_simdgroup = 1;
+            constexpr int pack_factor = 4;             // 32/8
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread = 8;       // pack_factor*packs_per_thread
+            constexpr int block_size = 256;            // vpt*SIMD_SIZE
+            constexpr int scale_step_per_thread = 8;   // gs(64)/vpt(8)
+            const device uint8_t* ws = (const device uint8_t*)w;
+            typedef float U;
+            thread U x_thread[8];
+            thread U result[1] = {0};
+            const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;   // K bytes
+            const int in_vec_size_g = in_vec_size / 64;
+            const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+            ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+            x += tid.x * in_vec_size + simd_lid * values_per_thread;
+            y += tid.x * out_vec_size + out_row;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                U sum = ld8(x, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                    const device half* sl = scales + row * in_vec_size_g;
+                    const device half* bl = biases + row * in_vec_size_g;
+                    U s = sl[0]; U b = bl[0];
+                    result[row] += qd8(wl, x_thread, s, b, sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                scales += block_size / 64;
+                biases += block_size / 64;
+                x += block_size;
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) y[row] = (half)result[row];
+            }
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
             _qmm8Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm8")!)
+            _qmm8R1Pipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm8_r1")!)
             return true
         } catch { print("[raw-qmm8] compile: \(error)"); return false }
     }
 
     static func qmm8(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int) -> MLXArray? {
+        qmm8Variant(x, wq, scales: scales, biases: biases, M: M, K: K, N: N, r1: false)
+    }
+    public static func qmm8Variant(_ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray, M: Int, K: Int, N: Int,
+                                   r1: Bool) -> MLXArray? {
         guard let (device, queue) = ensure(), compileQmm8() else { return nil }
         guard N % 8 == 0, K % 512 == 0 else { print("[raw-qmm8] 非fast N=\(N) K=\(K)"); return nil }
         guard let bx = mtlBuf(x.asType(.float16), device),
@@ -449,12 +545,12 @@ public enum SeedlessMetalForward {
               let bbi = mtlBuf(biases.asType(.float16), device) else { return nil }
         let outBuf = device.makeBuffer(length: M * N * 2, options: .storageModeShared)!
         let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(_qmm8Pipeline!)
+        enc.setComputePipelineState(r1 ? _qmm8R1Pipeline! : _qmm8Pipeline!)
         enc.setBuffer(bwq, offset: 0, index: 0); enc.setBuffer(bsc, offset: 0, index: 1)
         enc.setBuffer(bbi, offset: 0, index: 2); enc.setBuffer(bx, offset: 0, index: 3); enc.setBuffer(outBuf, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N); enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
         bindStop(enc, 16)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / (r1 ? 2 : 8), depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * N)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * N)), [M, N])
@@ -5007,6 +5103,232 @@ public enum SeedlessMetalForward {
         enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9)
         enc.setBytes(&sc, length: 4, index: 10)
         enc.dispatchThreadgroups(MTLSize(width: H, height: M, depth: 1), threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H * D)
+        return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H * D)), [M * H, D])
+    }
+
+    // ── sdpa_rows split (decode / verify rows): bit-exact two-pass form of sdpa_rows ─────────
+    // sdpa_rows runs one 1024-thread threadgroup per (head, row): at M=1 that is 16 threadgroups
+    // for a 14-core GPU (two waves), and each keeps its whole KV scan on one core. The split form
+    // keeps sdpa_rows' arithmetic exactly: simdgroup s (0..31) still owns positions s, s+32, ...
+    // with the same per-lane online softmax, but the 32 simdgroups are spread over `parts`
+    // threadgroups and write their (max, sum, o[256]) partials as f32. The combine kernel then
+    // repeats sdpa_rows' cross-simdgroup reduction verbatim (lane l holds simdgroup l's partial,
+    // same simd_max / simd_sum / fast::exp, same compile options) → byte-identical output.
+    nonisolated(unsafe) static var _sdpaPartPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sdpaCombinePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _sdpaSplitScratch: MTLBuffer?
+    nonisolated(unsafe) static var _sdpaPartGPipelines: [Int: MTLComputePipelineState] = [:]
+    static let sdpaSplitMaxM = 16
+    static let sdpaSplitMaxH = 64
+    static let sdpaSplitPartFloats = 2 + 256
+
+    static func ensureSdpaSplit() -> Bool {
+        if _sdpaPartPipeline != nil && _sdpaCombinePipeline != nil && _sdpaSplitScratch != nil { return true }
+        guard let (device, _) = ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        #include <metal_simdgroup>
+        using namespace metal;
+        kernel void sdpa_rows_part(device const half* queries [[buffer(0)]],
+                                   device const half* keys    [[buffer(1)]],
+                                   device const half* values  [[buffer(2)]],
+                                   device float* part         [[buffer(3)]],   // [M*H, 32, 258]
+                                   constant int& gqa_factor   [[buffer(4)]],
+                                   constant int& baseN        [[buffer(5)]],
+                                   constant int& k_head_stride[[buffer(6)]],
+                                   constant int& k_seq_stride [[buffer(7)]],
+                                   constant int& v_head_stride[[buffer(8)]],
+                                   constant int& v_seq_stride [[buffer(9)]],
+                                   constant float& scale      [[buffer(10)]],
+                                   constant int& sg_per_tg    [[buffer(11)]],
+                                   uint3 tid [[threadgroup_position_in_grid]],
+                                   uint3 tpg [[threadgroups_per_grid]],
+                                   uint simd_gid [[simdgroup_index_in_threadgroup]],
+                                   uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int BN = 32, BD = 32, D = 256, V = 256;
+            constexpr int qk_per_thread = D / BD;
+            constexpr int v_per_thread = V / BD;
+            int inner_k_stride = BN * k_seq_stride;
+            int inner_v_stride = BN * v_seq_stride;
+            typedef float U;
+            thread U q[qk_per_thread]; thread U k[qk_per_thread]; thread U o[v_per_thread];
+            const int s = (int)tid.z * sg_per_tg + (int)simd_gid;     // sdpa_rows' simd_gid
+            const int q_batch_head_idx = tid.x;
+            const int q_seq_idx = tid.y;
+            const int kv_head_idx = q_batch_head_idx / gqa_factor;
+            const int N = baseN + q_seq_idx;
+            const int o_offset = q_seq_idx * (int)tpg.x + q_batch_head_idx;
+            queries += o_offset * D + simd_lid * qk_per_thread;
+            keys   += kv_head_idx * k_head_stride + s * k_seq_stride + simd_lid * qk_per_thread;
+            values += kv_head_idx * v_head_stride + s * v_seq_stride + simd_lid * v_per_thread;
+            for (int i = 0; i < qk_per_thread; i++) q[i] = (U)scale * queries[i];
+            for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+            U max_score = -INFINITY;
+            U sum_exp_score = 0;
+            for (int i = s; i < N; i += BN) {
+                for (int j = 0; j < qk_per_thread; j++) k[j] = keys[j];
+                U score = 0;
+                for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
+                score = simd_sum(score);
+                U new_max = max(max_score, score);
+                U factor = fast::exp(max_score - new_max);
+                U exp_score = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+                for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * values[j];
+                keys += inner_k_stride;
+                values += inner_v_stride;
+            }
+            device float* pp = part + ((long)o_offset * 32 + s) * 258;
+            if (simd_lid == 0) { pp[0] = max_score; pp[1] = sum_exp_score; }
+            for (int i = 0; i < v_per_thread; i++) pp[2 + simd_lid * v_per_thread + i] = o[i];
+        }
+        // Same as sdpa_rows_part but each simdgroup serves G query heads of one KV head: K/V rows
+        // are loaded once and reused; every head keeps sdpa_rows' exact per-head arithmetic.
+        template <int G>
+        [[kernel]] void sdpa_rows_part_g(device const half* queries [[buffer(0)]],
+                                   device const half* keys    [[buffer(1)]],
+                                   device const half* values  [[buffer(2)]],
+                                   device float* part         [[buffer(3)]],
+                                   constant int& gqa_factor   [[buffer(4)]],
+                                   constant int& baseN        [[buffer(5)]],
+                                   constant int& k_head_stride[[buffer(6)]],
+                                   constant int& k_seq_stride [[buffer(7)]],
+                                   constant int& v_head_stride[[buffer(8)]],
+                                   constant int& v_seq_stride [[buffer(9)]],
+                                   constant float& scale      [[buffer(10)]],
+                                   constant int& sg_per_tg    [[buffer(11)]],
+                                   uint3 tid [[threadgroup_position_in_grid]],
+                                   uint3 tpg [[threadgroups_per_grid]],
+                                   uint simd_gid [[simdgroup_index_in_threadgroup]],
+                                   uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int BN = 32, BD = 32, D = 256, V = 256;
+            constexpr int qk_per_thread = D / BD;
+            constexpr int v_per_thread = V / BD;
+            int inner_k_stride = BN * k_seq_stride;
+            int inner_v_stride = BN * v_seq_stride;
+            typedef float U;
+            thread U q[G][qk_per_thread]; thread U k[qk_per_thread]; thread U vv[v_per_thread];
+            thread U o[G][v_per_thread]; thread U max_score[G]; thread U sum_exp_score[G];
+            const int s = (int)tid.z * sg_per_tg + (int)simd_gid;
+            const int H = (int)tpg.x * G;
+            const int head0 = (int)tid.x * G;
+            const int q_seq_idx = tid.y;
+            const int kv_head_idx = head0 / gqa_factor;
+            const int N = baseN + q_seq_idx;
+            for (int g = 0; g < G; g++) {
+                device const half* qq = queries + (q_seq_idx * H + head0 + g) * D + simd_lid * qk_per_thread;
+                for (int i = 0; i < qk_per_thread; i++) q[g][i] = (U)scale * qq[i];
+                for (int i = 0; i < v_per_thread; i++) o[g][i] = 0;
+                max_score[g] = -INFINITY; sum_exp_score[g] = 0;
+            }
+            keys   += kv_head_idx * k_head_stride + s * k_seq_stride + simd_lid * qk_per_thread;
+            values += kv_head_idx * v_head_stride + s * v_seq_stride + simd_lid * v_per_thread;
+            for (int i = s; i < N; i += BN) {
+                for (int j = 0; j < qk_per_thread; j++) k[j] = keys[j];
+                for (int j = 0; j < v_per_thread; j++) vv[j] = values[j];
+                for (int g = 0; g < G; g++) {
+                    U score = 0;
+                    for (int j = 0; j < qk_per_thread; j++) score += q[g][j] * k[j];
+                    score = simd_sum(score);
+                    U new_max = max(max_score[g], score);
+                    U factor = fast::exp(max_score[g] - new_max);
+                    U exp_score = fast::exp(score - new_max);
+                    max_score[g] = new_max;
+                    sum_exp_score[g] = sum_exp_score[g] * factor + exp_score;
+                    for (int j = 0; j < v_per_thread; j++) o[g][j] = o[g][j] * factor + exp_score * vv[j];
+                }
+                keys += inner_k_stride;
+                values += inner_v_stride;
+            }
+            for (int g = 0; g < G; g++) {
+                const int o_offset = q_seq_idx * H + head0 + g;
+                device float* pp = part + ((long)o_offset * 32 + s) * 258;
+                if (simd_lid == 0) { pp[0] = max_score[g]; pp[1] = sum_exp_score[g]; }
+                for (int i = 0; i < v_per_thread; i++) pp[2 + simd_lid * v_per_thread + i] = o[g][i];
+            }
+        }
+        template [[host_name("sdpa_rows_part_g2")]] [[kernel]] decltype(sdpa_rows_part_g<2>) sdpa_rows_part_g<2>;
+        template [[host_name("sdpa_rows_part_g4")]] [[kernel]] decltype(sdpa_rows_part_g<4>) sdpa_rows_part_g<4>;
+        template [[host_name("sdpa_rows_part_g8")]] [[kernel]] decltype(sdpa_rows_part_g<8>) sdpa_rows_part_g<8>;
+        kernel void sdpa_rows_combine(device const float* part [[buffer(0)]],
+                                      device half* out         [[buffer(1)]],
+                                      uint3 tid [[threadgroup_position_in_grid]],
+                                      uint3 tpg [[threadgroups_per_grid]],
+                                      uint simd_gid [[simdgroup_index_in_threadgroup]],
+                                      uint simd_lid [[thread_index_in_simdgroup]]) {
+            constexpr int V = 256, BD = 32;
+            constexpr int v_per_thread = V / BD;
+            typedef float U;
+            const int o_offset = (int)tid.y * (int)tpg.x + (int)tid.x;
+            device const float* pl = part + ((long)o_offset * 32 + simd_lid) * 258;   // simdgroup simd_lid's partial
+            U max_score = pl[0];
+            U new_max = simd_max(max_score);
+            U factor = fast::exp(max_score - new_max);
+            U sum_exp_score = simd_sum(pl[1] * factor);
+            out += o_offset * V + simd_gid * v_per_thread;
+            for (int i = 0; i < v_per_thread; i++) {
+                U oi = simd_sum(pl[2 + simd_gid * v_per_thread + i] * factor);
+                oi = sum_exp_score == 0 ? oi : (oi / sum_exp_score);
+                if (simd_lid == 0) out[i] = (half)oi;
+            }
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
+            _sdpaPartPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa_rows_part")!)
+            _sdpaCombinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa_rows_combine")!)
+            for g in [2, 4, 8] {
+                _sdpaPartGPipelines[g] = try device.makeComputePipelineState(function: lib.makeFunction(name: "sdpa_rows_part_g\(g)")!)
+            }
+        } catch { print("[raw-sdpa-split] compile: \(error)"); return false }
+        _sdpaSplitScratch = device.makeBuffer(length: sdpaSplitMaxM * sdpaSplitMaxH * 32 * sdpaSplitPartFloats * 4,
+                                              options: .storageModePrivate)
+        return _sdpaSplitScratch != nil
+    }
+
+    /// Encode the split form. Same argument meaning as sdpa_rows; `parts` must divide 32.
+    static func encodeSdpaRowsSplit(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
+                                    H: Int, KV: Int, baseN: Int, M: Int, scale: Float,
+                                    kHeadStride: Int, kSeqStride: Int, vHeadStride: Int, vSeqStride: Int, parts: Int,
+                                    headsPerSG: Int = 1) {
+        let scratch = _sdpaSplitScratch!
+        let G = (headsPerSG > 1 && (H / KV) % headsPerSG == 0) ? headsPerSG : 1
+        enc.setComputePipelineState(G > 1 ? _sdpaPartGPipelines[G]! : _sdpaPartPipeline!)
+        enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
+        enc.setBuffer(v, offset: 0, index: 2); enc.setBuffer(scratch, offset: 0, index: 3)
+        var gqa = Int32(H / KV), bn = Int32(baseN)
+        var khs = Int32(kHeadStride), kss = Int32(kSeqStride), vhs = Int32(vHeadStride), vss = Int32(vSeqStride), sc = scale
+        var sgp = Int32(32 / parts)
+        enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&bn, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9)
+        enc.setBytes(&sc, length: 4, index: 10); enc.setBytes(&sgp, length: 4, index: 11)
+        enc.dispatchThreadgroups(MTLSize(width: H / G, height: M, depth: parts),
+                                 threadsPerThreadgroup: MTLSize(width: 32 * (32 / parts), height: 1, depth: 1))
+        enc.setComputePipelineState(_sdpaCombinePipeline!)
+        enc.setBuffer(scratch, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: H, height: M, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+    }
+
+    /// Test helper mirroring sdpaRows() through the split kernels.
+    public static func sdpaRowsSplit(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+                                     H: Int, KV: Int, D: Int, baseLen: Int, M: Int, scale: Float, parts: Int,
+                                     headsPerSG: Int = 1) -> MLXArray? {
+        guard let (device, queue) = ensure(), D == 256, M <= sdpaSplitMaxM, H <= sdpaSplitMaxH,
+              32 % parts == 0, ensureSdpaSplit() else { return nil }
+        let totalSeq = baseLen + M - 1
+        guard let bq = mtlBuf(q.asType(.float16), device),
+              let bk = mtlBuf(k.asType(.float16), device),
+              let bv = mtlBuf(v.asType(.float16), device) else { return nil }
+        let outBuf = device.makeBuffer(length: M * H * D * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeSdpaRowsSplit(enc, q: bq, k: bk, v: bv, out: outBuf, H: H, KV: KV, baseN: baseLen, M: M, scale: scale,
+                            kHeadStride: totalSeq * D, kSeqStride: D, vHeadStride: totalSeq * D, vSeqStride: D, parts: parts,
+                            headsPerSG: headsPerSG)
         enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         let ptr = outBuf.contents().bindMemory(to: Float16.self, capacity: M * H * D)
         return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H * D)), [M * H, D])

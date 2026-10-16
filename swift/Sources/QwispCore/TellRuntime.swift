@@ -96,6 +96,10 @@ extension Tell {
         // Steel-prefill hybrid (QWISP_HYBRID_PREFILL=1): prefill-scoped forward with GDN dense
         // matmuls via MLX steel. nil → prefill uses `forward`. Decode/verify NEVER use this.
         var forwardHybrid: (([Int32]) -> MLXArray?)? = nil
+        /// Called once when Tell.prefill finishes all chunks (fast prefill drops its MLX mirror).
+        var prefillEnded: (() -> Void)? = nil
+        /// Drops an encoded-but-uncommitted chain-ahead (SeedlessFusedForward.cancelPendingChain).
+        var chainCancelAhead: (() -> Void)? = nil
         var hybridChunk: Int = 64
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
@@ -236,7 +240,15 @@ extension Tell {
                 return fwd.forwardRowsHybrid(x, M: tokens.count, finalNormW: fnBuf)
             }
             backend.hybridChunk = Swift.min(1024, maxM)
+            // Non-strict fast prefill (QWISP_FAST_PREFILL=1): whole-chunk MLX graph, state handed
+            // to the Seedless buffers; decode unchanged. Off → this block is skipped.
+            if FastPrefill.enabled, let fp = FastPrefill(fwd: fwd, reference: backend.forwardHybrid) {
+                backend.forwardHybrid = { fp.forward($0) }
+                backend.prefillEnded = { fp.prefillEnded() }
+                backend.hybridChunk = FastPrefill.chunk
+            }
         }
+        backend.chainCancelAhead = { fwd.cancelPendingChain() }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
         if fwd.head != nil {
@@ -657,6 +669,8 @@ extension Tell {
         //
         // Default ON. QWISP_PREFILL_CHUNK_POOL=0 restores the pre-fix behavior for A/B only.
         let chunkPool = Tell.envInt("QWISP_PREFILL_CHUNK_POOL", 1) != 0
+        FastPrefill.wiredBegin()
+        defer { backend.prefillEnded?(); FastPrefill.wiredEnd() }
         while pos < pLen {
             let ok = chunkPool ? autoreleasepool { runChunk() } : runChunk()
             if !ok { return nil }
@@ -748,9 +762,12 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         // #119: env-gated per-step wall-time buckets (QWISP_SPEC_PROFILE=1). Flag off →
         // no Date() calls on the hot path, loop byte-identical.
+        defer { backend.chainCancelAhead?() }
         let prof = Tell.envFlag("QWISP_SPEC_PROFILE")
         var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0
         var pfChainCalls = 0
+        var pfChainGPU = 0.0, pfChainEnc = 0.0, pfSubmit = 0.0, pfWake = 0.0, pfBetween = 0.0, pfAhead = 0.0, pfWait = 0.0, pfWhole = 0.0
+        var lastChainEnd: Date? = nil
         let tLoop0 = Date()
 
         // #119 speculation gate state (see Tell.specGate*): rolling accepted-per-attempt
@@ -762,8 +779,14 @@ extension Tell {
         // sk-style adaptive maxK: clamp draftK to recent accept + grace (feeds SCORE trunc too).
         var recentAccepts: [Int] = []
 
-        while out.count < N && !(isCancelled?() ?? false) {
+        var pfFlush = 0.0, pfSnap = 0.0, pfCond = 0.0
+        while true {
+            let tQ = prof ? Date() : Date.distantPast
+            guard out.count < N && !(isCancelled?() ?? false) else { break }
+            if prof { pfCond += Date().timeIntervalSince(tQ) * 1000 }
+            let tF = prof ? Date() : Date.distantPast
             flush()
+            if prof { pfFlush += Date().timeIntervalSince(tF) * 1000 }
             let tD = prof ? Date() : Date.distantPast
             let effK = Tell.adaptiveDraftK(cap: maxK, recentAccepts: recentAccepts)
             var drafts = (gateOn && out.count < gateSuspendedUntil) ? []
@@ -778,7 +801,9 @@ extension Tell {
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
+            let tS = prof ? Date() : Date.distantPast
             let snap = backend.snapshot()
+            if prof { pfSnap += Date().timeIntervalSince(tS) * 1000 }
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -788,7 +813,16 @@ extension Tell {
                 let tC = prof ? Date() : Date.distantPast
                 if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
                    let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
-                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1 }
+                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1
+                              pfChainGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                              pfChainEnc += SeedlessFusedVerify.SeedlessFusedForward.profLastEncodeMs
+                              pfSubmit += SeedlessFusedVerify.SeedlessFusedForward.profLastSubmitMs
+                              pfWake += SeedlessFusedVerify.SeedlessFusedForward.profLastWakeMs
+                              pfAhead += SeedlessFusedVerify.SeedlessFusedForward.profLastAheadMs
+                              pfWait += SeedlessFusedVerify.SeedlessFusedForward.profLastWaitMs
+                              pfWhole += SeedlessFusedVerify.SeedlessFusedForward.profLastWholeMs
+                              if let l = lastChainEnd { pfBetween += tC.timeIntervalSince(l) * 1000 }
+                              lastChainEnd = Date() }
                     out.append(u); hist.append(u)
                     let addN = Swift.min(chainResult.count - 1, N - out.count)
                     for i in 0 ..< addN {
@@ -902,9 +936,9 @@ extension Tell {
             let total = Date().timeIntervalSince(tLoop0) * 1000
             let other = total - pfDraft - pfChain - pfVerify - pfRebuild
             FileHandle.standardError.write(Data(String(format:
-                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
+                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f (gpu %.0f, encode %.0f, submit %.0f, wake %.0f, ahead-encode %.0f, wait %.0f, in-func %.0f; loop-between %.0f [cond %.0f flush %.0f snap %.0f]) + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
                 promptIds.count, out.count, stSteps, pfChainCalls,
-                total, pfDraft, pfChain, pfVerify, pfRebuild, other,
+                total, pfDraft, pfChain, pfChainGPU, pfChainEnc, pfSubmit, pfWake, pfAhead, pfWait, pfWhole, pfBetween, pfCond, pfFlush, pfSnap, pfVerify, pfRebuild, other,
                 out.isEmpty ? 0 : total / Double(out.count)).utf8))
         }
         return Array(out.prefix(N))

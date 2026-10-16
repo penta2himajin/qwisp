@@ -67,6 +67,8 @@ if CommandLine.arguments.contains("stream") {
                run: { _, _ in Tell.laneKernelBench() }),
         Runner(name: "conc-bench", desc: "#143 U2 CEILING: N independent tiny dispatches, serial vs concurrent encoder (GPU, no model; QWISP_CONC_REPS/N)",
                run: { _, _ in GroupedMoEPoC.dispatchConcurrencyBench() }),
+        Runner(name: "moe-roofline", desc: "MoE decode (M=1) per-stage µs, GB/s vs copy ceiling, FLOP/B over 40 layers (GPU+model; QWISP_MOEB_REPS)",
+               run: { md, _ in Tell.moeDecodeRoofline(modelDir: md) }),
         Runner(name: "grouped-moe-bench", desc: "grouped MoE expert kernel micro-bench",
                run: { _, _ in GroupedMoEPoC.bench() }),
         Runner(name: "dense-tiled-bench", desc: "dense tiled matmul micro-bench",

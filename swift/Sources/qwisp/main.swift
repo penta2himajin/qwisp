@@ -20,6 +20,7 @@ usage: qwisp <command> [options]
   chat [opts] <prompt>   one-shot chat; reads stdin if no prompt is given
       --max-tokens N     cap generation (default: until EOS / context)
       --lossless         force strict bit-exact mode (streaming tiers default to bolt)
+      --fast             non-bit-exact speed tier: faster prefill (resident tier); --lossless wins
       --no-thinking      skip the <think> phase (enable_thinking=false; answers start immediately)
   pull [hf-repo-id]      download a checkpoint (default: Qwen3.6-35B-A3B MTPLX) + write config
   config [--defaults]    show effective settings / the full default set
@@ -56,6 +57,11 @@ let args = Array(CommandLine.arguments.dropFirst())
 if args.isEmpty || args.contains("--help") || args.contains("-h") || args.first == "help" {
     print(helpText)
     exit(0)
+}
+// Fast tier: resolve once, before any engine switch is read. --lossless (or env/config lossless) wins.
+if (args.contains("--fast") || Config.resolveFast(env: ProcessInfo.processInfo.environment, config: qwispConfig))
+    && !args.contains("--lossless") && !Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig) {
+    Config.applyFastTier()
 }
 switch args.first {
 case "serve":
@@ -108,6 +114,7 @@ case "chat":
     var maxTokens = -1
     var chatLossless = Config.resolveLossless(env: ProcessInfo.processInfo.environment, config: qwispConfig)
     if let i = rest.firstIndex(of: "--lossless") { chatLossless = true; rest.remove(at: i) }
+    if let i = rest.firstIndex(of: "--fast") { rest.remove(at: i) }   // applied above
     var noThinking = false   // issue #77: enable_thinking=false via the chat template
     if let i = rest.firstIndex(of: "--no-thinking") { noThinking = true; rest.remove(at: i) }
     if let i = rest.firstIndex(where: { $0 == "--max-tokens" || $0.hasPrefix("--max-tokens=") }) {

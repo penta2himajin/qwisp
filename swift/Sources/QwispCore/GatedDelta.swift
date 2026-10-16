@@ -129,6 +129,97 @@ public enum GatedDelta {
         outputNames: ["y", "state_out"],
         source: stepKernelSource)
 
+    /// mlx-lm's Dk=128 "packed" prefill kernel (gated_delta.py _make_gated_delta_packed_kernel):
+    /// 8 value rows per SIMD-group, 4 lanes per row, 32 state elements per lane in registers, and an
+    /// explicit ascending butterfly so the reduction order is fixed by construction. Opt-in via
+    /// `usePacked` (fast prefill); the generic kernel above stays the default.
+    nonisolated(unsafe) public static var usePacked = false
+    static let packedKernelSource = """
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        constexpr int values_per_lane = Dk / lanes_per_row;
+        constexpr int partials_per_lane = values_per_lane / 4;
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto row_group = thread_position_in_grid.y;
+        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
+
+        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+        y += (b_idx * T * Hv + hv_idx) * Dv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+        float state[values_per_lane];
+        for (int i = 0; i < values_per_lane; ++i) {
+          state[i] = static_cast<float>(i_state[i]);
+        }
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float gt = static_cast<float>(g_[hv_idx]);
+          float part[partials_per_lane];
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] * gt;
+              acc += state[e] * static_cast<float>(k_[e]);
+            }
+            part[pb] = acc;
+          }
+          float kv_mem =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          kv_mem += simd_shuffle_xor(kv_mem, 1);
+          kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+              acc += state[e] * static_cast<float>(q_[e]);
+            }
+            part[pb] = acc;
+          }
+          float out =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          out += simd_shuffle_xor(out, 1);
+          out += simd_shuffle_xor(out, 2);
+          if (lane_in_row == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+        """
+    static let packedKernel = MLXFast.metalKernel(
+        name: "gated_delta_step_packed_btree",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: packedKernelSource)
+
     /// fused Metal kernel 経路（use_kernel=True 相当）。q,k は repeat しない([B,T,Hk,Dk])。
     public static func updateKernel(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ a: MLXArray,
                                     _ b: MLXArray, _ aLog: MLXArray, _ dtBias: MLXArray,
@@ -139,6 +230,17 @@ public enum GatedDelta {
         let Hv = v.dim(2), Dv = v.dim(3)
         let st = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
         let inT = q.dtype
+        if usePacked && Dk == 128 && Dv % 8 == 0 {
+            let out = packedKernel(
+                [q, k, v, g, beta, st, T],
+                template: [("InT", inT), ("StT", DType.float32),
+                           ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+                grid: (32, Dv / 8, B * Hv),
+                threadGroup: (32, 2, 1),
+                outputShapes: [[B, T, Hv, Dv], [B, Hv, Dv, Dk]],
+                outputDTypes: [inT, .float32])
+            return (out[0], out[1])
+        }
         let out = stepKernel(
             [q, k, v, g, beta, st, T],
             template: [("InT", inT), ("StT", DType.float32),

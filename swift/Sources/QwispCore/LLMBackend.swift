@@ -227,7 +227,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             store.residentAll()
         }
         self.store = store
+        if !isStreamingTier { SeedlessMetalForward.registerPersistentWeights(Array(store.arrays.values)) }
         self.engine = SeedlessEngine.build(store: store)
+        FastPrefill.applyWiredLimit(store: store)
+        FastPrefill.install(store: store)
         // #162 measurement knob. The lane path bounds MLX's free-buffer pool in
         // LaneBackend.init (QWISP_LANE_MLX_CACHE_MB, default 2048, −22.5GB peak there); the
         // serialize path never did, and #150 measured the pool growing +7.7GB (cache 4,845 →
