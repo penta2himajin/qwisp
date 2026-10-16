@@ -3279,6 +3279,7 @@ public enum SeedlessFusedVerify {
         /// matrix-unit gather_qmm only when tile rows >= get_qmv_batch_limit (14 on M1/M2 base/Pro,
         /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
         static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
+        static let steelPad = Swift.max(1, Tell.envInt("QWISP_STEEL_PAD", 32))
         static let chainSpinWait = Tell.envInt("QWISP_CHAIN_SPIN", 0) != 0
         static let chainAhead = Tell.envInt("QWISP_CHAIN_AHEAD", 0) != 0
         /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
@@ -4374,13 +4375,18 @@ public enum SeedlessFusedVerify {
         // Steel qmm with M pinned into the steel kernel class (M>=14) by zero-padding — per-element
         // M-invariance and padding bit-identity are proven (mlx-qmm-minv) → split-invariant prefill.
         private func steelQmm(_ x: MLXArray, _ w: (MLXArray, MLXArray, MLXArray), M: Int) -> MLXArray {
+            // QWISP_STEEL_PAD (default 32, was 14): rows to zero-pad up to. MLX takes its matrix-unit qmm only
+            // at M >= get_qmv_batch_limit — 14 on M1/M2 base/Pro but 18 on M3+ non-'d' (issue #186),
+            // so with 14 a small chunk on an M3 silently runs qmv and diverges from the same rows
+            // computed inside a large chunk.
+            let pad = SeedlessFusedForward.steelPad
             var xi = x
-            if M < 14 {
-                xi = MLX.concatenated([x, MLXArray.zeros([14 - M, x.dim(1)]).asType(.float16)], axis: 0)
+            if M < pad {
+                xi = MLX.concatenated([x, MLXArray.zeros([pad - M, x.dim(1)]).asType(.float16)], axis: 0)
             }
             let y = MLX.quantizedMatmul(xi, w.0, scales: w.1, biases: w.2,
                                         transpose: true, groupSize: 64, bits: 4)
-            return M < 14 ? y[0 ..< M] : y
+            return M < pad ? y[0 ..< M] : y
         }
         private func bufToArr(_ b: MTLBuffer, _ rows: Int, _ cols: Int) -> MLXArray {
             let p = b.contents().bindMemory(to: Float16.self, capacity: rows * cols)
