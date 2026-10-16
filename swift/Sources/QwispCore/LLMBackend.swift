@@ -227,6 +227,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             store.residentAll()
         }
         self.store = store
+        if !isStreamingTier { SeedlessMetalForward.registerPersistentWeights(Array(store.arrays.values)) }
         self.engine = SeedlessEngine.build(store: store)
         FastPrefill.applyWiredLimit(store: store)
         FastPrefill.install(store: store)

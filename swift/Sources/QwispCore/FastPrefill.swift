@@ -123,6 +123,7 @@ public final class FastPrefill {
     }
 
     private func run(_ tokens: [Int32]) -> MLXArray? {
+        fwd.cancelPendingChain()
         let M = tokens.count
         let t0 = DispatchTime.now().uptimeNanoseconds
         let caches: [LayerCache]

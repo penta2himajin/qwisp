@@ -37,8 +37,43 @@ public enum SeedlessMetalForward {
 
     /// buffer 化: MLX 常駐テンソルは可能なら zero-copy(unified memory 直参照)、不可なら copy。
     /// 実モデル重みの per-call copy(254MB 級)を排除する perf 用。数値へは無影響(同一バイト)。
+    // ── Persistent-weight wrappers + one process-wide residency set (QWISP_RESIDENCY_SET=1) ──
+    // Every forward used to wrap the same WeightStore memory in fresh noCopy MTLBuffers (~2,100
+    // allocations per command buffer), and Metal paid per-allocation residency work at every
+    // commit: 3.4-4.8 ms from commit to GPU start per decode chain CB on an M3 Pro. Weights are
+    // registered ONCE here (arrays that live as long as the backend), mtlBuf() hands back the
+    // registered wrapper for the same (address, length), and a single residency set holding only
+    // those wrappers is attached to the queue. Transient arrays are never registered.
+    struct WrapperKey: Hashable { let ptr: UInt; let len: Int }
+    nonisolated(unsafe) static var weightWrappers: [WrapperKey: MTLBuffer] = [:]
+    nonisolated(unsafe) static var weightResidencySet: AnyObject?
+
+    public static func registerPersistentWeights(_ arrays: [MLXArray]) {
+        guard let (device, queue) = ensure() else { return }
+        for a in arrays {
+            guard let b = a.asMTLBuffer(device: device, noCopy: true) else { continue }
+            weightWrappers[WrapperKey(ptr: UInt(bitPattern: b.contents()), len: b.length)] = b
+        }
+        guard Tell.envInt("QWISP_RESIDENCY_SET", 0) != 0, #available(macOS 15.0, *), weightResidencySet == nil else { return }
+        let desc = MTLResidencySetDescriptor()
+        desc.initialCapacity = weightWrappers.count
+        guard let rs = try? device.makeResidencySet(descriptor: desc) else { return }
+        for b in weightWrappers.values { rs.addAllocation(b) }
+        rs.commit()
+        rs.requestResidency()
+        queue.addResidencySet(rs)
+        weightResidencySet = rs
+        let bytes = weightWrappers.values.reduce(0) { $0 + $1.length }
+        FileHandle.standardError.write(Data(String(format: "[qwisp] weight residency set: %d buffers, %.1f GB\n",
+                                                   weightWrappers.count, Double(bytes) / 1073741824).utf8))
+    }
+
     static func mtlBuf(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
-        if let b = a.asMTLBuffer(device: device, noCopy: true) { return b }
+        if let b = a.asMTLBuffer(device: device, noCopy: true) {
+            if !weightWrappers.isEmpty,
+               let w = weightWrappers[WrapperKey(ptr: UInt(bitPattern: b.contents()), len: b.length)] { return w }
+            return b
+        }
         // #177: this fallback used to call mtlBuf(a, device) — the same arguments — so the
         // documented copy path was an infinite recursion. Latent only because mlx-swift
         // currently copies internally rather than returning nil; a version that returns nil

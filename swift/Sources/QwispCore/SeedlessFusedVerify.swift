@@ -3,6 +3,7 @@ import MLX
 import MLXFast
 import MLXRandom
 import Metal
+import QuartzCore
 
 /// D1 P2(path A): order-stable rows kernel を単一 command buffer + GPU 常駐中間 buffer で連結する
 /// 融合経路。per-op CB commit/wait/readback(composed 経路の律速)を除去し、fused アーキテクチャへ
@@ -406,6 +407,15 @@ public enum SeedlessFusedVerify {
     /// commit + wait, then verify the buffer actually completed.
     /// Returns nil on success, or a fault description. A non-nil result means the caller
     /// MUST NOT read any output buffer of this command buffer.
+    /// Wait half of commitAndWaitChecked for a command buffer committed elsewhere.
+    static func waitChecked(_ cb: MTLCommandBuffer, _ label: String, spin: Bool = false) -> String? {
+        if spin { while cb.status != .completed && cb.status != .error { } }
+        cb.waitUntilCompleted()
+        guard !injectCBFailure, cb.status == .completed, cb.error == nil else {
+            return "\(label): status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
+        }
+        return nil
+    }
     static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String, spin: Bool = false) -> String? {
         cb.commit()
         if spin {
@@ -3152,6 +3162,11 @@ public enum SeedlessFusedVerify {
         /// profile: 直近 step の全 CB GPU-exec 合計 ms。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
         nonisolated(unsafe) public static var profLastEncodeMs = 0.0
+        nonisolated(unsafe) public static var profLastSubmitMs = 0.0
+        nonisolated(unsafe) public static var profLastWakeMs = 0.0
+        nonisolated(unsafe) public static var profLastAheadMs = 0.0
+        nonisolated(unsafe) public static var profLastWaitMs = 0.0
+        nonisolated(unsafe) public static var profLastWholeMs = 0.0
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
@@ -3175,6 +3190,7 @@ public enum SeedlessFusedVerify {
         /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
         static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
         static let chainSpinWait = Tell.envInt("QWISP_CHAIN_SPIN", 0) != 0
+        static let chainAhead = Tell.envInt("QWISP_CHAIN_AHEAD", 0) != 0
         /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
         /// split over this many threadgroups per (head, row); 1 = original single-pass kernel.
         static let sdpaSplitParts: Int = {
@@ -3678,6 +3694,7 @@ public enum SeedlessFusedVerify {
         /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
         /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
         public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
+            cancelPendingChain()
             guard !gpuFault.isPoisoned else { return nil }
             guard M <= maxM else { return nil }
             // hBuf upload(resident/bolt/strict 共通)
@@ -3869,6 +3886,7 @@ public enum SeedlessFusedVerify {
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
         public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
+            cancelPendingChain()
             guard !gpuFault.isPoisoned else { return nil }
             guard let hd = head, tokens.count <= maxM else { return nil }
             let M = tokens.count
@@ -3993,6 +4011,7 @@ public enum SeedlessFusedVerify {
         public func stepSampleRows(_ tokens: [Int32], drafts: [Int], invT: Float, seed: UInt64, basePos: Int,
                                    logitAdj: [Float]? = nil, topP: Float = 1.0)
             -> (full: [Int], resid: [Int], accept: [Bool])? {
+            cancelPendingChain()
             guard let hd = head, tokens.count <= maxM else { return nil }
             guard SamplerGPU.ensurePipeline(device), let samp = SamplerGPU._pipeline else { return nil }
             let M = tokens.count
@@ -4076,9 +4095,13 @@ public enum SeedlessFusedVerify {
         /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。
         /// KV は len の巻き戻し、GDN state/conv hist は ping-pong の swap 戻し(裏面に pre-step 値)。
         public struct Snapshot { let kvLens: [Int] }
-        public func snapshot() -> Snapshot { Snapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }) }
+        /// Read-only: with a chain-ahead pending, report the lengths from before its encode (the
+        /// pending chain is either committed next — snapshot then unused — or cancelled at the
+        /// entry of the step that uses this snapshot, restoring exactly these lengths).
+        public func snapshot() -> Snapshot { Snapshot(kvLens: pendingChain?.kvLensBefore ?? layers.map { $0.kvCache?.len ?? 0 }) }
         /// snapshot 以降に forwardRows をちょうど 1 回だけ呼んだ状態から巻き戻す(2 回以上は不可)。
         public func rollbackOneStep(_ s: Snapshot) {
+            cancelPendingChain()
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = s.kvLens[i] }
                 if let gc = L.gdnCache { gc.swapState() }
@@ -4091,6 +4114,7 @@ public enum SeedlessFusedVerify {
         /// over on restore); GDN's ping-pong holds only 1 step, so its state is deep-copied.
         public struct FullSnapshot { let kvLens: [Int]; let gdn: [(conv: MLXArray, rec: MLXArray)?] }
         public func fullSnapshot() -> FullSnapshot {
+            cancelPendingChain()
             let gdn = layers.map { L -> (conv: MLXArray, rec: MLXArray)? in
                 guard let gc = L.gdnCache else { return nil }
                 let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r)
@@ -4098,6 +4122,7 @@ public enum SeedlessFusedVerify {
             return FullSnapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }, gdn: gdn)
         }
         public func fullRestore(_ s: FullSnapshot) {
+            cancelPendingChain()
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = s.kvLens[i] }
                 if let gc = L.gdnCache, let g = s.gdn[i] {
@@ -4121,6 +4146,7 @@ public enum SeedlessFusedVerify {
         static let persistFormat: UInt32 = 1
 
         public func persistentStateData() -> Data {
+            cancelPendingChain()
             var d = Data()
             func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
             u32(Self.persistMagic); u32(Self.persistFormat); u32(UInt32(layers.count))
@@ -4151,6 +4177,7 @@ public enum SeedlessFusedVerify {
         /// the caller must then fall back to a cold prefill and MUST NOT trust partial state
         /// (shapes are validated per layer, but earlier layers may already be written).
         public func restorePersistentState(_ d: Data) -> Bool {
+            cancelPendingChain()
             var off = 0
             func u32() -> UInt32? {
                 guard d.count >= off + 4 else { return nil }
@@ -4290,6 +4317,7 @@ public enum SeedlessFusedVerify {
         /// new canonical prefill config (refs re-canonicalization gated). Deterministic and
         /// chunk/split-invariant by construction. Resident mode only; else falls back.
         public func forwardRowsHybrid(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
+            cancelPendingChain()
             guard M <= maxM else { return nil }
             if hybridGdnW.isEmpty { return forwardRows(x, M: M, finalNormW: finalNormW) }
             if case .resident = streamMode {} else { return forwardRows(x, M: M, finalNormW: finalNormW) }
@@ -4424,6 +4452,7 @@ public enum SeedlessFusedVerify {
         /// exactly the same and the token math is unchanged. Adds ~2 sync/layer of CPU overhead,
         /// which inflates wall time but NOT the per-CB gpu times being reported.
         public func forwardRowsProfiled(_ x: MLXArray, M: Int) -> (gdn: Double, attn: Double, moe: Double)? {
+            cancelPendingChain()
             guard M <= maxM else { return nil }
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
@@ -4453,6 +4482,7 @@ public enum SeedlessFusedVerify {
 
         /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
         public func readLayerCache(_ i: Int) -> (MLXArray?, MLXArray?) {
+            cancelPendingChain()
             let L = layers[i]
             if let gc = L.gdnCache { let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r) }
             if let kv = L.kvCache { let (k, v) = SeedlessFusedVerify.readKVCache(kv); return (k, v) }
@@ -4484,21 +4514,86 @@ public enum SeedlessFusedVerify {
         ///
         /// STUB — implementation pending.
         /// NOTE: Delegation to forwardRows or stepArgmax in this stub is FORBIDDEN per §4-G1.
-        public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
-            guard !gpuFault.isPoisoned else { return nil }
-            guard let hd = head, K > 0 else { return nil }
-            guard streamMode == .resident || streamMode == .bolt else { return nil }
+        /// Chain-ahead (QWISP_CHAIN_AHEAD=1): while chain n runs on the GPU, chain n+1 is already
+        /// ENCODED (seeded GPU-side from chain n's last token) but NOT committed. If the spec loop's
+        /// next action is again a chain from that same token it is committed at once, removing the
+        /// CPU encode from the GPU's idle gap; otherwise it is dropped without ever reaching the GPU
+        /// and only the encode-time bookkeeping (kv.len, GDN ping-pong parity) is undone. Every
+        /// other entry point that touches cache state cancels it first. Byte-identical stream.
+        final class PendingChain {
+            let cb: MTLCommandBuffer, chainBuf: MTLBuffer, K: Int
+            let seedBuf: MTLBuffer, seedIndex: Int, kvLensBefore: [Int]
+            init(cb: MTLCommandBuffer, chainBuf: MTLBuffer, K: Int, seedBuf: MTLBuffer, seedIndex: Int, kvLensBefore: [Int]) {
+                self.cb = cb; self.chainBuf = chainBuf; self.K = K
+                self.seedBuf = seedBuf; self.seedIndex = seedIndex; self.kvLensBefore = kvLensBefore
+            }
+            var seedValue: Int32 { seedBuf.contents().bindMemory(to: Int32.self, capacity: seedIndex + 1)[seedIndex] }
+        }
+        var pendingChain: PendingChain?
 
-            // Write seed token for step 0 (CPU → shared buffer; GPU reads it inside the CB).
-            hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM)[0] = firstToken
+        /// Per-forward residency set for the buffers that are NOT process-wide weights (KV arena,
+        /// GDN state, scratch, fused-weight concats): weights are in the shared set
+        /// (SeedlessMetalForward.registerPersistentWeights). Removed from the queue on deinit, so a
+        /// rebuilt forward never stacks a second copy of anything large.
+        private var residencyApplied = false
+        private var residencySetHold: AnyObject?
+        func applyResidencySetOnce() {
+            guard !residencyApplied, SeedlessMetalForward.weightResidencySet != nil else { return }
+            residencyApplied = true
+            let shared = Set(SeedlessMetalForward.weightWrappers.values.map { ObjectIdentifier($0) })
+            var seen = Set<ObjectIdentifier>(), bufs: [MTLBuffer] = []
+            var visited = Set<ObjectIdentifier>()
+            func walk(_ v: Any, depth: Int) {
+                guard depth < 12 else { return }
+                if let b = v as? MTLBuffer {
+                    let id = ObjectIdentifier(b)
+                    if !shared.contains(id), seen.insert(id).inserted { bufs.append(b) }
+                    return
+                }
+                let m = Mirror(reflecting: v)
+                if m.displayStyle == .class, !visited.insert(ObjectIdentifier(v as AnyObject)).inserted { return }
+                for c in m.children { walk(c.value, depth: depth + 1) }
+            }
+            walk(self, depth: 0)
+            guard #available(macOS 15.0, *), !bufs.isEmpty else { return }
+            let desc = MTLResidencySetDescriptor()
+            desc.initialCapacity = bufs.count
+            guard let rs = try? device.makeResidencySet(descriptor: desc) else { return }
+            for b in bufs { rs.addAllocation(b) }
+            rs.commit()
+            rs.requestResidency()
+            queue.addResidencySet(rs)
+            residencySetHold = rs
+            let bytes = bufs.reduce(0) { $0 + $1.length }
+            FileHandle.standardError.write(Data(String(format: "[qwisp] forward residency set: %d buffers, %.2f GB\n",
+                                                       bufs.count, Double(bytes) / 1073741824).utf8))
+        }
+        deinit {
+            if #available(macOS 15.0, *), let rs = residencySetHold as? MTLResidencySet {
+                queue.removeResidencySet(rs)
+                rs.endResidency()
+            }
+        }
 
+        /// Drop an encoded-but-uncommitted chain and undo its encode-time cache bookkeeping.
+        public func cancelPendingChain() {
+            guard let p = pendingChain else { return }
+            pendingChain = nil
+            for (i, L) in layers.enumerated() {
+                if let kv = L.kvCache { kv.len = p.kvLensBefore[i] }
+                if let gc = L.gdnCache, p.K % 2 == 1 { gc.swapState() }
+            }
+        }
+
+        /// Encode K chained greedy steps into a new (uncommitted) command buffer. Step 0 embeds the
+        /// token at seed[seedOffset]. Advances kv.len / GDN ping-pong at encode time (encodeLayer).
+        private func encodeChain(seed: MTLBuffer, seedOffset: Int, K: Int, hd: HeadBufs) -> (MTLCommandBuffer, MTLBuffer)? {
             // Per-call chain output buffer (avoids the maxM size limit on hd.tokensOut —
             // the test uses maxM=4 with K=8, so hd.tokensOut cannot hold K int32s).
             guard let chainBuf = device.makeBuffer(
                 length: K * MemoryLayout<Int32>.stride, options: .storageModeShared
             ) else { return nil }
 
-            let tEnc0 = DispatchTime.now().uptimeNanoseconds
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
 
@@ -4514,7 +4609,7 @@ public enum SeedlessFusedVerify {
                 enc.setBuffer(hd.embedS, offset: 0, index: 1)
                 enc.setBuffer(hd.embedB, offset: 0, index: 2)
                 if k == 0 {
-                    enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+                    enc.setBuffer(seed, offset: seedOffset, index: 3)
                 } else {
                     enc.setBuffer(chainBuf, offset: (k - 1) * MemoryLayout<Int32>.stride, index: 3)
                 }
@@ -4569,11 +4664,51 @@ public enum SeedlessFusedVerify {
 
             if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
             enc.endEncoding()
+            return (cb, chainBuf)
+        }
+
+        public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
+            let tWhole0 = DispatchTime.now().uptimeNanoseconds
+            defer { SeedlessFusedForward.profLastWholeMs = Double(DispatchTime.now().uptimeNanoseconds - tWhole0) / 1e6 }
+            guard !gpuFault.isPoisoned else { cancelPendingChain(); return nil }
+            guard let hd = head, K > 0 else { return nil }
+            guard streamMode == .resident || streamMode == .bolt else { return nil }
+            applyResidencySetOnce()
+            let ahead = SeedlessFusedForward.chainAhead && streamMode == .resident
+                && diagRouteBufs == nil && !SeedlessFusedVerify.logitDbg
+
+            let tEnc0 = DispatchTime.now().uptimeNanoseconds
+            let cb: MTLCommandBuffer, chainBuf: MTLBuffer
+            if let p = pendingChain, p.K == K, p.seedValue == firstToken {
+                pendingChain = nil
+                cb = p.cb; chainBuf = p.chainBuf
+            } else {
+                cancelPendingChain()
+                // Write seed token for step 0 (CPU → shared buffer; GPU reads it inside the CB).
+                hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM)[0] = firstToken
+                guard let r = encodeChain(seed: hd.tokensIn, seedOffset: 0, K: K, hd: hd) else { return nil }
+                (cb, chainBuf) = r
+            }
             SeedlessFusedForward.profLastEncodeMs = Double(DispatchTime.now().uptimeNanoseconds - tEnc0) / 1e6
-            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "chainedStepArgmax(K=\(K))", spin: SeedlessFusedForward.chainSpinWait) {
-                gpuFault.record(f); return nil
+            let tCommit = CACurrentMediaTime()
+            cb.commit()
+            let tAhead0 = DispatchTime.now().uptimeNanoseconds
+            if ahead {
+                let before = layers.map { $0.kvCache?.len ?? 0 }
+                if let r = encodeChain(seed: chainBuf, seedOffset: (K - 1) * MemoryLayout<Int32>.stride, K: K, hd: hd) {
+                    pendingChain = PendingChain(cb: r.0, chainBuf: r.1, K: K, seedBuf: chainBuf,
+                                                seedIndex: K - 1, kvLensBefore: before)
+                }
+            }
+            SeedlessFusedForward.profLastAheadMs = Double(DispatchTime.now().uptimeNanoseconds - tAhead0) / 1e6
+            let tWait0 = DispatchTime.now().uptimeNanoseconds
+            if let f = SeedlessFusedVerify.waitChecked(cb, "chainedStepArgmax(K=\(K))", spin: SeedlessFusedForward.chainSpinWait) {
+                cancelPendingChain(); gpuFault.record(f); return nil
             }
             SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            SeedlessFusedForward.profLastSubmitMs = (cb.gpuStartTime - tCommit) * 1000.0
+            SeedlessFusedForward.profLastWakeMs = (CACurrentMediaTime() - cb.gpuEndTime) * 1000.0
+            SeedlessFusedForward.profLastWaitMs = Double(DispatchTime.now().uptimeNanoseconds - tWait0) / 1e6
 
             // QWISP_LOGIT_DBG: hd.logits holds the LAST chain step's row (reused per k) — enough
             // to tell a constant/zero row from a genuine peak.
