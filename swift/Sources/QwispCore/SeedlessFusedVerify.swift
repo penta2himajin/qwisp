@@ -5228,6 +5228,9 @@ public enum SeedlessFusedVerify {
             var numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int
             var ropeBase: Float, eps: Float, maxSeqLen: Int
             var expertGroupSize: Int                        // 64 synthetic / 32 production
+            /// Production loaders set this: dense projections are re-quantized to 8-bit gs64 at
+            /// init and run on qmm8 (drafts only — verify decides the output). Tests leave it off.
+            var denseQ8: Bool = false
             // F16 plain [out, in] row-major
             var fc: MLXArray                                // [H, 2H]
             var qW: MLXArray, kW: MLXArray, vW: MLXArray, oW: MLXArray
@@ -5273,6 +5276,9 @@ public enum SeedlessFusedVerify {
         // noCopy 寿命規約: weight MTLBuffer 群の backing MLXArray を head と同寿命で保持
         private let _retainedWeights: [MLXArray]
         private var _len: Int = 0
+        /// 8-bit copies of dense F16 weights (keyed by the F16 buffer) when spec.denseQ8.
+        private var q8: [ObjectIdentifier: (w: MTLBuffer, s: MTLBuffer, b: MTLBuffer)] = [:]
+        private var q8Retained: [MLXArray] = []
         // Scratch buffers for M=1 draft/feed operations (shared, sequential access)
         // named _s_ prefix for scratch
         private let _sTok: MTLBuffer           // [1] int32 — current token id
@@ -5405,6 +5411,21 @@ public enum SeedlessFusedVerify {
             swUWBuf = _swUWq; swUSBuf = _swUSc; swUBBuf = _swUBi
             swDWBuf = _swDWq; swDSBuf = _swDSc; swDBBuf = _swDBi
             lmWBuf = _lmWq; lmSBuf = _lmSc; lmBBuf = _lmBi
+            if spec.denseQ8 {
+                for (a, b) in [(spec.fc, _fc), (spec.qW, _q), (spec.kW, _k), (spec.vW, _v), (spec.oW, _o),
+                               (spec.routerGate, _rg), (spec.shGate, _shG), (spec.shUp, _shU), (spec.shDown, _shD)] {
+                    let n = a.dim(0), k = a.dim(1)
+                    guard n % 8 == 0, k % 256 == 0 else { continue }
+                    let (wq, sc, bi) = MLX.quantized(a.asType(.float16), groupSize: 64, bits: 8, mode: .affine)
+                    guard let bi else { continue }
+                    let s16 = sc.asType(.float16), b16 = bi.asType(.float16)
+                    MLX.eval([wq, s16, b16]); q8Retained += [wq, s16, b16]
+                    if let bw = SeedlessMetalForward.mtlBuf(wq, dev), let bs = SeedlessMetalForward.mtlBuf(s16, dev),
+                       let bb = SeedlessMetalForward.mtlBuf(b16, dev) {
+                        q8[ObjectIdentifier(b)] = (bw, bs, bb)
+                    }
+                }
+            }
 
             // KV cache
             let kvBytes = spec.numKV * spec.maxSeqLen * spec.headDim * 2
@@ -5511,9 +5532,9 @@ public enum SeedlessFusedVerify {
             let qd2 = 2 * headDim
             let scale = 1.0 / sqrt(Float(headDim))
             // q/k/v proj (F16 fmm)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
+            dense(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
+            dense(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
+            dense(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
             // extract_q: qOut[nH, 2*hD] → qX[nH, hD]
             SeedlessFusedVerify.encodeExtractQ(enc, qOut: _sQOut, q: _sQX,
                                           headDim: headDim, qd2: qd2, total: numHeads * headDim)
@@ -5543,7 +5564,7 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: _sAttnOut, qOut: _sQOut, gated: _sGated,
                                              headDim: headDim, qd2: qd2, total: numHeads * headDim)
             // o_proj
-            SeedlessFusedVerify.encodeFmmRows(enc, w: oBuf, x: _sGated, out: out,
+            dense(enc, w: oBuf, x: _sGated, out: out,
                                           M: 1, K: numHeads * headDim, N: H)
         }
 
@@ -5551,7 +5572,7 @@ public enum SeedlessFusedVerify {
         /// x: [H] post_ln input; out: [H] MoE output.
         private func encodeMoE(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer) {
             // Router gate: F16 fmm [E, H]
-            SeedlessFusedVerify.encodeFmmRows(enc, w: routerGateBuf, x: x, out: _sRGl,
+            dense(enc, w: routerGateBuf, x: x, out: _sRGl,
                                           M: 1, K: H, N: E)
             // Top-K routing
             SeedlessFusedVerify.encodeRouteTop8Rows(enc, logits: _sRGl, inds: _sRInds,
@@ -5570,13 +5591,13 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeCombineRows(enc, d: _sExpD, scores: _sRScores, y: _sMoeY,
                                               Ktop: Ktop, N: H, M: 1)
             // Shared expert: F16 fmm
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
+            dense(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
+            dense(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
             SeedlessFusedVerify.encodeSwiglu(enc, g: _sShG, u: _sShU, h: _sShAct, total: I)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
+            dense(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
             // Shared gate scalar: sharedGate [1,H] → sgl[0]; _sSgl is sized [8] so index 0 for
             // final_combine_rows which reads sgl[m*8].
-            SeedlessFusedVerify.encodeFmmRows(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
+            dense(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
             // Final combine: out = moeY + sigmoid(sgl[0]) * sharedY
             SeedlessFusedVerify.encodeFinalCombineRows(enc, y: _sMoeY, sharedY: _sShY,
                                                    sgl: _sSgl, out: out, N: H, M: 1)
@@ -5606,7 +5627,7 @@ public enum SeedlessFusedVerify {
             // 5. concat(embNormed, hidNormed) → _sCat
             encodeConcat(enc, a: _sEmbN, b: _sAN, out: _sCat)
             // 6. fc: _sCat @ fcᵀ → _sX
-            SeedlessFusedVerify.encodeFmmRows(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
+            dense(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
             // 7. attn input norm: rmsNorm(_sX, inputLN) → _sAN (inputLN must be [H])
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: inputLNBuf, out: _sAN,
                                               rows: 1, D: H, eps: eps)
@@ -5636,6 +5657,16 @@ public enum SeedlessFusedVerify {
                 var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 2)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+        }
+
+        /// Dense projection: qmm8 on the 8-bit copy when present, else F16 GEMV.
+        private func dense(_ enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
+                           M: Int, K: Int, N: Int) {
+            if let q = q8[ObjectIdentifier(w)] {
+                SeedlessFusedVerify.encodeQmm8Rows(enc, w: q.w, scales: q.s, biases: q.b, x: x, out: out, M: M, K: K, N: N)
+            } else {
+                SeedlessFusedVerify.encodeFmmRows(enc, w: w, x: x, out: out, M: M, K: K, N: N)
             }
         }
 
