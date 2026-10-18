@@ -5348,6 +5348,8 @@ public enum SeedlessFusedVerify {
         nonisolated(unsafe) public static var profFeed = (wall: 0.0, gpu: 0.0, n: 0)
         /// Forget all committed pairs (new request on the same head).
         public func resetKV() { _len = 0 }
+        /// Keep only the first `n` committed pairs (KV is append-only, so they stay valid).
+        public func truncate(to n: Int) { _len = Swift.min(_len, Swift.max(0, n)) }
         public var capacity: Int { maxSeqLen }
 
         // ── init? ───────────────────────────────────────────────────────────

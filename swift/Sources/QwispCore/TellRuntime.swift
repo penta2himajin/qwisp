@@ -756,17 +756,25 @@ extension Tell {
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
+                             mtpCarry: MLXArray? = nil,
                              isCancelled: (() -> Bool)? = nil,
                              onToken: ((Int) -> Void)? = nil) -> [Int]? {
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
-        // MTP-D1 (serve): only with a full prefill (a prefix-cache hit would leave the head's KV
-        // without the cached prefix) and while the prompt fits the head's KV.
-        let mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = (prefillTokens == nil && !useA3
+        // MTP-D1 (serve). Full prefill: the head's KV starts empty. Partial prefill (prefix cache):
+        // the caller has kept the head aligned with the cached prefix and passes the hidden of the
+        // position before prefillTokens[0] (mtpCarry) for the boundary pair. A misaligned head only
+        // lowers acceptance — the verify decides every token.
+        let mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = (!useA3
             && promptIds.count + N + 2 <= (backend.mtpHead?.capacity ?? 0)) ? backend.mtpHead : nil
         let mtpFwd = backend.fusedFwd
-        mtpHead?.resetKV()
+        if prefillTokens == nil { mtpHead?.resetKV() }
+        else if let head = mtpHead, let c = mtpCarry, let first = prefillTokens?.first,
+                let dev = SeedlessMetalForward.ensure()?.0,
+                let cb = c.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false) {
+            _ = head.feedPairs(hBuf: cb, rowRange: 0 ..< 1, toks: [first])
+        }
         SeedlessFusedVerify.SeedlessMTPHead.profDraft = (0, 0, 0); SeedlessFusedVerify.SeedlessMTPHead.profFeed = (0, 0, 0)
         guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
                                        mtpHead: mtpHead, mtpFwd: mtpFwd) else { return nil }

@@ -638,6 +638,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // Re-prefill the delta [restoreLen ..< contentLen], snapshotting at stride-aligned
                 // boundaries (so different conversations that share a prefix snapshot at the SAME
                 // positions → cross-conversation reuse), plus one at the content boundary.
+                // MTP head follows the arena: same prefix length (pairs = positions - 1); the delta
+                // prefill feeds it, with each chunk's boundary pair taken from the previous chunk's
+                // last hidden (`carry`). A restored boundary has no carry → that one pair is skipped.
+                let mtpH = backend.mtpHead
+                if let h = mtpH { if restoreLen == 0 { h.resetKV() } else { h.truncate(to: restoreLen - 1) } }
+                var carry: MLXArray? = nil
                 var pos = restoreLen
                 while pos < contentLen {
                     // Client abort (2026-07-22): without this check a 30K+ delta prefill grinds
@@ -649,7 +655,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         return
                     }
                     let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
-                    _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
+                    if let h = mtpH, let c = carry, let dev = SeedlessMetalForward.ensure()?.0,
+                       let cbuf = c.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false) {
+                        _ = h.feedPairs(hBuf: cbuf, rowRange: 0 ..< 1, toks: [content[pos]])
+                    }
+                    carry = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend,
+                                         mtpHead: mtpH, mtpFwd: backend.fusedFwd)
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
                     pos = end
                 }
@@ -683,7 +694,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
                     : cfg.maxK
                 _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
-                                     N: genBudget, maxK: maxK, prefillTokens: genSuffix,
+                                     N: genBudget, maxK: maxK, prefillTokens: genSuffix, mtpCarry: carry,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 if let f = backend.gpuFault?() { continuation.finish(throwing: GPUGenerationFailure(fault: f)) }
