@@ -3255,6 +3255,11 @@ public enum SeedlessFusedVerify {
         let device: MTLDevice, queue: MTLCommandQueue
         /// zero-copy buffer の裏 MLXArray 保持(asType 変換の一時 array を allocator 再利用から守る)
         public var retainedArrays: [MLXArray] = []
+        /// Spec replay (SpecReplay.swift): per-GDN-layer recurrence-input tapes of the last verify,
+        /// and how many rows of it are valid (0 = none; any non-taped forward clears it).
+        var gdnTapes: [ObjectIdentifier: SeedlessFusedVerify.GdnTape] = [:]
+        var tapeRows = 0
+        var lastReplayCB: MTLCommandBuffer? = nil
         /// profile: 直近 step の全 CB GPU-exec 合計 ms。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
         nonisolated(unsafe) public static var profLastEncodeMs = 0.0
@@ -3686,6 +3691,7 @@ public enum SeedlessFusedVerify {
                                                   M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                   headKDim: headKDim, headVDim: headVDim,
                                                   convKernel: convKernel, eps: eps)
+                if Self.specReplay { tapeGdnLayer(enc, cache: gc, M: M) }
                 gc.swapState()
             } else if let aw = L.attn, let kv = L.kvCache {
                 SeedlessFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,

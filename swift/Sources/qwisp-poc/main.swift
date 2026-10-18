@@ -43,6 +43,8 @@ if CommandLine.arguments.contains("stream") {
                run: { md, _ in Tell.longContextDecayProbe(modelDir: md) }),
         Runner(name: "spec-width", desc: "verify forward stage ms by draft width M at fixed ctx (#119; QWISP_SPEC_CTX) — is speculation paying?",
                run: { md, _ in Tell.specWidthProbe(modelDir: md) }),
+        Runner(name: "spec-replay-check", desc: "partial-reject replay vs rollback+rebuild: byte-equal decode state for every accepted count (QWISP_SPEC_REPLAY=1, QWISP_SPEC_REPLAY_D/CTX)",
+               run: { md, _ in Tell.specReplayCheck(modelDir: md) }),
         Runner(name: "seqmt-m", desc: "M-row verify scaling r_M (#90) — cost of widening the verify",
                run: { md, _ in Tell.seqMTScalingProbe(modelDir: md) }),
         // ── prefill / TTFT ──

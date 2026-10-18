@@ -87,6 +87,9 @@ extension Tell {
         let rollback: (Any) -> Void
         // Full-state save/restore for arbitrary-length rewind (cross-request prefix caching).
         // Distinct from snapshot/rollback (1-step spec). nil if the backend doesn't support it.
+        /// Partial reject without a rebuild forward: keep the first `rows` rows of the last verify
+        /// (SpecReplay). Returns false when unavailable → caller does rollback + rebuild.
+        var commitAccepted: ((Any, Int) -> Bool)? = nil
         var fullSnapshot: (() -> Any)? = nil
         var fullRestore: ((Any) -> Void)? = nil
         // Disk-persistable state (issue #89): serialize/restore the CURRENT decode state
@@ -210,6 +213,11 @@ extension Tell {
         }
         backend.persistentState = { fwd.persistentStateData() }              // issue #89
         backend.restorePersistentState = { fwd.restorePersistentState($0) }
+        fwd.prepareSpecReplay()
+        backend.commitAccepted = { snap, rows in                              // QWISP_SPEC_REPLAY
+            guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return false }
+            return fwd.replayAccepted(s, rows: rows)
+        }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
@@ -323,6 +331,11 @@ extension Tell {
         }
         backend.persistentState = { fwd.persistentStateData() }              // issue #89
         backend.restorePersistentState = { fwd.restorePersistentState($0) }
+        fwd.prepareSpecReplay()
+        backend.commitAccepted = { snap, rows in                              // QWISP_SPEC_REPLAY
+            guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return false }
+            return fwd.replayAccepted(s, rows: rows)
+        }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
@@ -920,11 +933,14 @@ extension Tell {
                     if Tell.traceAltsEnabled, p < Tell.lastDraftAlts.count,
                        Tell.lastDraftAlts[p] == evals[p] { stAltHits += 1 }
                     let tR = prof ? Date() : Date.distantPast
-                    backend.rollback(snap)
+                    let replayed = backend.commitAccepted?(snap, p + 1) ?? false
+                    if !replayed { backend.rollback(snap) }
                     out.append(u); hist.append(u)
                     for d in drafts.prefix(p) { out.append(d); hist.append(d) }
-                    let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
-                    guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    if !replayed {
+                        let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                        guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    }
                     if prof { pfRebuild += Date().timeIntervalSince(tR) * 1000 }
                     u = evals[p]
                 }
