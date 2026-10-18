@@ -188,6 +188,27 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
+    /// MTP-D1 head for serve-path drafts (QWISP_MTP_DRAFT=1, resident tier). Built once, rebuilt only
+    /// when a backend needs a longer KV; nil if the checkpoint has no MTP head.
+    private var mtpHeadCache: SeedlessFusedVerify.SeedlessMTPHead?
+    private var mtpHeadTried = false
+
+    /// Attach the MTP head to a freshly built resident backend (no-op when disabled/unavailable).
+    private func attachMTP(_ b: inout Tell.SpecBackend, maxSeqLen: Int) {
+        guard Tell.envFlag("QWISP_MTP_DRAFT"), !isStreamingTier, b.fusedFwd != nil else { return }
+        if let h = mtpHeadCache, h.capacity >= maxSeqLen { b.mtpHead = h; return }
+        if mtpHeadTried && mtpHeadCache == nil { return }
+        mtpHeadTried = true
+        mtpHeadCache = nil   // free the old KV before allocating a longer one
+        if let spec = try? SeedlessMTPValidate.loadSpec(modelDir: modelDir, store: store, maxSeqLen: maxSeqLen),
+           let h = SeedlessFusedVerify.SeedlessMTPHead(spec: spec) {
+            mtpHeadCache = h
+            b.mtpHead = h
+            FileHandle.standardError.write(Data("[qwisp] MTP-D1 draft head active (maxSeqLen=\(maxSeqLen))\n".utf8))
+        } else {
+            FileHandle.standardError.write(Data("[qwisp] QWISP_MTP_DRAFT=1 but no usable MTP head → drafts off\n".utf8))
+        }
+    }
     // Streaming tier (#76): the C-slot expert arena persists across cached-backend rebuilds
     // (only the KV/GDN arena is rebuilt on growth) — rebuilding providers would re-stream GBs.
     private var prefixProviders: [ArenaExpertProvider]? = nil
@@ -415,13 +436,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         budget = Swift.min(budget * 2, 65536)
                         continue
                     }
-                    let sb: Tell.SpecBackend? = cfg.isStreaming
+                    var sb: Tell.SpecBackend? = cfg.isStreaming
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
                         : Tell.fusedBackend(
                             engine: self.engine,
                             maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                             maxSeqLen: maxSeqLen)
+                    if sb != nil { self.attachMTP(&sb!, maxSeqLen: maxSeqLen) }
                     guard let backend = sb else { break }
                     lastFault = backend.gpuFault
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
@@ -521,7 +543,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         self.prefixSlots = []; self.arenaContent = []; self.prefixEmptySnap = nil
                         Memory.clearCache()
                     }
-                    let built: Tell.SpecBackend?
+                    var built: Tell.SpecBackend?
                     if cfg.isStreaming {
                         // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
                         // existingProviders survive KV-arena growth rebuilds.
@@ -538,6 +560,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
                         built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen)
                     }
+                    if built != nil { self.attachMTP(&built!, maxSeqLen: newLen) }
                     guard let b = built else {
                         continuation.finish(); return
                     }

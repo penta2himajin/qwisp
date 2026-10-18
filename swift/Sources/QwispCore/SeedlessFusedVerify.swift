@@ -5314,6 +5314,9 @@ public enum SeedlessFusedVerify {
 
         // ── Committed pair count ────────────────────────────────────────────
         public var len: Int { _len }
+        /// Forget all committed pairs (new request on the same head).
+        public func resetKV() { _len = 0 }
+        public var capacity: Int { maxSeqLen }
 
         // ── init? ───────────────────────────────────────────────────────────
         public init?(spec: WeightsSpec) {
