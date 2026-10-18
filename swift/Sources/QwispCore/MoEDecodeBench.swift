@@ -125,6 +125,30 @@ extension Tell {
             SeedlessFusedVerify.encodeCombineRows(enc, d: sc.d, scores: sc.scores, y: sc.y, Ktop: K, N: H, M: 1,
                                                   dByteOffset: 0, scoresOffset: 0, yByteOffset: 0)
         })
+        // ── shared-as-9th-expert plausibility: the routed g/u and down dispatches at Ktop 8 vs 9 on
+        // a fixed index list. (K9 - K8) is what folding the shared expert into the routed
+        // dispatches would cost, to set against shared.S1 + shared.down run on their own. ──
+        if envInt("QWISP_MOEB_K9", 0) != 0,
+           let fixed = device.makeBuffer(length: 9 * 4, options: .storageModeShared) {
+            let ids: [Int32] = [3, 17, 40, 77, 101, 150, 199, 230, 251]
+            let p = fixed.contents().bindMemory(to: Int32.self, capacity: 9)
+            for (i, v) in ids.enumerated() { p[i] = v }
+            for kk in [8, 9] {
+                lines.append(stage("  k\(kk) gate+up+swiglu", bytes: guB / Double(K) * Double(kk), flops: guF / Double(K) * Double(kk)) { enc, L in
+                    SeedlessFusedVerify.encodeGatherQmmSwigluRows(enc, wG: L.moe.swGW, sG: L.moe.swGS, bG: L.moe.swGB,
+                                                                  wU: L.moe.swUW, sU: L.moe.swUS, bU: L.moe.swUB,
+                                                                  x: fwd.postNorm, inds: fixed, out: sc.h,
+                                                                  M: 1, Ktop: kk, K: H, N: I,
+                                                                  xByteOffset: 0, indsOffset: 0, outByteOffset: 0)
+                })
+                lines.append(stage("  k\(kk) down", bytes: downB / Double(K) * Double(kk), flops: downF / Double(K) * Double(kk)) { enc, L in
+                    SeedlessFusedVerify.encodeGatherQmmRows(enc, w: L.moe.swDW, scales: L.moe.swDS, biases: L.moe.swDB,
+                                                            x: sc.h, inds: fixed, out: sc.d,
+                                                            M: 1, Ktop: kk, K: I, N: H, lhsPer: true,
+                                                            xByteOffset: 0, indsOffset: 0, outByteOffset: 0)
+                })
+            }
+        }
         // ── horizontal-fusion ceiling: independent pairs on a CONCURRENT encoder (no barrier inside
         // a pair, barrier between pairs) vs the same pair serial. Upper bound for fusing them. ──
         func gpuMsConc(_ body: (MTLComputeCommandEncoder) -> Void) -> Double {

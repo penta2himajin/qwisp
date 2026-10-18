@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 103
+        let total = 104
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -304,6 +304,45 @@ public enum SeedlessVerifyTests {
                 else { return (false, "nil M=\(M) N=\(N)") }
                 let (ok, d) = bitEqual(b, a)
                 if !ok { return (false, "M=\(M) K=\(K) N=\(N): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // moe_shared_in_routed_bitexact — WRITE-LOCKED (guarded by total = 104). Do not weaken/skip/delete.
+        // The shared expert folded into the routed g/u and down dispatches as slice Ktop
+        // (fuseSharedInRouted, M == 1) must reproduce the separate shared path byte-for-byte,
+        // with the S2 combine both folded (MOE2 on) and separate (MOE2 off). M = 3 must ignore the flag.
+        run("moe_shared_in_routed_bitexact") {
+            let H = 2048, E = 16, I = 512, Ktop = 8
+            func q(_ shape: [Int], _ bits: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal(shape).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: bits, mode: .affine); return (q, s, b!)
+            }
+            let (gW, gS, gB) = q([E, H], 8); let (sgW, sgS, sgB) = q([8, H], 8)
+            let (a0, a1, a2) = q([E, I, H], 4); let (b0, b1, b2) = q([E, I, H], 4); let (c0, c1, c2) = q([E, H, I], 4)
+            let (d0, d1, d2) = q([I, H], 4); let (e0, e1, e2) = q([I, H], 4); let (f0, f1, f2) = q([H, I], 4)
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            typealias F = SeedlessFusedVerify.SeedlessFusedForward
+            let saved = (F.fuseSharedInRouted, F.fuseMOE2Enabled, F.fuseSHEXP)
+            defer { F.fuseSharedInRouted = saved.0; F.fuseMOE2Enabled = saved.1; F.fuseSHEXP = saved.2 }
+            F.fuseSHEXP = true
+            for (M, moe2) in [(1, false), (1, true), (3, false)] {
+                F.fuseMOE2Enabled = moe2
+                for rep in 0 ..< 3 {
+                    let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                    F.fuseSharedInRouted = false
+                    guard let ref = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                    else { return (false, "ref nil M=\(M)") }
+                    F.fuseSharedInRouted = true
+                    guard let got = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                    else { return (false, "got nil M=\(M)") }
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) moe2=\(moe2) rep=\(rep): \(d)") }
+                }
             }
             return (true, "ok")
         }

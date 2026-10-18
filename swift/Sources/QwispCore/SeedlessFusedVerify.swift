@@ -1845,8 +1845,8 @@ public enum SeedlessFusedVerify {
     static func makeMoEScratch(_ device: MTLDevice, M: Int, E: Int, I: Int, Ktop: Int, H: Int) -> MoEScratch? {
         func buf(_ n: Int) -> MTLBuffer? { device.makeBuffer(length: n, options: .storageModeShared) }
         guard let gl = buf(M * E * 2), let inds = buf(M * Ktop * 4), let scores = buf(M * Ktop * 2),
-              let g = buf(M * Ktop * I * 2), let u = buf(M * Ktop * I * 2), let h = buf(M * Ktop * I * 2),
-              let d = buf(M * Ktop * H * 2), let y = buf(M * H * 2),
+              let g = buf(M * Ktop * I * 2), let u = buf(M * Ktop * I * 2), let h = buf((M * Ktop + 1) * I * 2),
+              let d = buf((M * Ktop + 1) * H * 2), let y = buf(M * H * 2),   // +1 slice: shared-in-routed
               let sg = buf(M * I * 2), let su = buf(M * I * 2), let shAct = buf(M * I * 2),
               let sharedY = buf(M * H * 2), let sgl = buf(M * 8 * 2) else { return nil }
         return MoEScratch(gl: gl, inds: inds, scores: scores, g: g, u: u, h: h, d: d, y: y,
@@ -2020,6 +2020,12 @@ public enum SeedlessFusedVerify {
                                                 indsDst: d.indsDst, indsDstByteOffset: d.indsOff,
                                                 glDst: d.glDst, glDstByteOffset: d.glOff,
                                                 Ktop: d.indsCount, E: d.glCount)
+        }
+        if M == 1, slotTable == nil, w.swMix == nil, SeedlessFusedForward.fuseSharedInRouted,
+           SeedlessFusedForward.fuseGUActive(M: 1) ?? false, SeedlessFusedForward.fuseSHEXP,
+           ensureWave3Pipelines(), SeedlessMetalForward.compileSharedInRouted() {
+            encodeMoEGatherSharedM1(enc, x: x, out: out, w: w, sc: sc, Ktop: Ktop, I: I, H: H)
+            return
         }
         encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
         encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H, Ktop: Ktop)
@@ -2285,12 +2291,12 @@ public enum SeedlessFusedVerify {
     static func encodeSharedGateCombineRows(_ enc: MTLComputeCommandEncoder,
                                              sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
                                              x: MTLBuffer, y: MTLBuffer, sharedY: MTLBuffer,
-                                             out: MTLBuffer, K: Int, H: Int, M: Int) {
+                                             out: MTLBuffer, K: Int, H: Int, M: Int, sharedYOffset: Int = 0) {
         let p = _sharedGateCombineRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(sgW,    offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
         enc.setBuffer(sgB,    offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
-        enc.setBuffer(y,      offset: 0, index: 4); enc.setBuffer(sharedY, offset: 0, index: 5)
+        enc.setBuffer(y,      offset: 0, index: 4); enc.setBuffer(sharedY, offset: sharedYOffset, index: 5)
         enc.setBuffer(out,    offset: 0, index: 6)
         var kk = Int32(K), hh = Int32(H)
         enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&hh, length: 4, index: 8)
@@ -2308,13 +2314,13 @@ public enum SeedlessFusedVerify {
                                                  sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
                                                  x: MTLBuffer, d: MTLBuffer, scores: MTLBuffer,
                                                  sharedY: MTLBuffer, out: MTLBuffer,
-                                                 K: Int, H: Int, M: Int, Ktop: Int) {
+                                                 K: Int, H: Int, M: Int, Ktop: Int, sharedYOffset: Int = 0) {
         let p = _sharedGateCombineRowsFoldPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(sgW,     offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
         enc.setBuffer(sgB,     offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
         enc.setBuffer(d,       offset: 0, index: 4); enc.setBuffer(scores,  offset: 0, index: 5)
-        enc.setBuffer(sharedY, offset: 0, index: 6); enc.setBuffer(out,     offset: 0, index: 7)
+        enc.setBuffer(sharedY, offset: sharedYOffset, index: 6); enc.setBuffer(out,     offset: 0, index: 7)
         var kk = Int32(K), hh = Int32(H), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&hh, length: 4, index: 9)
         enc.setBytes(&kt, length: 4, index: 10)
@@ -3353,6 +3359,12 @@ public enum SeedlessFusedVerify {
         /// stage-1 recon の +3-4% は fuseSHEXP proxy の過大評価(proxy は compute も畳んでいた)。QWISP_FUSE_MOE2=1 で有効。
         nonisolated(unsafe) public static var fuseMOE2Enabled =
             ProcessInfo.processInfo.environment["QWISP_FUSE_MOE2"] == "1"
+
+        /// Shared expert folded into the routed g/u and down dispatches as slice Ktop (M == 1,
+        /// resident). Bit-exact with the separate shared path; see SharedInRoutedMoE.swift.
+        /// QWISP_SHARED_IN_ROUTED=1 to enable.
+        nonisolated(unsafe) public static var fuseSharedInRouted =
+            ProcessInfo.processInfo.environment["QWISP_SHARED_IN_ROUTED"] == "1"
 
         /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
         /// for the chained GPU token-feedback decode default. Tell resolves the
