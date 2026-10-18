@@ -117,7 +117,27 @@ enum Config {
           port     = \(p)  [\(sourceOfPort(env: env, config: config))]
           lossless = \(l)  [\(sourceOfLossless(env: env, config: config))]
           fast     = \(resolveFast(env: env, config: config))  [\(sourceOfFast(env: env, config: config))]
+          draft    = \(draftSummary(env: env, hasMTPHead: hasMTPHead(modelDir: m)))
         """
+    }
+
+    /// The checkpoint carries an MTP head (MTPLX `mtp.safetensors` or a grafted `model-mtp.safetensors`).
+    static func hasMTPHead(modelDir: String) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: modelDir + "/mtp.safetensors") || fm.fileExists(atPath: modelDir + "/model-mtp.safetensors")
+    }
+
+    /// Speculative-draft configuration the server will use (resident tier). Drafts never change the
+    /// output — the verify is bit-exact — so this is a speed choice made per request at runtime.
+    static func draftSummary(env: [String: String], hasMTPHead: Bool) -> String {
+        if env["QWISP_MTP_DRAFT"] == "0" { return "chain + suffix drafts (MTP off: QWISP_MTP_DRAFT=0)" }
+        guard hasMTPHead else { return "chain + suffix drafts (checkpoint has no MTP head)" }
+        let depth = Swift.max(1, Swift.min(4, Int(env["QWISP_MTP_DEPTH"] ?? "") ?? 2))
+        let select = env["QWISP_MTP_SELECT"] != "0"
+        let vocab = Int(env["QWISP_MTP_DRAFT_VOCAB"] ?? "") ?? 65536
+        return "MTP head, " + (select ? "per-request choice of chain / depth 1-\(depth) by measured ms/token"
+                                       : "fixed depth 1")
+            + ", draft vocab " + (vocab > 0 ? "\(vocab) + seen tokens" : "full")
     }
 
     // GPU-free, model-free self-check — the CONFIGTEST gate.
@@ -143,6 +163,13 @@ enum Config {
         check("source model default", sourceOfModel(env: [:], config: empty) == "default")
         check("source port default",  sourceOfPort(env: [:], config: empty) == "default")
         check("source port env",      sourceOfPort(env: ["QWISP_PORT": "1"], config: empty) == "env")
+
+        // draft summary
+        check("draft no head",        draftSummary(env: [:], hasMTPHead: false).hasPrefix("chain"))
+        check("draft head default",   draftSummary(env: [:], hasMTPHead: true).contains("depth 1-2"))
+        check("draft env off",        draftSummary(env: ["QWISP_MTP_DRAFT": "0"], hasMTPHead: true).contains("MTP off"))
+        check("draft fixed depth",    draftSummary(env: ["QWISP_MTP_SELECT": "0"], hasMTPHead: true).contains("fixed depth 1"))
+        check("draft full vocab",     draftSummary(env: ["QWISP_MTP_DRAFT_VOCAB": "0"], hasMTPHead: true).contains("draft vocab full"))
 
         // lossless resolution (productization: <32GB defaults bolt; this forces strict)
         check("env wins lossless",     resolveLossless(env: ["QWISP_LOSSLESS": "1"], config: empty) == true)
