@@ -5102,6 +5102,7 @@ public enum SeedlessFusedVerify {
         w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
         M: Int, K: Int, N: Int
     ) {
+        if encodeFmv16Rows(enc, w: w, x: x, out: out, M: M, K: K, N: N) { return }   // MTPFastGEMV.swift
         guard ensureFmmPipeline(), let p = _fmmRowsPipeline else { return }
         enc.setComputePipelineState(p)
         enc.setBuffer(w, offset: 0, index: 0)
@@ -5314,6 +5315,10 @@ public enum SeedlessFusedVerify {
 
         // ── Committed pair count ────────────────────────────────────────────
         public var len: Int { _len }
+        /// QWISP_SPEC_PROFILE=1: wall / GPU ms and call counts of draft and feed CBs.
+        static let prof = ProcessInfo.processInfo.environment["QWISP_SPEC_PROFILE"] == "1"
+        nonisolated(unsafe) public static var profDraft = (wall: 0.0, gpu: 0.0, n: 0)
+        nonisolated(unsafe) public static var profFeed = (wall: 0.0, gpu: 0.0, n: 0)
         /// Forget all committed pairs (new request on the same head).
         public func resetKV() { _len = 0 }
         public var capacity: Int { maxSeqLen }
@@ -5641,12 +5646,17 @@ public enum SeedlessFusedVerify {
             // ponytail: single CB, int32 readback only, no MLX ops
             _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
 
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             encodeForward(enc, hPrevBuf: hPrevBuf, hRow: hPrevRow,
                           pos: _len, totalKeys: _len + 1,
                           doLMHead: true)
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profDraft.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profDraft.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profDraft.n += 1
+            }
 
             return Int(_sDraft.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
         }
@@ -5663,6 +5673,7 @@ public enum SeedlessFusedVerify {
                 device.makeBuffer(bytes: raw.baseAddress!, length: M * 4, options: .storageModeShared)
             }) else { return false }
 
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             for i in 0..<M {
@@ -5674,6 +5685,10 @@ public enum SeedlessFusedVerify {
                               tokBuf: tokBuf, tokOffset: i * 4)
             }
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profFeed.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profFeed.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profFeed.n += 1
+            }
             _len += M
             return true
         }

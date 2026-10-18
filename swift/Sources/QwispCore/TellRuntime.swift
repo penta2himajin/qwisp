@@ -767,6 +767,7 @@ extension Tell {
             && promptIds.count + N + 2 <= (backend.mtpHead?.capacity ?? 0)) ? backend.mtpHead : nil
         let mtpFwd = backend.fusedFwd
         mtpHead?.resetKV()
+        SeedlessFusedVerify.SeedlessMTPHead.profDraft = (0, 0, 0); SeedlessFusedVerify.SeedlessMTPHead.profFeed = (0, 0, 0)
         guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
                                        mtpHead: mtpHead, mtpFwd: mtpFwd) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
@@ -804,7 +805,7 @@ extension Tell {
         // no Date() calls on the hot path, loop byte-identical.
         defer { backend.chainCancelAhead?() }
         let prof = Tell.envFlag("QWISP_SPEC_PROFILE")
-        var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0
+        var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0, pfVerifyGPU = 0.0
         var pfChainCalls = 0
         var pfChainGPU = 0.0, pfChainEnc = 0.0, pfSubmit = 0.0, pfWake = 0.0, pfBetween = 0.0, pfAhead = 0.0, pfWait = 0.0, pfWhole = 0.0
         var lastChainEnd: Date? = nil
@@ -941,7 +942,8 @@ extension Tell {
                 let tV = prof ? Date() : Date.distantPast
                 let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
                 guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
-                if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
+                if prof { pfVerify += Date().timeIntervalSince(tV) * 1000
+                          pfVerifyGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
@@ -1002,6 +1004,12 @@ extension Tell {
                 promptIds.count, out.count, stSteps, pfChainCalls,
                 total, pfDraft, pfChain, pfChainGPU, pfChainEnc, pfSubmit, pfWake, pfAhead, pfWait, pfWhole, pfBetween, pfCond, pfFlush, pfSnap, pfVerify, pfRebuild, other,
                 out.isEmpty ? 0 : total / Double(out.count)).utf8))
+            if mtpHead != nil {
+                let d = SeedlessFusedVerify.SeedlessMTPHead.profDraft, f = SeedlessFusedVerify.SeedlessMTPHead.profFeed
+                FileHandle.standardError.write(Data(String(format:
+                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms\n",
+                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU).utf8))
+            }
         }
         return Array(out.prefix(N))
     }
