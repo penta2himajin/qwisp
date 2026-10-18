@@ -121,3 +121,103 @@ extension SeedlessFusedVerify {
                             threadsPerThreadgroup: MTLSize(width: Swift.min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
     }
 }
+
+// Draft-vocabulary lm_head for the MTP head (QWISP_MTP_DRAFT_VOCAB, default 65536).
+// The head's lm_head reads all 248K rows (286 MB, ~2.2 ms on an M3 Pro) for one argmax per draft.
+// Drafting only needs the argmax over likely tokens, so the head scores a subset of rows (ids below
+// the base plus every token the server has seen in prompts and outputs) and maps the winner back
+// to its id. A token outside the subset can never be drafted — that lowers acceptance, never output.
+extension SeedlessFusedVerify {
+    nonisolated(unsafe) static var _qmm4GatherRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _argmaxMapPipeline: MTLComputePipelineState?
+
+    static func ensureDraftVocabPipelines() -> Bool {
+        if _qmm4GatherRowsPipeline != nil && _argmaxMapPipeline != nil { return true }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        inline float ld16(const device half* x, thread float* xt) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) { sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+                xt[i]=x[i]; xt[i+1]=x[i+1]/16.0f; xt[i+2]=x[i+2]/256.0f; xt[i+3]=x[i+3]/4096.0f; }
+            return sum;
+        }
+        inline float qd4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+            float accum = 0.0f; const device uint16_t* ws = (const device uint16_t*)w;
+            for (int i = 0; i < 4; i++) {
+                accum += (xt[4*i]*(float)(ws[i]&0x000f) + xt[4*i+1]*(float)(ws[i]&0x00f0) +
+                          xt[4*i+2]*(float)(ws[i]&0x0f00) + xt[4*i+3]*(float)(ws[i]&0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        // y[j] = W[ids[j]] · x  (4-bit gs64 rows; grid (1, n/8), threads (32, 2): 4 subset rows per simdgroup)
+        kernel void qmm4_gather_rows(device const uint32_t* w [[buffer(0)]], device const half* scales [[buffer(1)]],
+                                     device const half* biases [[buffer(2)]], device const half* x [[buffer(3)]],
+                                     device half* y [[buffer(4)]], device const uint* ids [[buffer(5)]],
+                                     constant int& K [[buffer(6)]],
+                                     uint3 tid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+            const int Kw = K / 2, Kg = K / 64;   // bytes / groups per row
+            const int j0 = (int)tid.y * 8 + (int)sg * 4;
+            thread float xt[16]; float acc[4] = {0, 0, 0, 0};
+            for (int k = (int)lane * 16; k < K; k += 512) {
+                float sum = ld16(x + k, xt);
+                for (int r = 0; r < 4; r++) {
+                    const uint row = ids[j0 + r];
+                    const device uint8_t* wr = (const device uint8_t*)w + (size_t)row * Kw + k / 2;
+                    const int g = (int)row * Kg + k / 64;
+                    acc[r] += qd4(wr, xt, (float)scales[g], (float)biases[g], sum);
+                }
+            }
+            for (int r = 0; r < 4; r++) { float s = simd_sum(acc[r]); if (lane == 0) y[j0 + r] = (half)s; }
+        }
+        // out = ids[argmax_j logits[j]]  (one threadgroup of 1024)
+        kernel void argmax_map(device const half* logits [[buffer(0)]], device const uint* ids [[buffer(1)]],
+                               device int* out [[buffer(2)]], constant uint& n [[buffer(3)]],
+                               uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+            float best = -INFINITY; uint bi = 0;
+            for (uint j = t; j < n; j += 1024) { float v = (float)logits[j]; if (v > best) { best = v; bi = j; } }
+            for (uint off = 16; off > 0; off >>= 1) {
+                float ov = simd_shuffle_down(best, off); uint oi = simd_shuffle_down(bi, off);
+                if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+            }
+            threadgroup float tb[32]; threadgroup uint ti[32];
+            if (lane == 0) { tb[sg] = best; ti[sg] = bi; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                best = tb[lane]; bi = ti[lane];
+                for (uint off = 16; off > 0; off >>= 1) {
+                    float ov = simd_shuffle_down(best, off); uint oi = simd_shuffle_down(bi, off);
+                    if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+                }
+                if (lane == 0) out[0] = (int)ids[bi];
+            }
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
+            _qmm4GatherRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "qmm4_gather_rows")!)
+            _argmaxMapPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "argmax_map")!)
+            return true
+        } catch { print("[draft-vocab] compile: \(error)"); return false }
+    }
+
+    /// logits over a row subset (n % 8 == 0) then the argmax's id into out[outOffset].
+    static func encodeDraftVocabArgmax(_ enc: MTLComputeCommandEncoder, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+                                       x: MTLBuffer, ids: MTLBuffer, n: Int, K: Int, logits: MTLBuffer,
+                                       out: MTLBuffer, outOffset: Int) {
+        let gp = _qmm4GatherRowsPipeline!
+        enc.setComputePipelineState(gp)
+        enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1); enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3); enc.setBuffer(logits, offset: 0, index: 4); enc.setBuffer(ids, offset: 0, index: 5)
+        var kk = Int32(K); enc.setBytes(&kk, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: n / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
+        let ap = _argmaxMapPipeline!
+        enc.setComputePipelineState(ap)
+        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(ids, offset: 0, index: 1); enc.setBuffer(out, offset: outOffset, index: 2)
+        var nn = UInt32(n); enc.setBytes(&nn, length: 4, index: 3)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+    }
+}

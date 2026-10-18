@@ -5671,7 +5671,12 @@ public enum SeedlessFusedVerify {
             // 13. finalNorm: rmsNorm(_sX, finalNorm) → _sNormed
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: finalNormBuf, out: _sNormed,
                                               rows: 1, D: H, eps: eps)
-            if doLMHead {
+            if doLMHead, let ids = draftVocabIds, draftVocabCount > 0 {
+                // 14'. draft vocabulary: score only the subset rows, write the winner's id.
+                SeedlessFusedVerify.encodeDraftVocabArgmax(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf, x: _sNormed,
+                                                       ids: ids, n: draftVocabCount, K: H, logits: _sLogits,
+                                                       out: draftOut ?? _sDraft, outOffset: draftOffset)
+            } else if doLMHead {
                 // 14. lm_head: qmm4 (_sNormed → _sLogits)
                 SeedlessFusedVerify.encodeQmmRows(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf,
                                               x: _sNormed, out: _sLogits, M: 1, K: H, N: V)
@@ -5816,6 +5821,22 @@ public enum SeedlessFusedVerify {
             }
 
             return Int(_sDraft.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
+        }
+
+        /// Draft vocabulary (MTPFastGEMV.swift): ids scored by the head's lm_head; nil = all V rows.
+        private var draftVocabIds: MTLBuffer?
+        private var draftVocabCount = 0
+        public private(set) var draftVocabSize = 0
+        /// Upload the subset (deduplicated by the caller); padded to a multiple of 8 with its last id.
+        public func setDraftVocab(_ ids: [Int32]) {
+            guard !ids.isEmpty, ids.count < V, SeedlessFusedVerify.ensureDraftVocabPipelines() else {
+                draftVocabIds = nil; draftVocabCount = 0; draftVocabSize = 0; return
+            }
+            var padded = ids.map { UInt32(bitPattern: $0) }
+            while padded.count % 8 != 0 { padded.append(padded.last!) }
+            draftVocabIds = device.makeBuffer(bytes: padded, length: padded.count * 4, options: .storageModeShared)
+            draftVocabCount = draftVocabIds == nil ? 0 : padded.count
+            draftVocabSize = ids.count
         }
 
         /// Chained drafts in one CB: step 0 is draftArgmax's forward (pair (h_prev, tok) at pos=_len);

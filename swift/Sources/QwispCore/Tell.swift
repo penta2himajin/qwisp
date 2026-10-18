@@ -43,6 +43,8 @@ public enum Tell {
     // the reference path — gating changes speed only, the token stream is unchanged.
     // QWISP_SPEC_GATE=0 opts out (always draft, pre-#119 behavior).
     static let specGateWindow = 8
+    /// Tokens (ids >= the draft-vocabulary base) seen by this process; grows the MTP draft vocabulary.
+    nonisolated(unsafe) static var draftVocabSeen = Set<Int32>()
     static var specGateEnabled: Bool { envInt("QWISP_SPEC_GATE", 1) != 0 }
     static var specGateReprobe: Int { Swift.max(8, envInt("QWISP_SPEC_REPROBE", 256)) }
     /// Conservative floor of the measured break-even curve (errs toward keeping spec on).

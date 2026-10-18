@@ -802,6 +802,19 @@ extension Tell {
         // the interval doubling (to 1024) while the winner holds a >10 % margin. Chains keep feeding
         // the head (their per-step normed rows are kept), so switching never desyncs its KV.
         let selectOn = mtpHead != nil && Tell.envInt("QWISP_MTP_SELECT", 1) != 0 && backend.chainedStepArgmax != nil
+        // Draft vocabulary: ids below QWISP_MTP_DRAFT_VOCAB (BPE merge order ≈ frequency) plus every
+        // token this process has seen in prompts and outputs; refreshed as new tokens appear.
+        let vocabBase = Tell.envInt("QWISP_MTP_DRAFT_VOCAB", 65536)
+        func refreshDraftVocab(_ toks: [Int]) {
+            guard let head = mtpHead, vocabBase > 0 else { return }
+            var grew = false
+            for t in toks where t >= vocabBase && Tell.draftVocabSeen.insert(Int32(t)).inserted { grew = true }
+            if grew || head.draftVocabSize == 0 {
+                head.setDraftVocab(Array(0 ..< Int32(vocabBase)) + Tell.draftVocabSeen.sorted())
+            }
+        }
+        refreshDraftVocab(promptIds.map { Int($0) })
+        var vocabCheckedUpTo = 0
         let maxDepth = mtpHead == nil ? 0 : Swift.max(1, Swift.min(4, Tell.envInt("QWISP_MTP_DEPTH", 2)))
         let probeTokens = Swift.max(16, Tell.envInt("QWISP_MTP_PROBE", 64))
         let warm = 2   // first samples of each mode dropped (one-time costs after prefill / a switch)
@@ -907,6 +920,9 @@ extension Tell {
                 drafts = []
             }
             var mtpDrafted = false, mtpDepth = 0
+            if mtpHead != nil, out.count - vocabCheckedUpTo >= 64 {
+                refreshDraftVocab(Array(out[vocabCheckedUpTo...])); vocabCheckedUpTo = out.count
+            }
             let tStep0 = Date()
             let mode = (drafts.isEmpty && mtpHead != nil) ? (selectOn ? chooseMode() : 1) : -1
             if mode == 0 { selChain += 1 }
