@@ -796,53 +796,55 @@ extension Tell {
             hPrevBuf = lastNormed.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false)
         }
         var rowOfU = hPrevBuf != nil ? 0 : -1
-        // Draft-mode selector (QWISP_MTP_SELECT, default on): per request, pick MTP-D1 drafting or
-        // chained greedy by measured wall ms per emitted token (EMA), with 3 % hysteresis; the mode
-        // not in use is re-probed once every `probeEvery` decisions. Chains keep feeding the head
-        // (their per-step normed rows are kept), so switching never desyncs its KV.
+        // Draft-mode selector (QWISP_MTP_SELECT, default on): per request, pick chained greedy (mode 0)
+        // or MTP drafting at depth 1...maxDepth (mode d) by measured wall ms per emitted token, with
+        // 3 % hysteresis; the losing modes are re-probed in turn after `probeTokens` emitted tokens,
+        // the interval doubling (to 1024) while the winner holds a >10 % margin. Chains keep feeding
+        // the head (their per-step normed rows are kept), so switching never desyncs its KV.
         let selectOn = mtpHead != nil && Tell.envInt("QWISP_MTP_SELECT", 1) != 0 && backend.chainedStepArgmax != nil
-        // Probe the mode not in use after this many emitted tokens; the first `warm` samples of each
-        // mode are dropped (the first verify / chain after prefill pays one-time costs).
+        let maxDepth = mtpHead == nil ? 0 : Swift.max(1, Swift.min(4, Tell.envInt("QWISP_MTP_DEPTH", 2)))
         let probeTokens = Swift.max(16, Tell.envInt("QWISP_MTP_PROBE", 64))
-        let warm = 2
-        // Estimates are ratios of sums over recent windows (an MTP step emits 1 or 2+ tokens, so a
+        let warm = 2   // first samples of each mode dropped (one-time costs after prefill / a switch)
+        // Estimates are ratios of sums over recent windows (an MTP step emits 1..d+1 tokens, so a
         // per-step average swings with every reject; a chain span averages K tokens already).
-        var winMTP: [(ms: Double, tok: Int)] = [], winChain: [(ms: Double, tok: Int)] = []
-        var emaMTP: Double? = nil, emaChain: Double? = nil
-        var seenMTP = 0, seenChain = 0, sinceProbe = 0, lastMTP = true
-        var probeInterval = probeTokens, probing = false, bestBeforeProbe = true
-        var mtpSteps = 0, chainSpans = 0, selChain = 0, draftNil = 0
-        func record(mtp: Bool, msPerTok: Double, tokens: Int) {
-            sinceProbe += tokens
-            func est(_ w: [(ms: Double, tok: Int)]) -> Double { w.reduce(0) { $0 + $1.ms } / Double(Swift.max(1, w.reduce(0) { $0 + $1.tok })) }
-            if mtp {
-                seenMTP += 1; guard seenMTP > warm else { return }
-                winMTP.append((msPerTok * Double(tokens), tokens)); if winMTP.count > 24 { winMTP.removeFirst() }
-                emaMTP = est(winMTP)
-            } else {
-                seenChain += 1; guard seenChain > warm else { return }
-                winChain.append((msPerTok * Double(tokens), tokens)); if winChain.count > 6 { winChain.removeFirst() }
-                emaChain = est(winChain)
-            }
+        let nModes = maxDepth + 1
+        var win = Array(repeating: [(ms: Double, tok: Int)](), count: nModes)
+        var est = Array<Double?>(repeating: nil, count: nModes)
+        var seen = Array(repeating: 0, count: nModes)
+        var current = 1, sinceProbe = 0, probeInterval = probeTokens, probing = false, bestBefore = 1, probeCursor = 0
+        // A measurement (warm-up or probe) stays on its mode for a burst: one MTP step emits 1..d+1
+        // tokens, so a single-step sample is too noisy to decide on; a chain span already averages K.
+        func burst(_ m: Int) -> Int { m == 0 ? 1 : 6 }
+        var probeMode = -1, probeLeft = 0
+        var modeSteps = Array(repeating: 0, count: nModes), selChain = 0, draftNil = 0
+        func record(mode: Int, msPerTok: Double, tokens: Int) {
+            sinceProbe += tokens; modeSteps[mode] += 1
+            seen[mode] += 1; guard seen[mode] > warm else { return }
+            win[mode].append((msPerTok * Double(tokens), tokens))
+            if win[mode].count > (mode == 0 ? 6 : 24) { win[mode].removeFirst() }
+            est[mode] = win[mode].reduce(0) { $0 + $1.ms } / Double(Swift.max(1, win[mode].reduce(0) { $0 + $1.tok }))
         }
-        func preferMTP() -> Bool {
-            let pick: Bool
-            if seenMTP <= warm { pick = true }                          // measure MTP first
-            else if seenChain <= warm { pick = false }                  // then chain
-            else if let m = emaMTP, let c = emaChain {
-                let best = m < c * 0.97 ? true : (c < m * 0.97 ? false : lastMTP)
-                if probing {
-                    // The probe sample is in: back off when it confirmed the winner by a clear margin.
-                    probing = false
-                    let margin = best ? c / m : m / c
-                    probeInterval = (best == bestBeforeProbe && margin > 1.10) ? Swift.min(probeInterval * 2, 1024) : probeTokens
-                }
-                if sinceProbe >= probeInterval {
-                    sinceProbe = 0; probing = true; bestBeforeProbe = best; pick = !best
-                } else { pick = best }
-            } else { pick = true }
-            lastMTP = pick
-            return pick
+        func chooseMode() -> Int {
+            if probeLeft > 0 { probeLeft -= 1; return probeMode }
+            // Warm-up order: depth 1, chain, then deeper depths; each until it has `burst` kept samples.
+            for m in [1, 0] + Array(stride(from: 2, through: maxDepth, by: 1)) where seen[m] < warm + burst(m) { return m }
+            var best = current
+            for m in 0 ..< nModes { if let e = est[m], let eb = est[best], e < eb * 0.97 { best = m } }
+            if probing {
+                probing = false
+                let others = (0 ..< nModes).filter { $0 != best }.compactMap { est[$0] }
+                let margin = (others.min() ?? .infinity) / (est[best] ?? .infinity)
+                probeInterval = (best == bestBefore && margin > 1.10) ? Swift.min(probeInterval * 2, 1024) : probeTokens
+            }
+            current = best
+            if sinceProbe >= probeInterval {
+                sinceProbe = 0; probing = true; bestBefore = best
+                let others = (0 ..< nModes).filter { $0 != best }
+                probeCursor = (probeCursor + 1) % others.count
+                probeMode = others[probeCursor]; probeLeft = burst(probeMode) - 1
+                return probeMode
+            }
+            return best
         }
         if selectOn { mtpFwd?.keepChainNormed = true }
         defer { mtpFwd?.keepChainNormed = false }
@@ -904,14 +906,15 @@ extension Tell {
                !Tell.specGateShouldDraft(score: Tell.lastDraftScore, drafted: drafts.count) {
                 drafts = []
             }
-            var mtpDrafted = false
+            var mtpDrafted = false, mtpDepth = 0
             let tStep0 = Date()
-            let wantMTP = drafts.isEmpty && mtpHead != nil && (!selectOn || preferMTP())
-            if selectOn && drafts.isEmpty && !wantMTP { selChain += 1 }
-            if wantMTP, let head = mtpHead, let hb = hPrevBuf,
-               let d = mtpDraftSpan(head: head, hPrevBuf: hb, rowOfU: rowOfU, u: u) {
-                drafts = [d]; mtpDrafted = true
-            } else if wantMTP { draftNil += 1 }
+            let mode = (drafts.isEmpty && mtpHead != nil) ? (selectOn ? chooseMode() : 1) : -1
+            if mode == 0 { selChain += 1 }
+            if mode >= 1, let head = mtpHead, let hb = hPrevBuf, rowOfU >= 0 {
+                let ds = mode == 1 ? mtpDraftSpan(head: head, hPrevBuf: hb, rowOfU: rowOfU, u: u).map { [$0] }
+                                   : head.draftChain(hPrevBuf: hb, hPrevRow: rowOfU, tok: Int32(u), depth: mode)
+                if let ds, !ds.isEmpty { drafts = ds; mtpDrafted = true; mtpDepth = mode } else { draftNil += 1 }
+            } else if mode >= 1 { draftNil += 1 }
             // u is committed this step: feed (h_prev, u) before any forward overwrites normed.
             if let head = mtpHead, let hb = hPrevBuf, rowOfU >= 0 {
                 if mtpDrafted { _ = head.commitLastDraft() }
@@ -957,8 +960,7 @@ extension Tell {
                             if addN > 0 { _ = head.feedPairs(hBuf: nb, rowRange: 0 ..< addN, toks: chainResult.prefix(addN).map { Int32($0) }) }
                             hPrevBuf = nb; rowOfU = chainResult.count - 1
                         } else { rowOfU = -1 }
-                        chainSpans += 1
-                        record(mtp: false, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(addN + 1), tokens: addN + 1)
+                        record(mode: 0, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(addN + 1), tokens: addN + 1)
                     }
                     continue
                 }
@@ -1072,8 +1074,7 @@ extension Tell {
                                        toks: drafts.prefix(p).map { Int32($0) })
                 }
                 if selectOn && mtpDrafted {
-                    mtpSteps += 1
-                    record(mtp: true, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(p + 1), tokens: p + 1)
+                    record(mode: mtpDepth, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(p + 1), tokens: p + 1)
                 }
             }
         }
@@ -1090,8 +1091,9 @@ extension Tell {
             if mtpHead != nil {
                 let d = SeedlessFusedVerify.SeedlessMTPHead.profDraft, f = SeedlessFusedVerify.SeedlessMTPHead.profFeed
                 FileHandle.standardError.write(Data(String(format:
-                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms | select mtpSteps=%d chainSpans=%d (selChain %d draftNil %d) ema mtp %.2f chain %.2f ms/tok\n",
-                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU, mtpSteps, chainSpans, selChain, draftNil, emaMTP ?? -1, emaChain ?? -1).utf8))
+                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms | select steps/mode %@ (draftNil %d) ms/tok %@\n",
+                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU, modeSteps.description as NSString, draftNil,
+                    est.map { $0.map { String(format: "%.2f", $0) } ?? "-" }.description as NSString).utf8))
             }
         }
         return Array(out.prefix(N))

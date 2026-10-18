@@ -5636,7 +5636,8 @@ public enum SeedlessFusedVerify {
                                    hPrevBuf: MTLBuffer, hRow: Int,
                                    pos: Int, totalKeys: Int,
                                    doLMHead: Bool,
-                                   tokBuf: MTLBuffer? = nil, tokOffset: Int = 0) {
+                                   tokBuf: MTLBuffer? = nil, tokOffset: Int = 0,
+                                   draftOut: MTLBuffer? = nil, draftOffset: Int = 0) {
             // 1. embed(tok) → _sEmb
             encodeEmbed(enc, embOut: _sEmb, tokBuf: tokBuf ?? _sTok, tokOffset: tokOffset)
             // 2. rmsNorm(emb, preEmb) → _sEmbN
@@ -5678,7 +5679,7 @@ public enum SeedlessFusedVerify {
                 let ap = SeedlessFusedVerify._mtpArgmaxPipeline!
                 enc.setComputePipelineState(ap)
                 enc.setBuffer(_sLogits, offset: 0, index: 0)
-                enc.setBuffer(_sDraft,  offset: 0, index: 1)
+                enc.setBuffer(draftOut ?? _sDraft, offset: draftOffset, index: 1)
                 var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 2)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -5815,6 +5816,35 @@ public enum SeedlessFusedVerify {
             }
 
             return Int(_sDraft.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
+        }
+
+        /// Chained drafts in one CB: step 0 is draftArgmax's forward (pair (h_prev, tok) at pos=_len);
+        /// step i > 0 feeds the previous step's own hidden (pre-final-norm residual, as in mlx-lm's
+        /// MTP chain) with its argmax token, writing provisional k/v at _len+i (overwritten by the
+        /// pair feed after the verify). _len is unchanged; commitLastDraft commits step 0's pair.
+        private var _sChainOut: MTLBuffer?
+        public func draftChain(hPrevBuf: MTLBuffer, hPrevRow: Int, tok: Int32, depth: Int) -> [Int]? {
+            guard depth >= 1, _len + depth <= maxSeqLen else { return nil }
+            if _sChainOut == nil { _sChainOut = device.makeBuffer(length: 16 * 4, options: .storageModeShared) }
+            guard let outBuf = _sChainOut, depth <= 16 else { return nil }
+            _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            encodeForward(enc, hPrevBuf: hPrevBuf, hRow: hPrevRow, pos: _len, totalKeys: _len + 1,
+                          doLMHead: true, draftOut: outBuf, draftOffset: 0)
+            for i in 1 ..< depth {
+                encodeForward(enc, hPrevBuf: _sX, hRow: 0, pos: _len + i, totalKeys: _len + i + 1,
+                              doLMHead: true, tokBuf: outBuf, tokOffset: (i - 1) * 4,
+                              draftOut: outBuf, draftOffset: i * 4)
+            }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profDraft.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profDraft.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profDraft.n += 1
+            }
+            let p = outBuf.contents().bindMemory(to: Int32.self, capacity: depth)
+            return (0 ..< depth).map { Int(p[$0]) }
         }
 
         /// Batch-ingest committed pairs. Advances _len by rowRange.count.
