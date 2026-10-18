@@ -807,11 +807,13 @@ extension Tell {
         let vocabBase = Tell.envInt("QWISP_MTP_DRAFT_VOCAB", 65536)
         func refreshDraftVocab(_ toks: [Int]) {
             guard let head = mtpHead, vocabBase > 0 else { return }
+            Tell.loadDraftVocabOnce()
             var grew = false
             for t in toks where t >= vocabBase && Tell.draftVocabSeen.insert(Int32(t)).inserted { grew = true }
             if grew || head.draftVocabSize == 0 {
-                head.setDraftVocab(Array(0 ..< Int32(vocabBase)) + Tell.draftVocabSeen.sorted())
+                head.setDraftVocab(Array(0 ..< Int32(vocabBase)) + Tell.draftVocabSeen.filter { $0 >= Int32(vocabBase) }.sorted())
             }
+            if grew { Tell.saveDraftVocab() }
         }
         refreshDraftVocab(promptIds.map { Int($0) })
         var vocabCheckedUpTo = 0
