@@ -780,6 +780,56 @@ extension Tell {
             hPrevBuf = lastNormed.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false)
         }
         var rowOfU = hPrevBuf != nil ? 0 : -1
+        // Draft-mode selector (QWISP_MTP_SELECT, default on): per request, pick MTP-D1 drafting or
+        // chained greedy by measured wall ms per emitted token (EMA), with 3 % hysteresis; the mode
+        // not in use is re-probed once every `probeEvery` decisions. Chains keep feeding the head
+        // (their per-step normed rows are kept), so switching never desyncs its KV.
+        let selectOn = mtpHead != nil && Tell.envInt("QWISP_MTP_SELECT", 1) != 0 && backend.chainedStepArgmax != nil
+        // Probe the mode not in use after this many emitted tokens; the first `warm` samples of each
+        // mode are dropped (the first verify / chain after prefill pays one-time costs).
+        let probeTokens = Swift.max(16, Tell.envInt("QWISP_MTP_PROBE", 64))
+        let warm = 2
+        // Estimates are ratios of sums over recent windows (an MTP step emits 1 or 2+ tokens, so a
+        // per-step average swings with every reject; a chain span averages K tokens already).
+        var winMTP: [(ms: Double, tok: Int)] = [], winChain: [(ms: Double, tok: Int)] = []
+        var emaMTP: Double? = nil, emaChain: Double? = nil
+        var seenMTP = 0, seenChain = 0, sinceProbe = 0, lastMTP = true
+        var probeInterval = probeTokens, probing = false, bestBeforeProbe = true
+        var mtpSteps = 0, chainSpans = 0, selChain = 0, draftNil = 0
+        func record(mtp: Bool, msPerTok: Double, tokens: Int) {
+            sinceProbe += tokens
+            func est(_ w: [(ms: Double, tok: Int)]) -> Double { w.reduce(0) { $0 + $1.ms } / Double(Swift.max(1, w.reduce(0) { $0 + $1.tok })) }
+            if mtp {
+                seenMTP += 1; guard seenMTP > warm else { return }
+                winMTP.append((msPerTok * Double(tokens), tokens)); if winMTP.count > 24 { winMTP.removeFirst() }
+                emaMTP = est(winMTP)
+            } else {
+                seenChain += 1; guard seenChain > warm else { return }
+                winChain.append((msPerTok * Double(tokens), tokens)); if winChain.count > 6 { winChain.removeFirst() }
+                emaChain = est(winChain)
+            }
+        }
+        func preferMTP() -> Bool {
+            let pick: Bool
+            if seenMTP <= warm { pick = true }                          // measure MTP first
+            else if seenChain <= warm { pick = false }                  // then chain
+            else if let m = emaMTP, let c = emaChain {
+                let best = m < c * 0.97 ? true : (c < m * 0.97 ? false : lastMTP)
+                if probing {
+                    // The probe sample is in: back off when it confirmed the winner by a clear margin.
+                    probing = false
+                    let margin = best ? c / m : m / c
+                    probeInterval = (best == bestBeforeProbe && margin > 1.10) ? Swift.min(probeInterval * 2, 1024) : probeTokens
+                }
+                if sinceProbe >= probeInterval {
+                    sinceProbe = 0; probing = true; bestBeforeProbe = best; pick = !best
+                } else { pick = best }
+            } else { pick = true }
+            lastMTP = pick
+            return pick
+        }
+        if selectOn { mtpFwd?.keepChainNormed = true }
+        defer { mtpFwd?.keepChainNormed = false }
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
@@ -839,10 +889,13 @@ extension Tell {
                 drafts = []
             }
             var mtpDrafted = false
-            if drafts.isEmpty, let head = mtpHead, let hb = hPrevBuf,
+            let tStep0 = Date()
+            let wantMTP = drafts.isEmpty && mtpHead != nil && (!selectOn || preferMTP())
+            if selectOn && drafts.isEmpty && !wantMTP { selChain += 1 }
+            if wantMTP, let head = mtpHead, let hb = hPrevBuf,
                let d = mtpDraftSpan(head: head, hPrevBuf: hb, rowOfU: rowOfU, u: u) {
                 drafts = [d]; mtpDrafted = true
-            }
+            } else if wantMTP { draftNil += 1 }
             // u is committed this step: feed (h_prev, u) before any forward overwrites normed.
             if let head = mtpHead, let hb = hPrevBuf, rowOfU >= 0 {
                 if mtpDrafted { _ = head.commitLastDraft() }
@@ -863,7 +916,7 @@ extension Tell {
                 // those positions — at d0≈90% almost always free. nil chain fn / failed call
                 // → fall through to per-step.
                 let tC = prof ? Date() : Date.distantPast
-                if mtpHead == nil, chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
+                if mtpHead == nil || selectOn, chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
                    let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
                     if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1
                               pfChainGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
@@ -881,6 +934,16 @@ extension Tell {
                         out.append(chainResult[i]); hist.append(chainResult[i])
                     }
                     u = chainResult[chainResult.count - 1]
+                    if selectOn, let head = mtpHead {
+                        // Pairs (h_k, c_k) for the committed chain tokens; c_{K-1} (= next u) pairs
+                        // with row K-1 at the next step's feed.
+                        if let nb = mtpFwd?.lastChainNormed {
+                            if addN > 0 { _ = head.feedPairs(hBuf: nb, rowRange: 0 ..< addN, toks: chainResult.prefix(addN).map { Int32($0) }) }
+                            hPrevBuf = nb; rowOfU = chainResult.count - 1
+                        } else { rowOfU = -1 }
+                        chainSpans += 1
+                        record(mtp: false, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(addN + 1), tokens: addN + 1)
+                    }
                     continue
                 }
                 if useA3 && !pending.isEmpty {
@@ -992,6 +1055,10 @@ extension Tell {
                     _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: 0 ..< p,
                                        toks: drafts.prefix(p).map { Int32($0) })
                 }
+                if selectOn && mtpDrafted {
+                    mtpSteps += 1
+                    record(mtp: true, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(p + 1), tokens: p + 1)
+                }
             }
         }
         flush()
@@ -1007,8 +1074,8 @@ extension Tell {
             if mtpHead != nil {
                 let d = SeedlessFusedVerify.SeedlessMTPHead.profDraft, f = SeedlessFusedVerify.SeedlessMTPHead.profFeed
                 FileHandle.standardError.write(Data(String(format:
-                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms\n",
-                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU).utf8))
+                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms | select mtpSteps=%d chainSpans=%d (selChain %d draftNil %d) ema mtp %.2f chain %.2f ms/tok\n",
+                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU, mtpSteps, chainSpans, selChain, draftNil, emaMTP ?? -1, emaChain ?? -1).utf8))
             }
         }
         return Array(out.prefix(N))

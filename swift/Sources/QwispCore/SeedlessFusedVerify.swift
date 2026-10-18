@@ -4644,6 +4644,12 @@ public enum SeedlessFusedVerify {
             var seedValue: Int32 { seedBuf.contents().bindMemory(to: Int32.self, capacity: seedIndex + 1)[seedIndex] }
         }
         var pendingChain: PendingChain?
+        /// MTP feed on chained spans: when set, each chain step's final-normed row is copied into a
+        /// per-chain [K, H] buffer (keyed by that chain's token buffer) and the buffer of the chain
+        /// whose tokens were just returned is exposed as lastChainNormed.
+        public var keepChainNormed = false
+        var chainNormedFor: [ObjectIdentifier: MTLBuffer] = [:]
+        public private(set) var lastChainNormed: MTLBuffer?
 
         /// Per-forward residency set for the buffers that are NOT process-wide weights (KV arena,
         /// GDN state, scratch, fused-weight concats): weights are in the shared set
@@ -4693,6 +4699,7 @@ public enum SeedlessFusedVerify {
         public func cancelPendingChain() {
             guard let p = pendingChain else { return }
             pendingChain = nil
+            chainNormedFor.removeValue(forKey: ObjectIdentifier(p.chainBuf))
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = p.kvLensBefore[i] }
                 if let gc = L.gdnCache, p.K % 2 == 1 { gc.swapState() }
@@ -4713,6 +4720,11 @@ public enum SeedlessFusedVerify {
 
             let ep = SeedlessFusedVerify._embedRowsPipeline!
             let ap = SeedlessFusedVerify._argmaxRowsPipeline!
+            var normedCopy: MTLBuffer? = nil
+            if keepChainNormed, SeedlessMetalForward.compileVecCopy(),
+               let nb = device.makeBuffer(length: K * H * 2, options: .storageModeShared) {
+                normedCopy = nb; chainNormedFor[ObjectIdentifier(chainBuf)] = nb
+            }
 
             for k in 0 ..< K {
                 // ── Embed 1 token ──────────────────────────────────────────────────
@@ -4753,6 +4765,14 @@ public enum SeedlessFusedVerify {
                 // ── Final ops: fnorm + lm_head + argmax → chainBuf[k] ─────────────
                 SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed,
                                                  rows: 1, D: H, eps: eps)
+                if let nb = normedCopy {
+                    let cp = SeedlessMetalForward._vecCopyPipeline!
+                    enc.setComputePipelineState(cp)
+                    enc.setBuffer(nb, offset: k * H * 2, index: 0); enc.setBuffer(normed, offset: 0, index: 1)
+                    var nn = UInt32(H); enc.setBytes(&nn, length: 4, index: 2)
+                    enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: Swift.min(cp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+                }
                 if SeedlessFusedForward.lmHeadQmv {
                     SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
                                                  x: normed, out: hd.logits, M: 1, K: H, N: hd.vocab)
@@ -4833,6 +4853,7 @@ public enum SeedlessFusedVerify {
                 dumpF16Stats(normed, n: H, tag: "chain k=\(K - 1) normed(lm_head input)")
                 dumpLogitStats(hd, M: 1, tag: "chain last k=\(K - 1)")
             }
+            lastChainNormed = chainNormedFor.removeValue(forKey: ObjectIdentifier(chainBuf))
             let ptr = chainBuf.contents().bindMemory(to: Int32.self, capacity: K)
             return (0 ..< K).map { Int(ptr[$0]) }
         }
