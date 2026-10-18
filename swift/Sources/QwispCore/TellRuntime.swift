@@ -87,6 +87,13 @@ extension Tell {
         let rollback: (Any) -> Void
         // Full-state save/restore for arbitrary-length rewind (cross-request prefix caching).
         // Distinct from snapshot/rollback (1-step spec). nil if the backend doesn't support it.
+        /// Partial reject without a rebuild forward: keep the first `rows` rows of the last verify
+        /// (SpecReplay). Returns false when unavailable → caller does rollback + rebuild.
+        var commitAccepted: ((Any, Int) -> Bool)? = nil
+        /// MTP-D1 drafts on the serve path (QWISP_MTP_DRAFT=1): head attached by the server, and the
+        /// fused forward whose normed rows feed it. nil → spec loop unchanged.
+        var mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil
+        var fusedFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil
         var fullSnapshot: (() -> Any)? = nil
         var fullRestore: ((Any) -> Void)? = nil
         // Disk-persistable state (issue #89): serialize/restore the CURRENT decode state
@@ -96,6 +103,10 @@ extension Tell {
         // Steel-prefill hybrid (QWISP_HYBRID_PREFILL=1): prefill-scoped forward with GDN dense
         // matmuls via MLX steel. nil → prefill uses `forward`. Decode/verify NEVER use this.
         var forwardHybrid: (([Int32]) -> MLXArray?)? = nil
+        /// Called once when Tell.prefill finishes all chunks (fast prefill drops its MLX mirror).
+        var prefillEnded: (() -> Void)? = nil
+        /// Drops an encoded-but-uncommitted chain-ahead (SeedlessFusedForward.cancelPendingChain).
+        var chainCancelAhead: (() -> Void)? = nil
         var hybridChunk: Int = 64
         var chainedStepArgmax: ((Int32, Int) -> [Int]?)? = nil   // Phase II-a
         // Option B (sampling): full logits per input row (readback), for speculative sampling.
@@ -206,6 +217,12 @@ extension Tell {
         }
         backend.persistentState = { fwd.persistentStateData() }              // issue #89
         backend.restorePersistentState = { fwd.restorePersistentState($0) }
+        fwd.prepareSpecReplay()
+        backend.fusedFwd = fwd
+        backend.commitAccepted = { snap, rows in                              // QWISP_SPEC_REPLAY
+            guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return false }
+            return fwd.replayAccepted(s, rows: rows)
+        }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
@@ -236,7 +253,15 @@ extension Tell {
                 return fwd.forwardRowsHybrid(x, M: tokens.count, finalNormW: fnBuf)
             }
             backend.hybridChunk = Swift.min(1024, maxM)
+            // Non-strict fast prefill (QWISP_FAST_PREFILL=1): whole-chunk MLX graph, state handed
+            // to the Seedless buffers; decode unchanged. Off → this block is skipped.
+            if FastPrefill.enabled, let fp = FastPrefill(fwd: fwd, reference: backend.forwardHybrid) {
+                backend.forwardHybrid = { fp.forward($0) }
+                backend.prefillEnded = { fp.prefillEnded() }
+                backend.hybridChunk = FastPrefill.chunk
+            }
         }
+        backend.chainCancelAhead = { fwd.cancelPendingChain() }
         // Phase II-a: wire chained greedy decode when the 1-CB head path is active.
         // Only resident/bolt return non-nil (strict returns nil → per-step fallback).
         if fwd.head != nil {
@@ -311,6 +336,12 @@ extension Tell {
         }
         backend.persistentState = { fwd.persistentStateData() }              // issue #89
         backend.restorePersistentState = { fwd.restorePersistentState($0) }
+        fwd.prepareSpecReplay()
+        backend.fusedFwd = fwd
+        backend.commitAccepted = { snap, rows in                              // QWISP_SPEC_REPLAY
+            guard let s = snap as? SeedlessFusedVerify.SeedlessFusedForward.Snapshot else { return false }
+            return fwd.replayAccepted(s, rows: rows)
+        }
         // Steel-prefill hybrid (opt-in): wire per-layer GDN MLX weights + the hybrid forward.
         // Chunk = min(1024, maxM): steel wins grow with chunk; callers wanting 1024 pass maxM>=1024.
         // Steel-prefill hybrid: default ON (canonical since refs re-canonicalization);
@@ -582,7 +613,8 @@ extension Tell {
 
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
-                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil,
+                        mtpFeedFrom: Int = 0) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
@@ -603,10 +635,20 @@ extension Tell {
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
-                let nPairs = (end < pLen) ? chunk.count : chunk.count - 1
+                let nAll = (end < pLen) ? chunk.count : chunk.count - 1
+                // Only pairs at index >= mtpFeedFrom (prompt window); skip rows before it.
+                let skip = Swift.min(nAll, Swift.max(0, mtpFeedFrom - pos))
+                let nPairs = nAll - skip
                 if nPairs > 0 {
-                    let toks = Array(promptIds[(pos + 1) ..< (pos + 1 + nPairs)])
-                    _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: 0 ..< nPairs, toks: toks)
+                    let toks = Array(promptIds[(pos + 1 + skip) ..< (pos + 1 + skip + nPairs)])
+                    // Hybrid/fast prefill return their own normed rows (the fused normed buffer is
+                    // not written), so feed from the returned array; plain fused prefill reads it.
+                    if backend.forwardHybrid != nil, let dev = SeedlessMetalForward.ensure()?.0,
+                       let hb = normed.asType(.float16).asMTLBuffer(device: dev, noCopy: false) {   // copy: temp array
+                        _ = head.feedPairs(hBuf: hb, rowRange: skip ..< (skip + nPairs), toks: toks)
+                    } else {
+                        _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: skip ..< (skip + nPairs), toks: toks)
+                    }
                 }
             }
             // Keep last row [H] — will be overwritten each chunk until the final one.
@@ -657,6 +699,8 @@ extension Tell {
         //
         // Default ON. QWISP_PREFILL_CHUNK_POOL=0 restores the pre-fix behavior for A/B only.
         let chunkPool = Tell.envInt("QWISP_PREFILL_CHUNK_POOL", 1) != 0
+        FastPrefill.wiredBegin()
+        defer { backend.prefillEnded?(); FastPrefill.wiredEnd() }
         while pos < pLen {
             let ok = chunkPool ? autoreleasepool { runChunk() } : runChunk()
             if !ok { return nil }
@@ -716,15 +760,109 @@ extension Tell {
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
+                             mtpCarry: MLXArray? = nil,
                              isCancelled: (() -> Bool)? = nil,
                              onToken: ((Int) -> Void)? = nil) -> [Int]? {
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
-        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend) else { return nil }
+        // MTP-D1 (serve). Full prefill: the head's KV starts empty. Partial prefill (prefix cache):
+        // the caller has kept the head aligned with the cached prefix and passes the hidden of the
+        // position before prefillTokens[0] (mtpCarry) for the boundary pair. A misaligned head only
+        // lowers acceptance — the verify decides every token.
+        let mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = (!useA3
+            && promptIds.count + N + 2 <= (backend.mtpHead?.capacity ?? 0)) ? backend.mtpHead : nil
+        let mtpFwd = backend.fusedFwd
+        // Prompt window fed into the head (QWISP_MTP_PROMPT_WINDOW, default 1024; 0 = whole prompt):
+        // each pair costs a head forward, so feeding a long prompt in full adds seconds of TTFT.
+        let mtpWindow = Tell.envInt("QWISP_MTP_PROMPT_WINDOW", 1024)
+        let feedFrom = (prefillTokens == nil && mtpWindow > 0) ? Swift.max(0, promptIds.count - 1 - mtpWindow) : 0
+        if prefillTokens == nil { mtpHead?.resetKV(start: feedFrom) }
+        else if let head = mtpHead, let c = mtpCarry, let first = prefillTokens?.first,
+                let dev = SeedlessMetalForward.ensure()?.0,
+                let cb = c.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false) {
+            _ = head.feedPairs(hBuf: cb, rowRange: 0 ..< 1, toks: [first])
+        }
+        SeedlessFusedVerify.SeedlessMTPHead.profDraft = (0, 0, 0); SeedlessFusedVerify.SeedlessMTPHead.profFeed = (0, 0, 0)
+        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
+                                       mtpHead: mtpHead, mtpFwd: mtpFwd, mtpFeedFrom: feedFrom) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
+        // Hidden that produced u: the prompt's last normed row (from prefill's own output, valid for
+        // fused, hybrid and fast prefill alike), then row `rowOfU` of the fused normed buffer.
+        var hPrevBuf: MTLBuffer? = nil
+        if mtpHead != nil, let dev = SeedlessMetalForward.ensure()?.0 {
+            hPrevBuf = lastNormed.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false)
+        }
+        var rowOfU = hPrevBuf != nil ? 0 : -1
+        // Draft-mode selector (QWISP_MTP_SELECT, default on): per request, pick chained greedy (mode 0)
+        // or MTP drafting at depth 1...maxDepth (mode d) by measured wall ms per emitted token, with
+        // 3 % hysteresis; the losing modes are re-probed in turn after `probeTokens` emitted tokens,
+        // the interval doubling (to 1024) while the winner holds a >10 % margin. Chains keep feeding
+        // the head (their per-step normed rows are kept), so switching never desyncs its KV.
+        let selectOn = mtpHead != nil && Tell.envInt("QWISP_MTP_SELECT", 1) != 0 && backend.chainedStepArgmax != nil
+        // Draft vocabulary: ids below QWISP_MTP_DRAFT_VOCAB (BPE merge order ≈ frequency) plus every
+        // token this process has seen in prompts and outputs; refreshed as new tokens appear.
+        let vocabBase = Tell.envInt("QWISP_MTP_DRAFT_VOCAB", 65536)
+        func refreshDraftVocab(_ toks: [Int]) {
+            guard let head = mtpHead, vocabBase > 0 else { return }
+            Tell.loadDraftVocabOnce()
+            var grew = false
+            for t in toks where t >= vocabBase && Tell.draftVocabSeen.insert(Int32(t)).inserted { grew = true }
+            if grew || head.draftVocabSize == 0 {
+                head.setDraftVocab(Array(0 ..< Int32(vocabBase)) + Tell.draftVocabSeen.filter { $0 >= Int32(vocabBase) }.sorted())
+            }
+            if grew { Tell.saveDraftVocab() }
+        }
+        refreshDraftVocab(promptIds.map { Int($0) })
+        var vocabCheckedUpTo = 0
+        let maxDepth = mtpHead == nil ? 0 : Swift.max(1, Swift.min(4, Tell.envInt("QWISP_MTP_DEPTH", 2)))
+        let probeTokens = Swift.max(16, Tell.envInt("QWISP_MTP_PROBE", 64))
+        let warm = 2   // first samples of each mode dropped (one-time costs after prefill / a switch)
+        // Estimates are ratios of sums over recent windows (an MTP step emits 1..d+1 tokens, so a
+        // per-step average swings with every reject; a chain span averages K tokens already).
+        let nModes = maxDepth + 1
+        var win = Array(repeating: [(ms: Double, tok: Int)](), count: nModes)
+        var est = Array<Double?>(repeating: nil, count: nModes)
+        var seen = Array(repeating: 0, count: nModes)
+        var current = 1, sinceProbe = 0, probeInterval = probeTokens, probing = false, bestBefore = 1, probeCursor = 0
+        // A measurement (warm-up or probe) stays on its mode for a burst: one MTP step emits 1..d+1
+        // tokens, so a single-step sample is too noisy to decide on; a chain span already averages K.
+        func burst(_ m: Int) -> Int { m == 0 ? 1 : 6 }
+        var probeMode = -1, probeLeft = 0
+        var modeSteps = Array(repeating: 0, count: nModes), selChain = 0, draftNil = 0
+        func record(mode: Int, msPerTok: Double, tokens: Int) {
+            sinceProbe += tokens; modeSteps[mode] += 1
+            seen[mode] += 1; guard seen[mode] > warm else { return }
+            win[mode].append((msPerTok * Double(tokens), tokens))
+            if win[mode].count > (mode == 0 ? 6 : 24) { win[mode].removeFirst() }
+            est[mode] = win[mode].reduce(0) { $0 + $1.ms } / Double(Swift.max(1, win[mode].reduce(0) { $0 + $1.tok }))
+        }
+        func chooseMode() -> Int {
+            if probeLeft > 0 { probeLeft -= 1; return probeMode }
+            // Warm-up order: depth 1, chain, then deeper depths; each until it has `burst` kept samples.
+            for m in [1, 0] + Array(stride(from: 2, through: maxDepth, by: 1)) where seen[m] < warm + burst(m) { return m }
+            var best = current
+            for m in 0 ..< nModes { if let e = est[m], let eb = est[best], e < eb * 0.97 { best = m } }
+            if probing {
+                probing = false
+                let others = (0 ..< nModes).filter { $0 != best }.compactMap { est[$0] }
+                let margin = (others.min() ?? .infinity) / (est[best] ?? .infinity)
+                probeInterval = (best == bestBefore && margin > 1.10) ? Swift.min(probeInterval * 2, 1024) : probeTokens
+            }
+            current = best
+            if sinceProbe >= probeInterval {
+                sinceProbe = 0; probing = true; bestBefore = best
+                let others = (0 ..< nModes).filter { $0 != best }
+                probeCursor = (probeCursor + 1) % others.count
+                probeMode = others[probeCursor]; probeLeft = burst(probeMode) - 1
+                return probeMode
+            }
+            return best
+        }
+        if selectOn { mtpFwd?.keepChainNormed = true }
+        defer { mtpFwd?.keepChainNormed = false }
 
         var hist = promptIds.map { Int($0) }
         var out: [Int] = []
@@ -748,9 +886,12 @@ extension Tell {
         // to N and orphaning the GPU (see SeedlessBackend.generate).
         // #119: env-gated per-step wall-time buckets (QWISP_SPEC_PROFILE=1). Flag off →
         // no Date() calls on the hot path, loop byte-identical.
+        defer { backend.chainCancelAhead?() }
         let prof = Tell.envFlag("QWISP_SPEC_PROFILE")
-        var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0
+        var pfDraft = 0.0, pfChain = 0.0, pfVerify = 0.0, pfRebuild = 0.0, pfVerifyGPU = 0.0
         var pfChainCalls = 0
+        var pfChainGPU = 0.0, pfChainEnc = 0.0, pfSubmit = 0.0, pfWake = 0.0, pfBetween = 0.0, pfAhead = 0.0, pfWait = 0.0, pfWhole = 0.0
+        var lastChainEnd: Date? = nil
         let tLoop0 = Date()
 
         // #119 speculation gate state (see Tell.specGate*): rolling accepted-per-attempt
@@ -762,8 +903,14 @@ extension Tell {
         // sk-style adaptive maxK: clamp draftK to recent accept + grace (feeds SCORE trunc too).
         var recentAccepts: [Int] = []
 
-        while out.count < N && !(isCancelled?() ?? false) {
+        var pfFlush = 0.0, pfSnap = 0.0, pfCond = 0.0
+        while true {
+            let tQ = prof ? Date() : Date.distantPast
+            guard out.count < N && !(isCancelled?() ?? false) else { break }
+            if prof { pfCond += Date().timeIntervalSince(tQ) * 1000 }
+            let tF = prof ? Date() : Date.distantPast
             flush()
+            if prof { pfFlush += Date().timeIntervalSince(tF) * 1000 }
             let tD = prof ? Date() : Date.distantPast
             let effK = Tell.adaptiveDraftK(cap: maxK, recentAccepts: recentAccepts)
             var drafts = (gateOn && out.count < gateSuspendedUntil) ? []
@@ -774,11 +921,31 @@ extension Tell {
                !Tell.specGateShouldDraft(score: Tell.lastDraftScore, drafted: drafts.count) {
                 drafts = []
             }
+            var mtpDrafted = false, mtpDepth = 0
+            if mtpHead != nil, out.count - vocabCheckedUpTo >= 64 {
+                refreshDraftVocab(Array(out[vocabCheckedUpTo...])); vocabCheckedUpTo = out.count
+            }
+            let tStep0 = Date()
+            let mode = (drafts.isEmpty && mtpHead != nil) ? (selectOn ? chooseMode() : 1) : -1
+            if mode == 0 { selChain += 1 }
+            if mode >= 1, let head = mtpHead, let hb = hPrevBuf, rowOfU >= 0 {
+                let ds = mode == 1 ? mtpDraftSpan(head: head, hPrevBuf: hb, rowOfU: rowOfU, u: u).map { [$0] }
+                                   : head.draftChain(hPrevBuf: hb, hPrevRow: rowOfU, tok: Int32(u), depth: mode)
+                if let ds, !ds.isEmpty { drafts = ds; mtpDrafted = true; mtpDepth = mode } else { draftNil += 1 }
+            } else if mode >= 1 { draftNil += 1 }
+            // u is committed this step: feed (h_prev, u) before any forward overwrites normed.
+            if let head = mtpHead, let hb = hPrevBuf, rowOfU >= 0 {
+                if mtpDrafted { _ = head.commitLastDraft() }
+                else { _ = head.feedPairs(hBuf: hb, rowRange: rowOfU ..< (rowOfU + 1), toks: [Int32(u)]) }
+            }
+            if mtpHead != nil { hPrevBuf = mtpFwd?.normedBuffer }   // every later u comes from a fused forward
             if prof { pfDraft += Date().timeIntervalSince(tD) * 1000 }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
+            let tS = prof ? Date() : Date.distantPast
             let snap = backend.snapshot()
+            if prof { pfSnap += Date().timeIntervalSince(tS) * 1000 }
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -786,15 +953,33 @@ extension Tell {
                 // those positions — at d0≈90% almost always free. nil chain fn / failed call
                 // → fall through to per-step.
                 let tC = prof ? Date() : Date.distantPast
-                if chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
+                if mtpHead == nil || selectOn, chainK > 0, (!useA3 || pending.isEmpty), let chainFn = backend.chainedStepArgmax,
                    let chainResult = chainFn(Int32(u), chainK), !chainResult.isEmpty {
-                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1 }
+                    if prof { pfChain += Date().timeIntervalSince(tC) * 1000; pfChainCalls += 1
+                              pfChainGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs
+                              pfChainEnc += SeedlessFusedVerify.SeedlessFusedForward.profLastEncodeMs
+                              pfSubmit += SeedlessFusedVerify.SeedlessFusedForward.profLastSubmitMs
+                              pfWake += SeedlessFusedVerify.SeedlessFusedForward.profLastWakeMs
+                              pfAhead += SeedlessFusedVerify.SeedlessFusedForward.profLastAheadMs
+                              pfWait += SeedlessFusedVerify.SeedlessFusedForward.profLastWaitMs
+                              pfWhole += SeedlessFusedVerify.SeedlessFusedForward.profLastWholeMs
+                              if let l = lastChainEnd { pfBetween += tC.timeIntervalSince(l) * 1000 }
+                              lastChainEnd = Date() }
                     out.append(u); hist.append(u)
                     let addN = Swift.min(chainResult.count - 1, N - out.count)
                     for i in 0 ..< addN {
                         out.append(chainResult[i]); hist.append(chainResult[i])
                     }
                     u = chainResult[chainResult.count - 1]
+                    if selectOn, let head = mtpHead {
+                        // Pairs (h_k, c_k) for the committed chain tokens; c_{K-1} (= next u) pairs
+                        // with row K-1 at the next step's feed.
+                        if let nb = mtpFwd?.lastChainNormed {
+                            if addN > 0 { _ = head.feedPairs(hBuf: nb, rowRange: 0 ..< addN, toks: chainResult.prefix(addN).map { Int32($0) }) }
+                            hPrevBuf = nb; rowOfU = chainResult.count - 1
+                        } else { rowOfU = -1 }
+                        record(mode: 0, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(addN + 1), tokens: addN + 1)
+                    }
                     continue
                 }
                 if useA3 && !pending.isEmpty {
@@ -811,6 +996,7 @@ extension Tell {
                     if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
                     out.append(u); hist.append(u)
                     u = evals[0]
+                    rowOfU = 0
                 }
                 continue
             }
@@ -855,7 +1041,8 @@ extension Tell {
                 let tV = prof ? Date() : Date.distantPast
                 let verifyTokens: [Int32] = [Int32(u)] + drafts.map { Int32($0) }
                 guard let evals = backend.stepArgmax(verifyTokens) else { return nil }
-                if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
+                if prof { pfVerify += Date().timeIntervalSince(tV) * 1000
+                          pfVerifyGPU += SeedlessFusedVerify.SeedlessFusedForward.profLastGPUMs }
 
                 var p = 0
                 while p < D && drafts[p] == evals[p] { p += 1 }
@@ -878,6 +1065,7 @@ extension Tell {
                     out.append(u); hist.append(u)
                     for d in drafts { out.append(d); hist.append(d) }
                     u = evals[D]
+                    rowOfU = D
                 } else {
                     // Width-2 tree prize probe: would the draft vote's runner-up at the reject
                     // position have matched the model's true token? (evals[p] = argmax after
@@ -886,13 +1074,25 @@ extension Tell {
                     if Tell.traceAltsEnabled, p < Tell.lastDraftAlts.count,
                        Tell.lastDraftAlts[p] == evals[p] { stAltHits += 1 }
                     let tR = prof ? Date() : Date.distantPast
-                    backend.rollback(snap)
+                    let replayed = backend.commitAccepted?(snap, p + 1) ?? false
+                    if !replayed { backend.rollback(snap) }
                     out.append(u); hist.append(u)
                     for d in drafts.prefix(p) { out.append(d); hist.append(d) }
-                    let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
-                    guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    if !replayed {
+                        let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
+                        guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    }
                     if prof { pfRebuild += Date().timeIntervalSince(tR) * 1000 }
                     u = evals[p]
+                    rowOfU = p   // replay keeps the verify rows; rebuild's last row is p too
+                }
+                // Accepted-draft pairs (h_i, tok_{i+1}) for i < p — same rows either way.
+                if let head = mtpHead, let fwd = mtpFwd, p > 0 {
+                    _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: 0 ..< p,
+                                       toks: drafts.prefix(p).map { Int32($0) })
+                }
+                if selectOn && mtpDrafted {
+                    record(mode: mtpDepth, msPerTok: Date().timeIntervalSince(tStep0) * 1000 / Double(p + 1), tokens: p + 1)
                 }
             }
         }
@@ -902,10 +1102,17 @@ extension Tell {
             let total = Date().timeIntervalSince(tLoop0) * 1000
             let other = total - pfDraft - pfChain - pfVerify - pfRebuild
             FileHandle.standardError.write(Data(String(format:
-                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
+                "[spec-profile] hist0=%d gen=%d steps=%d chainCalls=%d | total %.0fms = draft %.0f + chain %.0f (gpu %.0f, encode %.0f, submit %.0f, wake %.0f, ahead-encode %.0f, wait %.0f, in-func %.0f; loop-between %.0f [cond %.0f flush %.0f snap %.0f]) + verify %.0f + rebuild %.0f + other %.0f | ms/tok %.1f\n",
                 promptIds.count, out.count, stSteps, pfChainCalls,
-                total, pfDraft, pfChain, pfVerify, pfRebuild, other,
+                total, pfDraft, pfChain, pfChainGPU, pfChainEnc, pfSubmit, pfWake, pfAhead, pfWait, pfWhole, pfBetween, pfCond, pfFlush, pfSnap, pfVerify, pfRebuild, other,
                 out.isEmpty ? 0 : total / Double(out.count)).utf8))
+            if mtpHead != nil {
+                let d = SeedlessFusedVerify.SeedlessMTPHead.profDraft, f = SeedlessFusedVerify.SeedlessMTPHead.profFeed
+                FileHandle.standardError.write(Data(String(format:
+                    "[spec-profile] mtp draft n=%d wall %.0fms gpu %.0fms | feed n=%d wall %.0fms gpu %.0fms | verify gpu %.0fms | select steps/mode %@ (draftNil %d) ms/tok %@\n",
+                    d.n, d.wall, d.gpu, f.n, f.wall, f.gpu, pfVerifyGPU, modeSteps.description as NSString, draftNil,
+                    est.map { $0.map { String(format: "%.2f", $0) } ?? "-" }.description as NSString).utf8))
+            }
         }
         return Array(out.prefix(N))
     }

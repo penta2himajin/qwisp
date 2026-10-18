@@ -39,6 +39,8 @@ public struct AttentionLayer {
     /// decode 経路と完全同一(同 key 集合・同 mask モード)ゆえ batched verify = 逐次 decode が bit 一致。
     /// seqMultiToken と違い射影/conv/MoE を再実行しない軽量版（per-query は SDPA のみ）。
     nonisolated(unsafe) public static var perQueryNone: Bool = false
+    /// Fast-prefill (non-strict) opt-in: split L>qb causal prefill into query blocks (0 = off).
+    nonisolated(unsafe) public static var prefillQueryBlock: Int = 0
 
     public init(numHeads: Int, numKVHeads: Int, headDim: Int, ropeDim: Int, ropeBase: Float,
                 eps: Float, qProj: Proj, kProj: Proj, vProj: Proj, oProj: Proj,
@@ -138,7 +140,25 @@ public struct AttentionLayer {
             if AttentionLayer.f32SDPA {
                 q2 = queries.asType(.float32); k2 = allKeys.asType(.float32); v2 = allValues.asType(.float32)
             }
-            output = MLXFast.scaledDotProductAttention(queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
+            let qb = AttentionLayer.prefillQueryBlock
+            if qb > 0 && L > qb {
+                // Query-blocked causal prefill: block [r0, r1) attends keys [0, offset + r1), and the
+                // bottom-right-aligned .causal mask makes that exactly the full causal pattern. Bounds
+                // the unfused head_dim-256 score tensor to [heads, qb, S] instead of [heads, L, S].
+                var parts: [MLXArray] = []
+                var r0 = 0
+                while r0 < L {
+                    let r1 = Swift.min(r0 + qb, L)
+                    let kEnd = S - L + r1
+                    parts.append(MLXFast.scaledDotProductAttention(
+                        queries: q2[0..., 0..., r0 ..< r1], keys: k2[0..., 0..., 0 ..< kEnd],
+                        values: v2[0..., 0..., 0 ..< kEnd], scale: scale, mask: .causal))
+                    r0 = r1
+                }
+                output = MLX.concatenated(parts, axis: 2)
+            } else {
+                output = MLXFast.scaledDotProductAttention(queries: q2, keys: k2, values: v2, scale: scale, mask: maskMode)
+            }
             if AttentionLayer.f32SDPA { output = output.asType(inDtype) }
         }
         output = output.transposed(0, 2, 1, 3).reshaped([B, L, -1])   // [B,L,H*headDim]

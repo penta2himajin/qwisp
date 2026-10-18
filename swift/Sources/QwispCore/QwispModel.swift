@@ -18,8 +18,11 @@ public final class WeightStore {
     ///
     /// Filtered at load rather than at eval: keeping the MLXArray alive holds its mmap slice,
     /// so excluding it from eval alone would not have returned the bytes.
+    /// MTP-head tensors grafted into the main index (`language_model.mtp.…`) are dropped too: the
+    /// main forward never reads them, and the MTP loader reads its own file (≈0.5 GB not made resident).
     public static func isUsedByEngine(_ tensorName: String) -> Bool {
-        !(tensorName.hasPrefix("vision_tower") || tensorName.contains("visual"))
+        !(tensorName.hasPrefix("vision_tower") || tensorName.contains("visual")
+          || tensorName.hasPrefix("mtp.") || tensorName.contains(".mtp."))
     }
 
     public init(modelDir: String) throws {
@@ -42,7 +45,7 @@ public final class WeightStore {
         }
         if dropped > 0 {
             FileHandle.standardError.write(Data(
-                "[qwisp] skipped \(dropped) vision-encoder tensors (text-only engine)\n".utf8))
+                "[qwisp] skipped \(dropped) vision-encoder / MTP-head tensors (not read by the main forward)\n".utf8))
         }
     }
 

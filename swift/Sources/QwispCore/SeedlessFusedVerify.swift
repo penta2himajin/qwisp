@@ -3,6 +3,7 @@ import MLX
 import MLXFast
 import MLXRandom
 import Metal
+import QuartzCore
 
 /// D1 P2(path A): order-stable rows kernel を単一 command buffer + GPU 常駐中間 buffer で連結する
 /// 融合経路。per-op CB commit/wait/readback(composed 経路の律速)を除去し、fused アーキテクチャへ
@@ -160,6 +161,92 @@ public enum SeedlessFusedVerify {
     }
 
     nonisolated(unsafe) static var _routeRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _routeRowsSGPipeline: MTLComputePipelineState?
+    /// QWISP_ROUTE_SG=1: route_top8_rows as ONE simdgroup per row (N == 256). route_top8_rows runs
+    /// 256 threads through ~100 threadgroup barriers (max tree, sum tree, K argmax trees): 18 µs per
+    /// layer at M=1 on an M3 Pro for 512 bytes of input. Here lane l owns elements l + 32j; the first
+    /// three tree levels (s = 128, 64, 32) are evaluated in registers with exactly the original
+    /// pairings and the last five with simd_shuffle_down, so every float sum is grouped as before
+    /// and every argmax keeps the original "right replaces left only if strictly greater" order.
+    static let routeSG = Tell.envInt("QWISP_ROUTE_SG", 1) != 0
+    static func ensureRouteSG() -> Bool {
+        if _routeRowsSGPipeline != nil { return true }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Cand { float v; int i; };
+        inline Cand best(Cand a, Cand b) { return (b.v > a.v) ? b : a; }   // a = left (lower tree slot)
+        kernel void route_top8_rows_sg(device const half* logits [[buffer(0)]],
+                                       device int* inds [[buffer(1)]], device half* scores [[buffer(2)]],
+                                       constant uint& N [[buffer(3)]], constant uint& K [[buffer(4)]],
+                                       uint tgid [[threadgroup_position_in_grid]],
+                                       uint l [[thread_index_in_simdgroup]]) {
+            const device half* lgrow = logits + tgid * N;
+            device int* indrow = inds + tgid * K;
+            device half* scrow = scores + tgid * K;
+            float lg[8], e[8], g[8], w[8];
+            for (int j = 0; j < 8; j++) lg[j] = (float)lgrow[l + 32 * j];
+            // max tree: s=128 pairs (i, i+128), s=64 (i, i+64), s=32 (i, i+32), then 16..1
+            float a0 = max(lg[0], lg[4]), a1 = max(lg[1], lg[5]), a2 = max(lg[2], lg[6]), a3 = max(lg[3], lg[7]);
+            float c = max(max(a0, a2), max(a1, a3));
+            for (ushort s = 16; s > 0; s >>= 1) c = max(c, simd_shuffle_down(c, s));
+            float m = simd_broadcast(c, 0);
+            for (int j = 0; j < 8; j++) e[j] = precise::exp(lg[j] - m);
+            float b0 = (e[0] + e[4]) + (e[2] + e[6]);
+            float b1 = (e[1] + e[5]) + (e[3] + e[7]);
+            float t = b0 + b1;
+            for (ushort s = 16; s > 0; s >>= 1) t = t + simd_shuffle_down(t, s);
+            float Z = simd_broadcast(t, 0);
+            for (int j = 0; j < 8; j++) { g[j] = (float)(half)(e[j] / Z); w[j] = lg[j]; }
+            for (uint k = 0; k < K; k++) {
+                Cand A0 = best(Cand{w[0], int(l)}, Cand{w[4], int(l + 128)});
+                Cand A1 = best(Cand{w[1], int(l + 32)}, Cand{w[5], int(l + 160)});
+                Cand A2 = best(Cand{w[2], int(l + 64)}, Cand{w[6], int(l + 192)});
+                Cand A3 = best(Cand{w[3], int(l + 96)}, Cand{w[7], int(l + 224)});
+                Cand C = best(best(A0, A2), best(A1, A3));
+                for (ushort s = 16; s > 0; s >>= 1) {
+                    Cand o = Cand{simd_shuffle_down(C.v, s), simd_shuffle_down(C.i, s)};
+                    C = best(C, o);
+                }
+                int bi = simd_broadcast(C.i, 0);
+                float gv = simd_shuffle(g[bi / 32], ushort(bi % 32));
+                if (int(l) == bi % 32) w[bi / 32] = -INFINITY;
+                if (l == 0) { indrow[k] = bi; scrow[k] = (half)gv; }
+            }
+            if (l == 0) { half ss = (half)0; for (uint k = 0; k < K; k++) ss += scrow[k]; for (uint k = 0; k < K; k++) scrow[k] = scrow[k] / ss; }
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
+            _routeRowsSGPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "route_top8_rows_sg")!)
+        } catch { print("[raw-route-sg] compile: \\(error)"); return false }
+        return true
+    }
+    /// Test helper: same contract as routeTop8Rows, through the simdgroup kernel.
+    public static func routeTop8RowsSG(_ logits: MLXArray, M: Int, N: Int = 256, K: Int = 8) -> (MLXArray, MLXArray)? {
+        guard N == 256, ensureRouteSG(), let (device, queue) = SeedlessMetalForward.ensure(),
+              let bl = SeedlessMetalForward.mtlBuf(logits.asType(.float16), device) else { return nil }
+        let bInds = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bScores = device.makeBuffer(length: M * K * 2, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!; let enc = cb.makeComputeCommandEncoder()!
+        encodeRouteTop8RowsSG(enc, logits: bl, inds: bInds, scores: bScores, M: M, N: N, K: K)
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ip = bInds.contents().bindMemory(to: Int32.self, capacity: M * K)
+        let sp = bScores.contents().bindMemory(to: Float16.self, capacity: M * K)
+        return (MLXArray(Array(UnsafeBufferPointer(start: ip, count: M * K)), [M, K]),
+                MLXArray(Array(UnsafeBufferPointer(start: sp, count: M * K)), [M, K]))
+    }
+    static func encodeRouteTop8RowsSG(_ enc: MTLComputeCommandEncoder, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+                                      M: Int, N: Int, K: Int) {
+        enc.setComputePipelineState(_routeRowsSGPipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        var nn = UInt32(N), kk = UInt32(K)
+        enc.setBytes(&nn, length: 4, index: 3); enc.setBytes(&kk, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
     nonisolated(unsafe) static var _routeRowsBiasPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var _fmmRowsPipeline: MTLComputePipelineState?  // fmm_rows: out[M,N]=x[M,K]@W[N,K]^T (F16, M-invariant per-thread dot)
     nonisolated(unsafe) static var _mtpCopyRowPipeline: MTLComputePipelineState?   // mtp_copy_row_f16: extract row[rowOff..rowOff+H) → dst[0..H)
@@ -406,8 +493,22 @@ public enum SeedlessFusedVerify {
     /// commit + wait, then verify the buffer actually completed.
     /// Returns nil on success, or a fault description. A non-nil result means the caller
     /// MUST NOT read any output buffer of this command buffer.
-    static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String) -> String? {
+    /// Wait half of commitAndWaitChecked for a command buffer committed elsewhere.
+    static func waitChecked(_ cb: MTLCommandBuffer, _ label: String, spin: Bool = false) -> String? {
+        if spin { while cb.status != .completed && cb.status != .error { } }
+        cb.waitUntilCompleted()
+        guard !injectCBFailure, cb.status == .completed, cb.error == nil else {
+            return "\(label): status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
+        }
+        return nil
+    }
+    static func commitAndWaitChecked(_ cb: MTLCommandBuffer, _ label: String, spin: Bool = false) -> String? {
         cb.commit()
+        if spin {
+            // Busy-poll instead of sleeping in waitUntilCompleted: the wake-up after a ~140 ms
+            // chain CB was measured as idle GPU time between chain calls.
+            while cb.status != .completed && cb.status != .error { }
+        }
         cb.waitUntilCompleted()
         guard !injectCBFailure, cb.status == .completed, cb.error == nil else {
             return "\(label): status=\(cb.status.rawValue) error=\(String(describing: cb.error))"
@@ -1487,14 +1588,15 @@ public enum SeedlessFusedVerify {
     static func encodeQmm8Rows(_ enc: MTLComputeCommandEncoder,
                                w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                                x: MTLBuffer, out: MTLBuffer, M: Int, K: Int, N: Int) {
-        enc.setComputePipelineState(SeedlessMetalForward._qmm8Pipeline!)
+        let r1 = SeedlessMetalForward.qmm8R1 && SeedlessMetalForward._qmm8R1Pipeline != nil
+        enc.setComputePipelineState(r1 ? SeedlessMetalForward._qmm8R1Pipeline! : SeedlessMetalForward._qmm8Pipeline!)
         enc.setBuffer(w, offset: 0, index: 0); enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2); enc.setBuffer(x, offset: 0, index: 3)
         enc.setBuffer(out, offset: 0, index: 4)
         var kk = Int32(K), nn = Int32(N)
         enc.setBytes(&kk, length: 4, index: 5); enc.setBytes(&nn, length: 4, index: 6)
         SeedlessMetalForward.bindStop(enc, 16)
-        enc.dispatchThreadgroups(MTLSize(width: M, height: N / 8, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: M, height: N / (r1 ? 2 : 8), depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 1))
     }
 
@@ -1502,6 +1604,9 @@ public enum SeedlessFusedVerify {
     static func encodeRouteTop8Rows(_ enc: MTLComputeCommandEncoder,
                                     logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
                                     M: Int, N: Int, K: Int) {
+        if routeSG && N == 256 && ensureRouteSG() {
+            encodeRouteTop8RowsSG(enc, logits: logits, inds: inds, scores: scores, M: M, N: N, K: K); return
+        }
         enc.setComputePipelineState(_routeRowsPipeline!)
         enc.setBuffer(logits, offset: 0, index: 0); enc.setBuffer(inds, offset: 0, index: 1)
         enc.setBuffer(scores, offset: 0, index: 2)
@@ -1740,8 +1845,8 @@ public enum SeedlessFusedVerify {
     static func makeMoEScratch(_ device: MTLDevice, M: Int, E: Int, I: Int, Ktop: Int, H: Int) -> MoEScratch? {
         func buf(_ n: Int) -> MTLBuffer? { device.makeBuffer(length: n, options: .storageModeShared) }
         guard let gl = buf(M * E * 2), let inds = buf(M * Ktop * 4), let scores = buf(M * Ktop * 2),
-              let g = buf(M * Ktop * I * 2), let u = buf(M * Ktop * I * 2), let h = buf(M * Ktop * I * 2),
-              let d = buf(M * Ktop * H * 2), let y = buf(M * H * 2),
+              let g = buf(M * Ktop * I * 2), let u = buf(M * Ktop * I * 2), let h = buf((M * Ktop + 1) * I * 2),
+              let d = buf((M * Ktop + 1) * H * 2), let y = buf(M * H * 2),   // +1 slice: shared-in-routed
               let sg = buf(M * I * 2), let su = buf(M * I * 2), let shAct = buf(M * I * 2),
               let sharedY = buf(M * H * 2), let sgl = buf(M * 8 * 2) else { return nil }
         return MoEScratch(gl: gl, inds: inds, scores: scores, g: g, u: u, h: h, d: d, y: y,
@@ -1916,6 +2021,12 @@ public enum SeedlessFusedVerify {
                                                 glDst: d.glDst, glDstByteOffset: d.glOff,
                                                 Ktop: d.indsCount, E: d.glCount)
         }
+        if M == 1, slotTable == nil, w.swMix == nil, SeedlessFusedForward.fuseSharedInRouted,
+           SeedlessFusedForward.fuseGUActive(M: 1) ?? false, SeedlessFusedForward.fuseSHEXP,
+           ensureWave3Pipelines(), SeedlessMetalForward.compileSharedInRouted() {
+            encodeMoEGatherSharedM1(enc, x: x, out: out, w: w, sc: sc, Ktop: Ktop, I: I, H: H)
+            return
+        }
         encodeMoEGatherRowsRange(enc, x: x, w: w, sc: sc, r0: 0, r1: M, Ktop: Ktop, I: I, H: H, slotTable: slotTable)
         encodeMoESharedRows(enc, x: x, out: out, w: w, sc: sc, M: M, I: I, H: H, Ktop: Ktop)
     }
@@ -2038,6 +2149,17 @@ public enum SeedlessFusedVerify {
     /// (stride を maxLen 基準で渡す — 論理位置の値列は composed と同一なので bit 一致)。
     static func encodeSdpaRows(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
                                H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int) {
+        if SeedlessFusedForward.sdpaSplitParts > 1, M <= SeedlessMetalForward.sdpaSplitMaxM,
+           H <= SeedlessMetalForward.sdpaSplitMaxH, D == 256, SeedlessMetalForward.ensureSdpaSplit() {
+            // Bit-exact two-pass form (see SeedlessMetalForward.ensureSdpaSplit).
+            SeedlessMetalForward.encodeSdpaRowsSplit(enc, q: q, k: k, v: v, out: out, H: H, KV: KV,
+                                                     baseN: baseLenPlus1, M: M, scale: scale,
+                                                     kHeadStride: maxLen * D, kSeqStride: D,
+                                                     vHeadStride: maxLen * D, vSeqStride: D,
+                                                     parts: SeedlessFusedForward.sdpaSplitParts,
+                                                     headsPerSG: SeedlessFusedForward.sdpaHeadsPerSG)
+            return
+        }
         let p = SeedlessMetalForward._sdpaRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
@@ -2169,12 +2291,12 @@ public enum SeedlessFusedVerify {
     static func encodeSharedGateCombineRows(_ enc: MTLComputeCommandEncoder,
                                              sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
                                              x: MTLBuffer, y: MTLBuffer, sharedY: MTLBuffer,
-                                             out: MTLBuffer, K: Int, H: Int, M: Int) {
+                                             out: MTLBuffer, K: Int, H: Int, M: Int, sharedYOffset: Int = 0) {
         let p = _sharedGateCombineRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(sgW,    offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
         enc.setBuffer(sgB,    offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
-        enc.setBuffer(y,      offset: 0, index: 4); enc.setBuffer(sharedY, offset: 0, index: 5)
+        enc.setBuffer(y,      offset: 0, index: 4); enc.setBuffer(sharedY, offset: sharedYOffset, index: 5)
         enc.setBuffer(out,    offset: 0, index: 6)
         var kk = Int32(K), hh = Int32(H)
         enc.setBytes(&kk, length: 4, index: 7); enc.setBytes(&hh, length: 4, index: 8)
@@ -2192,13 +2314,13 @@ public enum SeedlessFusedVerify {
                                                  sgW: MTLBuffer, sgS: MTLBuffer, sgB: MTLBuffer,
                                                  x: MTLBuffer, d: MTLBuffer, scores: MTLBuffer,
                                                  sharedY: MTLBuffer, out: MTLBuffer,
-                                                 K: Int, H: Int, M: Int, Ktop: Int) {
+                                                 K: Int, H: Int, M: Int, Ktop: Int, sharedYOffset: Int = 0) {
         let p = _sharedGateCombineRowsFoldPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(sgW,     offset: 0, index: 0); enc.setBuffer(sgS,     offset: 0, index: 1)
         enc.setBuffer(sgB,     offset: 0, index: 2); enc.setBuffer(x,       offset: 0, index: 3)
         enc.setBuffer(d,       offset: 0, index: 4); enc.setBuffer(scores,  offset: 0, index: 5)
-        enc.setBuffer(sharedY, offset: 0, index: 6); enc.setBuffer(out,     offset: 0, index: 7)
+        enc.setBuffer(sharedY, offset: sharedYOffset, index: 6); enc.setBuffer(out,     offset: 0, index: 7)
         var kk = Int32(K), hh = Int32(H), kt = Int32(Ktop)
         enc.setBytes(&kk, length: 4, index: 8); enc.setBytes(&hh, length: 4, index: 9)
         enc.setBytes(&kt, length: 4, index: 10)
@@ -3133,8 +3255,19 @@ public enum SeedlessFusedVerify {
         let device: MTLDevice, queue: MTLCommandQueue
         /// zero-copy buffer の裏 MLXArray 保持(asType 変換の一時 array を allocator 再利用から守る)
         public var retainedArrays: [MLXArray] = []
+        /// Spec replay (SpecReplay.swift): per-GDN-layer recurrence-input tapes of the last verify,
+        /// and how many rows of it are valid (0 = none; any non-taped forward clears it).
+        var gdnTapes: [ObjectIdentifier: SeedlessFusedVerify.GdnTape] = [:]
+        var tapeRows = 0
+        var lastReplayCB: MTLCommandBuffer? = nil
         /// profile: 直近 step の全 CB GPU-exec 合計 ms。
         nonisolated(unsafe) public static var profLastGPUMs = 0.0
+        nonisolated(unsafe) public static var profLastEncodeMs = 0.0
+        nonisolated(unsafe) public static var profLastSubmitMs = 0.0
+        nonisolated(unsafe) public static var profLastWakeMs = 0.0
+        nonisolated(unsafe) public static var profLastAheadMs = 0.0
+        nonisolated(unsafe) public static var profLastWaitMs = 0.0
+        nonisolated(unsafe) public static var profLastWholeMs = 0.0
         /// lm_head を qmm4(qmv, 高 occupancy)にする(QWISP_LMHEAD_QMV=1)。M=1 decode 高速化。M 不変維持。
         nonisolated(unsafe) public static var lmHeadQmv =
             ProcessInfo.processInfo.environment["QWISP_LMHEAD_QMV"] != "0"   // 既定 ON(全M で速い無条件改善)
@@ -3148,6 +3281,30 @@ public enum SeedlessFusedVerify {
         /// flag-off で encodeGdnLayerRows は既存経路のままで byte 不変(G3 gate)。
         nonisolated(unsafe) public static var fuseGDN =
             ProcessInfo.processInfo.environment["QWISP_FUSE_GDN"] != "0"
+
+        /// QWISP_PREFILL_PROF=1: measurement-only wall-clock split of forwardRowsHybrid per stage
+        /// (stderr, one line per call). Adds one CB boundary per layer so the MoE tail gets its own
+        /// bucket; kernels, encode order and numerics are unchanged.
+        static let prefillProf = ProcessInfo.processInfo.environment["QWISP_PREFILL_PROF"] == "1"
+        /// QWISP_STEEL_R (experiment): rows per steel-CSR MoE tile, default 16. MLX picks the
+        /// matrix-unit gather_qmm only when tile rows >= get_qmv_batch_limit (14 on M1/M2 base/Pro,
+        /// 18 on M3+ non-'d' for these shapes) — at 16 the M3 Pro silently takes gather_qmv.
+        static let steelTileR = Swift.max(1, Tell.envInt("QWISP_STEEL_R", 16))
+        static let steelPad = Swift.max(1, Tell.envInt("QWISP_STEEL_PAD", 32))
+        static let chainSpinWait = Tell.envInt("QWISP_CHAIN_SPIN", 0) != 0
+        static let chainAhead = Tell.envInt("QWISP_CHAIN_AHEAD", 1) != 0
+        /// QWISP_SDPA_SPLIT_PARTS: decode/verify attention as the bit-exact two-pass sdpa_rows
+        /// split over this many threadgroups per (head, row); 1 = original single-pass kernel.
+        static let sdpaSplitParts: Int = {
+            let p = Tell.envInt("QWISP_SDPA_SPLIT_PARTS", 8)
+            return [1, 2, 4, 8, 16, 32].contains(p) ? p : 1
+        }()
+        /// QWISP_SDPA_HEADS_PER_SG: query heads per simdgroup in the split kernel (K/V loaded once
+        /// and reused across them; per-head arithmetic unchanged → still byte-identical).
+        static let sdpaHeadsPerSG: Int = {
+            let g = Tell.envInt("QWISP_SDPA_HEADS_PER_SG", 2)
+            return [1, 2, 4, 8].contains(g) ? g : 1
+        }()
 
         /// 層跨ぎ融合(#144): 層 i 末尾の resid_add と層 i+1 先頭の input rmsnorm を、既にこの
         /// ファイルが持つ gdn_resid_postnorm_rows(h += r; out = rmsnorm(h, w))の 1 dispatch に
@@ -3207,6 +3364,12 @@ public enum SeedlessFusedVerify {
         /// stage-1 recon の +3-4% は fuseSHEXP proxy の過大評価(proxy は compute も畳んでいた)。QWISP_FUSE_MOE2=1 で有効。
         nonisolated(unsafe) public static var fuseMOE2Enabled =
             ProcessInfo.processInfo.environment["QWISP_FUSE_MOE2"] == "1"
+
+        /// Shared expert folded into the routed g/u and down dispatches as slice Ktop (M == 1,
+        /// resident). Bit-exact with the separate shared path; see SharedInRoutedMoE.swift.
+        /// QWISP_SHARED_IN_ROUTED=1 to enable.
+        nonisolated(unsafe) public static var fuseSharedInRouted =
+            ProcessInfo.processInfo.environment["QWISP_SHARED_IN_ROUTED"] == "1"
 
         /// Phase II-a chain default length (QWISP_CHAIN_K unset). Single production seam
         /// for the chained GPU token-feedback decode default. Tell resolves the
@@ -3528,6 +3691,7 @@ public enum SeedlessFusedVerify {
                                                   M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                   headKDim: headKDim, headVDim: headVDim,
                                                   convKernel: convKernel, eps: eps)
+                if Self.specReplay { tapeGdnLayer(enc, cache: gc, M: M) }
                 gc.swapState()
             } else if let aw = L.attn, let kv = L.kvCache {
                 SeedlessFusedVerify.encodeAttnLayerRows(enc, x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
@@ -3639,6 +3803,7 @@ public enum SeedlessFusedVerify {
         /// 全層 forward。x[M,H] → h[M,H]。cache は常駐更新(次 call にチェーン)。
         /// finalNormW を渡すと最終 rmsNorm も同梱し normed [M,H] を返す。
         public func forwardRows(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
+            cancelPendingChain()
             guard !gpuFault.isPoisoned else { return nil }
             guard M <= maxM else { return nil }
             // hBuf upload(resident/bolt/strict 共通)
@@ -3830,6 +3995,7 @@ public enum SeedlessFusedVerify {
         /// 1-CB decode/verify step: token ids → 行毎 greedy argmax token ids。
         /// CB 1 本(resident/bolt)または multi-CB(strict)。readback は int32 [M] のみ(MLX op ゼロ)。
         public func stepArgmax(_ tokens: [Int32]) -> [Int]? {
+            cancelPendingChain()
             guard !gpuFault.isPoisoned else { return nil }
             guard let hd = head, tokens.count <= maxM else { return nil }
             let M = tokens.count
@@ -3954,6 +4120,7 @@ public enum SeedlessFusedVerify {
         public func stepSampleRows(_ tokens: [Int32], drafts: [Int], invT: Float, seed: UInt64, basePos: Int,
                                    logitAdj: [Float]? = nil, topP: Float = 1.0)
             -> (full: [Int], resid: [Int], accept: [Bool])? {
+            cancelPendingChain()
             guard let hd = head, tokens.count <= maxM else { return nil }
             guard SamplerGPU.ensurePipeline(device), let samp = SamplerGPU._pipeline else { return nil }
             let M = tokens.count
@@ -4037,9 +4204,13 @@ public enum SeedlessFusedVerify {
         /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。
         /// KV は len の巻き戻し、GDN state/conv hist は ping-pong の swap 戻し(裏面に pre-step 値)。
         public struct Snapshot { let kvLens: [Int] }
-        public func snapshot() -> Snapshot { Snapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }) }
+        /// Read-only: with a chain-ahead pending, report the lengths from before its encode (the
+        /// pending chain is either committed next — snapshot then unused — or cancelled at the
+        /// entry of the step that uses this snapshot, restoring exactly these lengths).
+        public func snapshot() -> Snapshot { Snapshot(kvLens: pendingChain?.kvLensBefore ?? layers.map { $0.kvCache?.len ?? 0 }) }
         /// snapshot 以降に forwardRows をちょうど 1 回だけ呼んだ状態から巻き戻す(2 回以上は不可)。
         public func rollbackOneStep(_ s: Snapshot) {
+            cancelPendingChain()
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = s.kvLens[i] }
                 if let gc = L.gdnCache { gc.swapState() }
@@ -4052,6 +4223,7 @@ public enum SeedlessFusedVerify {
         /// over on restore); GDN's ping-pong holds only 1 step, so its state is deep-copied.
         public struct FullSnapshot { let kvLens: [Int]; let gdn: [(conv: MLXArray, rec: MLXArray)?] }
         public func fullSnapshot() -> FullSnapshot {
+            cancelPendingChain()
             let gdn = layers.map { L -> (conv: MLXArray, rec: MLXArray)? in
                 guard let gc = L.gdnCache else { return nil }
                 let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r)
@@ -4059,6 +4231,7 @@ public enum SeedlessFusedVerify {
             return FullSnapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }, gdn: gdn)
         }
         public func fullRestore(_ s: FullSnapshot) {
+            cancelPendingChain()
             for (i, L) in layers.enumerated() {
                 if let kv = L.kvCache { kv.len = s.kvLens[i] }
                 if let gc = L.gdnCache, let g = s.gdn[i] {
@@ -4082,6 +4255,7 @@ public enum SeedlessFusedVerify {
         static let persistFormat: UInt32 = 1
 
         public func persistentStateData() -> Data {
+            cancelPendingChain()
             var d = Data()
             func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
             u32(Self.persistMagic); u32(Self.persistFormat); u32(UInt32(layers.count))
@@ -4112,6 +4286,7 @@ public enum SeedlessFusedVerify {
         /// the caller must then fall back to a cold prefill and MUST NOT trust partial state
         /// (shapes are validated per layer, but earlier layers may already be written).
         public func restorePersistentState(_ d: Data) -> Bool {
+            cancelPendingChain()
             var off = 0
             func u32() -> UInt32? {
                 guard d.count >= off + 4 else { return nil }
@@ -4172,8 +4347,9 @@ public enum SeedlessFusedVerify {
         // (2.24x @T=1024 vs per-pair qmv). Reads sc.inds (route must be flushed), writes sc.d in mk
         // order; scores/shared/combine stay raw. Deterministic + tile-composition-invariant.
         private func steelMoEGather(M: Int, E: Int, Ktop: Int,
-                                    mw: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray))) {
-            let R = 16
+                                    mw: (g: (MLXArray, MLXArray, MLXArray), u: (MLXArray, MLXArray, MLXArray), d: (MLXArray, MLXArray, MLXArray)),
+                                    onMark: ((String) -> Void)? = nil) {
+            let R = SeedlessFusedForward.steelTileR
             let ip = moeSc.inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
             var byE = [[Int32]](repeating: [], count: E)
             for mk in 0 ..< (M * Ktop) { byE[Int(ip[mk])].append(Int32(mk)) }
@@ -4195,9 +4371,11 @@ public enum SeedlessFusedVerify {
                 }
             }
             let Gt = tileE.count
+            onMark?("moe.tileCPU")
             let xa = bufToArr(postNorm, M, H)
             let xg = MLX.take(xa, MLXArray(rowSrc), axis: 0).reshaped([Gt, R, H])
             let te = MLXArray(tileE)
+            if onMark != nil { MLX.eval([xg, te]); onMark?("moe.xin") }
             func gq(_ x: MLXArray, _ w: (MLXArray, MLXArray, MLXArray)) -> MLXArray {
                 MLX.gatherQuantizedMatmul(x, w.0, scales: w.1, biases: w.2, rhsIndices: te,
                                           transpose: true, groupSize: 64, bits: 4, mode: .affine,
@@ -4207,19 +4385,26 @@ public enum SeedlessFusedVerify {
             let h = g * MLX.sigmoid(g) * u
             let d = gq(h, mw.d)
             let dm = MLX.take(d.reshaped([Gt * R, H]), MLXArray(invIdx), axis: 0)
+            if onMark != nil { MLX.eval([dm]); onMark?("moe.mlx") }
             arrToBuf(dm, moeSc.d, M * Ktop * H)
+            onMark?("moe.out")
         }
 
         // Steel qmm with M pinned into the steel kernel class (M>=14) by zero-padding — per-element
         // M-invariance and padding bit-identity are proven (mlx-qmm-minv) → split-invariant prefill.
         private func steelQmm(_ x: MLXArray, _ w: (MLXArray, MLXArray, MLXArray), M: Int) -> MLXArray {
+            // QWISP_STEEL_PAD (default 32, was 14): rows to zero-pad up to. MLX takes its matrix-unit qmm only
+            // at M >= get_qmv_batch_limit — 14 on M1/M2 base/Pro but 18 on M3+ non-'d' (issue #186),
+            // so with 14 a small chunk on an M3 silently runs qmv and diverges from the same rows
+            // computed inside a large chunk.
+            let pad = SeedlessFusedForward.steelPad
             var xi = x
-            if M < 14 {
-                xi = MLX.concatenated([x, MLXArray.zeros([14 - M, x.dim(1)]).asType(.float16)], axis: 0)
+            if M < pad {
+                xi = MLX.concatenated([x, MLXArray.zeros([pad - M, x.dim(1)]).asType(.float16)], axis: 0)
             }
             let y = MLX.quantizedMatmul(xi, w.0, scales: w.1, biases: w.2,
                                         transpose: true, groupSize: 64, bits: 4)
-            return M < 14 ? y[0 ..< M] : y
+            return M < pad ? y[0 ..< M] : y
         }
         private func bufToArr(_ b: MTLBuffer, _ rows: Int, _ cols: Int) -> MLXArray {
             let p = b.contents().bindMemory(to: Float16.self, capacity: rows * cols)
@@ -4233,6 +4418,7 @@ public enum SeedlessFusedVerify {
                let src = v.asMTLBuffer(device: device, noCopy: true) {
                 memcpy(b.contents(), src.contents(), count * 2)
             } else {
+                if SeedlessFusedForward.prefillProf { FileHandle.standardError.write(Data("[prefill-prof] arrToBuf fallback copy\n".utf8)) }
                 let arr = v.reshaped([-1]).asArray(Float16.self)
                 b.contents().bindMemory(to: Float16.self, capacity: count).update(from: arr, count: count)
             }
@@ -4245,12 +4431,23 @@ public enum SeedlessFusedVerify {
         /// new canonical prefill config (refs re-canonicalization gated). Deterministic and
         /// chunk/split-invariant by construction. Resident mode only; else falls back.
         public func forwardRowsHybrid(_ x: MLXArray, M: Int, finalNormW: MTLBuffer? = nil) -> MLXArray? {
+            cancelPendingChain()
             guard M <= maxM else { return nil }
             if hybridGdnW.isEmpty { return forwardRows(x, M: M, finalNormW: finalNormW) }
             if case .resident = streamMode {} else { return forwardRows(x, M: M, finalNormW: finalNormW) }
+            let prof = SeedlessFusedForward.prefillProf
+            var profT = DispatchTime.now().uptimeNanoseconds
+            var profMs: [String: Double] = [:]
+            func mark(_ k: String) {
+                guard prof else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                profMs[k, default: 0] += Double(now - profT) / 1e6
+                profT = now
+            }
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
             hBuf.contents().bindMemory(to: Float16.self, capacity: maxM * H).update(from: arr, count: M * H)
+            mark("in")
 
             var curCB: MTLCommandBuffer? = nil
             var curEnc: MTLComputeCommandEncoder? = nil
@@ -4270,18 +4467,22 @@ public enum SeedlessFusedVerify {
                 if L.isLinear, let gw = L.gdn, let gc = L.gdnCache, let hw = hybridGdnW[li] {
                     SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
                     flush()
+                    mark("gdn.norm")
                     let xa = bufToArr(normed, M, H)
                     let yQkv = steelQmm(xa, hw.qkv, M: M), yZ = steelQmm(xa, hw.z, M: M)
                     MLX.eval([yQkv, yZ])
                     arrToBuf(yQkv, gdnSc.qkv, M * convDim)
                     arrToBuf(yZ, gdnSc.z, M * valueDim)
+                    mark("gdn.steelIn")
                     SeedlessFusedVerify.encodeGdnLayerRows(enc(), x: normed, out: mixerOut, w: gw, sc: gdnSc, cache: gc,
                                                       M: M, H: H, numKHeads: numKHeads, numVHeads: numVHeads,
                                                       headKDim: headKDim, headVDim: headVDim,
                                                       convKernel: convKernel, eps: eps, hybridDense: true)
                     gc.swapState()
                     flush()
+                    mark("gdn.raw")
                     arrToBuf(steelQmm(bufToArr(gdnSc.outV, M, valueDim), hw.out, M: M), mixerOut, M * H)
+                    mark("gdn.steelOut")
                     if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
                         SeedlessFusedVerify.encodeGdnResidPostNormRows(enc(), h: hBuf, r: mixerOut,
                                                                   w: L.postLN, postNorm: postNorm, M: M, H: H, eps: eps)
@@ -4292,19 +4493,23 @@ public enum SeedlessFusedVerify {
                 } else if !L.isLinear, let aw = L.attn, let kv = L.kvCache, let hwA = hybridAttnW[li] {
                     SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: L.inputLN, out: normed, rows: M, D: H, eps: eps)
                     flush()
+                    mark("attn.norm")
                     let xa = bufToArr(normed, M, H)
                     let yQ = steelQmm(xa, hwA.q, M: M), yK = steelQmm(xa, hwA.k, M: M), yV = steelQmm(xa, hwA.v, M: M)
                     MLX.eval([yQ, yK, yV])
                     arrToBuf(yQ, attnSc.qOut, M * numHeads * headDim * 2)
                     arrToBuf(yK, attnSc.kOut, M * numKV * headDim)
                     arrToBuf(yV, attnSc.vOut, M * numKV * headDim)
+                    mark("attn.steelIn")
                     SeedlessFusedVerify.encodeAttnLayerRows(enc(), x: normed, out: mixerOut, w: aw, sc: attnSc, kv: kv,
                                                        M: M, H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
                                                        ropeDim: ropeDim, ropeBase: ropeBase, eps: eps, hybridDense: true,
                                                        useMmaPrefill: ProcessInfo.processInfo.environment["QWISP_ATTN_MMA_PREFILL"] == "1")
                     kv.len += M
                     flush()
+                    mark("attn.raw")
                     arrToBuf(steelQmm(bufToArr(attnSc.gated, M, numHeads * headDim), hwA.o, M: M), mixerOut, M * H)
+                    mark("attn.steelOut")
                     if SeedlessFusedForward.fuseGDN, SeedlessFusedVerify._gdnResidPostNormRowsPipeline != nil {
                         SeedlessFusedVerify.encodeGdnResidPostNormRows(enc(), h: hBuf, r: mixerOut,
                                                                   w: L.postLN, postNorm: postNorm, M: M, H: H, eps: eps)
@@ -4320,7 +4525,8 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoERouteRows(enc(), x: postNorm, w: L.moe, sc: moeSc,
                                                       M: M, E: L.E, H: H, Ktop: L.Ktop)
                     flush()
-                    steelMoEGather(M: M, E: L.E, Ktop: L.Ktop, mw: mw)
+                    mark("moe.route")
+                    steelMoEGather(M: M, E: L.E, Ktop: L.Ktop, mw: mw, onMark: prof ? { mark($0) } : nil)
                     // combine (sc.d × scores → sc.y) lives inside encodeMoEGatherRowsRange in the raw
                     // path, which the hybrid skips — encode it here or sharedRows reads stale sc.y.
                     SeedlessFusedVerify.encodeCombineRows(enc(), d: moeSc.d, scores: moeSc.scores, y: moeSc.y,
@@ -4329,6 +4535,7 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoESharedRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                        M: M, I: L.I, H: H, Ktop: L.Ktop)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
+                    if prof { flush(); mark("moe.tail") }
                 } else {
                     SeedlessFusedVerify.encodeMoEBlockRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                       M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
@@ -4341,7 +4548,16 @@ public enum SeedlessFusedVerify {
             flush()
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
-            return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+            let out = MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])
+            if prof {
+                mark("out")
+                let total = profMs.values.reduce(0, +)
+                let parts = profMs.sorted { $0.value > $1.value }
+                    .map { String(format: "%@ %.0f", $0.key, $0.value) }.joined(separator: " | ")
+                FileHandle.standardError.write(Data(String(format: "[prefill-prof] M=%d total %.0fms (%.0f tok/s) | %@\n",
+                                                           M, total, Double(M) * 1000 / total, parts).utf8))
+            }
+            return out
         }
 
         /// Measurement-only prefill profiler: resident forward with per-stage CB splits, bucketing
@@ -4350,6 +4566,7 @@ public enum SeedlessFusedVerify {
         /// exactly the same and the token math is unchanged. Adds ~2 sync/layer of CPU overhead,
         /// which inflates wall time but NOT the per-CB gpu times being reported.
         public func forwardRowsProfiled(_ x: MLXArray, M: Int) -> (gdn: Double, attn: Double, moe: Double)? {
+            cancelPendingChain()
             guard M <= maxM else { return nil }
             let xf = x.asType(.float16).reshaped([-1]); xf.eval()
             let arr = xf.asArray(Float16.self)
@@ -4379,6 +4596,7 @@ public enum SeedlessFusedVerify {
 
         /// テスト比較用: 層 i の cache を MLX で読む(gdn: (conv, rec) / attn: (k, v))。
         public func readLayerCache(_ i: Int) -> (MLXArray?, MLXArray?) {
+            cancelPendingChain()
             let L = layers[i]
             if let gc = L.gdnCache { let (c, r) = SeedlessFusedVerify.readGdnCache(gc); return (c, r) }
             if let kv = L.kvCache { let (k, v) = SeedlessFusedVerify.readKVCache(kv); return (k, v) }
@@ -4410,14 +4628,87 @@ public enum SeedlessFusedVerify {
         ///
         /// STUB — implementation pending.
         /// NOTE: Delegation to forwardRows or stepArgmax in this stub is FORBIDDEN per §4-G1.
-        public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
-            guard !gpuFault.isPoisoned else { return nil }
-            guard let hd = head, K > 0 else { return nil }
-            guard streamMode == .resident || streamMode == .bolt else { return nil }
+        /// Chain-ahead (QWISP_CHAIN_AHEAD=1): while chain n runs on the GPU, chain n+1 is already
+        /// ENCODED (seeded GPU-side from chain n's last token) but NOT committed. If the spec loop's
+        /// next action is again a chain from that same token it is committed at once, removing the
+        /// CPU encode from the GPU's idle gap; otherwise it is dropped without ever reaching the GPU
+        /// and only the encode-time bookkeeping (kv.len, GDN ping-pong parity) is undone. Every
+        /// other entry point that touches cache state cancels it first. Byte-identical stream.
+        final class PendingChain {
+            let cb: MTLCommandBuffer, chainBuf: MTLBuffer, K: Int
+            let seedBuf: MTLBuffer, seedIndex: Int, kvLensBefore: [Int]
+            init(cb: MTLCommandBuffer, chainBuf: MTLBuffer, K: Int, seedBuf: MTLBuffer, seedIndex: Int, kvLensBefore: [Int]) {
+                self.cb = cb; self.chainBuf = chainBuf; self.K = K
+                self.seedBuf = seedBuf; self.seedIndex = seedIndex; self.kvLensBefore = kvLensBefore
+            }
+            var seedValue: Int32 { seedBuf.contents().bindMemory(to: Int32.self, capacity: seedIndex + 1)[seedIndex] }
+        }
+        var pendingChain: PendingChain?
+        /// MTP feed on chained spans: when set, each chain step's final-normed row is copied into a
+        /// per-chain [K, H] buffer (keyed by that chain's token buffer) and the buffer of the chain
+        /// whose tokens were just returned is exposed as lastChainNormed.
+        public var keepChainNormed = false
+        var chainNormedFor: [ObjectIdentifier: MTLBuffer] = [:]
+        public private(set) var lastChainNormed: MTLBuffer?
 
-            // Write seed token for step 0 (CPU → shared buffer; GPU reads it inside the CB).
-            hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM)[0] = firstToken
+        /// Per-forward residency set for the buffers that are NOT process-wide weights (KV arena,
+        /// GDN state, scratch, fused-weight concats): weights are in the shared set
+        /// (SeedlessMetalForward.registerPersistentWeights). Removed from the queue on deinit, so a
+        /// rebuilt forward never stacks a second copy of anything large.
+        private var residencyApplied = false
+        private var residencySetHold: AnyObject?
+        func applyResidencySetOnce() {
+            guard !residencyApplied, SeedlessMetalForward.weightResidencySet != nil else { return }
+            residencyApplied = true
+            let shared = Set(SeedlessMetalForward.weightWrappers.values.map { ObjectIdentifier($0) })
+            var seen = Set<ObjectIdentifier>(), bufs: [MTLBuffer] = []
+            var visited = Set<ObjectIdentifier>()
+            func walk(_ v: Any, depth: Int) {
+                guard depth < 12 else { return }
+                if let b = v as? MTLBuffer {
+                    let id = ObjectIdentifier(b)
+                    if !shared.contains(id), seen.insert(id).inserted { bufs.append(b) }
+                    return
+                }
+                let m = Mirror(reflecting: v)
+                if m.displayStyle == .class, !visited.insert(ObjectIdentifier(v as AnyObject)).inserted { return }
+                for c in m.children { walk(c.value, depth: depth + 1) }
+            }
+            walk(self, depth: 0)
+            guard #available(macOS 15.0, *), !bufs.isEmpty else { return }
+            let desc = MTLResidencySetDescriptor()
+            desc.initialCapacity = bufs.count
+            guard let rs = try? device.makeResidencySet(descriptor: desc) else { return }
+            for b in bufs { rs.addAllocation(b) }
+            rs.commit()
+            rs.requestResidency()
+            queue.addResidencySet(rs)
+            residencySetHold = rs
+            let bytes = bufs.reduce(0) { $0 + $1.length }
+            FileHandle.standardError.write(Data(String(format: "[qwisp] forward residency set: %d buffers, %.2f GB\n",
+                                                       bufs.count, Double(bytes) / 1073741824).utf8))
+        }
+        deinit {
+            if #available(macOS 15.0, *), let rs = residencySetHold as? MTLResidencySet {
+                queue.removeResidencySet(rs)
+                rs.endResidency()
+            }
+        }
 
+        /// Drop an encoded-but-uncommitted chain and undo its encode-time cache bookkeeping.
+        public func cancelPendingChain() {
+            guard let p = pendingChain else { return }
+            pendingChain = nil
+            chainNormedFor.removeValue(forKey: ObjectIdentifier(p.chainBuf))
+            for (i, L) in layers.enumerated() {
+                if let kv = L.kvCache { kv.len = p.kvLensBefore[i] }
+                if let gc = L.gdnCache, p.K % 2 == 1 { gc.swapState() }
+            }
+        }
+
+        /// Encode K chained greedy steps into a new (uncommitted) command buffer. Step 0 embeds the
+        /// token at seed[seedOffset]. Advances kv.len / GDN ping-pong at encode time (encodeLayer).
+        private func encodeChain(seed: MTLBuffer, seedOffset: Int, K: Int, hd: HeadBufs) -> (MTLCommandBuffer, MTLBuffer)? {
             // Per-call chain output buffer (avoids the maxM size limit on hd.tokensOut —
             // the test uses maxM=4 with K=8, so hd.tokensOut cannot hold K int32s).
             guard let chainBuf = device.makeBuffer(
@@ -4429,6 +4720,11 @@ public enum SeedlessFusedVerify {
 
             let ep = SeedlessFusedVerify._embedRowsPipeline!
             let ap = SeedlessFusedVerify._argmaxRowsPipeline!
+            var normedCopy: MTLBuffer? = nil
+            if keepChainNormed, SeedlessMetalForward.compileVecCopy(),
+               let nb = device.makeBuffer(length: K * H * 2, options: .storageModeShared) {
+                normedCopy = nb; chainNormedFor[ObjectIdentifier(chainBuf)] = nb
+            }
 
             for k in 0 ..< K {
                 // ── Embed 1 token ──────────────────────────────────────────────────
@@ -4439,7 +4735,7 @@ public enum SeedlessFusedVerify {
                 enc.setBuffer(hd.embedS, offset: 0, index: 1)
                 enc.setBuffer(hd.embedB, offset: 0, index: 2)
                 if k == 0 {
-                    enc.setBuffer(hd.tokensIn, offset: 0, index: 3)
+                    enc.setBuffer(seed, offset: seedOffset, index: 3)
                 } else {
                     enc.setBuffer(chainBuf, offset: (k - 1) * MemoryLayout<Int32>.stride, index: 3)
                 }
@@ -4469,6 +4765,14 @@ public enum SeedlessFusedVerify {
                 // ── Final ops: fnorm + lm_head + argmax → chainBuf[k] ─────────────
                 SeedlessFusedVerify.encodeRmsNormRows(enc, x: hBuf, w: hd.fnW, out: normed,
                                                  rows: 1, D: H, eps: eps)
+                if let nb = normedCopy {
+                    let cp = SeedlessMetalForward._vecCopyPipeline!
+                    enc.setComputePipelineState(cp)
+                    enc.setBuffer(nb, offset: k * H * 2, index: 0); enc.setBuffer(normed, offset: 0, index: 1)
+                    var nn = UInt32(H); enc.setBytes(&nn, length: 4, index: 2)
+                    enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: Swift.min(cp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+                }
                 if SeedlessFusedForward.lmHeadQmv {
                     SeedlessFusedVerify.encodeQmmRows(enc, w: hd.lmW, scales: hd.lmS, biases: hd.lmB,
                                                  x: normed, out: hd.logits, M: 1, K: H, N: hd.vocab)
@@ -4494,10 +4798,51 @@ public enum SeedlessFusedVerify {
 
             if diagRouteBufs != nil { diagChainSlot = 0 }   // notes/13: slot reset(非 chain=slot 0)
             enc.endEncoding()
-            if let f = SeedlessFusedVerify.commitAndWaitChecked(cb, "chainedStepArgmax(K=\(K))") {
-                gpuFault.record(f); return nil
+            return (cb, chainBuf)
+        }
+
+        public func chainedStepArgmax(_ firstToken: Int32, K: Int) -> [Int]? {
+            let tWhole0 = DispatchTime.now().uptimeNanoseconds
+            defer { SeedlessFusedForward.profLastWholeMs = Double(DispatchTime.now().uptimeNanoseconds - tWhole0) / 1e6 }
+            guard !gpuFault.isPoisoned else { cancelPendingChain(); return nil }
+            guard let hd = head, K > 0 else { return nil }
+            guard streamMode == .resident || streamMode == .bolt else { return nil }
+            applyResidencySetOnce()
+            let ahead = SeedlessFusedForward.chainAhead && streamMode == .resident
+                && diagRouteBufs == nil && !SeedlessFusedVerify.logitDbg
+
+            let tEnc0 = DispatchTime.now().uptimeNanoseconds
+            let cb: MTLCommandBuffer, chainBuf: MTLBuffer
+            if let p = pendingChain, p.K == K, p.seedValue == firstToken {
+                pendingChain = nil
+                cb = p.cb; chainBuf = p.chainBuf
+            } else {
+                cancelPendingChain()
+                // Write seed token for step 0 (CPU → shared buffer; GPU reads it inside the CB).
+                hd.tokensIn.contents().bindMemory(to: Int32.self, capacity: maxM)[0] = firstToken
+                guard let r = encodeChain(seed: hd.tokensIn, seedOffset: 0, K: K, hd: hd) else { return nil }
+                (cb, chainBuf) = r
+            }
+            SeedlessFusedForward.profLastEncodeMs = Double(DispatchTime.now().uptimeNanoseconds - tEnc0) / 1e6
+            let tCommit = CACurrentMediaTime()
+            cb.commit()
+            let tAhead0 = DispatchTime.now().uptimeNanoseconds
+            if ahead {
+                let before = layers.map { $0.kvCache?.len ?? 0 }
+                if let r = encodeChain(seed: chainBuf, seedOffset: (K - 1) * MemoryLayout<Int32>.stride, K: K, hd: hd) {
+                    pendingChain = PendingChain(cb: r.0, chainBuf: r.1, K: K, seedBuf: chainBuf,
+                                                seedIndex: K - 1, kvLensBefore: before)
+                }
+            }
+            SeedlessFusedForward.profLastAheadMs = Double(DispatchTime.now().uptimeNanoseconds - tAhead0) / 1e6
+            let tWait0 = DispatchTime.now().uptimeNanoseconds
+            if let f = SeedlessFusedVerify.waitChecked(cb, "chainedStepArgmax(K=\(K))", spin: SeedlessFusedForward.chainSpinWait) {
+                cancelPendingChain(); gpuFault.record(f); return nil
             }
             SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+            SeedlessFusedForward.profLastSubmitMs = (cb.gpuStartTime - tCommit) * 1000.0
+            SeedlessFusedForward.profLastWakeMs = (CACurrentMediaTime() - cb.gpuEndTime) * 1000.0
+            SeedlessFusedForward.profLastWaitMs = Double(DispatchTime.now().uptimeNanoseconds - tWait0) / 1e6
 
             // QWISP_LOGIT_DBG: hd.logits holds the LAST chain step's row (reused per k) — enough
             // to tell a constant/zero row from a genuine peak.
@@ -4508,6 +4853,7 @@ public enum SeedlessFusedVerify {
                 dumpF16Stats(normed, n: H, tag: "chain k=\(K - 1) normed(lm_head input)")
                 dumpLogitStats(hd, M: 1, tag: "chain last k=\(K - 1)")
             }
+            lastChainNormed = chainNormedFor.removeValue(forKey: ObjectIdentifier(chainBuf))
             let ptr = chainBuf.contents().bindMemory(to: Int32.self, capacity: K)
             return (0 ..< K).map { Int(ptr[$0]) }
         }
@@ -4777,6 +5123,7 @@ public enum SeedlessFusedVerify {
         w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
         M: Int, K: Int, N: Int
     ) {
+        if encodeFmv16Rows(enc, w: w, x: x, out: out, M: M, K: K, N: N) { return }   // MTPFastGEMV.swift
         guard ensureFmmPipeline(), let p = _fmmRowsPipeline else { return }
         enc.setComputePipelineState(p)
         enc.setBuffer(w, offset: 0, index: 0)
@@ -4902,6 +5249,9 @@ public enum SeedlessFusedVerify {
             var numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int
             var ropeBase: Float, eps: Float, maxSeqLen: Int
             var expertGroupSize: Int                        // 64 synthetic / 32 production
+            /// Production loaders set this: dense projections are re-quantized to 8-bit gs64 at
+            /// init and run on qmm8 (drafts only — verify decides the output). Tests leave it off.
+            var denseQ8: Bool = false
             // F16 plain [out, in] row-major
             var fc: MLXArray                                // [H, 2H]
             var qW: MLXArray, kW: MLXArray, vW: MLXArray, oW: MLXArray
@@ -4947,6 +5297,9 @@ public enum SeedlessFusedVerify {
         // noCopy 寿命規約: weight MTLBuffer 群の backing MLXArray を head と同寿命で保持
         private let _retainedWeights: [MLXArray]
         private var _len: Int = 0
+        /// 8-bit copies of dense F16 weights (keyed by the F16 buffer) when spec.denseQ8.
+        private var q8: [ObjectIdentifier: (w: MTLBuffer, s: MTLBuffer, b: MTLBuffer)] = [:]
+        private var q8Retained: [MLXArray] = []
         // Scratch buffers for M=1 draft/feed operations (shared, sequential access)
         // named _s_ prefix for scratch
         private let _sTok: MTLBuffer           // [1] int32 — current token id
@@ -4989,6 +5342,17 @@ public enum SeedlessFusedVerify {
 
         // ── Committed pair count ────────────────────────────────────────────
         public var len: Int { _len }
+        /// QWISP_SPEC_PROFILE=1: wall / GPU ms and call counts of draft and feed CBs.
+        static let prof = ProcessInfo.processInfo.environment["QWISP_SPEC_PROFILE"] == "1"
+        nonisolated(unsafe) public static var profDraft = (wall: 0.0, gpu: 0.0, n: 0)
+        nonisolated(unsafe) public static var profFeed = (wall: 0.0, gpu: 0.0, n: 0)
+        /// Forget all committed pairs (new request on the same head).
+        public func resetKV(start: Int = 0) { _len = 0; startPos = start }
+        /// Keep only the first `n` committed pairs (KV is append-only, so they stay valid).
+        public func truncate(to n: Int) { _len = Swift.min(_len, Swift.max(0, n)) }
+        /// Sequence position of the first committed pair (the prompt may be fed from a window).
+        public private(set) var startPos = 0
+        public var capacity: Int { maxSeqLen }
 
         // ── init? ───────────────────────────────────────────────────────────
         public init?(spec: WeightsSpec) {
@@ -5072,6 +5436,21 @@ public enum SeedlessFusedVerify {
             swUWBuf = _swUWq; swUSBuf = _swUSc; swUBBuf = _swUBi
             swDWBuf = _swDWq; swDSBuf = _swDSc; swDBBuf = _swDBi
             lmWBuf = _lmWq; lmSBuf = _lmSc; lmBBuf = _lmBi
+            if spec.denseQ8 {
+                for (a, b) in [(spec.fc, _fc), (spec.qW, _q), (spec.kW, _k), (spec.vW, _v), (spec.oW, _o),
+                               (spec.routerGate, _rg), (spec.shGate, _shG), (spec.shUp, _shU), (spec.shDown, _shD)] {
+                    let n = a.dim(0), k = a.dim(1)
+                    guard n % 8 == 0, k % 256 == 0 else { continue }
+                    let (wq, sc, bi) = MLX.quantized(a.asType(.float16), groupSize: 64, bits: 8, mode: .affine)
+                    guard let bi else { continue }
+                    let s16 = sc.asType(.float16), b16 = bi.asType(.float16)
+                    MLX.eval([wq, s16, b16]); q8Retained += [wq, s16, b16]
+                    if let bw = SeedlessMetalForward.mtlBuf(wq, dev), let bs = SeedlessMetalForward.mtlBuf(s16, dev),
+                       let bb = SeedlessMetalForward.mtlBuf(b16, dev) {
+                        q8[ObjectIdentifier(b)] = (bw, bs, bb)
+                    }
+                }
+            }
 
             // KV cache
             let kvBytes = spec.numKV * spec.maxSeqLen * spec.headDim * 2
@@ -5178,9 +5557,9 @@ public enum SeedlessFusedVerify {
             let qd2 = 2 * headDim
             let scale = 1.0 / sqrt(Float(headDim))
             // q/k/v proj (F16 fmm)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
+            dense(enc, w: qBuf, x: x, out: _sQOut,  M: 1, K: H, N: numHeads * qd2)
+            dense(enc, w: kBuf, x: x, out: _sKOut,  M: 1, K: H, N: numKV * headDim)
+            dense(enc, w: vBuf, x: x, out: _sVOut,  M: 1, K: H, N: numKV * headDim)
             // extract_q: qOut[nH, 2*hD] → qX[nH, hD]
             SeedlessFusedVerify.encodeExtractQ(enc, qOut: _sQOut, q: _sQX,
                                           headDim: headDim, qd2: qd2, total: numHeads * headDim)
@@ -5210,7 +5589,7 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: _sAttnOut, qOut: _sQOut, gated: _sGated,
                                              headDim: headDim, qd2: qd2, total: numHeads * headDim)
             // o_proj
-            SeedlessFusedVerify.encodeFmmRows(enc, w: oBuf, x: _sGated, out: out,
+            dense(enc, w: oBuf, x: _sGated, out: out,
                                           M: 1, K: numHeads * headDim, N: H)
         }
 
@@ -5218,7 +5597,7 @@ public enum SeedlessFusedVerify {
         /// x: [H] post_ln input; out: [H] MoE output.
         private func encodeMoE(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, out: MTLBuffer) {
             // Router gate: F16 fmm [E, H]
-            SeedlessFusedVerify.encodeFmmRows(enc, w: routerGateBuf, x: x, out: _sRGl,
+            dense(enc, w: routerGateBuf, x: x, out: _sRGl,
                                           M: 1, K: H, N: E)
             // Top-K routing
             SeedlessFusedVerify.encodeRouteTop8Rows(enc, logits: _sRGl, inds: _sRInds,
@@ -5237,13 +5616,13 @@ public enum SeedlessFusedVerify {
             SeedlessFusedVerify.encodeCombineRows(enc, d: _sExpD, scores: _sRScores, y: _sMoeY,
                                               Ktop: Ktop, N: H, M: 1)
             // Shared expert: F16 fmm
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
+            dense(enc, w: shGateBuf, x: x, out: _sShG, M: 1, K: H, N: I)
+            dense(enc, w: shUpBuf,   x: x, out: _sShU, M: 1, K: H, N: I)
             SeedlessFusedVerify.encodeSwiglu(enc, g: _sShG, u: _sShU, h: _sShAct, total: I)
-            SeedlessFusedVerify.encodeFmmRows(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
+            dense(enc, w: shDownBuf, x: _sShAct, out: _sShY, M: 1, K: I, N: H)
             // Shared gate scalar: sharedGate [1,H] → sgl[0]; _sSgl is sized [8] so index 0 for
             // final_combine_rows which reads sgl[m*8].
-            SeedlessFusedVerify.encodeFmmRows(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
+            dense(enc, w: sharedGateBuf, x: x, out: _sSgl, M: 1, K: H, N: 1)
             // Final combine: out = moeY + sigmoid(sgl[0]) * sharedY
             SeedlessFusedVerify.encodeFinalCombineRows(enc, y: _sMoeY, sharedY: _sShY,
                                                    sgl: _sSgl, out: out, N: H, M: 1)
@@ -5257,7 +5636,8 @@ public enum SeedlessFusedVerify {
                                    hPrevBuf: MTLBuffer, hRow: Int,
                                    pos: Int, totalKeys: Int,
                                    doLMHead: Bool,
-                                   tokBuf: MTLBuffer? = nil, tokOffset: Int = 0) {
+                                   tokBuf: MTLBuffer? = nil, tokOffset: Int = 0,
+                                   draftOut: MTLBuffer? = nil, draftOffset: Int = 0) {
             // 1. embed(tok) → _sEmb
             encodeEmbed(enc, embOut: _sEmb, tokBuf: tokBuf ?? _sTok, tokOffset: tokOffset)
             // 2. rmsNorm(emb, preEmb) → _sEmbN
@@ -5273,7 +5653,7 @@ public enum SeedlessFusedVerify {
             // 5. concat(embNormed, hidNormed) → _sCat
             encodeConcat(enc, a: _sEmbN, b: _sAN, out: _sCat)
             // 6. fc: _sCat @ fcᵀ → _sX
-            SeedlessFusedVerify.encodeFmmRows(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
+            dense(enc, w: fcBuf, x: _sCat, out: _sX, M: 1, K: 2 * H, N: H)
             // 7. attn input norm: rmsNorm(_sX, inputLN) → _sAN (inputLN must be [H])
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: inputLNBuf, out: _sAN,
                                               rows: 1, D: H, eps: eps)
@@ -5291,7 +5671,12 @@ public enum SeedlessFusedVerify {
             // 13. finalNorm: rmsNorm(_sX, finalNorm) → _sNormed
             SeedlessFusedVerify.encodeRmsNormRows(enc, x: _sX, w: finalNormBuf, out: _sNormed,
                                               rows: 1, D: H, eps: eps)
-            if doLMHead {
+            if doLMHead, let ids = draftVocabIds, draftVocabCount > 0 {
+                // 14'. draft vocabulary: score only the subset rows, write the winner's id.
+                SeedlessFusedVerify.encodeDraftVocabArgmax(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf, x: _sNormed,
+                                                       ids: ids, n: draftVocabCount, K: H, logits: _sLogits,
+                                                       out: draftOut ?? _sDraft, outOffset: draftOffset)
+            } else if doLMHead {
                 // 14. lm_head: qmm4 (_sNormed → _sLogits)
                 SeedlessFusedVerify.encodeQmmRows(enc, w: lmWBuf, scales: lmSBuf, biases: lmBBuf,
                                               x: _sNormed, out: _sLogits, M: 1, K: H, N: V)
@@ -5299,10 +5684,120 @@ public enum SeedlessFusedVerify {
                 let ap = SeedlessFusedVerify._mtpArgmaxPipeline!
                 enc.setComputePipelineState(ap)
                 enc.setBuffer(_sLogits, offset: 0, index: 0)
-                enc.setBuffer(_sDraft,  offset: 0, index: 1)
+                enc.setBuffer(draftOut ?? _sDraft, offset: draftOffset, index: 1)
                 var vv = UInt32(V); enc.setBytes(&vv, length: 4, index: 2)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+        }
+
+        // ── Row-batched pair feed (QWISP_MTP_FEED_BATCH, default on) ──────────────────────────
+        // feedPairs used to run one full head forward per pair (≈0.85 ms each on an M3 Pro), which
+        // made feeding a long prompt cost seconds of TTFT. Here up to `feedRows` pairs go through the
+        // head together: the same ops at M rows (causal SDPA over the new keys, M-row MoE gather).
+        // Drafts only — the verify decides every token, so feed numerics need not match per-row.
+        static let feedBatch = ProcessInfo.processInfo.environment["QWISP_MTP_FEED_BATCH"] != "0"
+        static let feedRows = 128
+        private final class FeedScratch {
+            let emb, embN, hn, cat, x, an, qOut, kOut, vOut, qx, qns, kns, qrot, krot, attnOut, gated,
+                attnRes, mn, mo, rgl, rinds, rscores, expG, expU, expH, expD, moeY, shG, shU, shAct, shY, sgl: MTLBuffer
+            init?(_ d: MTLDevice, R: Int, H: Int, nH: Int, hD: Int, nKV: Int, E: Int, I: Int, K: Int) {
+                func hb(_ n: Int) -> MTLBuffer? { d.makeBuffer(length: n * 2, options: .storageModeShared) }
+                func ib(_ n: Int) -> MTLBuffer? { d.makeBuffer(length: n * 4, options: .storageModeShared) }
+                guard let emb = hb(R * H), let embN = hb(R * H), let hn = hb(R * H), let cat = hb(R * 2 * H),
+                      let x = hb(R * H), let an = hb(R * H), let qOut = hb(R * nH * 2 * hD),
+                      let kOut = hb(R * nKV * hD), let vOut = hb(R * nKV * hD), let qx = hb(R * nH * hD),
+                      let qns = hb(R * nH * hD), let kns = hb(R * nKV * hD), let qrot = hb(R * nH * hD),
+                      let krot = hb(R * nKV * hD), let attnOut = hb(R * nH * hD), let gated = hb(R * nH * hD),
+                      let attnRes = hb(R * H), let mn = hb(R * H), let mo = hb(R * H), let rgl = hb(R * E),
+                      let rinds = ib(R * K), let rscores = hb(R * K), let expG = hb(R * K * I), let expU = hb(R * K * I),
+                      let expH = hb(R * K * I), let expD = hb(R * K * H), let moeY = hb(R * H), let shG = hb(R * I),
+                      let shU = hb(R * I), let shAct = hb(R * I), let shY = hb(R * H), let sgl = hb(R)
+                else { return nil }
+                self.emb = emb; self.embN = embN; self.hn = hn; self.cat = cat; self.x = x; self.an = an
+                self.qOut = qOut; self.kOut = kOut; self.vOut = vOut; self.qx = qx; self.qns = qns; self.kns = kns
+                self.qrot = qrot; self.krot = krot; self.attnOut = attnOut; self.gated = gated; self.attnRes = attnRes
+                self.mn = mn; self.mo = mo; self.rgl = rgl; self.rinds = rinds; self.rscores = rscores
+                self.expG = expG; self.expU = expU; self.expH = expH; self.expD = expD; self.moeY = moeY
+                self.shG = shG; self.shU = shU; self.shAct = shAct; self.shY = shY; self.sgl = sgl
+            }
+        }
+        private var _feedScratch: FeedScratch?
+
+        /// One head pass over M pairs: hidden rows [hRow0, hRow0+M) of hBuf with tokens tokBuf[0..M),
+        /// k/v written at positions pos..pos+M-1. No lm_head (feed only).
+        private func encodeFeedRows(_ enc: MTLComputeCommandEncoder, sc: FeedScratch, hBuf: MTLBuffer, hRow0: Int,
+                                    M: Int, pos: Int, tokBuf: MTLBuffer) {
+            let qd2 = 2 * headDim
+            // embed M tokens → emb; prenorms; concat; fc
+            let ep = SeedlessFusedVerify._embedRowsPipeline!
+            enc.setComputePipelineState(ep)
+            enc.setBuffer(embedWBuf, offset: 0, index: 0); enc.setBuffer(embedSBuf, offset: 0, index: 1)
+            enc.setBuffer(embedBBuf, offset: 0, index: 2); enc.setBuffer(tokBuf, offset: 0, index: 3)
+            enc.setBuffer(sc.emb, offset: 0, index: 4)
+            var hh = UInt32(H), tt = UInt32(M * H)
+            enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: Swift.min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.emb, w: preEmbBuf, out: sc.embN, rows: M, D: H, eps: eps)
+            let cp = SeedlessMetalForward._vecCopyPipeline!
+            enc.setComputePipelineState(cp)
+            enc.setBuffer(sc.hn, offset: 0, index: 0); enc.setBuffer(hBuf, offset: hRow0 * H * 2, index: 1)
+            var nn = UInt32(M * H); enc.setBytes(&nn, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: Swift.min(cp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.hn, w: preHidBuf, out: sc.an, rows: M, D: H, eps: eps)
+            SeedlessFusedVerify.encodeMTPConcatRows(enc, a: sc.embN, b: sc.an, out: sc.cat, H: H, M: M)
+            dense(enc, w: fcBuf, x: sc.cat, out: sc.x, M: M, K: 2 * H, N: H)
+            // attention
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.x, w: inputLNBuf, out: sc.an, rows: M, D: H, eps: eps)
+            dense(enc, w: qBuf, x: sc.an, out: sc.qOut, M: M, K: H, N: numHeads * qd2)
+            dense(enc, w: kBuf, x: sc.an, out: sc.kOut, M: M, K: H, N: numKV * headDim)
+            dense(enc, w: vBuf, x: sc.an, out: sc.vOut, M: M, K: H, N: numKV * headDim)
+            SeedlessFusedVerify.encodeExtractQ(enc, qOut: sc.qOut, q: sc.qx, headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.qx, w: qNormBuf, out: sc.qns, rows: M * numHeads, D: headDim, eps: eps)
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.kOut, w: kNormBuf, out: sc.kns, rows: M * numKV, D: headDim, eps: eps)
+            SeedlessFusedVerify.encodeRopeRows(enc, x: sc.qns, out: sc.qrot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: M, numHeads: numHeads)
+            SeedlessFusedVerify.encodeRopeRows(enc, x: sc.kns, out: sc.krot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: M, numHeads: numKV)
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: sc.krot, cache: kCache, KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: M)
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: sc.vOut, cache: vCache, KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: M)
+            SeedlessFusedVerify.encodeSdpaRows(enc, q: sc.qrot, k: kCache, v: vCache, out: sc.attnOut,
+                                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: pos + 1,
+                                           M: M, scale: 1.0 / sqrt(Float(headDim)), maxLen: maxSeqLen)
+            SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: sc.attnOut, qOut: sc.qOut, gated: sc.gated,
+                                             headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
+            dense(enc, w: oBuf, x: sc.gated, out: sc.attnRes, M: M, K: numHeads * headDim, N: H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: sc.x, r: sc.attnRes, total: M * H)
+            // MoE
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.x, w: postLNBuf, out: sc.mn, rows: M, D: H, eps: eps)
+            dense(enc, w: routerGateBuf, x: sc.mn, out: sc.rgl, M: M, K: H, N: E)
+            SeedlessFusedVerify.encodeRouteTop8Rows(enc, logits: sc.rgl, inds: sc.rinds, scores: sc.rscores, M: M, N: E, K: Ktop)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swGWBuf, scales: swGSBuf, biases: swGBBuf, x: sc.mn, inds: sc.rinds,
+                                                out: sc.expG, M: M, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swUWBuf, scales: swUSBuf, biases: swUBBuf, x: sc.mn, inds: sc.rinds,
+                                                out: sc.expU, M: M, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            SeedlessFusedVerify.encodeSwiglu(enc, g: sc.expG, u: sc.expU, h: sc.expH, total: M * Ktop * I)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swDWBuf, scales: swDSBuf, biases: swDBBuf, x: sc.expH, inds: sc.rinds,
+                                                out: sc.expD, M: M, Ktop: Ktop, K: I, N: H, lhsPer: true, gs: expertGS)
+            SeedlessFusedVerify.encodeCombineRows(enc, d: sc.expD, scores: sc.rscores, y: sc.moeY, Ktop: Ktop, N: H, M: M)
+            dense(enc, w: shGateBuf, x: sc.mn, out: sc.shG, M: M, K: H, N: I)
+            dense(enc, w: shUpBuf, x: sc.mn, out: sc.shU, M: M, K: H, N: I)
+            SeedlessFusedVerify.encodeSwiglu(enc, g: sc.shG, u: sc.shU, h: sc.shAct, total: M * I)
+            dense(enc, w: shDownBuf, x: sc.shAct, out: sc.shY, M: M, K: I, N: H)
+            dense(enc, w: sharedGateBuf, x: sc.mn, out: sc.sgl, M: M, K: H, N: 1)
+            SeedlessFusedVerify.encodeMTPFinalCombineRows(enc, y: sc.moeY, sharedY: sc.shY, sgl: sc.sgl, out: sc.mo, N: H, M: M)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: sc.x, r: sc.mo, total: M * H)
+        }
+
+        /// Dense projection: qmm8 on the 8-bit copy when present, else F16 GEMV.
+        private func dense(_ enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
+                           M: Int, K: Int, N: Int) {
+            if let q = q8[ObjectIdentifier(w)] {
+                SeedlessFusedVerify.encodeQmm8Rows(enc, w: q.w, scales: q.s, biases: q.b, x: x, out: out, M: M, K: K, N: N)
+            } else {
+                SeedlessFusedVerify.encodeFmmRows(enc, w: w, x: x, out: out, M: M, K: K, N: N)
             }
         }
 
@@ -5313,14 +5808,64 @@ public enum SeedlessFusedVerify {
             // ponytail: single CB, int32 readback only, no MLX ops
             _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
 
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             encodeForward(enc, hPrevBuf: hPrevBuf, hRow: hPrevRow,
                           pos: _len, totalKeys: _len + 1,
                           doLMHead: true)
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profDraft.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profDraft.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profDraft.n += 1
+            }
 
             return Int(_sDraft.contents().bindMemory(to: Int32.self, capacity: 1).pointee)
+        }
+
+        /// Draft vocabulary (MTPFastGEMV.swift): ids scored by the head's lm_head; nil = all V rows.
+        private var draftVocabIds: MTLBuffer?
+        private var draftVocabCount = 0
+        public private(set) var draftVocabSize = 0
+        /// Upload the subset (deduplicated by the caller); padded to a multiple of 8 with its last id.
+        public func setDraftVocab(_ ids: [Int32]) {
+            guard !ids.isEmpty, ids.count < V, SeedlessFusedVerify.ensureDraftVocabPipelines() else {
+                draftVocabIds = nil; draftVocabCount = 0; draftVocabSize = 0; return
+            }
+            var padded = ids.map { UInt32(bitPattern: $0) }
+            while padded.count % 8 != 0 { padded.append(padded.last!) }
+            draftVocabIds = device.makeBuffer(bytes: padded, length: padded.count * 4, options: .storageModeShared)
+            draftVocabCount = draftVocabIds == nil ? 0 : padded.count
+            draftVocabSize = ids.count
+        }
+
+        /// Chained drafts in one CB: step 0 is draftArgmax's forward (pair (h_prev, tok) at pos=_len);
+        /// step i > 0 feeds the previous step's own hidden (pre-final-norm residual, as in mlx-lm's
+        /// MTP chain) with its argmax token, writing provisional k/v at _len+i (overwritten by the
+        /// pair feed after the verify). _len is unchanged; commitLastDraft commits step 0's pair.
+        private var _sChainOut: MTLBuffer?
+        public func draftChain(hPrevBuf: MTLBuffer, hPrevRow: Int, tok: Int32, depth: Int) -> [Int]? {
+            guard depth >= 1, _len + depth <= maxSeqLen else { return nil }
+            if _sChainOut == nil { _sChainOut = device.makeBuffer(length: 16 * 4, options: .storageModeShared) }
+            guard let outBuf = _sChainOut, depth <= 16 else { return nil }
+            _sTok.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            encodeForward(enc, hPrevBuf: hPrevBuf, hRow: hPrevRow, pos: _len, totalKeys: _len + 1,
+                          doLMHead: true, draftOut: outBuf, draftOffset: 0)
+            for i in 1 ..< depth {
+                encodeForward(enc, hPrevBuf: _sX, hRow: 0, pos: _len + i, totalKeys: _len + i + 1,
+                              doLMHead: true, tokBuf: outBuf, tokOffset: (i - 1) * 4,
+                              draftOut: outBuf, draftOffset: i * 4)
+            }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profDraft.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profDraft.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profDraft.n += 1
+            }
+            let p = outBuf.contents().bindMemory(to: Int32.self, capacity: depth)
+            return (0 ..< depth).map { Int(p[$0]) }
         }
 
         /// Batch-ingest committed pairs. Advances _len by rowRange.count.
@@ -5335,8 +5880,31 @@ public enum SeedlessFusedVerify {
                 device.makeBuffer(bytes: raw.baseAddress!, length: M * 4, options: .storageModeShared)
             }) else { return false }
 
+            let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
+            if Self.feedBatch, M > 1, SeedlessFusedVerify.ensureMTPRowsPipelines(), SeedlessMetalForward.compileVecCopy() {
+                if _feedScratch == nil {
+                    _feedScratch = FeedScratch(device, R: Self.feedRows, H: H, nH: numHeads, hD: headDim, nKV: numKV,
+                                               E: E, I: I, K: Ktop)
+                }
+                if let sc = _feedScratch {
+                    var done = 0
+                    while done < M {
+                        let m = Swift.min(Self.feedRows, M - done)
+                        let tb = device.makeBuffer(bytes: Array(toks[done ..< done + m]), length: m * 4, options: .storageModeShared)!
+                        encodeFeedRows(enc, sc: sc, hBuf: hBuf, hRow0: rowRange.lowerBound + done, M: m, pos: _len + done, tokBuf: tb)
+                        done += m
+                    }
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    if Self.prof {
+                        Self.profFeed.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                        Self.profFeed.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profFeed.n += 1
+                    }
+                    _len += M
+                    return true
+                }
+            }
             for i in 0..<M {
                 let pos = _len + i
                 // Commit k/v to cache (pos committed), skip lm_head/argmax
@@ -5346,6 +5914,10 @@ public enum SeedlessFusedVerify {
                               tokBuf: tokBuf, tokOffset: i * 4)
             }
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if Self.prof {
+                Self.profFeed.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                Self.profFeed.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profFeed.n += 1
+            }
             _len += M
             return true
         }

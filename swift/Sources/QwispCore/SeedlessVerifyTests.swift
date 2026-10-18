@@ -49,7 +49,7 @@ public enum SeedlessVerifyTests {
         MLXRandom.seed(UInt64(42))
         var lines: [String] = []
         var passed = 0
-        let total = 100
+        let total = 104
 
         // Nested runner: records result and increments counter
         func run(_ name: String, body: () -> (Bool, String)) {
@@ -233,6 +233,116 @@ public enum SeedlessVerifyTests {
                 got.eval()
                 let (ok, d) = bitEqual(got, ref)
                 if !ok { return (false, "M=\(M): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // sdpa_rows_split_bitexact — WRITE-LOCKED (guarded by total = 101). Do not weaken/skip/delete.
+        // The two-pass split decode attention (SeedlessMetalForward.ensureSdpaSplit) must be
+        // byte-identical to sdpa_rows for every split count, row count and KV length, including
+        // N < 32 (simdgroups with no positions) and N not a multiple of 32.
+        run("sdpa_rows_split_bitexact") {
+            let H = 16, KV = 2, D = 256
+            let scale = Float(pow(Double(D), -0.5))
+            for L0 in [1, 31, 64, 1000] {
+                for M in [1, 2, 9, 16] {
+                    let totalSeq = L0 + M - 1
+                    let q     = MLXRandom.normal([M * H, D]).asType(.float16)
+                    let kFull = MLXRandom.normal([KV, totalSeq, D]).asType(.float16)
+                    let vFull = MLXRandom.normal([KV, totalSeq, D]).asType(.float16)
+                    MLX.eval([q, kFull, vFull])
+                    guard let ref = SeedlessMetalForward.sdpaRows(q, kFull, vFull, H: H, KV: KV, D: D,
+                                                                  baseLen: L0, M: M, scale: scale)
+                    else { return (false, "sdpaRows nil L0=\(L0) M=\(M)") }
+                    ref.eval()
+                    for parts in [2, 4, 8] {
+                        for g in [1, 2, 4, 8] {
+                            guard let got = SeedlessMetalForward.sdpaRowsSplit(q, kFull, vFull, H: H, KV: KV, D: D,
+                                                                               baseLen: L0, M: M, scale: scale, parts: parts,
+                                                                               headsPerSG: g)
+                            else { return (false, "sdpaRowsSplit nil L0=\(L0) M=\(M) parts=\(parts) G=\(g)") }
+                            got.eval()
+                            let (ok, d) = bitEqual(got, ref)
+                            if !ok { return (false, "L0=\(L0) M=\(M) parts=\(parts) G=\(g): \(d)") }
+                        }
+                    }
+                }
+            }
+            return (true, "ok")
+        }
+
+        // route_top8_rows_sg_bitexact — WRITE-LOCKED (guarded by total = 102). Do not weaken/skip/delete.
+        // The one-simdgroup router (SeedlessFusedVerify.ensureRouteSG) must reproduce route_top8_rows
+        // byte-for-byte (inds AND renormalized scores), including heavy ties: logits are quantized to a
+        // coarse grid so equal maxima are common, exercising the original tree's tie order.
+        run("route_top8_rows_sg_bitexact") {
+            for (M, grid) in [(1, Float(0)), (7, Float(0)), (5, Float(0.25)), (33, Float(1.0)), (16, Float(4.0))] {
+                var lg = MLXRandom.normal([M, 256]) * 3
+                if grid > 0 { lg = MLX.round(lg / grid) * grid }
+                let l16 = lg.asType(.float16); l16.eval()
+                guard let (ri, rs) = SeedlessFusedVerify.routeTop8Rows(l16, M: M),
+                      let (gi, gs) = SeedlessFusedVerify.routeTop8RowsSG(l16, M: M)
+                else { return (false, "nil M=\(M)") }
+                let (okI, dI) = bitEqual(gi.asType(.float32), ri.asType(.float32))
+                if !okI { return (false, "inds M=\(M) grid=\(grid): \(dI)") }
+                let (okS, dS) = bitEqual(gs, rs)
+                if !okS { return (false, "scores M=\(M) grid=\(grid): \(dS)") }
+            }
+            return (true, "ok")
+        }
+
+        // qmm8_r1_bitexact — WRITE-LOCKED (guarded by total = 103). Do not weaken/skip/delete.
+        // qmm8_r1 (1 output row per simdgroup) must equal qmm8 (4 rows per simdgroup) byte-for-byte.
+        run("qmm8_r1_bitexact") {
+            for (M, K, N) in [(1, 2048, 256), (3, 2048, 256), (1, 2048, 8), (2, 1024, 64)] {
+                let wf = MLXRandom.normal([N, K]).asType(.float16)
+                let (wq, sc, bi) = MLX.quantized(wf, groupSize: 64, bits: 8, mode: .affine)
+                let x = MLXRandom.normal([M, K]).asType(.float16)
+                MLX.eval([wq, sc, bi!, x])
+                guard let a = SeedlessMetalForward.qmm8Variant(x, wq, scales: sc, biases: bi!, M: M, K: K, N: N, r1: false),
+                      let b = SeedlessMetalForward.qmm8Variant(x, wq, scales: sc, biases: bi!, M: M, K: K, N: N, r1: true)
+                else { return (false, "nil M=\(M) N=\(N)") }
+                let (ok, d) = bitEqual(b, a)
+                if !ok { return (false, "M=\(M) K=\(K) N=\(N): \(d)") }
+            }
+            return (true, "ok")
+        }
+
+        // moe_shared_in_routed_bitexact — WRITE-LOCKED (guarded by total = 104). Do not weaken/skip/delete.
+        // The shared expert folded into the routed g/u and down dispatches as slice Ktop
+        // (fuseSharedInRouted, M == 1) must reproduce the separate shared path byte-for-byte,
+        // with the S2 combine both folded (MOE2 on) and separate (MOE2 off). M = 3 must ignore the flag.
+        run("moe_shared_in_routed_bitexact") {
+            let H = 2048, E = 16, I = 512, Ktop = 8
+            func q(_ shape: [Int], _ bits: Int) -> (MLXArray, MLXArray, MLXArray) {
+                let wf = MLXRandom.normal(shape).asType(.float16)
+                let (q, s, b) = MLX.quantized(wf, groupSize: 64, bits: bits, mode: .affine); return (q, s, b!)
+            }
+            let (gW, gS, gB) = q([E, H], 8); let (sgW, sgS, sgB) = q([8, H], 8)
+            let (a0, a1, a2) = q([E, I, H], 4); let (b0, b1, b2) = q([E, I, H], 4); let (c0, c1, c2) = q([E, H, I], 4)
+            let (d0, d1, d2) = q([I, H], 4); let (e0, e1, e2) = q([I, H], 4); let (f0, f1, f2) = q([H, I], 4)
+            let w = SeedlessVerifyForward.MoEBlockW(gateWq: gW, gateSc: gS, gateBi: gB,
+                swGWq: a0, swGSc: a1, swGBi: a2, swUWq: b0, swUSc: b1, swUBi: b2,
+                swDWq: c0, swDSc: c1, swDBi: c2, shGWq: d0, shGSc: d1, shGBi: d2,
+                shUWq: e0, shUSc: e1, shUBi: e2, shDWq: f0, shDSc: f1, shDBi: f2,
+                sharedGateWq: sgW, sharedGateSc: sgS, sharedGateBi: sgB)
+            typealias F = SeedlessFusedVerify.SeedlessFusedForward
+            let saved = (F.fuseSharedInRouted, F.fuseMOE2Enabled, F.fuseSHEXP)
+            defer { F.fuseSharedInRouted = saved.0; F.fuseMOE2Enabled = saved.1; F.fuseSHEXP = saved.2 }
+            F.fuseSHEXP = true
+            for (M, moe2) in [(1, false), (1, true), (3, false)] {
+                F.fuseMOE2Enabled = moe2
+                for rep in 0 ..< 3 {
+                    let x = MLXRandom.normal([M, H]).asType(.float16); x.eval()
+                    F.fuseSharedInRouted = false
+                    guard let ref = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                    else { return (false, "ref nil M=\(M)") }
+                    F.fuseSharedInRouted = true
+                    guard let got = SeedlessFusedVerify.fusedMoEBlockRows(x, w, M: M, E: E, I: I, Ktop: Ktop)
+                    else { return (false, "got nil M=\(M)") }
+                    let (ok, d) = bitEqual(got, ref)
+                    if !ok { return (false, "M=\(M) moe2=\(moe2) rep=\(rep): \(d)") }
+                }
             }
             return (true, "ok")
         }

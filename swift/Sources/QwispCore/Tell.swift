@@ -43,6 +43,31 @@ public enum Tell {
     // the reference path — gating changes speed only, the token stream is unchanged.
     // QWISP_SPEC_GATE=0 opts out (always draft, pre-#119 behavior).
     static let specGateWindow = 8
+    /// Tokens (ids >= the draft-vocabulary base) seen in prompts and outputs; grows the MTP draft
+    /// vocabulary. Persisted across processes (QWISP_MTP_VOCAB_CACHE, default on) so a restart keeps
+    /// what earlier conversations taught it — e.g. the CJK tokens of Japanese chats.
+    nonisolated(unsafe) static var draftVocabSeen = Set<Int32>()
+    nonisolated(unsafe) private static var draftVocabLoaded = false
+    static var draftVocabPath: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("qwisp/draft-vocab.u32")
+    }
+    static func loadDraftVocabOnce() {
+        guard !draftVocabLoaded else { return }
+        draftVocabLoaded = true
+        guard envInt("QWISP_MTP_VOCAB_CACHE", 1) != 0, let d = try? Data(contentsOf: draftVocabPath) else { return }
+        d.withUnsafeBytes { raw in
+            for v in raw.bindMemory(to: Int32.self).prefix(400_000) where v >= 0 { draftVocabSeen.insert(v) }
+        }
+    }
+    static func saveDraftVocab() {
+        guard envInt("QWISP_MTP_VOCAB_CACHE", 1) != 0 else { return }
+        let ids = draftVocabSeen.sorted(), url = draftVocabPath
+        DispatchQueue.global(qos: .utility).async {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            ids.withUnsafeBufferPointer { try? Data(buffer: $0).write(to: url, options: .atomic) }
+        }
+    }
     static var specGateEnabled: Bool { envInt("QWISP_SPEC_GATE", 1) != 0 }
     static var specGateReprobe: Int { Swift.max(8, envInt("QWISP_SPEC_REPROBE", 256)) }
     /// Conservative floor of the measured break-even curve (errs toward keeping spec on).

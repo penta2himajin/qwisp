@@ -43,6 +43,8 @@ if CommandLine.arguments.contains("stream") {
                run: { md, _ in Tell.longContextDecayProbe(modelDir: md) }),
         Runner(name: "spec-width", desc: "verify forward stage ms by draft width M at fixed ctx (#119; QWISP_SPEC_CTX) — is speculation paying?",
                run: { md, _ in Tell.specWidthProbe(modelDir: md) }),
+        Runner(name: "spec-replay-check", desc: "partial-reject replay vs rollback+rebuild: byte-equal decode state for every accepted count (QWISP_SPEC_REPLAY=1, QWISP_SPEC_REPLAY_D/CTX)",
+               run: { md, _ in Tell.specReplayCheck(modelDir: md) }),
         Runner(name: "seqmt-m", desc: "M-row verify scaling r_M (#90) — cost of widening the verify",
                run: { md, _ in Tell.seqMTScalingProbe(modelDir: md) }),
         // ── prefill / TTFT ──
@@ -67,6 +69,8 @@ if CommandLine.arguments.contains("stream") {
                run: { _, _ in Tell.laneKernelBench() }),
         Runner(name: "conc-bench", desc: "#143 U2 CEILING: N independent tiny dispatches, serial vs concurrent encoder (GPU, no model; QWISP_CONC_REPS/N)",
                run: { _, _ in GroupedMoEPoC.dispatchConcurrencyBench() }),
+        Runner(name: "moe-roofline", desc: "MoE decode (M=1) per-stage µs, GB/s vs copy ceiling, FLOP/B over 40 layers (GPU+model; QWISP_MOEB_REPS)",
+               run: { md, _ in Tell.moeDecodeRoofline(modelDir: md) }),
         Runner(name: "grouped-moe-bench", desc: "grouped MoE expert kernel micro-bench",
                run: { _, _ in GroupedMoEPoC.bench() }),
         Runner(name: "dense-tiled-bench", desc: "dense tiled matmul micro-bench",

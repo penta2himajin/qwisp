@@ -46,6 +46,9 @@ enum ModelStore {
 
     /// MTPLX / mlx-community-4bit / Ornith-MLX-4bit recipe: default 4/64/affine, and every
     /// per-tensor override is bits=8 on `….mlp.gate` or `….mlp.shared_expert_gate` only.
+    /// Overrides under an MTP head (`….mtp.…`, e.g. a grafted 8-bit MTP layer) are ignored:
+    /// the main forward never reads them (WeightStore drops them) and the MTP loader handles
+    /// its own layout.
     /// At least one router-gate override is required so uniform-4bit (gates packed as 4)
     /// cannot pass and then SIGTRAP in `qmm8`.
     static func matchesMTPLXQuantRecipe(_ q: [String: Any]?) -> Bool {
@@ -55,6 +58,7 @@ enum ModelStore {
         var sawRouterGate = false
         for (k, v) in q {
             if k == "bits" || k == "group_size" || k == "mode" { continue }
+            if isMTPTensor(k) { continue }
             guard let ov = v as? [String: Any], intVal(ov["bits"]) == 8 else { return false }
             let isRouter = k.hasSuffix(".mlp.gate")
             let isSharedGate = k.hasSuffix(".mlp.shared_expert_gate")
@@ -62,6 +66,11 @@ enum ModelStore {
             if isRouter { sawRouterGate = true }
         }
         return sawRouterGate
+    }
+
+    /// `language_model.mtp.…` / `mtp.…`: an MTP head's tensors, not the main model's.
+    static func isMTPTensor(_ name: String) -> Bool {
+        name.hasPrefix("mtp.") || name.contains(".mtp.")
     }
 
     /// JSONSerialization boxes numbers as NSNumber; accept Int bridging either way.
@@ -85,6 +94,15 @@ enum ModelStore {
             "language_model.model.layers.0.mlp.gate": gate8,
             "language_model.model.layers.0.mlp.shared_expert_gate": gate8,
         ])
+        let ornithMTP = cfg(4, overrides: [
+            "language_model.model.layers.0.mlp.gate": gate8,
+            "language_model.mtp.layers.0.self_attn.q_proj": ["bits": 8, "group_size": 64, "mode": "affine"],
+            "language_model.mtp.layers.0.mlp.switch_mlp.up_proj": ["bits": 4, "group_size": 64, "mode": "affine"],
+            "language_model.mtp.fc": ["bits": 8, "group_size": 64, "mode": "affine"],
+        ])
+        let mtpOnlyGate = cfg(4, overrides: [
+            "language_model.mtp.layers.0.mlp.gate": gate8,
+        ])
         let nailish = cfg(4, overrides: [
             "language_model.model.layers.0.mlp.gate": gate8,
             "language_model.model.layers.0.linear_attn.in_proj_qkv": gate8,
@@ -92,6 +110,8 @@ enum ModelStore {
         return [
             ("mtplx_stamp", isSupportedCheckpoint(cfg(4, policy: true))),
             ("ornith_recipe", isSupportedCheckpoint(ornith)),
+            ("ornith_with_mtp_head", isSupportedCheckpoint(ornithMTP)),
+            ("reject_mtp_gate_only", !isSupportedCheckpoint(mtpOnlyGate)),
             ("reject_uniform_4bit", !isSupportedCheckpoint(cfg(4))),
             ("reject_nail_attn8", !isSupportedCheckpoint(nailish)),
             ("reject_8bit_default", !isSupportedCheckpoint(cfg(8))),
