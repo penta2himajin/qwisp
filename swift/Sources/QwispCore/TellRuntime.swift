@@ -613,7 +613,8 @@ extension Tell {
 
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
-                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil,
+                        mtpFeedFrom: Int = 0) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
@@ -634,16 +635,19 @@ extension Tell {
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
-                let nPairs = (end < pLen) ? chunk.count : chunk.count - 1
+                let nAll = (end < pLen) ? chunk.count : chunk.count - 1
+                // Only pairs at index >= mtpFeedFrom (prompt window); skip rows before it.
+                let skip = Swift.min(nAll, Swift.max(0, mtpFeedFrom - pos))
+                let nPairs = nAll - skip
                 if nPairs > 0 {
-                    let toks = Array(promptIds[(pos + 1) ..< (pos + 1 + nPairs)])
+                    let toks = Array(promptIds[(pos + 1 + skip) ..< (pos + 1 + skip + nPairs)])
                     // Hybrid/fast prefill return their own normed rows (the fused normed buffer is
                     // not written), so feed from the returned array; plain fused prefill reads it.
                     if backend.forwardHybrid != nil, let dev = SeedlessMetalForward.ensure()?.0,
                        let hb = normed.asType(.float16).asMTLBuffer(device: dev, noCopy: false) {   // copy: temp array
-                        _ = head.feedPairs(hBuf: hb, rowRange: 0 ..< nPairs, toks: toks)
+                        _ = head.feedPairs(hBuf: hb, rowRange: skip ..< (skip + nPairs), toks: toks)
                     } else {
-                        _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: 0 ..< nPairs, toks: toks)
+                        _ = head.feedPairs(hBuf: fwd.normedBuffer, rowRange: skip ..< (skip + nPairs), toks: toks)
                     }
                 }
             }
@@ -769,7 +773,11 @@ extension Tell {
         let mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = (!useA3
             && promptIds.count + N + 2 <= (backend.mtpHead?.capacity ?? 0)) ? backend.mtpHead : nil
         let mtpFwd = backend.fusedFwd
-        if prefillTokens == nil { mtpHead?.resetKV() }
+        // Prompt window fed into the head (QWISP_MTP_PROMPT_WINDOW, default 1024; 0 = whole prompt):
+        // each pair costs a head forward, so feeding a long prompt in full adds seconds of TTFT.
+        let mtpWindow = Tell.envInt("QWISP_MTP_PROMPT_WINDOW", 1024)
+        let feedFrom = (prefillTokens == nil && mtpWindow > 0) ? Swift.max(0, promptIds.count - 1 - mtpWindow) : 0
+        if prefillTokens == nil { mtpHead?.resetKV(start: feedFrom) }
         else if let head = mtpHead, let c = mtpCarry, let first = prefillTokens?.first,
                 let dev = SeedlessMetalForward.ensure()?.0,
                 let cb = c.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false) {
@@ -777,7 +785,7 @@ extension Tell {
         }
         SeedlessFusedVerify.SeedlessMTPHead.profDraft = (0, 0, 0); SeedlessFusedVerify.SeedlessMTPHead.profFeed = (0, 0, 0)
         guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
-                                       mtpHead: mtpHead, mtpFwd: mtpFwd) else { return nil }
+                                       mtpHead: mtpHead, mtpFwd: mtpFwd, mtpFeedFrom: feedFrom) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)

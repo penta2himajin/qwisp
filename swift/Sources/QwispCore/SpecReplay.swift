@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 
-// Partial-reject rollback by replay (QWISP_SPEC_REPLAY=1).
+// Partial-reject rollback by replay (default on; QWISP_SPEC_REPLAY=0 restores rollback + rebuild).
 //
 // After an M-row verify accepts only the first `rows` rows, the old path rolls the cache back one
 // step (KV length + GDN ping-pong swap) and re-runs a full forward over those rows to rebuild the
@@ -32,8 +32,8 @@ extension SeedlessFusedVerify {
 }
 
 extension SeedlessFusedVerify.SeedlessFusedForward {
-    /// Opt-in: tape GDN inputs on verify forwards and replay accepted rows on partial reject.
-    static let specReplay = ProcessInfo.processInfo.environment["QWISP_SPEC_REPLAY"] == "1"
+    /// Tape GDN inputs on verify forwards and replay accepted rows on partial reject (default on).
+    static let specReplay = ProcessInfo.processInfo.environment["QWISP_SPEC_REPLAY"] != "0"
     /// Largest verify width that is taped (wider forwards fall back to rollback + rebuild).
     static let specReplayCap = Swift.max(2, Tell.envInt("QWISP_SPEC_REPLAY_CAP", 16))
     static let replayTrace = ProcessInfo.processInfo.environment["QWISP_SPEC_REPLAY_TRACE"] == "1"

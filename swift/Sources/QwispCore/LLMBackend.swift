@@ -188,14 +188,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
     var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
     private var prefixBackend: Tell.SpecBackend?
-    /// MTP-D1 head for serve-path drafts (QWISP_MTP_DRAFT=1, resident tier). Built once, rebuilt only
+    /// MTP-D1 head for serve-path drafts (default on when the checkpoint has one; resident tier). Built once, rebuilt only
     /// when a backend needs a longer KV; nil if the checkpoint has no MTP head.
     private var mtpHeadCache: SeedlessFusedVerify.SeedlessMTPHead?
     private var mtpHeadTried = false
 
     /// Attach the MTP head to a freshly built resident backend (no-op when disabled/unavailable).
     private func attachMTP(_ b: inout Tell.SpecBackend, maxSeqLen: Int) {
-        guard Tell.envFlag("QWISP_MTP_DRAFT"), !isStreamingTier, b.fusedFwd != nil else { return }
+        // Default: use the checkpoint's MTP head when it has one (QWISP_MTP_DRAFT=0 disables).
+        let env = ProcessInfo.processInfo.environment["QWISP_MTP_DRAFT"]
+        guard env != "0", !isStreamingTier, b.fusedFwd != nil else { return }
         if let h = mtpHeadCache, h.capacity >= maxSeqLen { b.mtpHead = h; return }
         if mtpHeadTried && mtpHeadCache == nil { return }
         mtpHeadTried = true
@@ -206,7 +208,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             b.mtpHead = h
             FileHandle.standardError.write(Data("[qwisp] MTP-D1 draft head active (maxSeqLen=\(maxSeqLen))\n".utf8))
         } else {
-            FileHandle.standardError.write(Data("[qwisp] QWISP_MTP_DRAFT=1 but no usable MTP head → drafts off\n".utf8))
+            FileHandle.standardError.write(Data((env == "1" ? "[qwisp] QWISP_MTP_DRAFT=1 but no usable MTP head → drafts off\n"
+                                                            : "[qwisp] no MTP head in this checkpoint → chain decode\n").utf8))
         }
     }
     // Streaming tier (#76): the C-slot expert arena persists across cached-backend rebuilds
@@ -641,8 +644,22 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // MTP head follows the arena: same prefix length (pairs = positions - 1); the delta
                 // prefill feeds it, with each chunk's boundary pair taken from the previous chunk's
                 // last hidden (`carry`). A restored boundary has no carry → that one pair is skipped.
+                // Head pairs cover positions [startPos, startPos + len). Keep them when they reach the
+                // restore point and the delta fits the prompt window; otherwise restart the head at
+                // the window start (an uncovered boundary pair is just skipped).
                 let mtpH = backend.mtpHead
-                if let h = mtpH { if restoreLen == 0 { h.resetKV() } else { h.truncate(to: restoreLen - 1) } }
+                let mtpWindow = Tell.envInt("QWISP_MTP_PROMPT_WINDOW", 1024)
+                var feedFrom = restoreLen   // absolute position of the first pair the delta prefill feeds
+                if let h = mtpH {
+                    let delta = contentLen - restoreLen
+                    let covers = restoreLen > 0 && h.startPos <= restoreLen - 1 && h.startPos + h.len >= restoreLen - 1
+                    if covers && (mtpWindow == 0 || delta <= mtpWindow) {
+                        h.truncate(to: restoreLen - 1 - h.startPos)
+                    } else {
+                        feedFrom = mtpWindow > 0 ? Swift.max(restoreLen, contentLen - mtpWindow) : restoreLen
+                        h.resetKV(start: feedFrom)
+                    }
+                }
                 var carry: MLXArray? = nil
                 var pos = restoreLen
                 while pos < contentLen {
@@ -655,12 +672,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         return
                     }
                     let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
-                    if let h = mtpH, let c = carry, let dev = SeedlessMetalForward.ensure()?.0,
+                    if let h = mtpH, let c = carry, pos - 1 >= feedFrom, let dev = SeedlessMetalForward.ensure()?.0,
                        let cbuf = c.reshaped([1, -1]).asType(.float16).asMTLBuffer(device: dev, noCopy: false) {
                         _ = h.feedPairs(hBuf: cbuf, rowRange: 0 ..< 1, toks: [content[pos]])
                     }
                     carry = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend,
-                                         mtpHead: mtpH, mtpFwd: backend.fusedFwd)
+                                         mtpHead: mtpH, mtpFwd: backend.fusedFwd,
+                                         mtpFeedFrom: Swift.max(0, feedFrom - pos))
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
                     pos = end
                 }
