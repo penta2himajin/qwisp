@@ -63,3 +63,61 @@ extension SeedlessFusedVerify {
         return true
     }
 }
+
+// Row-batched helpers for the MTP head's pair feed (feedPairs over M rows in one pass).
+extension SeedlessFusedVerify {
+    nonisolated(unsafe) static var _mtpConcatRowsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var _mtpFinalCombineRowsPipeline: MTLComputePipelineState?
+
+    static func ensureMTPRowsPipelines() -> Bool {
+        if _mtpConcatRowsPipeline != nil && _mtpFinalCombineRowsPipeline != nil { return true }
+        guard let (device, _) = SeedlessMetalForward.ensure() else { return false }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        // out[m, 0:H] = a[m], out[m, H:2H] = b[m]
+        kernel void mtp_concat_rows(device const half* a [[buffer(0)]], device const half* b [[buffer(1)]],
+                                    device half* out [[buffer(2)]], constant uint& H [[buffer(3)]],
+                                    uint2 pos [[thread_position_in_grid]]) {
+            uint i = pos.x, m = pos.y;
+            if (i >= 2 * H) return;
+            out[m * 2 * H + i] = i < H ? a[m * H + i] : b[m * H + i - H];
+        }
+        // out[m, n] = y[m, n] + sigmoid(sgl[m]) * sharedY[m, n]   (sgl stride 1)
+        kernel void mtp_final_combine_rows(device const half* y [[buffer(0)]], device const half* sy [[buffer(1)]],
+                                           device const half* sgl [[buffer(2)]], device half* out [[buffer(3)]],
+                                           constant uint& N [[buffer(4)]], uint2 pos [[thread_position_in_grid]]) {
+            uint n = pos.x, m = pos.y;
+            if (n >= N) return;
+            float g = 1.0f / (1.0f + exp(-float(sgl[m])));
+            out[m * N + n] = half(float(y[m * N + n]) + g * float(sy[m * N + n]));
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: SeedlessMetalForward.mlxMatchCompileOpts())
+            _mtpConcatRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_concat_rows")!)
+            _mtpFinalCombineRowsPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "mtp_final_combine_rows")!)
+            return true
+        } catch { print("[mtp-rows] compile: \(error)"); return false }
+    }
+
+    static func encodeMTPConcatRows(_ enc: MTLComputeCommandEncoder, a: MTLBuffer, b: MTLBuffer, out: MTLBuffer, H: Int, M: Int) {
+        let p = _mtpConcatRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(a, offset: 0, index: 0); enc.setBuffer(b, offset: 0, index: 1); enc.setBuffer(out, offset: 0, index: 2)
+        var hh = UInt32(H); enc.setBytes(&hh, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: 2 * H, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: Swift.min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+
+    static func encodeMTPFinalCombineRows(_ enc: MTLComputeCommandEncoder, y: MTLBuffer, sharedY: MTLBuffer, sgl: MTLBuffer,
+                                          out: MTLBuffer, N: Int, M: Int) {
+        let p = _mtpFinalCombineRowsPipeline!
+        enc.setComputePipelineState(p)
+        enc.setBuffer(y, offset: 0, index: 0); enc.setBuffer(sharedY, offset: 0, index: 1)
+        enc.setBuffer(sgl, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
+        var nn = UInt32(N); enc.setBytes(&nn, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: N, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: Swift.min(p.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+    }
+}

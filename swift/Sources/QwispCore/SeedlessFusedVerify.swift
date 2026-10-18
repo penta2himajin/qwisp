@@ -5685,6 +5685,106 @@ public enum SeedlessFusedVerify {
             }
         }
 
+        // ── Row-batched pair feed (QWISP_MTP_FEED_BATCH, default on) ──────────────────────────
+        // feedPairs used to run one full head forward per pair (≈0.85 ms each on an M3 Pro), which
+        // made feeding a long prompt cost seconds of TTFT. Here up to `feedRows` pairs go through the
+        // head together: the same ops at M rows (causal SDPA over the new keys, M-row MoE gather).
+        // Drafts only — the verify decides every token, so feed numerics need not match per-row.
+        static let feedBatch = ProcessInfo.processInfo.environment["QWISP_MTP_FEED_BATCH"] != "0"
+        static let feedRows = 128
+        private final class FeedScratch {
+            let emb, embN, hn, cat, x, an, qOut, kOut, vOut, qx, qns, kns, qrot, krot, attnOut, gated,
+                attnRes, mn, mo, rgl, rinds, rscores, expG, expU, expH, expD, moeY, shG, shU, shAct, shY, sgl: MTLBuffer
+            init?(_ d: MTLDevice, R: Int, H: Int, nH: Int, hD: Int, nKV: Int, E: Int, I: Int, K: Int) {
+                func hb(_ n: Int) -> MTLBuffer? { d.makeBuffer(length: n * 2, options: .storageModeShared) }
+                func ib(_ n: Int) -> MTLBuffer? { d.makeBuffer(length: n * 4, options: .storageModeShared) }
+                guard let emb = hb(R * H), let embN = hb(R * H), let hn = hb(R * H), let cat = hb(R * 2 * H),
+                      let x = hb(R * H), let an = hb(R * H), let qOut = hb(R * nH * 2 * hD),
+                      let kOut = hb(R * nKV * hD), let vOut = hb(R * nKV * hD), let qx = hb(R * nH * hD),
+                      let qns = hb(R * nH * hD), let kns = hb(R * nKV * hD), let qrot = hb(R * nH * hD),
+                      let krot = hb(R * nKV * hD), let attnOut = hb(R * nH * hD), let gated = hb(R * nH * hD),
+                      let attnRes = hb(R * H), let mn = hb(R * H), let mo = hb(R * H), let rgl = hb(R * E),
+                      let rinds = ib(R * K), let rscores = hb(R * K), let expG = hb(R * K * I), let expU = hb(R * K * I),
+                      let expH = hb(R * K * I), let expD = hb(R * K * H), let moeY = hb(R * H), let shG = hb(R * I),
+                      let shU = hb(R * I), let shAct = hb(R * I), let shY = hb(R * H), let sgl = hb(R)
+                else { return nil }
+                self.emb = emb; self.embN = embN; self.hn = hn; self.cat = cat; self.x = x; self.an = an
+                self.qOut = qOut; self.kOut = kOut; self.vOut = vOut; self.qx = qx; self.qns = qns; self.kns = kns
+                self.qrot = qrot; self.krot = krot; self.attnOut = attnOut; self.gated = gated; self.attnRes = attnRes
+                self.mn = mn; self.mo = mo; self.rgl = rgl; self.rinds = rinds; self.rscores = rscores
+                self.expG = expG; self.expU = expU; self.expH = expH; self.expD = expD; self.moeY = moeY
+                self.shG = shG; self.shU = shU; self.shAct = shAct; self.shY = shY; self.sgl = sgl
+            }
+        }
+        private var _feedScratch: FeedScratch?
+
+        /// One head pass over M pairs: hidden rows [hRow0, hRow0+M) of hBuf with tokens tokBuf[0..M),
+        /// k/v written at positions pos..pos+M-1. No lm_head (feed only).
+        private func encodeFeedRows(_ enc: MTLComputeCommandEncoder, sc: FeedScratch, hBuf: MTLBuffer, hRow0: Int,
+                                    M: Int, pos: Int, tokBuf: MTLBuffer) {
+            let qd2 = 2 * headDim
+            // embed M tokens → emb; prenorms; concat; fc
+            let ep = SeedlessFusedVerify._embedRowsPipeline!
+            enc.setComputePipelineState(ep)
+            enc.setBuffer(embedWBuf, offset: 0, index: 0); enc.setBuffer(embedSBuf, offset: 0, index: 1)
+            enc.setBuffer(embedBBuf, offset: 0, index: 2); enc.setBuffer(tokBuf, offset: 0, index: 3)
+            enc.setBuffer(sc.emb, offset: 0, index: 4)
+            var hh = UInt32(H), tt = UInt32(M * H)
+            enc.setBytes(&hh, length: 4, index: 5); enc.setBytes(&tt, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: Swift.min(ep.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.emb, w: preEmbBuf, out: sc.embN, rows: M, D: H, eps: eps)
+            let cp = SeedlessMetalForward._vecCopyPipeline!
+            enc.setComputePipelineState(cp)
+            enc.setBuffer(sc.hn, offset: 0, index: 0); enc.setBuffer(hBuf, offset: hRow0 * H * 2, index: 1)
+            var nn = UInt32(M * H); enc.setBytes(&nn, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: M * H, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: Swift.min(cp.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.hn, w: preHidBuf, out: sc.an, rows: M, D: H, eps: eps)
+            SeedlessFusedVerify.encodeMTPConcatRows(enc, a: sc.embN, b: sc.an, out: sc.cat, H: H, M: M)
+            dense(enc, w: fcBuf, x: sc.cat, out: sc.x, M: M, K: 2 * H, N: H)
+            // attention
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.x, w: inputLNBuf, out: sc.an, rows: M, D: H, eps: eps)
+            dense(enc, w: qBuf, x: sc.an, out: sc.qOut, M: M, K: H, N: numHeads * qd2)
+            dense(enc, w: kBuf, x: sc.an, out: sc.kOut, M: M, K: H, N: numKV * headDim)
+            dense(enc, w: vBuf, x: sc.an, out: sc.vOut, M: M, K: H, N: numKV * headDim)
+            SeedlessFusedVerify.encodeExtractQ(enc, qOut: sc.qOut, q: sc.qx, headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.qx, w: qNormBuf, out: sc.qns, rows: M * numHeads, D: headDim, eps: eps)
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.kOut, w: kNormBuf, out: sc.kns, rows: M * numKV, D: headDim, eps: eps)
+            SeedlessFusedVerify.encodeRopeRows(enc, x: sc.qns, out: sc.qrot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: M, numHeads: numHeads)
+            SeedlessFusedVerify.encodeRopeRows(enc, x: sc.kns, out: sc.krot, headDim: headDim, ropeDim: ropeDim, base: ropeBase,
+                                           startOffset: pos, M: M, numHeads: numKV)
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: sc.krot, cache: kCache, KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: M)
+            SeedlessFusedVerify.encodeWriteKVRows(enc, src: sc.vOut, cache: vCache, KV: numKV, D: headDim, maxLen: maxSeqLen, pos: pos, M: M)
+            SeedlessFusedVerify.encodeSdpaRows(enc, q: sc.qrot, k: kCache, v: vCache, out: sc.attnOut,
+                                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: pos + 1,
+                                           M: M, scale: 1.0 / sqrt(Float(headDim)), maxLen: maxSeqLen)
+            SeedlessFusedVerify.encodeSigmoidMul(enc, attnOut: sc.attnOut, qOut: sc.qOut, gated: sc.gated,
+                                             headDim: headDim, qd2: qd2, total: M * numHeads * headDim)
+            dense(enc, w: oBuf, x: sc.gated, out: sc.attnRes, M: M, K: numHeads * headDim, N: H)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: sc.x, r: sc.attnRes, total: M * H)
+            // MoE
+            SeedlessFusedVerify.encodeRmsNormRows(enc, x: sc.x, w: postLNBuf, out: sc.mn, rows: M, D: H, eps: eps)
+            dense(enc, w: routerGateBuf, x: sc.mn, out: sc.rgl, M: M, K: H, N: E)
+            SeedlessFusedVerify.encodeRouteTop8Rows(enc, logits: sc.rgl, inds: sc.rinds, scores: sc.rscores, M: M, N: E, K: Ktop)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swGWBuf, scales: swGSBuf, biases: swGBBuf, x: sc.mn, inds: sc.rinds,
+                                                out: sc.expG, M: M, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swUWBuf, scales: swUSBuf, biases: swUBBuf, x: sc.mn, inds: sc.rinds,
+                                                out: sc.expU, M: M, Ktop: Ktop, K: H, N: I, lhsPer: false, gs: expertGS)
+            SeedlessFusedVerify.encodeSwiglu(enc, g: sc.expG, u: sc.expU, h: sc.expH, total: M * Ktop * I)
+            SeedlessFusedVerify.encodeGatherQmmRows(enc, w: swDWBuf, scales: swDSBuf, biases: swDBBuf, x: sc.expH, inds: sc.rinds,
+                                                out: sc.expD, M: M, Ktop: Ktop, K: I, N: H, lhsPer: true, gs: expertGS)
+            SeedlessFusedVerify.encodeCombineRows(enc, d: sc.expD, scores: sc.rscores, y: sc.moeY, Ktop: Ktop, N: H, M: M)
+            dense(enc, w: shGateBuf, x: sc.mn, out: sc.shG, M: M, K: H, N: I)
+            dense(enc, w: shUpBuf, x: sc.mn, out: sc.shU, M: M, K: H, N: I)
+            SeedlessFusedVerify.encodeSwiglu(enc, g: sc.shG, u: sc.shU, h: sc.shAct, total: M * I)
+            dense(enc, w: shDownBuf, x: sc.shAct, out: sc.shY, M: M, K: I, N: H)
+            dense(enc, w: sharedGateBuf, x: sc.mn, out: sc.sgl, M: M, K: H, N: 1)
+            SeedlessFusedVerify.encodeMTPFinalCombineRows(enc, y: sc.moeY, sharedY: sc.shY, sgl: sc.sgl, out: sc.mo, N: H, M: M)
+            SeedlessFusedVerify.encodeResidAdd(enc, h: sc.x, r: sc.mo, total: M * H)
+        }
+
         /// Dense projection: qmm8 on the 8-bit copy when present, else F16 GEMV.
         private func dense(_ enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, out: MTLBuffer,
                            M: Int, K: Int, N: Int) {
@@ -5732,6 +5832,28 @@ public enum SeedlessFusedVerify {
             let t0 = Self.prof ? DispatchTime.now().uptimeNanoseconds : 0
             let cb = queue.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
+            if Self.feedBatch, M > 1, SeedlessFusedVerify.ensureMTPRowsPipelines(), SeedlessMetalForward.compileVecCopy() {
+                if _feedScratch == nil {
+                    _feedScratch = FeedScratch(device, R: Self.feedRows, H: H, nH: numHeads, hD: headDim, nKV: numKV,
+                                               E: E, I: I, K: Ktop)
+                }
+                if let sc = _feedScratch {
+                    var done = 0
+                    while done < M {
+                        let m = Swift.min(Self.feedRows, M - done)
+                        let tb = device.makeBuffer(bytes: Array(toks[done ..< done + m]), length: m * 4, options: .storageModeShared)!
+                        encodeFeedRows(enc, sc: sc, hBuf: hBuf, hRow0: rowRange.lowerBound + done, M: m, pos: _len + done, tokBuf: tb)
+                        done += m
+                    }
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    if Self.prof {
+                        Self.profFeed.wall += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                        Self.profFeed.gpu += (cb.gpuEndTime - cb.gpuStartTime) * 1000; Self.profFeed.n += 1
+                    }
+                    _len += M
+                    return true
+                }
+            }
             for i in 0..<M {
                 let pos = _len + i
                 // Commit k/v to cache (pos committed), skip lm_head/argmax
