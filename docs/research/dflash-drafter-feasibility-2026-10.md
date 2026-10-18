@@ -607,6 +607,29 @@ What this shows on this machine:
    are optimistic for the M3 Pro; agentic (≈ 1.55×) is consistent with the measured +21 %
    given oMLX's higher per-cycle overhead.
 
+## 9. Measured: oMLX MTP on the grafted Ornith checkpoint (M3 Pro, 2026-10-18)
+
+The uncensored Ornith checkpoint gained an MTP layer on 2026-10-16 (`language_model.mtp.*` in
+`model-mtp.safetensors`, 8-bit dense parts, 4-bit gs64 experts). oMLX 0.7.0 with
+`mtp_enabled: true` ("Lightning MTP": depth 1-3 chosen per sequence, replay-free rollback),
+same harness as §8 (greedy, 384 tokens, two runs, `--memory-guard off`):
+
+| decode tok/s | code | agentic | longctx | shortnl |
+|---|---|---|---|---|
+| no drafter (same run) | 59.4 / 59.3 | 56.1 / 56.1 | 52.3 / 52.2 | 56.4 / 58.5 |
+| **MTP** | **67.0 / 65.4** | **75.4 / 74.0** | **62.4 / 64.1** | **67.6 / 67.5** |
+| DFlash2 incoai 4-bit, block 4 (§8) | 69.0 | 67.2 | 59.6 | 51.4 |
+
+oMLX's per-request MTP log: acceptance 78-87 %, depth-1 acceptance 83-93 %, 1.9-2.8 tokens
+per cycle, MTP head time ~0.5 ms per cycle (`timing[mtp=…]`), backbone ~29 ms per cycle.
+
+MTP gains on every regime including shortnl (+11 % code, +33 % agentic, +21 % longctx, +18 %
+shortnl), and beats the best DFlash2 setting everywhere except code. Unlike DFlash, an MTP draft
+verified by qwisp's bit-exact M-row verify keeps the strict stream, so it is a candidate for the
+lossless tier as well. qwisp's own MTP-D1 path lost to chain on M1 Max (notes/17) because of the
+rebuild forward on every reject, the head cost, and having to turn chain off; the rebuild term is
+the one replay-based rollback removes.
+
 ## Sources
 
 - Hugging Face: [ornith-ai/Ornith-1.5-35B-A3B-DFlash](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-DFlash)
