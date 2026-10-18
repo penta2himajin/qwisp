@@ -65,7 +65,10 @@ extension Tell {
         lines.append(String(format: "  M=%2d  wall %7.2fms  gpu %7.2fms  cpu-gap %6.2fms   r_M = 1.00  (baseline)",
                             1, base.wall, base.gpu, base.wall - base.gpu))
         var rM: [Int: Double] = [1: 1.0]
-        for m in [2, 4, 9, 17] {
+        // QWISP_SEQMT_MS: comma list of verify widths (default 2,4,9,17).
+        let ms = (ProcessInfo.processInfo.environment["QWISP_SEQMT_MS"] ?? "2,4,9,17")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }.filter { $0 > 1 }
+        for m in ms {
             guard let r = run(M: m) else { lines.append("  M=\(m) FAIL"); continue }
             rM[m] = r.wall / base.wall
             lines.append(String(format: "  M=%2d  wall %7.2fms  gpu %7.2fms  cpu-gap %6.2fms   r_M = %.2f  (r_M/M = %.2f)",
@@ -74,7 +77,7 @@ extension Tell {
 
         // Q2: GDN-recurrence share via skip differential (M=1 and M=17).
         lines.append("  — approach-(B) replay budget —")
-        for m in [1, 17] {
+        for m in (Tell.envInt("QWISP_SEQMT_Q2", 1) != 0 ? [1, 17] : []) {
             guard let full = run(M: m), let skip = run(M: m, skipRecur: true) else { continue }
             let share = (full.wall - skip.wall) / base.wall
             lines.append(String(format: "  M=%2d  GDN-recur cost = %6.2fms (%.2f of an M=1 forward%@)",
